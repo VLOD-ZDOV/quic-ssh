@@ -34,6 +34,7 @@ cleanup() {
     if [[ -z ${QSH_TEST_NS:-} ]]; then
         userdel -r qsh-alice 2>/dev/null || true
         userdel -r qsh-bob 2>/dev/null || true
+        userdel -r qsh-nol 2>/dev/null || true
         groupdel qsh-team 2>/dev/null || true
     fi
     rm -rf "$T"
@@ -41,28 +42,35 @@ cleanup() {
 trap cleanup EXIT
 
 # --- test users -------------------------------------------------------------
+# qsh-nol has a nologin shell: like with sshd, that must also block file access.
+NOLOGIN=/bin/false
+for p in /usr/sbin/nologin /sbin/nologin /usr/bin/nologin; do [[ -x $p ]] && { NOLOGIN=$p; break; }; done
 if [[ -n ${QSH_TEST_NS:-} ]]; then
-    mkdir -p "$T/home/alice" "$T/home/bob"
+    mkdir -p "$T/home/alice" "$T/home/bob" "$T/home/nol"
     cp /etc/passwd "$T/passwd"
     cp /etc/group "$T/group"
     cat >> "$T/passwd" <<EOF
 qsh-alice:x:2001:2001::$T/home/alice:/bin/sh
 qsh-bob:x:2002:2002::$T/home/bob:/bin/sh
+qsh-nol:x:2003:2003::$T/home/nol:$NOLOGIN
 EOF
     cat >> "$T/group" <<EOF
 qsh-alice:x:2001:
 qsh-bob:x:2002:
+qsh-nol:x:2003:
 qsh-team:x:2010:qsh-alice
 EOF
     mount --bind "$T/passwd" /etc/passwd
     mount --bind "$T/group" /etc/group
     chown 2001:2001 "$T/home/alice"
     chown 2002:2002 "$T/home/bob"
-    chmod 700 "$T/home/alice" "$T/home/bob"
+    chown 2003:2003 "$T/home/nol"
+    chmod 700 "$T/home/alice" "$T/home/bob" "$T/home/nol"
 else
     groupadd qsh-team
     useradd -m -s /bin/sh -U qsh-alice
     useradd -m -s /bin/sh -U qsh-bob
+    useradd -m -s "$NOLOGIN" -U qsh-nol
     usermod -aG qsh-team qsh-alice
 fi
 ALICE_UID=$(id -u qsh-alice)
@@ -70,6 +78,8 @@ BOB_UID=$(id -u qsh-bob)
 TEAM_GID=$(getent group qsh-team | cut -d: -f3)
 ALICE_HOME=$(getent passwd qsh-alice | cut -d: -f6)
 BOB_HOME=$(getent passwd qsh-bob | cut -d: -f6)
+NOL_UID=$(id -u qsh-nol)
+NOL_HOME=$(getent passwd qsh-nol | cut -d: -f6)
 
 as_user() { local u=$1; shift; setpriv --reuid "$u" --regid "$u" --init-groups env HOME="$(getent passwd "$u" | cut -d: -f6)" "$@"; }
 
@@ -80,9 +90,13 @@ cp "$BIN_DIR/qsh" "$BIN_DIR/qshd" "$T/bin/"
 chmod 755 "$T/bin" "$T/bin/qsh" "$T/bin/qshd"
 QSH="$T/bin/qsh"
 QSHD="$T/bin/qshd"
+mkdir -m 1777 "$T/shared"
 cat > "$T/config.toml" <<EOF
 listen = "127.0.0.1:0"
 host_key = "$T/host_ed25519"
+
+[subsystems]
+probe = "touch $T/shared/probe-\$USER"
 EOF
 "$QSHD" -c "$T/config.toml" serve 2> "$T/server.log" &
 SERVER_PID=$!
@@ -155,6 +169,21 @@ chmod 600 "$T/secret"
 check "download of a root-only file is denied" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-alice@127.0.0.1:$T/secret' '$T/stolen' 2>/dev/null"
 check "no file was created locally" test ! -e "$T/stolen"
 check "alice cannot read bob's home" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-alice@127.0.0.1:$BOB_HOME/.config/qsh/authorized_keys' '$T/x' 2>/dev/null"
+
+# --- restricted shells ----------------------------------------------------------------
+install -d -m 700 -o "$NOL_UID" -g "$NOL_UID" "$NOL_HOME/.config" "$NOL_HOME/.config/qsh"
+install -o "$NOL_UID" -g "$NOL_UID" -m 600 "$AK" "$NOL_HOME/.config/qsh/authorized_keys"
+q -s qsh-alice@127.0.0.1 probe >/dev/null 2>&1 || true
+check "subsystems run (through the user's shell)" test -e "$T/shared/probe-qsh-alice"
+check "nologin user cannot run commands" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-nol@127.0.0.1 true </dev/null &>/dev/null"
+HOME="$T/client" "$QSH" -p "$PORT" -s qsh-nol@127.0.0.1 probe </dev/null >/dev/null 2>&1 || true
+check "nologin user cannot run subsystems" test ! -e "$T/shared/probe-qsh-nol"
+check "nologin user cannot upload" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT '$T/payload' qsh-nol@127.0.0.1:up.bin 2>/dev/null"
+check "nothing was written to its home" test ! -e "$NOL_HOME/up.bin"
+echo hidden > "$NOL_HOME/file"
+chown "$NOL_UID:$NOL_UID" "$NOL_HOME/file"
+check "nologin user cannot download" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT qsh-nol@127.0.0.1:file '$T/nol-file' 2>/dev/null"
+check "nologin user cannot download trees" bash -c "! HOME='$T/client' '$QSH' cp -r -p $PORT qsh-nol@127.0.0.1:.config '$T/nol-tree' 2>/dev/null"
 
 # --- port forwarding runs as the user (compare CVE-2016-10010) ------------------------
 # A listener that reports its port and holds one connection open.

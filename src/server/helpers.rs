@@ -9,19 +9,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
+pub use super::users::{decode_args, HELPER_ARGS, HELPER_FROM_ENV};
 
 /// Where an upload goes: `path`, or `path/name` if `path` is a directory.
 fn upload_target(path: &str, name: &str) -> Result<PathBuf> {
-    let base = if path.is_empty() { Path::new(".") } else { Path::new(path) };
-    if base.is_dir() {
-        let file = Path::new(name).file_name().context("invalid file name")?;
-        if file == ".." || file == "." {
-            bail!("invalid file name");
-        }
-        Ok(base.join(file))
-    } else {
-        Ok(base.to_path_buf())
-    }
+    crate::tree::tree_target(Path::new(if path.is_empty() { "." } else { path }), name)
 }
 
 /// Receives exactly `size` bytes from stdin into the target file.
@@ -47,7 +39,7 @@ pub fn recv(path: &str, name: &str, size: u64, mode: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes a 12-byte header (size, mode) and then the file contents to stdout.
+/// Writes "ok", a 12-byte header (size, mode) and then the file contents to stdout.
 pub fn send(path: &str) -> Result<()> {
     let mut f = fs::File::open(path).with_context(|| path.to_string())?;
     let meta = f.metadata()?;
@@ -55,6 +47,7 @@ pub fn send(path: &str) -> Result<()> {
         bail!("{path}: not a regular file");
     }
     let mut out = io::stdout().lock();
+    writeln!(out, "ok")?;
     out.write_all(&meta.len().to_be_bytes())?;
     out.write_all(&(meta.mode() & 0o7777).to_be_bytes())?;
     io::copy(&mut Read::take(&mut f, meta.len()), &mut out)?;
@@ -101,8 +94,7 @@ pub fn connect(host: &str, port: u16) -> Result<()> {
 /// Receives a tar stream on stdin into `path` (or `path/name` if `path` is a
 /// directory). Prints "ok" once the target directory exists.
 pub fn untar(path: &str, name: &str) -> Result<()> {
-    let base = if path.is_empty() { "." } else { path };
-    let target = crate::tree::tree_target(Path::new(base), name)?;
+    let target = upload_target(path, name)?;
     crate::tree::create_target(&target)?;
     let mut out = io::stdout();
     writeln!(out, "ok")?;

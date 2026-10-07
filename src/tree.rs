@@ -138,14 +138,61 @@ pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
     Ok(stats)
 }
 
-/// Where a tree named `name` lands: inside `dest` if that is an existing
-/// directory, otherwise at `dest` itself (like `cp -r` and `scp -r`).
+/// Where a file or tree named `name` lands: inside `dest` if that is an
+/// existing directory, otherwise at `dest` itself (like `cp -r` and `scp -r`).
+/// Only the last component of `name` counts, and `.`/`..` are refused.
 pub fn tree_target(dest: &Path, name: &str) -> Result<PathBuf> {
-    let name = Path::new(name).file_name().context("invalid directory name")?;
+    let name = Path::new(name).file_name().context("invalid name")?;
     if name == ".." || name == "." {
-        bail!("invalid directory name");
+        bail!("invalid name");
     }
     Ok(if dest.is_dir() { dest.join(name) } else { dest.to_path_buf() })
+}
+
+/// Reads the chunked framing of a tree download: chunks of a big-endian u32
+/// length and that many bytes, ended by a zero length. A final status follows
+/// it on the stream, after [`Unchunk::finish`].
+pub struct Unchunk<R> {
+    inner: R,
+    left: usize,
+    done: bool,
+}
+
+impl<R: Read> Unchunk<R> {
+    pub fn new(inner: R) -> Unchunk<R> {
+        Unchunk { inner, left: 0, done: false }
+    }
+
+    /// Skips whatever the reader did not consume (e.g. tar padding) up to the
+    /// end marker and returns the underlying stream.
+    pub fn finish(mut self) -> io::Result<R> {
+        io::copy(&mut self, &mut io::sink())?;
+        Ok(self.inner)
+    }
+}
+
+impl<R: Read> Read for Unchunk<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            let mut len = [0u8; 4];
+            self.inner.read_exact(&mut len)?;
+            self.left = u32::from_be_bytes(len) as usize;
+            if self.left == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let want = buf.len().min(self.left);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        self.left -= n;
+        Ok(n)
+    }
 }
 
 /// Creates the target directory of a tree transfer (it may already exist).

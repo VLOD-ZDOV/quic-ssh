@@ -571,6 +571,10 @@ fn key_state(host: &str, port: u16, key: crate::keys::PublicKey) -> KeyState {
 
 /// TLS handshake only (no login) with a throwaway key: is qshd there, how fast?
 async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
+    if target.needs_proxy {
+        // Reached through a proxy: connecting directly could reveal this machine's address.
+        return (Probe::NoQshd, None);
+    }
     let Ok(tls) = crate::tls::client_config(&id) else { return (Probe::NoQshd, None) };
     let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
     let start = Instant::now();

@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{GatewayPorts, ServerConfig};
 use crate::keys::{qsh_dir, read_key_list_strict, Identity, PublicKey};
-use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, MIN_VERSION, VERSION};
+use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, MIN_VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use users::User;
 
@@ -156,7 +156,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     .context("no hello in time")??;
 
     let (name, pairing) = match hello {
-        Hello::Login { version, user } | Hello::Pair { version, user } if !(MIN_VERSION..=VERSION).contains(&version) => {
+        Hello::Login { version, user } | Hello::Pair { version, user } if version < MIN_VERSION => {
             write_msg(&mut send, &Reply::Err(format!("unsupported protocol version {version}"))).await?;
             bail!("client {user:?} uses protocol version {version}");
         }
@@ -226,10 +226,11 @@ async fn handle_stream(
     };
     match request {
         Request::Exec { command, env, pty } => {
-            exec::run(send, recv, user, exec::Launch::Shell(command), env, pty, closed).await
+            exec::run(send, recv, user, command, env, pty, closed).await
         }
-        Request::Subsystem { name, env } => match subsystem_argv(&state.cfg, &name) {
-            Some(argv) => exec::run(send, recv, user, exec::Launch::Program(argv), env, None, closed).await,
+        // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
+        Request::Subsystem { name, env } => match subsystem_command(&state.cfg, &name) {
+            Some(cmd) => exec::run(send, recv, user, Some(cmd), env, None, closed).await,
             None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
         },
         Request::RemoteForward { bind, port } => remote_forward(send, recv, conn.clone(), user, state, &bind, port).await,
@@ -275,13 +276,12 @@ const SFTP_SERVERS: [&str; 5] = [
 ];
 
 /// Command line for a subsystem: from the config, or a detected sftp-server.
-fn subsystem_argv(cfg: &ServerConfig, name: &str) -> Option<Vec<String>> {
+fn subsystem_command(cfg: &ServerConfig, name: &str) -> Option<String> {
     if let Some(cmd) = cfg.subsystems.get(name) {
-        let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
-        return (!argv.is_empty()).then_some(argv);
+        return (!cmd.trim().is_empty()).then(|| cmd.clone());
     }
     if name == "sftp" {
-        return SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| vec![p.to_string()]);
+        return SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string());
     }
     None
 }

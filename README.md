@@ -18,8 +18,9 @@ Features:
 
 - interactive shell with a PTY, window resizing and exit codes;
 - remote commands (`qsh host cmd`) with stdin/stdout/stderr;
-- local port forwarding (`-L`);
-- file copy (`qsh cp`);
+- port forwarding: local (`-L`), remote (`-R`), SOCKS proxy (`-D`), stdio (`-W`) and jump hosts (`-J`);
+- file copy, including directories (`qsh cp -r`);
+- the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
 - Ed25519 key login only (your existing `~/.ssh/id_ed25519` works);
 - pairing with a one-time code, so you never copy keys by hand;
 - host aliases from your existing `~/.ssh/config` (`qsh myserver`).
@@ -122,15 +123,25 @@ qsh user@host uname -a                 # run a command
 qsh -t user@host htop                  # command with a forced PTY
 qsh -L 8080:localhost:80 user@host     # port forward (+ shell)
 qsh -N -L 5432:db.internal:5432 host   # port forward only
+qsh -N -R 8080:localhost:3000 host     # remote forward: host's port 8080 -> your port 3000
+qsh -N -D 1080 host                    # SOCKS4/5 proxy on localhost:1080
+qsh -J bastion user@internal           # through a jump host (both run qshd)
+qsh -f -N -L 5432:db:5432 host         # log in, then go to the background
 qsh cp file.txt user@host:dir/         # upload
 qsh cp user@host:logs/app.log .        # download
+qsh cp -r project/ user@host:src/      # copy a directory (either direction)
 qsh -p 2222 user@host                  # another port (or user@host:2222)
 qsh --transport tcp user@host          # force TCP (or quic)
 qsh -v user@host                       # show which transport is used
+qsh -G myserver                        # print the resolved settings for a host
 qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
 qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
 ```
+
+Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them).
+
+In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
 
 The client key is chosen in this order: `-i FILE`, then the first Ed25519 `IdentityFile` from the config (see below), then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
 
@@ -159,22 +170,39 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`, `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
 With `--full` (automatic when qsh is installed as `ssh`), qsh behaves like a drop-in for `ssh`:
 
-- It also reads `Port`, `LocalForward` and `RequestTTY` from `~/.ssh/config`. Without `--full`, these describe the ssh session and are ignored.
+- It also reads `Port`, `LocalForward`, `RemoteForward`, `DynamicForward` and `RequestTTY` from `~/.ssh/config`. Without `--full`, these describe the ssh session and are ignored.
 - It looks for qshd **both** on the ssh port (default 22) **and** on 4422, in parallel, and uses whichever answers. On 22, qshd can run UDP-only next to sshd (`tcp = false` in the server config). An explicit qsh port (`-p`, `:port` or `Port` in `~/.config/qsh/config`) means only that port is tried.
-- If no qshd answers within 1 s, or the host is configured with `ProxyJump`/`ProxyCommand` (which qsh cannot do), qsh runs the regular **`ssh`** (or **`scp`** for `qsh --full cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
+- If no qshd answers within 1 s, or `~/.ssh/config` gives the host a `ProxyJump`/`ProxyCommand` (the hops may not run qshd), qsh runs the regular **`ssh`** (or **`scp`** for `qsh --full cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
 - Hosts without qshd are remembered for an hour, so later connections go straight to ssh. `--transport quic` forces a new check.
 - A wrong host key or a refused login never falls back to ssh.
 
 ```sh
 qsh --full myserver               # QUIC if qshd is there, otherwise plain ssh
-qsh --full -v myserver             # prints which one was used
-ln -s $(command -v qsh) ~/.local/bin/ssh   # use qsh as ssh everywhere (ssh's flags keep their meaning)
+qsh --full -v myserver            # prints which one was used
+```
+
+### OpenSSH tools over qsh
+
+Programs that run `ssh` underneath can use qsh instead:
+
+```sh
+sftp -S qsh user@host                         # needs sftp-server on the server (package openssh-sftp-server)
+scp -S qsh file.txt user@host:dir/
+rsync -a -e qsh project/ user@host:src/
+GIT_SSH_COMMAND=qsh git clone user@host:repo.git
+sshfs -o ssh_command=qsh user@host:/srv /mnt/srv
+```
+
+To make every program use qsh, install it as `ssh` earlier in your `PATH`. Run as `ssh`, qsh turns on `--full`, so hosts without qshd are still reached with the real ssh:
+
+```sh
+ln -s "$(command -v qsh)" ~/.local/bin/ssh
 ```
 
 ### Host menu and speed test (`qsh ui`, `qsh speed`)
@@ -224,7 +252,13 @@ max_connections = 256
 max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
 max_startups_per_ip = 8         # ... from one IP address
 tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`
+gateway_ports = "no"            # -R listens on loopback only; "yes": all addresses; "clientspecified"
+
+[subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
+# sftp = "/usr/lib/openssh/sftp-server"   # found automatically if installed
 ```
+
+Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
 
 User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. Only `ssh-ed25519` lines count. Lines with options (`from=`, `command=` and so on) are **ignored**, because qsh cannot enforce those restrictions.
 
@@ -277,8 +311,9 @@ python3 bench/bench.py
 - **The server** presents a self-signed certificate carrying its Ed25519 key. The client checks that key against `known_hosts` (TOFU, like ssh). If the key changes, the connection is dropped before any data is sent.
 - **The client** logs in with mutual TLS using its Ed25519 key. The signature is checked inside the TLS handshake, so the login is bound to the channel. There are no passwords at all.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code is single-use (burned after the first attempt, even a failed one) and expires after 10 minutes.
-- **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules.
+- **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. Like sshd, file transfers and subsystems (sftp) start through the user's login shell, so `nologin` or `git-shell` also block them. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules.
 - **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout.
+- **Directory copy** (`cp -r`) unpacks only regular files and directories. Absolute paths, `..`, links and device files are refused, and setuid/setgid bits are dropped, so a malicious server cannot write outside the target directory.
 - **Port forwarding** in system mode connects as the user, not as root, so firewall rules based on uid apply. Accounts whose expiry date has passed (`chage -E`, `usermod -e`) are refused.
 - **Disconnects:** if the client goes away, the session's whole process group gets SIGHUP, then SIGKILL after 2 s. Unlike ssh, a command without a PTY does not keep running unattended. On SIGINT/SIGTERM/SIGHUP the client closes the connection cleanly, so the server knows right away instead of waiting for the timeout.
 
@@ -289,8 +324,15 @@ This is still a young project and has not had an external audit. For critical sy
 ## Limitations
 
 - No PAM (2FA, `pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login).
-- No agent forwarding, X11, `-R` or recursive `cp -r`.
+- No agent forwarding (`-A`), X11, tunnels (`-w`) or connection sharing (`ControlMaster`).
+- Only Ed25519 keys, and authorized_keys lines with options are skipped.
+- As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
+- `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.
 - Linux/Unix only.
+
+### Upgrading
+
+qsh 0.4 needs qshd 0.4 or newer on the server; older servers reject it with "unsupported protocol version". Update qshd first. From 0.4 on, servers accept newer clients, and features the server lacks fail with a clear error.
 
 ## Development
 

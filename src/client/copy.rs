@@ -149,16 +149,25 @@ pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str) -> Result<()> 
     write_msg(&mut send, &Request::UploadTree { path: remote.to_string(), name }).await?;
     expect_ok(&mut recv).await?;
     let root = local.to_path_buf();
-    let stats = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
+    let sent = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
         let mut w = tokio_util::io::SyncIoBridge::new(send);
         let stats = crate::tree::write_tree(&root, &mut w)?;
         w.shutdown()?;
         Ok((stats, w.into_inner()))
     })
-    .await??;
-    expect_ok(&mut recv).await?;
-    report(&stats.0);
-    Ok(())
+    .await?;
+    match sent {
+        Ok((stats, _send)) => {
+            expect_ok(&mut recv).await?;
+            report(&stats);
+            Ok(())
+        }
+        // If the server gave up, its reason is more useful than our write error.
+        Err(e) => match tokio::time::timeout(std::time::Duration::from_secs(2), expect_ok(&mut recv)).await {
+            Ok(Err(server)) => Err(server),
+            _ => Err(e),
+        },
+    }
 }
 
 /// `qsh cp -r` download: receives the contents of remote directory `remote`.
@@ -167,18 +176,21 @@ pub async fn download_tree(conn: &Conn, remote: &str, local: &Path) -> Result<()
     write_msg(&mut send, &Request::DownloadTree { path: remote.to_string() }).await?;
     expect_ok(&mut recv).await?;
     drop(send);
-    // The name comes from what we asked for, never from the server.
-    let name = Path::new(remote.trim_end_matches('/'))
-        .file_name()
-        .context("remote path has no directory name")?
-        .to_string_lossy()
-        .into_owned();
-    let target = crate::tree::tree_target(local, &name)?;
+    // The name comes from what we asked for, never from the server. Without
+    // one (`host:`, `host:.`), the contents go straight into `local`.
+    let target = match Path::new(remote.trim_end_matches('/')).file_name() {
+        Some(name) => crate::tree::tree_target(local, &name.to_string_lossy())?,
+        None => local.to_path_buf(),
+    };
     crate::tree::create_target(&target)?;
-    let stats = tokio::task::spawn_blocking(move || {
-        crate::tree::extract_tree(tokio_util::io::SyncIoBridge::new(recv), &target)
+    let (stats, mut recv) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut input = crate::tree::Unchunk::new(tokio_util::io::SyncIoBridge::new(recv));
+        let stats = crate::tree::extract_tree(&mut input, &target)?;
+        Ok((stats, input.finish()?.into_inner()))
     })
     .await??;
+    // The server's verdict: the tar stream ends cleanly even if it gave up half-way.
+    expect_ok(&mut recv).await.context("copy incomplete")?;
     report(&stats);
     Ok(())
 }

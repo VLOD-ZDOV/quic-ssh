@@ -10,7 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"qsh/1";
 pub const VERSION: u32 = 3;
-/// Oldest client protocol version the server still accepts.
+/// Oldest client protocol version the server still accepts. Newer versions are
+/// accepted too: their unknown requests are answered with an error, so newer
+/// clients can detect what an older server supports.
 pub const MIN_VERSION: u32 = 1;
 const MAX_MSG: usize = 1 << 20;
 

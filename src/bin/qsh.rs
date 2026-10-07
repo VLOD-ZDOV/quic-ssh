@@ -199,7 +199,9 @@ const DAEMON_FD: &str = "QSH_BACKGROUND_FD";
 fn run_in_background(args: &[String]) -> Result<i32> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    // Only the write end is handed to the child (by number); the read end must not leak.
     let (read, write) = nix::unistd::pipe()?;
+    nix::fcntl::fcntl(&read, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
     let mut child = std::process::Command::new(std::env::current_exe()?)
         .args(&args[1..])
         .env(DAEMON_FD, write.as_raw_fd().to_string())
@@ -427,7 +429,17 @@ fn exec_openssh(tool: &str, args: Vec<String>, reason: &str) -> Result<i32> {
     use std::os::unix::process::CommandExt;
     tracing::info!("using {tool}: {reason}");
     let program = find_openssh(tool)?;
-    Err(anyhow!("cannot run {}: {}", program.display(), std::process::Command::new(&program).args(args).exec()))
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(args);
+    if let Some(fd) = std::env::var(DAEMON_FD).ok().and_then(|v| v.parse::<i32>().ok()) {
+        // In a `-f` child: ssh gets `-f` too and goes to the background by itself.
+        // Closing the readiness pipe makes our parent wait for ssh's own exit
+        // instead of for the pipe, which ssh would otherwise keep open.
+        // SAFETY: the fd was created for this process by the parent and is not used elsewhere.
+        unsafe { libc::close(fd) };
+        cmd.env_remove(DAEMON_FD);
+    }
+    Err(anyhow!("cannot run {}: {}", program.display(), cmd.exec()))
 }
 
 async fn speed_test(target: &Target, opts: &ConnectOptions, seconds: Duration) -> Result<i32> {

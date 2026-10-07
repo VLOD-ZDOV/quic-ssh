@@ -854,6 +854,48 @@ fn cp_recursive_roundtrip() {
     }
 }
 
+#[test]
+fn cp_recursive_edge_cases() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    // Names that look like options stay names.
+    let src = c.home.path().join("-data");
+    tree(&src);
+    let out = c.run(&["cp", "-r", "-p", &port, src.to_str().unwrap(), &format!("{}:-backup", dest())]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    same_tree(&src, &s.home.path().join("-backup"));
+    // A remote path without a name (`host:`) copies its contents into the target.
+    let whole = c.home.path().join("whole");
+    let out = c.run(&["cp", "-r", "-p", &port, &format!("{}:", dest()), whole.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    same_tree(&src, &whole.join("-backup"));
+    // A file the server cannot read makes the copy fail instead of silently ending early.
+    if !nix_is_root() {
+        let bad = s.home.path().join("bad");
+        tree(&bad);
+        std::fs::set_permissions(bad.join("a.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = c.run(&["cp", "-r", "-p", &port, &format!("{}:bad", dest()), c.home.path().to_str().unwrap()]);
+        assert!(!out.status.success(), "copy of an unreadable tree succeeded");
+        assert!(stderr(&out).contains("copy incomplete"), "{}", stderr(&out));
+    }
+}
+
+fn nix_is_root() -> bool {
+    std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0).unwrap_or(false)
+}
+
+/// ProxyCommand cannot be followed by qsh itself: never connect around it.
+#[test]
+fn proxy_command_is_not_bypassed() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let out = c.run(&["-p", &s.port.to_string(), "-o", "ProxyCommand=nc %h %p", &dest(), "true"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("ProxyCommand"), "{}", stderr(&out));
+}
+
 /// sftp, scp (SFTP mode), rsync and git, all with qsh as their transport.
 #[test]
 fn openssh_tools_over_qsh() {

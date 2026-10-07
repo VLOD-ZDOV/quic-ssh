@@ -161,10 +161,83 @@ impl User {
 
     /// Runs one of `qshd`'s internal helper subcommands as this user, so all
     /// file access in the user's home happens with the user's own permissions.
+    /// `args` is the subcommand followed by its positional arguments.
     pub fn helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
         let exe = std::env::current_exe().context("cannot locate qshd binary")?;
         let mut cmd = self.command(exe);
-        cmd.args(args);
+        cmd.args(helper_argv(args));
         Ok(cmd)
+    }
+
+    /// Like [`User::helper`], but started through the user's shell
+    /// (`$SHELL -c`), as sshd does for scp and sftp: a restricted shell
+    /// (nologin, git-shell) then also restricts file transfers. The arguments
+    /// travel in the environment, so the shell never parses client input.
+    pub fn shell_helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
+        let exe = std::env::current_exe().context("cannot locate qshd binary")?;
+        let exe = exe.to_str().context("qshd path is not UTF-8")?;
+        let mut cmd = self.command(&self.shell);
+        cmd.arg("-c").arg(format!("{} {HELPER_FROM_ENV}", shell_quote(exe)?));
+        cmd.env(HELPER_ARGS, encode_args(&helper_argv(args)));
+        Ok(cmd)
+    }
+}
+
+/// Subcommand that takes its arguments from [`HELPER_ARGS`].
+pub const HELPER_FROM_ENV: &str = "internal-env";
+/// Environment variable with a helper's arguments, hex-encoded and NUL-separated.
+pub const HELPER_ARGS: &str = "QSHD_HELPER_ARGS";
+
+/// `[subcommand, "--", args...]`, so arguments starting with `-` stay arguments.
+fn helper_argv(args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = args.iter().take(1).map(|s| s.to_string()).collect();
+    argv.push("--".into());
+    argv.extend(args.iter().skip(1).map(|s| s.to_string()));
+    argv
+}
+
+fn encode_args(args: &[String]) -> String {
+    args.join("\0").bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decodes [`HELPER_ARGS`]; `None` if it is malformed.
+pub fn decode_args(hex: &str) -> Option<Vec<String>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
+    let text = String::from_utf8(bytes?).ok()?;
+    Some(text.split('\0').map(String::from).collect())
+}
+
+/// Quotes a word for `sh -c` (and for fish and zsh, which read single quotes the
+/// same way as long as there is no backslash).
+fn shell_quote(word: &str) -> Result<String> {
+    if word.contains(['\\', '\n', '\0']) {
+        bail!("cannot quote {word:?} for the shell");
+    }
+    if word.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b)) {
+        return Ok(word.to_string());
+    }
+    Ok(format!("'{}'", word.replace('\'', "'\\''")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_args_roundtrip() {
+        let argv = helper_argv(&["internal-recv", "-dir/a b", "$(x)", ""]);
+        assert_eq!(argv, ["internal-recv", "--", "-dir/a b", "$(x)", ""]);
+        assert_eq!(decode_args(&encode_args(&argv)).unwrap(), argv);
+        assert!(decode_args("zz").is_none() && decode_args("abc").is_none());
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("/usr/bin/qshd").unwrap(), "/usr/bin/qshd");
+        assert_eq!(shell_quote("/opt/my qsh/it's").unwrap(), "'/opt/my qsh/it'\\''s'");
+        assert!(shell_quote("a\\b").is_err());
     }
 }

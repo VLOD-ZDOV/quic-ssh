@@ -83,8 +83,10 @@ impl Escapes {
     }
 
     /// Returns the bytes to send and an action, if an escape was completed.
+    /// Input after `~.` is dropped; input after `~?` is still sent.
     fn process(&mut self, input: &[u8]) -> (Vec<u8>, Option<EscapeAction>) {
         let mut out = Vec::with_capacity(input.len());
+        let mut action = None;
         for &b in input {
             if self.pending {
                 self.pending = false;
@@ -92,7 +94,8 @@ impl Escapes {
                     b'.' => return (out, Some(EscapeAction::Disconnect)),
                     b'?' => {
                         self.at_line_start = false;
-                        return (out, Some(EscapeAction::Help));
+                        action = Some(EscapeAction::Help);
+                        continue;
                     }
                     b if b == self.ch => out.push(b),
                     b => {
@@ -108,7 +111,7 @@ impl Escapes {
             }
             self.at_line_start = b == b'\r' || b == b'\n';
         }
-        (out, None)
+        (out, action)
     }
 
     fn help(&self) -> String {
@@ -294,5 +297,10 @@ mod tests {
         assert_eq!(e.process(b"~z").0, b"~z");
         let mut e = Escapes::new(b'%');
         assert!(matches!(e.process(b"%.").1, Some(EscapeAction::Disconnect)));
+        // Input after ~? in the same read is kept.
+        let mut e = Escapes::new(b'~');
+        let (out, a) = e.process(b"\r~?ls\r");
+        assert_eq!(out, b"\rls\r");
+        assert!(matches!(a, Some(EscapeAction::Help)));
     }
 }

@@ -234,6 +234,8 @@ struct NoQshdCache {
 }
 
 const NO_QSHD_TTL: u64 = 3600;
+/// Time for the TLS handshake with a host behind a jump host.
+const JUMP_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl NoQshdCache {
     fn new() -> Result<NoQshdCache> {
@@ -364,13 +366,30 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option
     let tls = crate::tls::client_config(id)?;
     if let Some(via) = via {
         // Through a jump host: TLS + yamux over a stream forwarded to the qshd TCP port.
-        let (mut send, mut recv) = via.open_bi().await?;
-        write_msg(&mut send, &crate::proto::Request::DirectTcp { host: target.host.clone(), port: target.port }).await?;
-        expect_ok(&mut recv).await.with_context(|| format!("jump host cannot reach {}:{}", target.host, target.port))?;
-        let label = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), target.port);
-        let conn = transport::connect_stream(tokio::io::join(recv, send), tls, label).await?;
-        tracing::info!("connected to {}:{} through a jump host", target.host, target.port);
-        return Ok(conn);
+        // In --full mode the target port may be sshd's, so the other candidates are tried too.
+        let mut last = None;
+        for port in std::iter::once(target.port).chain(target.alt_ports.iter().copied()) {
+            let attempt = async {
+                let (send, recv) = crate::client::forward::open_direct(via, &target.host, port)
+                    .await
+                    .with_context(|| format!("jump host cannot reach {}:{port}", target.host))?;
+                let label = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
+                tokio::time::timeout(JUMP_HANDSHAKE_TIMEOUT, transport::connect_stream(tokio::io::join(recv, send), tls.clone(), label))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("no TLS answer from {}:{port}", target.host))?
+                    .with_context(|| format!("no qshd at {}:{port}", target.host))
+            };
+            match attempt.await {
+                Ok(conn) => {
+                    tracing::info!("connected to {}:{port} through a jump host", target.host);
+                    return Ok(conn);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        let e = last.expect("at least one port");
+        // In --full mode a missing qshd behind the jump host means: use ssh instead.
+        return Err(if opts.full { transport::Unreachable(format!("{e:#}")).into() } else { e });
     }
     let conn = if opts.full {
         // `--transport quic` forces a fresh attempt even for hosts cached as qshd-less.
@@ -433,6 +452,14 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
 
 /// Opens, verifies and logs in to one host (directly or through `via`).
 async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
+    if target.needs_proxy {
+        // Connecting directly could bypass a proxy the user relies on (e.g. Tor).
+        bail!(
+            "the config for {} uses ProxyCommand or (in ~/.ssh/config) ProxyJump, which qsh cannot follow; \
+             use --full to connect with ssh instead, or set ProxyJump in ~/.config/qsh/config",
+            target.host
+        );
+    }
     let id = load_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
     let conn = open(target, opts, &id, via).await?;
     verify_host_key(&conn, target, opts).await?;
@@ -473,6 +500,9 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
 
 /// Pairs this client with the server using a one-time code from `qshd pair`.
 pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<()> {
+    if target.needs_proxy {
+        bail!("the config for {} uses ProxyCommand or ProxyJump; pairing needs a direct connection", target.host);
+    }
     let id = load_identity(&opts.identities, &target.identity_files, true, target.batch_mode)?;
     let conn = open(target, opts, &id, None).await?;
     let (mut send, mut recv) = conn.open_bi().await?;

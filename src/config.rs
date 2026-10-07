@@ -30,8 +30,9 @@ pub struct ServerConfig {
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).
     pub gateway_ports: GatewayPorts,
-    /// Subsystems (`qsh -s host NAME`): name → command line, run without a
-    /// shell. `sftp` is found automatically if OpenSSH's sftp-server is installed.
+    /// Subsystems (`qsh -s host NAME`): name → command line, run like sshd as
+    /// `$SHELL -c command`. `sftp` is found automatically if OpenSSH's
+    /// sftp-server is installed.
     pub subsystems: BTreeMap<String, String>,
 }
 

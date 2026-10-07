@@ -72,7 +72,18 @@ fn host_key(path: &std::path::Path) -> Result<Identity> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match std::env::args().nth(1).as_deref() {
+        // A helper started through the user's shell: the real arguments are in the environment.
+        Some(helpers::HELPER_FROM_ENV) => {
+            let args = std::env::var(helpers::HELPER_ARGS).ok().and_then(|a| helpers::decode_args(&a));
+            let Some(args) = args.filter(|a| a.first().is_some_and(|c| c.starts_with("internal-"))) else {
+                eprintln!("qshd: bad helper arguments");
+                std::process::exit(2);
+            };
+            Cli::parse_from(std::iter::once("qshd".to_string()).chain(args))
+        }
+        _ => Cli::parse(),
+    };
     let result = match cli.cmd {
         Some(Cmd::InternalRecv { path, name, size, mode }) => helpers::recv(&path, &name, size, &mode),
         Some(Cmd::InternalSend { path }) => helpers::send(&path),
