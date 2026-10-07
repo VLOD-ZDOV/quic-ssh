@@ -153,10 +153,8 @@ impl Parser<'_> {
                 "requesttty" if self.full && self.out.request_tty.is_none() => {
                     self.out.request_tty = args.into_iter().next().map(|v| v.to_ascii_lowercase());
                 }
-                "proxyjump" | "proxycommand" => {
-                    if args.first().is_some_and(|v| !v.eq_ignore_ascii_case("none")) {
-                        self.out.needs_proxy = true;
-                    }
+                "proxyjump" | "proxycommand" if args.first().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                    self.out.needs_proxy = true;
                 }
                 _ => {}
             }
