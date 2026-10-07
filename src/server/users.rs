@@ -4,10 +4,11 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use nix::unistd::{geteuid, getgrouplist, Gid, Group, User as PwUser};
+use nix::unistd::{geteuid, Gid, Group, User as PwUser};
 
-/// Android has no shadow database (and no other user accounts to expire).
-#[cfg(target_os = "android")]
+/// Only Linux has the shadow database (Android has no other accounts to expire;
+/// macOS keeps account policy in Directory Services, which PAM would consult).
+#[cfg(not(target_os = "linux"))]
 fn account_expired(_name: &str) -> bool {
     false
 }
@@ -15,7 +16,7 @@ fn account_expired(_name: &str) -> bool {
 /// Whether the account's expiry date (`chage -E`, `usermod -e`) has passed,
 /// checked the way pam_unix does: `sp_expire` is set and today is on or after
 /// it. Without a readable shadow entry the account counts as not expired.
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "linux")]
 fn account_expired(name: &str) -> bool {
     let Ok(cname) = CString::new(name) else { return true };
     // SAFETY: getspnam_r fills `entry` using `buf`; both outlive the call and
@@ -35,6 +36,33 @@ fn account_expired(name: &str) -> bool {
         .map(|d| d.as_secs() / 86400)
         .unwrap_or(0) as libc::c_long;
     entry != -1 && today >= entry
+}
+
+/// The user's groups, including `gid` (resolved before forking).
+#[cfg(not(target_vendor = "apple"))]
+fn group_list(name: &str, gid: Gid) -> Result<Vec<libc::gid_t>> {
+    let cname = CString::new(name)?;
+    Ok(nix::unistd::getgrouplist(&cname, gid)?.into_iter().map(Gid::as_raw).collect())
+}
+
+/// macOS: `getgrouplist` takes `int` group IDs and nix does not wrap it.
+#[cfg(target_vendor = "apple")]
+fn group_list(name: &str, gid: Gid) -> Result<Vec<libc::gid_t>> {
+    let cname = CString::new(name)?;
+    let mut n: libc::c_int = 64;
+    loop {
+        let mut groups = vec![0 as libc::c_int; n as usize];
+        // SAFETY: `groups` has room for `n` entries; libc updates `n` to the count.
+        let rc = unsafe { libc::getgrouplist(cname.as_ptr(), gid.as_raw() as libc::c_int, groups.as_mut_ptr(), &mut n) };
+        if rc >= 0 {
+            groups.truncate(n as usize);
+            return Ok(groups.into_iter().map(|g| g as libc::gid_t).collect());
+        }
+        if n >= 65536 {
+            bail!("too many groups for {name}");
+        }
+        n *= 2;
+    }
 }
 
 /// A user sessions run as.
@@ -67,12 +95,7 @@ impl User {
         if switch && account_expired(name) {
             bail!("account {name:?} has expired");
         }
-        let groups = if switch {
-            let cname = CString::new(name)?;
-            getgrouplist(&cname, pw.gid)?.into_iter().map(Gid::as_raw).collect()
-        } else {
-            Vec::new()
-        };
+        let groups = if switch { group_list(name, pw.gid)? } else { Vec::new() };
         let shell = if pw.shell.as_os_str().is_empty() { PathBuf::from("/bin/sh") } else { pw.shell };
         Ok(User {
             name: pw.name,
@@ -135,7 +158,7 @@ impl User {
                 if own_tty && libc::fchown(0, uid, tty_gid) == 0 {
                     libc::fchmod(0, tty_mode);
                 }
-                if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0
                     || libc::setgid(gid) != 0
                     || libc::setuid(uid) != 0
                 {

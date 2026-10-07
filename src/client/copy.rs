@@ -1,7 +1,6 @@
 //! `qsh cp`: scp-style single-file copies.
 
 use std::io::IsTerminal;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -98,7 +97,7 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
     let name = local.file_name().context("source has no file name")?.to_string_lossy().into_owned();
     let size = meta.len();
     let (mut send, mut recv) = conn.open_bi().await?;
-    let req = Request::Upload { path: remote.to_string(), name: name.clone(), size, mode: meta.mode() & 0o777 };
+    let req = Request::Upload { path: remote.to_string(), name: name.clone(), size, mode: crate::platform::mode(&meta) & 0o777 };
     write_msg(&mut send, &req).await?;
     expect_ok(&mut recv).await?;
     let sent = transfer(&mut file, &mut send, size, &name).await?;
@@ -119,14 +118,13 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
     };
     let name = Path::new(remote).file_name().context("remote path has no file name")?;
     let target = if local.is_dir() { local.join(name) } else { local.to_path_buf() };
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode & 0o777)
-        .open(&target)
-        .await
-        .with_context(|| format!("cannot create {}", target.display()))?;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(mode & 0o777);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = opts.open(&target).await.with_context(|| format!("cannot create {}", target.display()))?;
     let got = transfer(&mut recv, &mut file, size, &name.to_string_lossy()).await?;
     if got != size {
         bail!("transfer interrupted ({got} of {size} bytes)");

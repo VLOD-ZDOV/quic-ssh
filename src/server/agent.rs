@@ -32,7 +32,8 @@ impl AgentSocket {
 /// user. Root creates them in a directory nobody else can enter yet, and only
 /// then hands it over, so no path the user controls is ever followed.
 fn listen(user: &User) -> Result<(UnixListener, PathBuf)> {
-    let template = std::env::temp_dir().join("qsh-XXXXXXXX");
+    // /tmp like sshd: root's own TMPDIR (e.g. on macOS) may be out of the user's reach.
+    let template = Path::new("/tmp").join("qsh-XXXXXXXX");
     let dir = nix::unistd::mkdtemp(&template).context("cannot create agent directory")?;
     let path = dir.join("agent.sock");
     let setup = || -> Result<UnixListener> {

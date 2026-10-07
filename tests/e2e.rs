@@ -1,5 +1,6 @@
 //! End-to-end tests: a real `qshd` (unprivileged mode) and `qsh` processes,
 //! each with its own temporary HOME, talking over loopback.
+#![cfg(unix)]
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, UdpSocket};
@@ -892,7 +893,7 @@ fn cp_recursive_edge_cases() {
 }
 
 fn nix_is_root() -> bool {
-    std::fs::metadata("/proc/self").map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0).unwrap_or(false)
+    nix::unistd::geteuid().is_root()
 }
 
 /// ProxyCommand cannot be followed by qsh itself: never connect around it.
@@ -1359,11 +1360,11 @@ fn agent_forwarding() {
         c.cmd(&all).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap()
     };
     // With -A the remote side sees our agent's key; the socket is private to the user.
-    let out = run(&["-A", &dest(), "sh -c 'ssh-add -l; stat -c %a $SSH_AUTH_SOCK'"]);
+    let out = run(&["-A", &dest(), "sh -c 'ssh-add -l; ls -l $SSH_AUTH_SOCK'"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("fwd (ECDSA)"), "{text}");
-    assert!(text.ends_with("600\n"), "{text}");
+    assert!(text.lines().last().unwrap_or_default().starts_with("srw------- "), "{text}");
     // Without -A there is no agent over there.
     let show = "sh -c 'echo [$SSH_AUTH_SOCK]'";
     let out = run(&[&dest(), show]);
@@ -1378,10 +1379,16 @@ fn agent_forwarding() {
 fn askpass_script(dir: &std::path::Path, answers: &[String]) -> PathBuf {
     let list = dir.join("answers");
     std::fs::write(&list, answers.join("\n") + "\n").unwrap();
+    let _ = std::fs::remove_file(dir.join("count"));
     let script = dir.join("askpass.sh");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\nhead -n1 '{0}'\nsed -i 1d '{0}'\necho \"$1\" >> '{1}'\n", list.display(), dir.join("asked").display()),
+        format!(
+            "#!/bin/sh\nn=$(( $(cat '{1}' 2>/dev/null || echo 0) + 1 ))\necho $n > '{1}'\nsed -n \"${{n}}p\" '{0}'\necho \"$1\" >> '{2}'\n",
+            list.display(),
+            dir.join("count").display(),
+            dir.join("asked").display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();

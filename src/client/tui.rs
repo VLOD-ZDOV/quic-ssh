@@ -682,7 +682,10 @@ fn child_flags(opts: &ConnectOptions) -> Vec<String> {
 
 pub async fn run(opts: ConnectOptions) -> Result<i32> {
     // ^C reaches us too while a session runs in the foreground; never die from it.
+    #[cfg(unix)]
     let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(windows)]
+    let _sigint = tokio::signal::windows::ctrl_c()?;
     let mut app = App::new(load_hosts());
     let (tx, mut rx) = mpsc::unbounded_channel();
     let probe_key = Arc::new(Identity::generate());

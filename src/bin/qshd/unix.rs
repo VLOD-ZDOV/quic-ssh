@@ -87,7 +87,7 @@ fn host_key(path: &std::path::Path) -> Result<Identity> {
     Ok(id)
 }
 
-fn main() {
+pub fn main() {
     let cli = match std::env::args().nth(1).as_deref() {
         // A helper started through the user's shell: the real arguments are in the environment.
         Some(helpers::HELPER_FROM_ENV) => {

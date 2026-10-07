@@ -2,11 +2,10 @@
 //! Keys in an agent never leave it, which is also how security keys (FIDO)
 //! and PKCS#11 tokens are used.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const FAILURE: u8 = 5;
 const REQUEST_IDENTITIES: u8 = 11;
@@ -17,8 +16,43 @@ const SIGN_RESPONSE: u8 = 14;
 const RSA_SHA2_512: u32 = 4;
 const MAX_REPLY: usize = 256 * 1024;
 
+/// A connection to an agent: a Unix socket, or a named pipe on Windows.
+pub trait AgentStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AgentStream for T {}
+
+/// Where the agent is: `SSH_AUTH_SOCK`, or on Windows the pipe of the
+/// OpenSSH agent service.
+pub fn default_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("SSH_AUTH_SOCK").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    #[cfg(windows)]
+    return Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent"));
+    #[cfg(not(windows))]
+    None
+}
+
+/// Opens a raw connection to the agent at `path`.
+pub async fn connect_raw(path: &Path) -> std::io::Result<Box<dyn AgentStream>> {
+    #[cfg(unix)]
+    return Ok(Box::new(tokio::net::UnixStream::connect(path).await?));
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        // A busy pipe frees up quickly; try a few times.
+        for _ in 0..20 {
+            match ClientOptions::new().open(path) {
+                Ok(pipe) => return Ok(Box::new(pipe)),
+                Err(e) if e.raw_os_error() == Some(231) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other("the agent's pipe stays busy"))
+    }
+}
+
 pub struct Agent {
-    sock: UnixStream,
+    sock: Box<dyn AgentStream>,
 }
 
 /// A key held by the agent: its SSH wire-format blob (a key or a certificate).
@@ -47,10 +81,10 @@ fn take_string<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 impl Agent {
-    /// The agent from `SSH_AUTH_SOCK`, if there is one.
+    /// The agent from `SSH_AUTH_SOCK` (or Windows' OpenSSH agent), if there is one.
     pub async fn from_env() -> Option<Agent> {
-        let path = std::env::var_os("SSH_AUTH_SOCK")?;
-        match Agent::connect(Path::new(&path)).await {
+        let path = default_path()?;
+        match Agent::connect(&path).await {
             Ok(a) => Some(a),
             Err(e) => {
                 tracing::debug!("ssh-agent: {e:#}");
@@ -60,7 +94,7 @@ impl Agent {
     }
 
     pub async fn connect(path: &Path) -> Result<Agent> {
-        let sock = UnixStream::connect(path).await.with_context(|| format!("cannot connect to {}", path.display()))?;
+        let sock = connect_raw(path).await.with_context(|| format!("cannot connect to {}", path.display()))?;
         Ok(Agent { sock })
     }
 

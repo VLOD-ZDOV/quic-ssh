@@ -252,8 +252,7 @@ impl Target {
 }
 
 fn local_user() -> Result<String> {
-    let uid = nix::unistd::getuid();
-    Ok(nix::unistd::User::from_uid(uid)?.context("cannot determine local user name")?.name)
+    crate::platform::local_user()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -391,7 +390,7 @@ fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
 
 /// Asks on the terminal whether to trust an unknown host key.
 fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
-    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").context(
+    let (input, tty) = crate::platform::terminal().context(
         "host key is unknown and there is no terminal to confirm it; use --accept-new-host or `qsh pair`",
     )?;
     let mut out = &tty;
@@ -404,7 +403,7 @@ fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
     )?;
     out.flush()?;
     let mut answer = String::new();
-    std::io::BufReader::new(&tty).read_line(&mut answer)?;
+    std::io::BufReader::new(&input).read_line(&mut answer)?;
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 

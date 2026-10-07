@@ -24,7 +24,7 @@ jobs:
       TARGET: ${{ matrix.arch }}-unknown-linux-musl
       NAME: qsh-${{ matrix.arch }}-linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +49,7 @@ jobs:
       TARGET: aarch64-linux-android
       NAME: qsh-aarch64-android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -70,8 +70,54 @@ jobs:
           name: ${{ env.NAME }}
           path: ${{ env.NAME }}.tar.gz
 
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [aarch64, x86_64]
+    env:
+      TARGET: ${{ matrix.arch }}-apple-darwin
+      NAME: qsh-${{ matrix.arch }}-macos
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Package
+        run: |
+          mkdir "$NAME"
+          cp "target/$TARGET/release/qsh" "target/$TARGET/release/qshd" README.md README.ru.md LICENSE "$NAME/"
+          file "$NAME/qsh"
+          tar czf "$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    env:
+      NAME: qsh-x86_64-windows
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked --bin qsh
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory $env:NAME | Out-Null
+          Copy-Item target/release/qsh.exe, README.md, README.ru.md, LICENSE $env:NAME
+          Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.zip
+
   release:
-    needs: [build, android]
+    needs: [build, android, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -82,9 +128,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           cat > notes.md <<NOTES
-          Static Linux binaries (musl) for x86_64 and aarch64, and a native Android build for Termux (qsh-aarch64-android).
+          Static Linux binaries (musl) for x86_64 and aarch64, macOS (Apple Silicon and Intel), Windows (the qsh client), and a native Android build for Termux (qsh-aarch64-android).
 
           \`\`\`sh
           ARCH=\$(uname -m)   # x86_64 or aarch64
@@ -94,4 +140,4 @@ jobs:
 
           See the README for setup.
           NOTES
-          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz SHA256SUMS
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz *.zip SHA256SUMS

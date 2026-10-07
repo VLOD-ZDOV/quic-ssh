@@ -7,7 +7,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -39,8 +40,9 @@ pub fn write_tree(root: &Path, out: impl Write) -> Result<Stats> {
             let path = rel.join(entry.file_name());
             let meta = entry.path().symlink_metadata()?;
             let mut header = tar::Header::new_gnu();
-            header.set_mode(meta.mode() & 0o777);
-            header.set_mtime(meta.mtime().max(0) as u64);
+            header.set_mode(crate::platform::mode(&meta) & 0o777);
+            let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+            header.set_mtime(mtime.map(|d| d.as_secs()).unwrap_or(0));
             if meta.is_dir() {
                 header.set_entry_type(tar::EntryType::Directory);
                 header.set_size(0);
@@ -114,21 +116,19 @@ pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 match fs::create_dir(&target) {
-                    Ok(()) => fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(mode | 0o700))?,
+                    Ok(()) => crate::platform::set_mode(&target, mode | 0o700)?,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists && target.is_dir() => {}
                     Err(e) => return Err(e).with_context(|| format!("{}", target.display())),
                 }
                 stats.dirs += 1;
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(mode)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&target)
-                    .with_context(|| format!("{}", target.display()))?;
+                let mut opts = OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                // Besides the symlink check above, never follow one that appears meanwhile.
+                #[cfg(unix)]
+                opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
+                let mut f = opts.open(&target).with_context(|| format!("{}", target.display()))?;
                 stats.bytes += io::copy(&mut entry, &mut f)?;
                 stats.files += 1;
             }
@@ -204,10 +204,10 @@ pub fn create_target(target: &Path) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn sample(root: &Path) {
         fs::create_dir_all(root.join("sub/deeper")).unwrap();

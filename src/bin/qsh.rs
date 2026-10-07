@@ -130,7 +130,7 @@ impl ConnArgs {
 
 /// True when this binary was started as `ssh` (e.g. through a symlink).
 fn invoked_as_ssh(argv0: &str) -> bool {
-    Path::new(argv0).file_name().is_some_and(|n| n == "ssh")
+    Path::new(argv0).file_stem().is_some_and(|n| n == "ssh")
 }
 
 fn init_logging(verbose: bool, quiet: bool) {
@@ -181,6 +181,11 @@ fn main() {
         std::process::exit(0);
     }
     a.full |= as_ssh;
+    #[cfg(not(unix))]
+    if a.background {
+        finish(Err(anyhow!("-f (going to the background) is not supported on this system")));
+    }
+    #[cfg(unix)]
     if a.background && std::env::var_os(DAEMON_FD).is_none() {
         finish(run_in_background(&args));
     }
@@ -193,10 +198,12 @@ fn main() {
 }
 
 /// Environment variable carrying the readiness pipe to a backgrounded qsh.
+#[cfg(unix)]
 const DAEMON_FD: &str = "QSH_BACKGROUND_FD";
 
 /// `-f`: runs qsh again as a child that logs in (it may still ask questions on
 /// the terminal), then detaches; this process exits once the child is ready.
+#[cfg(unix)]
 fn run_in_background(args: &[String]) -> Result<i32> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -219,6 +226,7 @@ fn run_in_background(args: &[String]) -> Result<i32> {
 
 /// In a backgrounded child: tell the parent we are ready, then detach from the
 /// terminal (new session, stdin from /dev/null; output stays, like ssh -f).
+#[cfg(unix)]
 fn detach() -> Result<()> {
     use std::io::Write;
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -350,7 +358,7 @@ async fn session_main(a: SshArgs) -> Result<i32> {
     let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
         true => match &target.identity_agent {
             Some(path) => path.clone(),
-            None => std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+            None => qsh::agent::default_path(),
         },
         false => None,
     };
@@ -359,6 +367,7 @@ async fn session_main(a: SshArgs) -> Result<i32> {
     }
     let uses_forwards = uses_forwards || agent.is_some();
     let _remote = forward::start_remote(&conn, &remotes, agent, quiet).await?;
+    #[cfg(unix)]
     if a.background {
         detach()?;
     }
@@ -445,19 +454,32 @@ fn ssh_args(a: &SshArgs, target: &Target) -> Vec<String> {
 fn find_openssh(tool: &str) -> Result<PathBuf> {
     let me = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let file = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
     std::env::split_paths(&path)
-        .map(|dir| dir.join(tool))
+        .map(|dir| dir.join(&file))
         .find(|c| c.is_file() && c.canonicalize().ok() != me)
         .with_context(|| format!("OpenSSH's {tool} was not found in PATH"))
 }
 
-/// `--full`: replaces this process with OpenSSH's `tool` (ssh or scp).
+/// `--full`: replaces this process with OpenSSH's `tool` (ssh or scp); on
+/// Windows, runs it and passes on its exit code.
 fn exec_openssh(tool: &str, args: Vec<String>, reason: &str) -> Result<i32> {
-    use std::os::unix::process::CommandExt;
     tracing::info!("using {tool}: {reason}");
     let program = find_openssh(tool)?;
     let mut cmd = std::process::Command::new(&program);
     cmd.args(args);
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().with_context(|| format!("cannot run {}", program.display()))?;
+        Ok(status.code().unwrap_or(255))
+    }
+    #[cfg(unix)]
+    exec_unix(cmd, &program)
+}
+
+#[cfg(unix)]
+fn exec_unix(mut cmd: std::process::Command, program: &Path) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
     if let Some(fd) = std::env::var(DAEMON_FD).ok().and_then(|v| v.parse::<i32>().ok()) {
         // In a `-f` child: ssh gets `-f` too and goes to the background by itself.
         // Closing the readiness pipe makes our parent wait for ssh's own exit

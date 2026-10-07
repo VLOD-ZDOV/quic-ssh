@@ -25,7 +25,35 @@ struct RawMode;
 impl RawMode {
     fn enable() -> Result<RawMode> {
         crossterm::terminal::enable_raw_mode()?;
+        #[cfg(windows)]
+        windows_vt::enable();
         Ok(RawMode)
+    }
+}
+
+/// Windows consoles: keys as VT escape sequences (arrows, function keys), and
+/// the remote side's VT output (colours, cursor movement) interpreted.
+#[cfg(windows)]
+mod windows_vt {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    fn add(handle: u32, flag: CONSOLE_MODE) {
+        // SAFETY: plain console API calls on the process's standard handles.
+        unsafe {
+            let h = GetStdHandle(handle);
+            let mut mode: CONSOLE_MODE = 0;
+            if GetConsoleMode(h, &mut mode) != 0 {
+                SetConsoleMode(h, mode | flag);
+            }
+        }
+    }
+
+    pub fn enable() {
+        add(STD_INPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_INPUT);
+        add(STD_OUTPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 }
 
@@ -40,17 +68,67 @@ impl Drop for RawMode {
 /// only notice after the idle timeout). In raw mode ^C is sent as a byte, so
 /// SIGINT is only watched in line mode.
 pub fn termination_signal(watch_sigint: bool) -> impl std::future::Future<Output = i32> {
-    use tokio::signal::unix::{signal, SignalKind};
     // Registered right away, so a signal that arrives before the first poll
     // is not handled by the default action (which would skip the clean close).
-    let mut term = signal(SignalKind::terminate()).expect("signal handler");
-    let mut hup = signal(SignalKind::hangup()).expect("signal handler");
-    let mut int = signal(SignalKind::interrupt()).expect("signal handler");
-    async move {
-        tokio::select! {
-            _ = term.recv() => 128 + libc::SIGTERM,
-            _ = hup.recv() => 128 + libc::SIGHUP,
-            _ = int.recv(), if watch_sigint => 128 + libc::SIGINT,
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("signal handler");
+        let mut hup = signal(SignalKind::hangup()).expect("signal handler");
+        let mut int = signal(SignalKind::interrupt()).expect("signal handler");
+        async move {
+            tokio::select! {
+                _ = term.recv() => 128 + libc::SIGTERM,
+                _ = hup.recv() => 128 + libc::SIGHUP,
+                _ = int.recv(), if watch_sigint => 128 + libc::SIGINT,
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
+        let mut close = ctrl_close().expect("console handler");
+        let mut brk = ctrl_break().expect("console handler");
+        let mut int = ctrl_c().expect("console handler");
+        async move {
+            tokio::select! {
+                _ = close.recv() => 128 + 1,
+                _ = brk.recv() => 128 + 3,
+                _ = int.recv(), if watch_sigint => 128 + 2,
+            }
+        }
+    }
+}
+
+/// Resolves on every change of the local terminal size.
+async fn window_changes(tx: mpsc::Sender<ClientMsg>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let Ok(mut winch) = signal(SignalKind::window_change()) else { return };
+        while winch.recv().await.is_some() {
+            if let Ok((cols, rows)) = crossterm::terminal::size() {
+                if tx.send(ClientMsg::Resize { cols, rows }).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // Windows has no resize signal for console programs: poll.
+    #[cfg(windows)]
+    {
+        let mut last = crossterm::terminal::size().ok();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let now = crossterm::terminal::size().ok();
+            if now != last {
+                last = now;
+                if let Some((cols, rows)) = now {
+                    if tx.send(ClientMsg::Resize { cols, rows }).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -291,18 +369,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     }
 
     if pty.is_some() {
-        let resize_tx = tx.clone();
-        tokio::spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut winch) = signal(SignalKind::window_change()) else { return };
-            while winch.recv().await.is_some() {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    if resize_tx.send(ClientMsg::Resize { cols, rows }).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(window_changes(tx.clone()));
     }
 
     let mut stdout = tokio::io::stdout();

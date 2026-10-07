@@ -22,7 +22,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -247,6 +249,7 @@ mod tests {
         assert!(s.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn pending_file_single_use() {
         let home = tempfile::tempdir().unwrap();

@@ -10,7 +10,7 @@ fn use_askpass() -> Option<String> {
     let program = std::env::var("SSH_ASKPASS").ok().filter(|p| !p.is_empty())?;
     let require = std::env::var("SSH_ASKPASS_REQUIRE").unwrap_or_default();
     let graphical = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let no_tty = std::fs::OpenOptions::new().read(true).open("/dev/tty").is_err();
+    let no_tty = crate::platform::terminal().is_err();
     match require.as_str() {
         "never" => None,
         "force" | "prefer" => Some(program),
@@ -46,10 +46,10 @@ pub fn line(prompt: &str) -> Result<String> {
     if let Some(program) = use_askpass() {
         return askpass(&program, prompt);
     }
-    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").context("no terminal to answer on")?;
-    write!(&tty, "{prompt}")?;
-    (&tty).flush()?;
+    let (input, output) = crate::platform::terminal().context("no terminal to answer on")?;
+    write!(&output, "{prompt}")?;
+    (&output).flush()?;
     let mut answer = String::new();
-    std::io::BufReader::new(&tty).read_line(&mut answer)?;
+    std::io::BufReader::new(&input).read_line(&mut answer)?;
     Ok(answer.trim_end_matches(['\r', '\n']).to_string())
 }

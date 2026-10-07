@@ -1920,7 +1920,7 @@ checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "qsh"
-version = "0.5.0"
+version = "0.6.0-dev"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1957,6 +1957,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "x509-parser",
  "yamux",
 ]

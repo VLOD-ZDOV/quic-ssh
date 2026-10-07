@@ -237,9 +237,9 @@ pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<
                     // Only if we asked for it: a server cannot reach our agent on its own.
                     Ok(Opened::Agent) => {
                         let Some(path) = agent else { return };
-                        match tokio::net::UnixStream::connect(path.as_path()).await {
+                        match crate::agent::connect_raw(path.as_path()).await {
                             Ok(sock) => {
-                                let (r, w) = sock.into_split();
+                                let (r, w) = tokio::io::split(sock);
                                 let _ = crate::transport::bridge(r, w, send, recv).await;
                             }
                             Err(e) => warn!("forwarded agent: {e}"),
