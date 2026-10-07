@@ -66,6 +66,12 @@ pub fn validate(line: &str) -> Result<()> {
     if !Path::new(program).is_absolute() {
         bail!("authorized_keys_command must be an absolute path, not {program:?}");
     }
+    // Unknown tokens are found now, not at the first login.
+    let who = Who { name: "", home: "/", uid: 0 };
+    let key = KeyData::Ed25519(ssh_key::public::Ed25519PublicKey([0; 32]));
+    for arg in &argv[1..] {
+        expand(arg, &who, Some(&key)).with_context(|| format!("authorized_keys_command argument {arg:?}"))?;
+    }
     Ok(())
 }
 
@@ -73,26 +79,34 @@ fn uses_key(argv: &[String]) -> bool {
     argv.iter().skip(1).any(|a| a.contains("%f") || a.contains("%k") || a.contains("%t"))
 }
 
-/// The program and every directory above it may only be writable by root
-/// or `owner` (like sshd's checks of AuthorizedKeysCommand).
-fn secure_path(program: &Path, owner: u32) -> Result<()> {
+/// Resolves the program (symlinks too) and checks that it and every
+/// directory above its real location may only be changed by root or
+/// `owner`, like sshd's checks of AuthorizedKeysCommand. Returns the real
+/// path, which is what then runs: nobody else can swap anything on it.
+fn secure_path(program: &Path, owner: u32) -> Result<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(program).with_context(|| format!("{}", program.display()))?;
+    let real = std::fs::canonicalize(program).with_context(|| format!("{}", program.display()))?;
+    let meta = std::fs::metadata(&real)?;
     if !meta.is_file() {
-        bail!("{} is not a file", program.display());
+        bail!("{} is not a file", real.display());
     }
-    let mut path = Some(program);
-    while let Some(p) = path {
-        let m = std::fs::metadata(p).with_context(|| format!("{}", p.display()))?;
+    for p in real.ancestors() {
+        let m = std::fs::symlink_metadata(p).with_context(|| format!("{}", p.display()))?;
         if (m.uid() != 0 && m.uid() != owner) || m.mode() & 0o022 != 0 {
             bail!("{} can be changed by other users", p.display());
         }
-        path = p.parent();
     }
-    Ok(())
+    Ok(real)
 }
 
-fn expand(arg: &str, user: &User, key: Option<&KeyData>) -> Result<String> {
+/// Whose keys are asked for (the `%u %h %U` tokens).
+struct Who<'a> {
+    name: &'a str,
+    home: &'a str,
+    uid: u32,
+}
+
+fn expand(arg: &str, user: &Who, key: Option<&KeyData>) -> Result<String> {
     let mut out = String::new();
     let mut chars = arg.chars();
     while let Some(c) = chars.next() {
@@ -102,8 +116,8 @@ fn expand(arg: &str, user: &User, key: Option<&KeyData>) -> Result<String> {
         }
         let k = || key.context("a key token outside a key check");
         match chars.next() {
-            Some('u') => out.push_str(&user.name),
-            Some('h') => out.push_str(&user.home.to_string_lossy()),
+            Some('u') => out.push_str(user.name),
+            Some('h') => out.push_str(user.home),
             Some('U') => out.push_str(&user.uid.to_string()),
             Some('f') => out.push_str(&k()?.fingerprint(ssh_key::HashAlg::Sha256).to_string()),
             Some('t') => out.push_str(k()?.algorithm().as_str()),
@@ -173,22 +187,30 @@ impl<'a> KeysCommand<'a> {
     }
 
     async fn run(&self, key: Option<&KeyData>) -> Result<Vec<AuthorizedKey>> {
-        let program = Path::new(&self.argv[0]);
-        secure_path(program, nix::unistd::geteuid().as_raw())?;
-        let args = self.argv[1..].iter().map(|a| expand(a, self.user, key)).collect::<Result<Vec<_>>>()?;
+        let program = secure_path(Path::new(&self.argv[0]), nix::unistd::geteuid().as_raw())?;
+        let home = self.user.home.to_string_lossy();
+        let who = Who { name: &self.user.name, home: &home, uid: self.user.uid };
+        let args = self.argv[1..].iter().map(|a| expand(a, &who, key)).collect::<Result<Vec<_>>>()?;
         let mut child = self
             .runner
-            .command(program)
+            .command(&program)
             .args(&args)
+            // The runner's home may not exist (nobody's is /nonexistent).
+            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("cannot run {}", program.display()))?;
-        let mut out = Vec::new();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
         let mut stdout = child.stdout.take().expect("piped");
+        let mut stderr = child.stderr.take().expect("piped");
         let finished = tokio::time::timeout(TIMEOUT, async {
-            (&mut stdout).take(MAX_OUTPUT).read_to_end(&mut out).await?;
+            // Both at once, so a chatty stderr cannot block the program.
+            let (mut o, mut e) = ((&mut stdout).take(MAX_OUTPUT), (&mut stderr).take(MAX_OUTPUT));
+            let (a, b) = tokio::join!(o.read_to_end(&mut out), e.read_to_end(&mut err));
+            a?;
+            b?;
             child.wait().await
         })
         .await;
@@ -200,10 +222,7 @@ impl<'a> KeysCommand<'a> {
             }
         };
         if !status.success() {
-            let mut err = String::new();
-            if let Some(e) = child.stderr.take() {
-                let _ = e.take(512).read_to_string(&mut err).await;
-            }
+            let err = String::from_utf8_lossy(&err[..err.len().min(512)]).into_owned();
             bail!("{status}: {}", err.trim());
         }
         let text = String::from_utf8_lossy(&out);
@@ -223,15 +242,17 @@ mod tests {
         assert!(validate("keys %u").is_err());
         assert!(validate("").is_err());
         assert!(validate("/usr/bin/keys %u").is_ok());
+        assert!(validate("/usr/bin/keys %u %k %f %t %h %U %%").is_ok());
+        assert!(validate("/usr/bin/keys %x").is_err(), "unknown token");
         assert!(uses_key(&split("/x %u %k")));
         assert!(!uses_key(&split("/x %u")));
     }
 
     #[test]
     fn tokens() {
-        let user = User::lookup(&nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name).unwrap();
+        let user = Who { name: "alice", home: "/home/alice", uid: 1000 };
         let key = KeyData::Ed25519(ssh_key::public::Ed25519PublicKey([7; 32]));
-        assert_eq!(expand("%u:%U:%%", &user, None).unwrap(), format!("{}:{}:%", user.name, user.uid));
+        assert_eq!(expand("%u:%U:%h:%%", &user, None).unwrap(), "alice:1000:/home/alice:%");
         assert!(expand("%f", &user, Some(&key)).unwrap().starts_with("SHA256:"));
         assert_eq!(expand("%t", &user, Some(&key)).unwrap(), "ssh-ed25519");
         assert!(expand("%k", &user, None).is_err());
@@ -252,5 +273,10 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(secure_path(&prog, me).is_err());
         assert!(secure_path(Path::new("/bin/sh"), me).is_ok());
+        // A symlink is judged by where it points.
+        let safe = tempfile::tempdir().unwrap();
+        let link = safe.path().join("link");
+        std::os::unix::fs::symlink(&prog, &link).unwrap();
+        assert!(secure_path(&link, me).is_err(), "through a symlink into an unsafe directory");
     }
 }

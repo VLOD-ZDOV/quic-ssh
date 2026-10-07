@@ -302,12 +302,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     }
     // Compression only wraps file transfers.
     let (request, compressed) = match request {
-        Request::Compressed(inner)
-            if matches!(*inner, Request::Upload { .. } | Request::Download { .. } | Request::UploadTree { .. } | Request::DownloadTree { .. }) =>
-        {
-            (*inner, true)
-        }
-        Request::Compressed(_) => return write_msg(&mut send, &Reply::Err("only file transfers can be compressed".into())).await,
+        Request::Compressed(transfer) => (Request::from(transfer), true),
         other => (other, false),
     };
     let limits = &grant.restrictions;

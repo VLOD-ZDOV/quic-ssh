@@ -37,16 +37,34 @@ pub struct Revoked {
 pub enum Revocation {
     /// No `revoked_keys` configured.
     None,
-    List(Revoked),
+    List(std::sync::Arc<Revoked>),
     /// Configured but unreadable or damaged: no key is accepted (as in sshd).
     Broken,
 }
 
 impl Revocation {
+    /// Reads the list, or reuses the one parsed before if the file has not
+    /// changed (it is checked at every login, also for unknown users).
     pub fn load(path: Option<&Path>) -> Revocation {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Mutex};
+        type Cached = Option<((u64, u64, u64, i64, i64), Arc<Revoked>)>;
+        static CACHE: Mutex<Cached> = Mutex::new(None);
         let Some(path) = path else { return Revocation::None };
+        let stamp = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()));
+        if let (Some(stamp), Some((cached, list))) = (stamp, CACHE.lock().unwrap().as_ref()) {
+            if stamp == *cached {
+                return Revocation::List(list.clone());
+            }
+        }
         match std::fs::read(path).map_err(anyhow::Error::from).and_then(|data| Revoked::parse(&data)) {
-            Ok(list) => Revocation::List(list),
+            Ok(list) => {
+                let list = Arc::new(list);
+                if let Some(stamp) = stamp {
+                    *CACHE.lock().unwrap() = Some((stamp, list.clone()));
+                }
+                Revocation::List(list)
+            }
             Err(e) => {
                 tracing::error!("revoked_keys {}: {e:#}; refusing all keys", path.display());
                 Revocation::Broken
@@ -189,14 +207,23 @@ fn parse_krl(data: &[u8]) -> Result<Revoked> {
                             if bits.len() * 8 > MAX_BITMAP_BITS {
                                 bail!("serial bitmap too large");
                             }
+                            // Runs of set bits become one range each.
+                            let mut run: Option<RangeInclusive<u64>> = None;
                             for (i, byte) in bits.iter().rev().enumerate() {
                                 for bit in 0..8 {
-                                    if byte & (1 << bit) != 0 {
-                                        let n = offset.checked_add((i * 8 + bit) as u64).context("serial overflow")?;
-                                        certs.serials.push(n..=n);
+                                    let n = offset.checked_add((i * 8 + bit) as u64).context("serial overflow")?;
+                                    match (byte & (1 << bit) != 0, run.take()) {
+                                        (true, Some(r)) if *r.end() + 1 == n => run = Some(*r.start()..=n),
+                                        (true, Some(r)) => {
+                                            certs.serials.push(r);
+                                            run = Some(n..=n);
+                                        }
+                                        (true, None) => run = Some(n..=n),
+                                        (false, r) => certs.serials.extend(r),
                                     }
                                 }
                             }
+                            certs.serials.extend(run);
                         }
                         0x23 => {
                             while !d.done() {

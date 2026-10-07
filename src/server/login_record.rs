@@ -1,10 +1,13 @@
 //! Login records for terminal sessions in system mode, like sshd's: `who`
 //! and `w` (utmp), `last` (wtmp) and `lastlog` show qsh logins.
 //!
-//! On Linux the files are written directly in glibc's format (static musl
-//! builds have no working utmp functions). Only files that already exist are
-//! written: distributions that dropped utmp/wtmp keep it that way. On macOS
-//! the system's utmpx functions are used.
+//! Linux only. The files are written directly in glibc's format (static
+//! musl builds have no working utmp functions), for the layouts of x86_64
+//! and aarch64; on other architectures nothing is written. Only files that
+//! already exist are written: distributions that dropped utmp/wtmp keep it
+//! that way. Records are written by one background thread, in order, and a
+//! file locked by someone else for too long is skipped, so a local user
+//! holding a lock cannot stall the server.
 
 use std::net::IpAddr;
 
@@ -21,47 +24,96 @@ fn line_of(tty: &str) -> String {
     tty.strip_prefix("/dev/").unwrap_or(tty).to_string()
 }
 
+struct Job {
+    line: String,
+    pid: i32,
+    /// `None` for a logout.
+    who: Option<(String, IpAddr)>,
+    at: std::time::Duration,
+}
+
+fn send(job: Job) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Mutex, OnceLock};
+    static WRITER: OnceLock<Mutex<Sender<Job>>> = OnceLock::new();
+    let tx = WRITER.get_or_init(|| {
+        let (tx, rx) = channel::<Job>();
+        std::thread::spawn(move || {
+            for job in rx {
+                if let Err(e) = imp::write(&job) {
+                    debug!("login record for {}: {e}", job.line);
+                }
+            }
+        });
+        Mutex::new(tx)
+    });
+    let _ = tx.lock().unwrap().send(job);
+}
+
+fn now() -> std::time::Duration {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+}
+
 /// Records a login of `user` on terminal `tty` (a device path) by process
 /// `pid`, from `host`.
 pub fn login(user: &str, tty: &str, pid: u32, host: IpAddr) -> LoginRecord {
     let record = LoginRecord { line: line_of(tty), pid: pid as i32 };
-    if let Err(e) = imp::write(&record, Some((user, host))) {
-        debug!("login record for {}: {e}", record.line);
-    }
+    send(Job { line: record.line.clone(), pid: record.pid, who: Some((user.to_string(), host)), at: now() });
     record
 }
 
 impl Drop for LoginRecord {
     fn drop(&mut self) {
-        if let Err(e) = imp::write(self, None) {
-            debug!("logout record for {}: {e}", self.line);
-        }
+        send(Job { line: std::mem::take(&mut self.line), pid: self.pid, who: None, at: now() });
     }
 }
 
-#[cfg(target_os = "linux")]
+/// glibc's `struct utmp` and `struct lastlog` differ between architectures:
+/// x86_64 keeps 32-bit times for compatibility with i386, aarch64 does not.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod layout {
+    pub const SIZE: usize = 384;
+    /// `ut_tv`: seconds and microseconds, each this many bytes.
+    pub const TV: usize = 340;
+    pub const TV_FIELD: usize = 4;
+    pub const ADDR: usize = 348;
+    pub const LASTLOG_SIZE: usize = 292;
+    pub const LASTLOG_TIME: usize = 4;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod layout {
+    pub const SIZE: usize = 400;
+    pub const TV: usize = 344;
+    pub const TV_FIELD: usize = 8;
+    pub const ADDR: usize = 360;
+    pub const LASTLOG_SIZE: usize = 296;
+    pub const LASTLOG_TIME: usize = 8;
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod imp {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::net::IpAddr;
-    use std::os::fd::AsRawFd;
+    use std::time::Duration;
 
-    use super::LoginRecord;
+    pub(super) use super::layout::SIZE;
+    use super::layout::*;
+    use super::Job;
 
     const UTMP: &str = "/var/run/utmp";
     const WTMP: &str = "/var/log/wtmp";
     const LASTLOG: &str = "/var/log/lastlog";
 
-    /// glibc's `struct utmp` on 64-bit Linux (x86_64 and aarch64 alike).
-    pub(super) const SIZE: usize = 384;
     const USER_PROCESS: i16 = 7;
     const DEAD_PROCESS: i16 = 8;
     const LINE: std::ops::Range<usize> = 8..40;
     const ID: std::ops::Range<usize> = 40..44;
     const USER: std::ops::Range<usize> = 44..76;
     const HOST: std::ops::Range<usize> = 76..332;
-    /// `struct lastlog`: time (i32), line (32), host (256).
-    const LASTLOG_SIZE: u64 = 292;
+    /// How long to wait for a lock someone else holds before skipping.
+    const LOCK_WAIT: Duration = Duration::from_secs(2);
 
     fn put(buf: &mut [u8], at: std::ops::Range<usize>, text: &str) {
         let field = &mut buf[at];
@@ -69,8 +121,17 @@ mod imp {
         field[..n].copy_from_slice(&text.as_bytes()[..n]);
     }
 
+    /// Writes `value` into a field of `width` bytes (4 or 8).
+    fn put_int(buf: &mut [u8], at: usize, width: usize, value: i64) {
+        if width == 8 {
+            buf[at..at + 8].copy_from_slice(&value.to_ne_bytes());
+        } else {
+            buf[at..at + 4].copy_from_slice(&(value as i32).to_ne_bytes());
+        }
+    }
+
     /// One utmp/wtmp entry; `who` is `None` for a logout.
-    pub(super) fn entry(line: &str, pid: i32, who: Option<(&str, IpAddr)>, now: std::time::Duration) -> [u8; SIZE] {
+    pub(super) fn entry(line: &str, pid: i32, who: Option<(&str, IpAddr)>, now: Duration) -> [u8; SIZE] {
         let mut b = [0u8; SIZE];
         let kind = if who.is_some() { USER_PROCESS } else { DEAD_PROCESS };
         b[0..2].copy_from_slice(&kind.to_ne_bytes());
@@ -82,25 +143,27 @@ mod imp {
             put(&mut b, USER, user);
             put(&mut b, HOST, &host.to_string());
             match host {
-                IpAddr::V4(a) => b[348..352].copy_from_slice(&a.octets()),
-                IpAddr::V6(a) => b[348..364].copy_from_slice(&a.octets()),
+                IpAddr::V4(a) => b[ADDR..ADDR + 4].copy_from_slice(&a.octets()),
+                IpAddr::V6(a) => b[ADDR..ADDR + 16].copy_from_slice(&a.octets()),
             }
         }
-        b[340..344].copy_from_slice(&(now.as_secs() as i32).to_ne_bytes());
-        b[344..348].copy_from_slice(&(now.subsec_micros() as i32).to_ne_bytes());
+        put_int(&mut b, TV, TV_FIELD, now.as_secs() as i64);
+        put_int(&mut b, TV + TV_FIELD, TV_FIELD, now.subsec_micros() as i64);
         b
     }
 
-    /// Exclusive lock for the duration of an update, as glibc takes it.
+    /// An exclusive lock as glibc takes it, waiting a little at most.
     fn lock(f: &File) -> io::Result<()> {
-        // SAFETY: a plain fcntl call with a valid descriptor and lock struct.
-        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
-        fl.l_type = libc::F_WRLCK as _;
-        fl.l_whence = libc::SEEK_SET as _;
-        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETLKW, &fl) } != 0 {
-            return Err(io::Error::last_os_error());
+        use nix::fcntl::{fcntl, FcntlArg};
+        let fl = libc::flock { l_type: libc::F_WRLCK as _, l_whence: libc::SEEK_SET as _, l_start: 0, l_len: 0, l_pid: 0 };
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match fcntl(f, FcntlArg::F_SETLK(&fl)) {
+                Ok(_) => return Ok(()),
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(io::Error::other(format!("locked by another process ({e})"))),
+            }
         }
-        Ok(())
     }
 
     /// Replaces the entry for the same line in a utmp file, or appends one.
@@ -125,74 +188,38 @@ mod imp {
         f.write_all(rec)
     }
 
-    fn lastlog(uid: u32, line: &str, host: IpAddr, now: std::time::Duration) -> io::Result<()> {
+    fn lastlog(uid: u32, line: &str, host: IpAddr, now: Duration) -> io::Result<()> {
         let mut f = OpenOptions::new().write(true).open(LASTLOG)?;
-        let mut rec = [0u8; LASTLOG_SIZE as usize];
-        rec[0..4].copy_from_slice(&(now.as_secs() as i32).to_ne_bytes());
-        put(&mut rec, 4..36, line);
-        put(&mut rec, 36..292, &host.to_string());
-        f.seek(SeekFrom::Start(uid as u64 * LASTLOG_SIZE))?;
+        let mut rec = [0u8; LASTLOG_SIZE];
+        put_int(&mut rec, 0, LASTLOG_TIME, now.as_secs() as i64);
+        put(&mut rec, LASTLOG_TIME..LASTLOG_TIME + 32, line);
+        put(&mut rec, LASTLOG_TIME + 32..LASTLOG_SIZE, &host.to_string());
+        f.seek(SeekFrom::Start(uid as u64 * LASTLOG_SIZE as u64))?;
         f.write_all(&rec)
     }
 
-    pub(super) fn write(r: &LoginRecord, who: Option<(&str, IpAddr)>) -> io::Result<()> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        let rec = entry(&r.line, r.pid, who, now);
+    pub(super) fn write(job: &Job) -> io::Result<()> {
+        let who = job.who.as_ref().map(|(u, h)| (u.as_str(), *h));
+        let rec = entry(&job.line, job.pid, who, job.at);
         let utmp = update_utmp(UTMP, &rec);
         let wtmp = append(WTMP, &rec);
         if let Some((user, host)) = who {
             if let Ok(Some(u)) = nix::unistd::User::from_name(user) {
-                let _ = lastlog(u.uid.as_raw(), &r.line, host, now);
+                let _ = lastlog(u.uid.as_raw(), &job.line, host, job.at);
             }
         }
         utmp.and(wtmp)
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod imp {
-    use std::net::IpAddr;
-
-    use super::LoginRecord;
-
-    fn put(field: &mut [libc::c_char], text: &str) {
-        let room = field.len().saturating_sub(1);
-        for (d, s) in field.iter_mut().zip(text.bytes().take(room)) {
-            *d = s as libc::c_char;
-        }
-    }
-
-    pub(super) fn write(r: &LoginRecord, who: Option<(&str, IpAddr)>) -> std::io::Result<()> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        // SAFETY: a zeroed utmpx is valid; the libc calls get a valid pointer.
-        unsafe {
-            let mut u: libc::utmpx = std::mem::zeroed();
-            u.ut_type = if who.is_some() { libc::USER_PROCESS } else { libc::DEAD_PROCESS };
-            u.ut_pid = r.pid;
-            put(&mut u.ut_line, &r.line);
-            put(&mut u.ut_id, &r.line[r.line.len().saturating_sub(4)..]);
-            if let Some((user, host)) = who {
-                put(&mut u.ut_user, user);
-                put(&mut u.ut_host, &host.to_string());
-            }
-            u.ut_tv.tv_sec = now.as_secs() as _;
-            u.ut_tv.tv_usec = now.subsec_micros() as _;
-            libc::setutxent();
-            let ok = !libc::pututxline(&u).is_null();
-            libc::endutxent();
-            if ok { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod imp {
-    pub(super) fn write(_: &super::LoginRecord, _: Option<(&str, std::net::IpAddr)>) -> std::io::Result<()> {
+    pub(super) fn write(_: &super::Job) -> std::io::Result<()> {
         Ok(())
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::imp::*;
 
@@ -201,12 +228,13 @@ mod tests {
         let host: std::net::IpAddr = "192.0.2.7".parse().unwrap();
         let now = std::time::Duration::from_secs(1_700_000_000);
         let login = entry("pts/12", 4242, Some(("alice", host)), now);
+        // glibc's sizeof(struct utmp) on this architecture.
+        assert_eq!(login.len(), if cfg!(target_arch = "x86_64") { 384 } else { 400 });
         assert_eq!(&login[0..2], &7i16.to_ne_bytes());
         assert_eq!(&login[8..14], b"pts/12");
         assert_eq!(&login[40..44], b"s/12");
         assert_eq!(&login[44..49], b"alice");
         assert_eq!(&login[76..85], b"192.0.2.7");
-        assert_eq!(&login[348..352], &[192, 0, 2, 7]);
         let dir = tempfile::tempdir().unwrap();
         let utmp = dir.path().join("utmp");
         let other = entry("pts/3", 1, Some(("bob", host)), now);
@@ -222,5 +250,12 @@ mod tests {
         append(path, &login).unwrap();
         assert_eq!(std::fs::read(&utmp).unwrap().len(), 3 * SIZE);
         assert!(update_utmp(dir.path().join("missing").to_str().unwrap(), &login).is_err(), "never created");
+    }
+
+    /// The layout matches the libc crate's `utmpx`, which mirrors glibc's struct.
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn layout_matches_libc() {
+        assert_eq!(SIZE, std::mem::size_of::<libc::utmpx>());
     }
 }

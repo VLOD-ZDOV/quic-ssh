@@ -134,11 +134,32 @@ pub enum Request {
     /// byte `received` on is sent again (as far as the server still has it).
     Resume { token: Vec<u8>, received: u64 },
     // --- protocol version 5 ---
-    /// A file transfer (`Upload`, `Download`, `UploadTree`, `DownloadTree`)
-    /// with zstd compression: after the first reply, the side that sends the
-    /// data compresses everything it sends on the stream, to its end
-    /// (including a final reply after a tree download).
-    Compressed(Box<Request>),
+    /// A file transfer with zstd compression: after the first reply, the
+    /// side that sends the data compresses everything it sends on the
+    /// stream, to its end (including a final reply after a tree download).
+    Compressed(Transfer),
+}
+
+/// The file transfers that can be compressed. A type of its own, not a
+/// boxed `Request`: a recursive type would let a peer nest it deep enough
+/// to overflow the stack while decoding.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Transfer {
+    Upload { path: String, name: String, size: u64, mode: u32 },
+    Download { path: String },
+    UploadTree { path: String, name: String },
+    DownloadTree { path: String },
+}
+
+impl From<Transfer> for Request {
+    fn from(t: Transfer) -> Request {
+        match t {
+            Transfer::Upload { path, name, size, mode } => Request::Upload { path, name, size, mode },
+            Transfer::Download { path } => Request::Download { path },
+            Transfer::UploadTree { path, name } => Request::UploadTree { path, name },
+            Transfer::DownloadTree { path } => Request::DownloadTree { path },
+        }
+    }
 }
 
 /// First message on a stream the server opens to the client.
@@ -309,6 +330,17 @@ mod tests {
             got.push(msg);
         }
         assert!(got.contains(&ServerMsg::Stdout(vec![5; 3000])), "{} messages", got.len());
+    }
+
+    #[test]
+    fn compressed_requests_do_not_nest() {
+        let t = Transfer::Download { path: "a".into() };
+        let bytes = postcard::to_stdvec(&Request::Compressed(t.clone())).unwrap();
+        assert!(matches!(postcard::from_bytes::<Request>(&bytes).unwrap(), Request::Compressed(x) if x == t));
+        // What used to nest (Compressed inside Compressed) is now just malformed.
+        let compressed = bytes[0];
+        let nested = [vec![compressed; 100_000], vec![0x03, 0x01, b'a']].concat();
+        assert!(postcard::from_bytes::<Request>(&nested).is_err());
     }
 
     #[tokio::test]
