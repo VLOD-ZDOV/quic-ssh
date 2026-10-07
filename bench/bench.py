@@ -114,8 +114,12 @@ class Bench:
     def timed(self, argv):
         env = dict(os.environ, HOME=self.client_home)
         start = time.perf_counter()
-        subprocess.run(argv, check=True, env=env, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+        p = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Plain blocking wait: `subprocess.run(timeout=...)` polls with up to
+        # 50 ms sleeps, which would round every measurement up.
+        if p.wait() != 0:
+            raise RuntimeError(f"{argv[0]} failed")
         return time.perf_counter() - start
 
     def run(self):

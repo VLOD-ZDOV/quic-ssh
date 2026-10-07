@@ -8,7 +8,7 @@
 
 Why QUIC:
 
-- **Faster connections:** on a 50 ms RTT link, running a command is 3× faster than with ssh (see [benchmarks](#benchmarks)).
+- **Faster connections:** on a 50 ms RTT link, running a command is 3.4× faster than with ssh (see [benchmarks](#benchmarks)).
 - **Better on bad networks:** BBR congestion control keeps throughput up under packet loss (Wi-Fi, mobile).
 - **No head-of-line blocking:** every session, port forward and copy has its own stream, so a slow `cp` never stalls your terminal.
 - **Survives client address changes** (NAT rebinding).
@@ -147,22 +147,22 @@ Compared with OpenSSH 10 (`ssh`/`scp` with default settings). The network is emu
 
 | Network | ssh | qsh (QUIC) | qsh (TCP fallback) |
 |---|---:|---:|---:|
-| loopback, no delay | 114 ms | 64 ms | 31 ms |
-| RTT 50 ms, 100 Mbit/s | 665 ms | **214 ms** | 264 ms |
-| RTT 100 ms, 1% loss, 20 Mbit/s | 1216 ms (worst 1516) | **364 ms** (worst 564) | 464 ms (worst 965) |
+| loopback, no delay | 87 ms | 37 ms | 15 ms |
+| RTT 50 ms, 100 Mbit/s | 631 ms | **188 ms** | 217 ms |
+| RTT 100 ms, 1% loss, 20 Mbit/s | 1183 ms (worst 1750) | **343 ms** (worst 345) | 420 ms (worst 1551) |
 
 **File upload** (`scp` vs `qsh cp`, median of 3 runs):
 
 | Network | Size | scp | qsh (QUIC) | qsh (TCP fallback) |
 |---|---:|---:|---:|---:|
-| loopback, no delay | 200 MiB | 5.3 Gbit/s | 4.6 Gbit/s | 10.2 Gbit/s |
-| RTT 50 ms, 100 Mbit/s | 50 MiB | 64.8 Mbit/s | **85.2 Mbit/s** | 78.8 Mbit/s |
-| RTT 100 ms, 1% loss, 20 Mbit/s | 10 MiB | 11.1 Mbit/s | **16.4 Mbit/s** | 13.7 Mbit/s |
+| loopback, no delay | 200 MiB | 5.8 Gbit/s | 5.2 Gbit/s | 16.8 Gbit/s |
+| RTT 50 ms, 100 Mbit/s | 50 MiB | 66.2 Mbit/s | **85.2 Mbit/s** | 79.2 Mbit/s |
+| RTT 100 ms, 1% loss, 20 Mbit/s | 10 MiB | 10.4 Mbit/s | **16.3 Mbit/s** | 14.1 Mbit/s |
 
 Takeaways:
 
-- **Connecting** is 3× faster than ssh on any link with noticeable latency. QUIC combines the transport and TLS handshakes into 1 RTT, while ssh spends several RTTs on version exchange, key exchange and authentication.
-- **Under packet loss**, QUIC with BBR uses almost the whole link (16.4 of 20 Mbit/s), while scp gets about half.
+- **Connecting** is 3–3.4× faster than ssh on any link with noticeable latency. QUIC combines the transport and TLS handshakes into 1 RTT, while ssh spends several RTTs on version exchange, key exchange and authentication.
+- **Under packet loss**, QUIC with BBR uses almost the whole link (16.3 of 20 Mbit/s), while scp gets about half.
 - **On loopback**, QUIC is CPU-bound (encryption and UDP in userspace), so TCP is faster there. On real links the network, not the CPU, is the bottleneck.
 
 To reproduce (needs only util-linux, iproute2 and OpenSSH; no root):
