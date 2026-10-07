@@ -183,6 +183,10 @@ check "forwarded connection is made as alice, not root" test "$FWD_UID" = "$ALIC
 exec 3>&-
 kill "$FWD_PID" "$LISTENER_PID" 2>/dev/null || true
 
+# --- remote forwarding limits --------------------------------------------------------
+OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -N -R 80:127.0.0.1:9 qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
+check "non-root user cannot listen on a privileged port (-R 80)" grep -q "only root may listen" <<<"$OUT"
+
 # --- PTY ------------------------------------------------------------------------------
 # `script` gives qsh a terminal; markers keep the values apart from terminal noise.
 OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'echo TTY=\$(stat -c %u:%g:%a \$(tty)) UID=\$(id -u)'" /dev/null < /dev/null || true)

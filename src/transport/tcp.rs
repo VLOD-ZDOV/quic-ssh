@@ -113,6 +113,7 @@ where
         peer_key,
         exporter,
         remote,
+        hops: Vec::new(),
     }
 }
 
@@ -123,6 +124,18 @@ pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result
     let stream = tokio_rustls::TlsConnector::from(tls).connect(name, sock).await?;
     let info = tls_info(stream.get_ref().1)?;
     Ok(finish(stream, Mode::Client, info, addr))
+}
+
+/// TLS + yamux over an already open byte stream (e.g. a stream forwarded
+/// through a jump host). `remote` is only used for display.
+pub async fn connect_stream<S>(tls: Arc<rustls::ClientConfig>, stream: S, remote: SocketAddr) -> Result<Conn>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
+    let stream = tokio_rustls::TlsConnector::from(tls).connect(name, stream).await?;
+    let info = tls_info(stream.get_ref().1)?;
+    Ok(finish(stream, Mode::Client, info, remote))
 }
 
 pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: SocketAddr) -> Result<Conn> {

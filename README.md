@@ -128,7 +128,7 @@ qsh -p 2222 user@host                  # another port (or user@host:2222)
 qsh --transport tcp user@host          # force TCP (or quic)
 qsh -v user@host                       # show which transport is used
 qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
-qsh -f myserver                        # OpenSSH-compatible mode, see below
+qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
 ```
 
@@ -161,20 +161,20 @@ Host myserver
 
 Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`, `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
-### OpenSSH-compatible mode (`-f`, `--full`)
+### OpenSSH-compatible mode (`--full`)
 
-With `-f`, qsh behaves like a drop-in for `ssh`:
+With `--full` (automatic when qsh is installed as `ssh`), qsh behaves like a drop-in for `ssh`:
 
-- It also reads `Port`, `LocalForward` and `RequestTTY` from `~/.ssh/config`. Without `-f`, these describe the ssh session and are ignored.
+- It also reads `Port`, `LocalForward` and `RequestTTY` from `~/.ssh/config`. Without `--full`, these describe the ssh session and are ignored.
 - It looks for qshd **both** on the ssh port (default 22) **and** on 4422, in parallel, and uses whichever answers. On 22, qshd can run UDP-only next to sshd (`tcp = false` in the server config). An explicit qsh port (`-p`, `:port` or `Port` in `~/.config/qsh/config`) means only that port is tried.
-- If no qshd answers within 1 s, or the host is configured with `ProxyJump`/`ProxyCommand` (which qsh cannot do), qsh runs the regular **`ssh`** (or **`scp`** for `qsh -f cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
+- If no qshd answers within 1 s, or the host is configured with `ProxyJump`/`ProxyCommand` (which qsh cannot do), qsh runs the regular **`ssh`** (or **`scp`** for `qsh --full cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
 - Hosts without qshd are remembered for an hour, so later connections go straight to ssh. `--transport quic` forces a new check.
 - A wrong host key or a refused login never falls back to ssh.
 
 ```sh
-qsh -f myserver                 # QUIC if qshd is there, otherwise plain ssh
-qsh -f -v myserver              # prints which one was used
-alias ssh='qsh -f'              # if you want it everywhere
+qsh --full myserver               # QUIC if qshd is there, otherwise plain ssh
+qsh --full -v myserver             # prints which one was used
+ln -s $(command -v qsh) ~/.local/bin/ssh   # use qsh as ssh everywhere (ssh's flags keep their meaning)
 ```
 
 ### Host menu and speed test (`qsh ui`, `qsh speed`)
@@ -182,7 +182,7 @@ alias ssh='qsh -f'              # if you want it everywhere
 `qsh ui` opens an interactive menu of every host from `~/.ssh/config`, `~/.config/qsh/config` and known_hosts:
 
 - **Live status:** each host is checked in the background for qshd (TLS handshake with a throwaway key, no login). The list shows `● quic 42 ms`, `● tcp` (UDP blocked) or `○ ssh` (no qshd), and whether the host key is known, new or changed.
-- **⏎ / tap** connects with `qsh -f`, so hosts without qshd open with plain ssh. When the session ends you return to the menu.
+- **⏎ / tap** connects with `qsh --full`, so hosts without qshd open with plain ssh. When the session ends you return to the menu.
 - **`s`** runs a speed test with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
 - **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`r`** re-checks, **`q`** quits.
 - The layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
@@ -223,7 +223,7 @@ allow_tcp_forwarding = true
 max_connections = 256
 max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
 max_startups_per_ip = 8         # ... from one IP address
-tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh -f`
+tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`
 ```
 
 User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. Only `ssh-ed25519` lines count. Lines with options (`from=`, `command=` and so on) are **ignored**, because qsh cannot enforce those restrictions.

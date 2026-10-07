@@ -1,16 +1,20 @@
 //! The `qsh` client.
 
+pub mod cli;
 pub mod config;
 pub mod copy;
 pub mod forward;
 pub mod keystroke;
 mod known_hosts;
 pub mod session;
+mod socks;
 pub mod speed;
 pub mod tui;
 
 use std::io::{BufRead, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
@@ -18,6 +22,19 @@ use crate::keys::{home_dir, qsh_dir, Identity, PublicKey};
 use crate::proto::{expect_ok, write_msg, Hello, VERSION};
 use crate::transport::{self, Conn, Mode};
 use known_hosts::{host_id, KnownHosts};
+
+/// How to treat a host key that is not in known_hosts (`StrictHostKeyChecking`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HostKeyPolicy {
+    /// Ask on the terminal (the default).
+    #[default]
+    Ask,
+    /// Trust and remember new keys (`accept-new`; `no` is treated the same:
+    /// a changed key is always refused).
+    AcceptNew,
+    /// Refuse unknown keys (`yes`).
+    Strict,
+}
 
 /// `[user@]host[:port]`; IPv6 literals go in brackets: `user@[::1]:4422`.
 /// `host` may be an alias from `~/.config/qsh/config` or `~/.ssh/config`.
@@ -35,14 +52,32 @@ pub struct Target {
     pub ssh_dest: String,
     /// Port given on the command line (`-p` or `:port`), if any.
     pub cli_port: Option<u16>,
-    /// `LocalForward`s from the config, as `-L` specs.
+    /// Forwards from the config, as `-L`/`-R`/`-D` specs.
     pub local_forwards: Vec<String>,
+    pub remote_forwards: Vec<String>,
+    pub dynamic_forwards: Vec<String>,
+    /// Jump hosts (`ProxyJump` in qsh's config or `-o`, or `-J`).
+    pub proxy_jump: Option<String>,
     /// `RequestTTY` from the config.
     pub request_tty: Option<String>,
-    /// The config routes this host through ProxyJump/ProxyCommand.
+    /// ssh's config routes this host through ProxyJump/ProxyCommand.
     pub needs_proxy: bool,
     /// Keystroke timing obfuscation interval (`None` = off).
     pub keystroke_interval: Option<std::time::Duration>,
+    /// Never prompt (`BatchMode`).
+    pub batch_mode: bool,
+    pub host_key_policy: HostKeyPolicy,
+    /// `UserKnownHostsFile` (qsh config or `-o` only).
+    pub known_hosts_file: Option<PathBuf>,
+    pub clear_all_forwardings: bool,
+    /// Session escape character; `None` disables escapes (`EscapeChar none`).
+    pub escape_char: Option<u8>,
+    pub family: transport::Family,
+    /// `LogLevel QUIET` or `-q`: no informational messages.
+    pub quiet: bool,
+    pub forward_agent: bool,
+    /// The config sources, reused for jump hosts.
+    pub sources: config::Sources,
 }
 
 /// Host names and aliases: no option-looking names, whitespace or control
@@ -51,18 +86,38 @@ fn valid_host(host: &str) -> bool {
     !host.is_empty() && !host.starts_with('-') && !host.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// `EscapeChar`: `none`, a single character, or `^X` for a control character.
+pub fn parse_escape(v: Option<&str>) -> Option<u8> {
+    match v {
+        None => Some(b'~'),
+        Some(v) if v.eq_ignore_ascii_case("none") => None,
+        Some(v) if v.len() == 2 && v.starts_with('^') => Some(v.as_bytes()[1].to_ascii_uppercase() & 0x1f),
+        Some(v) if v.len() == 1 => Some(v.as_bytes()[0]),
+        Some(_) => Some(b'~'),
+    }
+}
+
 impl Target {
     /// Parses a destination and applies the matching config entries.
-    /// Precedence: `-p`/`user@`/`:port` on the command line, then
+    /// Precedence: `-p`/`user@`/`:port` on the command line, then `-o`, then
     /// `~/.config/qsh/config`, then `~/.ssh/config`. The latter's `Port` is
     /// the SSH port and only used with `full` (`qsh --full`), where the
     /// default port is 22 instead of 4422.
     pub fn parse(s: &str, port: Option<u16>, full: bool) -> Result<Target> {
-        Self::parse_with(s, port, home_dir().ok().as_deref(), full)
+        Self::resolve(s, port, &config::Sources { full, ..Default::default() })
+    }
+
+    pub fn resolve(s: &str, port: Option<u16>, sources: &config::Sources) -> Result<Target> {
+        Self::resolve_with(s, port, home_dir().ok().as_deref(), sources)
     }
 
     /// Like [`Target::parse`], reading the configs under `home` (none if `None`).
     pub fn parse_with(s: &str, port: Option<u16>, home: Option<&Path>, full: bool) -> Result<Target> {
+        Self::resolve_with(s, port, home, &config::Sources { full, ..Default::default() })
+    }
+
+    pub fn resolve_with(s: &str, port: Option<u16>, home: Option<&Path>, sources: &config::Sources) -> Result<Target> {
+        let full = sources.full;
         let (user, rest) = match s.rsplit_once('@') {
             Some((u, r)) if !u.is_empty() => (Some(u.to_string()), r),
             Some(_) => bail!("empty user name in {s:?}"),
@@ -85,9 +140,9 @@ impl Target {
             bail!("invalid host {alias:?}");
         }
         let parsed_port = parsed_port.map(|p| p.parse::<u16>().context("invalid port")).transpose()?;
-        let cfg = home.map(|h| config::lookup(h, alias, full)).unwrap_or_default();
+        let cfg = home.map(|h| config::lookup(h, alias, sources)).unwrap_or_default();
 
-        let host = cfg.hostname.map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
+        let host = cfg.hostname.clone().map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
         if !valid_host(&host) {
             bail!("invalid HostName {host:?} for {alias}");
         }
@@ -95,27 +150,21 @@ impl Target {
             Some(u) => format!("{u}@{alias}"),
             None => alias.to_string(),
         };
-        let user = match user.or(cfg.user) {
+        let user = match user.or(cfg.user.clone()) {
             Some(u) => u,
             None => local_user()?,
         };
         if !crate::proto::valid_user_name(&user) {
             bail!("invalid user name {user:?}");
         }
-        let identity_files = match home {
-            Some(home) => {
-                let local = local_user().unwrap_or_default();
-                cfg.identity_files
-                    .iter()
-                    .map(|f| config::expand_path(f, home, &host, &user, &local))
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+        let local = local_user().unwrap_or_default();
+        let expand = |f: &str| home.map(|h| config::expand_path(f, h, &host, &user, &local));
+        let identity_files = cfg.identity_files.iter().filter_map(|f| expand(f)).collect();
+        let known_hosts_file = cfg.user_known_hosts_file.as_deref().and_then(expand);
         let cli_port = port.or(parsed_port);
-        // An explicit qsh port (command line or ~/.config/qsh/config) is used as is.
-        // Otherwise `--full` looks for qshd both on the ssh port (UDP-only qshd
-        // next to sshd) and on the standard qsh port.
+        // An explicit qsh port (command line, -o or ~/.config/qsh/config) is used
+        // as is. Otherwise `--full` looks for qshd both on the ssh port (UDP-only
+        // qshd next to sshd) and on the standard qsh port.
         let (port, alt_ports) = match cli_port.or(cfg.port) {
             Some(p) => (p, Vec::new()),
             None if full => {
@@ -125,18 +174,40 @@ impl Target {
             }
             None => (crate::DEFAULT_PORT, Vec::new()),
         };
+        let host_key_policy = match cfg.strict_host_key_checking.as_deref() {
+            Some("yes") => HostKeyPolicy::Strict,
+            Some("accept-new" | "no" | "off") => HostKeyPolicy::AcceptNew,
+            _ => HostKeyPolicy::Ask,
+        };
+        let family = match cfg.address_family.as_deref() {
+            Some("inet") => transport::Family::V4,
+            Some("inet6") => transport::Family::V6,
+            _ => transport::Family::Any,
+        };
         Ok(Target {
             user,
-            host,
-            port,
             alt_ports,
             identity_files,
             ssh_dest,
             cli_port,
             local_forwards: cfg.local_forwards,
+            remote_forwards: cfg.remote_forwards,
+            dynamic_forwards: cfg.dynamic_forwards,
+            proxy_jump: cfg.proxy_jump,
             request_tty: cfg.request_tty,
             needs_proxy: cfg.needs_proxy,
             keystroke_interval: config::keystroke_interval(cfg.obscure_keystrokes.as_deref()),
+            batch_mode: cfg.batch_mode.unwrap_or(false),
+            host_key_policy,
+            known_hosts_file,
+            clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
+            escape_char: parse_escape(cfg.escape_char.as_deref()),
+            family,
+            quiet: cfg.log_level.as_deref() == Some("quiet"),
+            forward_agent: cfg.forward_agent.unwrap_or(false),
+            sources: sources.clone(),
+            host,
+            port,
         })
     }
 }
@@ -146,9 +217,10 @@ fn local_user() -> Result<String> {
     Ok(nix::unistd::User::from_uid(uid)?.context("cannot determine local user name")?.name)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
-    pub identity: Option<PathBuf>,
+    /// `-i` keys, tried in order (the first Ed25519 one is used).
+    pub identities: Vec<PathBuf>,
     pub transport: Mode,
     /// Trust unknown host keys without asking (still refuses changed keys).
     pub accept_new_host: bool,
@@ -209,25 +281,30 @@ fn default_identity_paths() -> Result<[PathBuf; 2]> {
     Ok([home.join(".ssh").join("id_ed25519"), qsh_dir(&home).join("id_ed25519")])
 }
 
-/// Loads the client key: `-i path`, else the first Ed25519 `IdentityFile` from
-/// the config, else `~/.ssh/id_ed25519`, else `~/.config/qsh/id_ed25519`.
-/// With `create`, generates the latter when no key exists.
-pub fn load_identity(explicit: Option<&Path>, configured: &[PathBuf], create: bool) -> Result<Identity> {
-    if let Some(p) = explicit {
-        return Identity::load(p);
+/// Loads the client key: the first Ed25519 key among `-i`, else among the
+/// config's `IdentityFile`s, else `~/.ssh/id_ed25519`, else
+/// `~/.config/qsh/id_ed25519`. With `create`, generates the latter when no key
+/// exists. With `batch`, an encrypted key is an error instead of a prompt.
+pub fn load_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool, batch: bool) -> Result<Identity> {
+    if !explicit.is_empty() {
+        if let Some(p) = explicit.iter().find(|p| Identity::is_ed25519_file(p)) {
+            return Identity::load_with(p, !batch);
+        }
+        // Report why the first one cannot be used (missing, not ed25519, unreadable).
+        return Identity::load_with(&explicit[0], !batch);
     }
     // Config entries may list RSA/ECDSA keys for ssh; skip those (without asking for a passphrase).
     for p in configured {
         if p.exists() {
             if Identity::is_ed25519_file(p) {
-                return Identity::load(p);
+                return Identity::load_with(p, !batch);
             }
             tracing::debug!("skipping {}: not an ed25519 key", p.display());
         }
     }
     let paths = default_identity_paths()?;
     if let Some(p) = paths.iter().find(|p| p.exists()) {
-        return Identity::load(p);
+        return Identity::load_with(p, !batch);
     }
     if create {
         let (id, _) = Identity::load_or_generate(&paths[1], "qsh")?;
@@ -255,6 +332,15 @@ fn known_hosts() -> Result<KnownHosts> {
     Ok(KnownHosts::new(qsh_dir(&home_dir()?).join("known_hosts")))
 }
 
+/// known_hosts for a target: its `UserKnownHostsFile`, or the default.
+fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
+    let path = match &target.known_hosts_file {
+        Some(p) => p.clone(),
+        None => qsh_dir(&home_dir()?).join("known_hosts"),
+    };
+    Ok((KnownHosts::new(path.clone()), path))
+}
+
 /// Asks on the terminal whether to trust an unknown host key.
 fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
     let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").context(
@@ -274,8 +360,18 @@ fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
-async fn open(target: &Target, opts: &ConnectOptions, id: &Identity) -> Result<Conn> {
+async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option<&Conn>) -> Result<Conn> {
     let tls = crate::tls::client_config(id)?;
+    if let Some(via) = via {
+        // Through a jump host: TLS + yamux over a stream forwarded to the qshd TCP port.
+        let (mut send, mut recv) = via.open_bi().await?;
+        write_msg(&mut send, &crate::proto::Request::DirectTcp { host: target.host.clone(), port: target.port }).await?;
+        expect_ok(&mut recv).await.with_context(|| format!("jump host cannot reach {}:{}", target.host, target.port))?;
+        let label = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), target.port);
+        let conn = transport::connect_stream(tokio::io::join(recv, send), tls, label).await?;
+        tracing::info!("connected to {}:{} through a jump host", target.host, target.port);
+        return Ok(conn);
+    }
     let conn = if opts.full {
         // `--transport quic` forces a fresh attempt even for hosts cached as qshd-less.
         let cache = NoQshdCache::new()?;
@@ -284,26 +380,23 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity) -> Result<C
             return Err(transport::Unreachable(format!("no qshd at {hid} (cached for up to an hour)")).into());
         }
         let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
-        let result = transport::connect_probe(&target.host, &ports, tls).await;
+        let result = transport::connect_probe(&target.host, &ports, target.family, tls).await;
         cache.set(&hid, result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
         result?
     } else {
-        transport::connect(&target.host, target.port, opts.transport, tls).await?
+        transport::connect(&target.host, target.port, opts.transport, target.family, tls).await?
     };
     tracing::info!("connected to {} over {}", conn.remote_addr(), conn.transport_name());
     Ok(conn)
 }
 
-/// Connects, verifies the host key against known_hosts and logs in.
-pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
-    let id = load_identity(opts.identity.as_deref(), &target.identity_files, false)?;
-    let conn = open(target, opts, &id).await?;
-
-    let kh = known_hosts()?;
+/// Checks the server's key against known_hosts, following the host key policy.
+async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) -> Result<()> {
+    let (kh, kh_path) = known_hosts_for(target)?;
     let hid = host_id(&target.host, conn.remote_addr().port());
     let key = conn.peer_key();
     match kh.lookup(&hid)? {
-        Some(known) if known == key => {}
+        Some(known) if known == key => Ok(()),
         Some(known) => {
             conn.close().await;
             bail!(
@@ -314,20 +407,35 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
                  If the change is legitimate, remove the line for '{hid}' from {}.",
                 key.fingerprint(),
                 known.fingerprint(),
-                qsh_dir(&home_dir()?).join("known_hosts").display()
+                kh_path.display()
             );
         }
         None => {
-            let trusted = opts.accept_new_host || confirm_new_host(&hid, key)?;
+            let policy = if opts.accept_new_host { HostKeyPolicy::AcceptNew } else { target.host_key_policy };
+            let trusted = match policy {
+                HostKeyPolicy::AcceptNew => true,
+                HostKeyPolicy::Strict => false,
+                HostKeyPolicy::Ask if target.batch_mode => false,
+                HostKeyPolicy::Ask => confirm_new_host(&hid, key)?,
+            };
             if !trusted {
                 conn.close().await;
-                bail!("host key verification failed");
+                bail!("host key verification failed for '{hid}' ({}); use `qsh pair` or --accept-new-host", key.fingerprint());
             }
             kh.add(&hid, key)?;
-            eprintln!("Permanently added '{hid}' (ED25519) to the list of known hosts.");
+            if !target.quiet {
+                eprintln!("Permanently added '{hid}' (ED25519) to the list of known hosts.");
+            }
+            Ok(())
         }
     }
+}
 
+/// Opens, verifies and logs in to one host (directly or through `via`).
+async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
+    let id = load_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
+    let conn = open(target, opts, &id, via).await?;
+    verify_host_key(&conn, target, opts).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Login { version: VERSION, user: target.user.clone() }).await?;
     if let Err(e) = expect_ok(&mut recv).await {
@@ -342,10 +450,31 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     Ok(conn)
 }
 
+/// Connects, verifies the host key against known_hosts and logs in, going
+/// through the target's jump hosts (`-J`/`ProxyJump`) if it has any.
+pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
+    let mut hops: Vec<Arc<Conn>> = Vec::new();
+    if let Some(jumps) = &target.proxy_jump {
+        // Jump hosts use the config files, but not this host's -o options.
+        let sources = config::Sources { full: false, overrides: Vec::new(), ssh_config: target.sources.ssh_config.clone() };
+        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, ..opts.clone() };
+        for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
+            let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))
+                .await
+                .with_context(|| format!("jump host {spec}"))?;
+            hops.push(Arc::new(conn));
+        }
+    }
+    let mut conn = establish(target, opts, hops.last().map(|c| c.as_ref())).await?;
+    conn.set_hops(hops);
+    Ok(conn)
+}
+
 /// Pairs this client with the server using a one-time code from `qshd pair`.
 pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<()> {
-    let id = load_identity(opts.identity.as_deref(), &target.identity_files, true)?;
-    let conn = open(target, opts, &id).await?;
+    let id = load_identity(&opts.identities, &target.identity_files, true, target.batch_mode)?;
+    let conn = open(target, opts, &id, None).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Pair { version: VERSION, user: target.user.clone() }).await?;
     let result = async {
@@ -357,8 +486,8 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
     result?;
 
     // The server proved knowledge of the code inside this TLS session, so its key is authentic.
-    let kh = known_hosts()?;
-    let hid = host_id(&target.host, target.port);
+    let (kh, _) = known_hosts_for(target)?;
+    let hid = host_id(&target.host, conn.remote_addr().port());
     let key = conn.peer_key();
     match kh.lookup(&hid)? {
         Some(known) if known == key => {}

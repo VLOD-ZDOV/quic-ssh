@@ -574,7 +574,7 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     let Ok(tls) = crate::tls::client_config(&id) else { return (Probe::NoQshd, None) };
     let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
     let start = Instant::now();
-    if let Ok(conn) = transport::connect_probe(&target.host, &ports, tls.clone()).await {
+    if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, tls.clone()).await {
         let handshake = start.elapsed();
         let port = conn.remote_addr().port();
         let key = key_state(&target.host, port, conn.peer_key());
@@ -584,7 +584,7 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     // UDP may be blocked: try the TLS-over-TCP fallback on the qsh port.
     let port = target.alt_ports.first().copied().unwrap_or(target.port);
     let start = Instant::now();
-    match tokio::time::timeout(PROBE_TCP_TIMEOUT, transport::connect(&target.host, port, Transport::Tcp, tls)).await {
+    match tokio::time::timeout(PROBE_TCP_TIMEOUT, transport::connect(&target.host, port, Transport::Tcp, target.family, tls)).await {
         Ok(Ok(conn)) => {
             let handshake = start.elapsed();
             let key = key_state(&target.host, port, conn.peer_key());
@@ -666,7 +666,7 @@ async fn run_child(args: &[String]) -> std::io::Result<std::process::ExitStatus>
 /// Common flags passed on to sessions started from the menu.
 fn child_flags(opts: &ConnectOptions) -> Vec<String> {
     let mut args = Vec::new();
-    if let Some(i) = &opts.identity {
+    for i in &opts.identities {
         args.push("-i".into());
         args.push(i.display().to_string());
     }
@@ -712,7 +712,7 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
             Action::Connect(i) => {
                 leave();
                 let mut args = child_flags(&opts);
-                args.push("-f".into());
+                args.push("--full".into());
                 args.push(app.hosts[i].alias.clone());
                 let status = run_child(&args).await;
                 terminal = enter()?;
@@ -725,7 +725,7 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
             }
             Action::Pair(i, code) => {
                 leave();
-                let mut args = vec!["pair".to_string(), "-f".into()];
+                let mut args = vec!["pair".to_string(), "--full".into()];
                 args.extend(child_flags(&opts));
                 args.push(app.hosts[i].alias.clone());
                 args.push(code);

@@ -467,7 +467,7 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
     assert!(!out.status.success());
     // With --full: Port and LocalForward come from ~/.ssh/config.
     let mut child = c
-        .cmd(&["-f", "--accept-new-host", "box", "sleep", "5"])
+        .cmd(&["--full", "--accept-new-host", "box", "sleep", "5"])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -486,7 +486,7 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
     assert_eq!(reply, "echo:cfg");
     child.kill().unwrap();
     child.wait().unwrap();
-    let out = c.run(&["-f", "box", "echo", "via-qsh"]);
+    let out = c.run(&["--full", "box", "echo", "via-qsh"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), "via-qsh\n");
 }
@@ -506,7 +506,7 @@ fn full_mode_finds_qshd_on_standard_port() {
     std::fs::create_dir_all(c.home.path().join(".ssh")).unwrap();
     // Port 22 here is sshd's; nothing qsh-related listens on UDP 22.
     std::fs::write(c.home.path().join(".ssh/config"), format!("Host std\n  HostName 127.0.0.1\n  Port 22\n  User {}\n", user())).unwrap();
-    let out = c.cmd(&["-f", "-v", "std", "echo", "quic-on-4422"]).env("PATH", &path).output().unwrap();
+    let out = c.cmd(&["--full", "-v", "std", "echo", "quic-on-4422"]).env("PATH", &path).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), "quic-on-4422\n");
     assert!(stderr(&out).contains("over quic"), "{}", stderr(&out));
@@ -533,18 +533,18 @@ fn full_mode_hands_over_to_ssh_and_scp() {
 
     // No qshd on the UDP port: closed ports are detected at once, not after a timeout.
     let start = Instant::now();
-    let out = run(&["-f", "-t", "-L", "9000:db:5432", "plain", "uname", "-a"]);
+    let out = run(&["--full", "-t", "-L", "9000:db:5432", "plain", "uname", "-a"]);
     assert_eq!(out.status.code(), Some(7), "exit code of ssh is passed through");
     assert!(start.elapsed() < Duration::from_millis(900), "took {:?}", start.elapsed());
     // Hosts behind ProxyJump go straight to ssh.
-    run(&["-f", "jumped", "id"]);
+    run(&["--full", "jumped", "id"]);
     // `cp` hands over to scp.
-    run(&["-f", "-p", "2200", "cp", "local.txt", "plain:remote.txt"]);
+    run(&["--full", "-p", "2200", "cp", "local.txt", "plain:remote.txt"]);
     // The second attempt uses the "no qshd here" cache.
-    run(&["-f", "plain", "true"]);
+    run(&["--full", "plain", "true"]);
     let calls = std::fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = calls.lines().collect();
-    assert_eq!(lines[0], "ssh -L 9000:db:5432 -t -- plain uname -a");
+    assert_eq!(lines[0], "ssh -t -L 9000:db:5432 -- plain uname -a");
     assert_eq!(lines[1], "ssh -- jumped id");
     assert_eq!(lines[2], "scp -P 2200 -- local.txt plain:remote.txt");
     assert_eq!(lines[3], "ssh -- plain true");
@@ -817,4 +817,264 @@ fn ui_lists_hosts_and_quits() {
         let _ = master.read(&mut [0u8; 65536]);
         sleep(Duration::from_millis(50));
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.4: OpenSSH tools on top of qsh, forwarding, jump hosts, escapes, -f.
+
+fn tree(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+    std::fs::write(root.join("a.txt"), "alpha").unwrap();
+    std::fs::write(root.join("sub/b.bin"), pseudo_random(300_000)).unwrap();
+    std::fs::write(root.join("sub/deep/c"), "").unwrap();
+}
+
+fn same_tree(a: &std::path::Path, b: &std::path::Path) {
+    for rel in ["a.txt", "sub/b.bin", "sub/deep/c"] {
+        assert_eq!(std::fs::read(a.join(rel)).unwrap(), std::fs::read(b.join(rel)).unwrap(), "{rel}");
+    }
+}
+
+#[test]
+fn cp_recursive_roundtrip() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let src = c.home.path().join("proj");
+    tree(&src);
+    let port = s.port.to_string();
+    for t in ["quic", "tcp"] {
+        let out = c.run(&["cp", "-r", "--transport", t, "-p", &port, src.to_str().unwrap(), &format!("{}:up-{t}", dest())]);
+        assert!(out.status.success(), "{t}: {}", stderr(&out));
+        same_tree(&src, &s.home.path().join(format!("up-{t}")));
+        let back = c.home.path().join(format!("back-{t}"));
+        std::fs::create_dir(&back).unwrap();
+        let out = c.run(&["cp", "-r", "--transport", t, "-p", &port, &format!("{}:up-{t}", dest()), back.to_str().unwrap()]);
+        assert!(out.status.success(), "{t}: {}", stderr(&out));
+        same_tree(&src, &back.join(format!("up-{t}")));
+    }
+}
+
+/// sftp, scp (SFTP mode), rsync and git, all with qsh as their transport.
+#[test]
+fn openssh_tools_over_qsh() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let env = |cmd: &mut Command| {
+        cmd.env("HOME", c.home.path()).stdin(Stdio::null());
+    };
+    let have = |tool: &str| Command::new(tool).arg("-V").output().is_ok() || Command::new(tool).arg("--version").output().is_ok();
+
+    if have("sftp") {
+        let local = c.home.path().join("f.txt");
+        std::fs::write(&local, "via sftp").unwrap();
+        let batch = c.home.path().join("batch");
+        std::fs::write(&batch, format!("put {} sftp.txt\nget sftp.txt {}\nls\n", local.display(), c.home.path().join("got.txt").display())).unwrap();
+        let mut cmd = Command::new("sftp");
+        cmd.args(["-S", QSH, "-P", &port, "-b", batch.to_str().unwrap(), &dest()]);
+        env(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "sftp: {}", stderr(&out));
+        assert_eq!(std::fs::read_to_string(s.home.path().join("sftp.txt")).unwrap(), "via sftp");
+        assert_eq!(std::fs::read_to_string(c.home.path().join("got.txt")).unwrap(), "via sftp");
+    }
+    if have("scp") {
+        let src = c.home.path().join("scp-tree");
+        tree(&src);
+        let mut cmd = Command::new("scp");
+        cmd.args(["-S", QSH, "-P", &port, "-r", src.to_str().unwrap(), &format!("{}:scp-tree", dest())]);
+        env(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "scp: {}", stderr(&out));
+        same_tree(&src, &s.home.path().join("scp-tree"));
+    }
+    if have("rsync") {
+        let src = c.home.path().join("rsync-src");
+        tree(&src);
+        let mut cmd = Command::new("rsync");
+        cmd.args(["-a", "-e", &format!("{QSH} -p {port}"), &format!("{}/", src.display()), &format!("{}:rsync-dst/", dest())]);
+        env(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "rsync: {}", stderr(&out));
+        same_tree(&src, &s.home.path().join("rsync-dst"));
+    }
+    if have("git") {
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let mut cmd = Command::new("git");
+            cmd.args(args).current_dir(dir).env("GIT_SSH_COMMAND", format!("{QSH} -p {port}"));
+            env(&mut cmd);
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+        };
+        let remote = s.home.path().join("repo.git");
+        git(&["init", "-q", "--bare", remote.to_str().unwrap()], c.home.path());
+        let work = c.home.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&["init", "-q", "-b", "main"], &work);
+        git(&["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "hi"], &work);
+        git(&["push", "-q", &format!("{}:{}", dest(), remote.display()), "main"], &work);
+        git(&["clone", "-q", &format!("{}:{}", dest(), remote.display()), "cloned"], c.home.path());
+        assert!(c.home.path().join("cloned/.git").exists());
+    }
+}
+
+#[test]
+fn remote_forward_dynamic_socks_and_stdio() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let port = s.port.to_string();
+
+    // -W: stdin/stdout to host:port through the server.
+    let mut child = c
+        .cmd(&["-p", &port, "-W", &format!("127.0.0.1:{target}"), &dest()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"stdio").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&out), "echo:stdio");
+
+    // -R: the server listens, connections come back to the client side.
+    let remote_port = free_port();
+    let socks_port = free_port();
+    let mut child = c
+        .cmd(&["-p", &port, "-N", "-R", &format!("{remote_port}:127.0.0.1:{target}"), "-D", &socks_port.to_string(), &dest()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let connect = |p: u16| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", p)) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "port {p} did not come up");
+            sleep(Duration::from_millis(50));
+        }
+    };
+    let mut sock = connect(remote_port);
+    sock.write_all(b"reverse").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "echo:reverse");
+
+    // -D: SOCKS5 CONNECT through the server.
+    let mut sock = connect(socks_port);
+    sock.write_all(&[5, 1, 0]).unwrap();
+    let mut buf = [0u8; 2];
+    sock.read_exact(&mut buf).unwrap();
+    assert_eq!(buf, [5, 0]);
+    let [hi, lo] = target.to_be_bytes();
+    sock.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, hi, lo]).unwrap();
+    let mut rep = [0u8; 10];
+    sock.read_exact(&mut rep).unwrap();
+    assert_eq!(rep[1], 0, "SOCKS request failed");
+    sock.write_all(b"socks").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "echo:socks");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn jump_host() {
+    let bastion = Server::start();
+    let inner = Server::start();
+    let c = Client::paired(&bastion);
+    let code = inner.pair_code();
+    let out = c.run(&["pair", "-p", &inner.port.to_string(), &dest(), &code]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let jump = format!("{}:{}", dest(), bastion.port);
+    let out = c.run(&["-v", "-J", &jump, "-p", &inner.port.to_string(), &dest(), "echo", "through-the-bastion"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "through-the-bastion\n");
+    assert!(stderr(&out).contains("through a jump host"), "{}", stderr(&out));
+}
+
+#[test]
+fn escape_sequence_disconnects() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "-p", &s.port.to_string(), &dest(), "sleep", "60"])
+        .env("HOME", c.home.path())
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    sleep(Duration::from_millis(800));
+    master.write_all(b"\r~.").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "~. did not end the session");
+        sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(255));
+}
+
+#[test]
+fn background_after_login() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let local = free_port();
+    let start = Instant::now();
+    // Like ssh -f, the background process keeps stdout/stderr, so do not capture them.
+    let status = c
+        .cmd(&["--transport", "tcp", "-f", "-N", "-L", &format!("{local}:127.0.0.1:{target}"), "-p", &s.port.to_string(), &dest()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(start.elapsed() < Duration::from_secs(5), "-f did not return");
+    // The forward keeps working from the background process.
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+    sock.write_all(b"bg").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "echo:bg");
+    // Without a command or -N, -f is refused like in ssh.
+    let out = c.run(&["-f", "-p", &s.port.to_string(), &dest()]);
+    assert!(!out.status.success());
+}
+
+/// Installed as `ssh`: OpenSSH semantics, and the fallback finds the real ssh, not itself.
+#[test]
+fn installed_as_ssh() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let bin = tempfile::tempdir().unwrap();
+    let ssh = bin.path().join("ssh");
+    std::os::unix::fs::symlink(QSH, &ssh).unwrap();
+    let fake = tempfile::tempdir().unwrap();
+    let (path, log) = fake_openssh(fake.path());
+    let path = format!("{}:{path}", bin.path().display());
+    let run = |args: &[&str]| Command::new(&ssh).args(args).env("HOME", c.home.path()).env("PATH", &path).stdin(Stdio::null()).output().unwrap();
+    // An explicit port: qshd answers there, so it is a qsh session.
+    let out = run(&["-p", &s.port.to_string(), &dest(), "echo", "qsh-as-ssh"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "qsh-as-ssh\n");
+    // `cp` is a host name for ssh, not a tool.
+    let closed = closed_udp_port().to_string();
+    let out = run(&["-p", &closed, "cp", "echo", "x"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr(&out));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.trim(), format!("ssh -p {closed} -- cp echo x"));
+    // -G works (git uses it to detect an OpenSSH-compatible client).
+    let out = run(&["-G", "-p", "2222", "somehost"]);
+    assert!(stdout(&out).contains("port 2222"), "{}", stdout(&out));
 }

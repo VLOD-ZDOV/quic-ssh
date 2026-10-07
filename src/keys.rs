@@ -86,6 +86,11 @@ impl Identity {
 
     /// Loads an OpenSSH private key, asking for a passphrase if it is encrypted.
     pub fn load(path: &Path) -> Result<Identity> {
+        Self::load_with(path, true)
+    }
+
+    /// Like [`Identity::load`]; without `prompt`, an encrypted key is an error.
+    pub fn load_with(path: &Path, prompt: bool) -> Result<Identity> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("cannot read key {}", path.display()))?;
         let mut key = PrivateKey::from_openssh(&text)
@@ -94,6 +99,9 @@ impl Identity {
             bail!("{} is not an ed25519 key (only ed25519 is supported)", path.display());
         }
         if key.is_encrypted() {
+            if !prompt {
+                bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
+            }
             let pass = rpassword::prompt_password(format!(
                 "Enter passphrase for {}: ",
                 path.display()

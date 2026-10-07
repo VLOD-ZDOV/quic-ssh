@@ -98,6 +98,35 @@ pub fn connect(host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Receives a tar stream on stdin into `path` (or `path/name` if `path` is a
+/// directory). Prints "ok" once the target directory exists.
+pub fn untar(path: &str, name: &str) -> Result<()> {
+    let base = if path.is_empty() { "." } else { path };
+    let target = crate::tree::tree_target(Path::new(base), name)?;
+    crate::tree::create_target(&target)?;
+    let mut out = io::stdout();
+    writeln!(out, "ok")?;
+    out.flush()?;
+    let stats = crate::tree::extract_tree(io::stdin().lock(), &target)?;
+    if stats.skipped > 0 {
+        eprintln!("{} entries skipped (only files and directories are copied)", stats.skipped);
+    }
+    Ok(())
+}
+
+/// Writes "ok" and then the contents of directory `path` as a tar stream.
+pub fn tar(path: &str) -> Result<()> {
+    let dir = Path::new(if path.is_empty() { "." } else { path });
+    if !dir.is_dir() {
+        bail!("{path}: not a directory");
+    }
+    let mut out = io::stdout().lock();
+    writeln!(out, "ok")?;
+    crate::tree::write_tree(dir, &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
 /// Prints and consumes the pending pairing code.
 pub fn pair_take() -> Result<()> {
     let code = crate::pair::take_pending(&home_dir()?)?;

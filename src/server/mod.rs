@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::config::ServerConfig;
+use crate::config::{GatewayPorts, ServerConfig};
 use crate::keys::{qsh_dir, read_key_list_strict, Identity, PublicKey};
 use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, MIN_VERSION, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
@@ -114,6 +114,7 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Re
         tokio::spawn(async move {
             match incoming.handshake().await {
                 Ok(conn) => {
+                    let conn = Arc::new(conn);
                     if let Err(e) = handle_conn(&conn, state, startup).await {
                         debug!("{addr}: {e:#}");
                     }
@@ -143,7 +144,7 @@ fn authorize(state: &State, user: &User, key: PublicKey) -> bool {
     })
 }
 
-async fn handle_conn(conn: &Conn, state: Arc<State>, startup: Startup) -> Result<()> {
+async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let (mut send, recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -195,9 +196,9 @@ async fn handle_conn(conn: &Conn, state: Arc<State>, startup: Startup) -> Result
     // finished sending on their stream.
     let (closed_tx, closed_rx) = watch::channel(false);
     while let Some((send, recv)) = conn.accept_bi().await {
-        let (user, state, closed) = (user.clone(), state.clone(), closed_rx.clone());
+        let (user, state, closed, conn) = (user.clone(), state.clone(), closed_rx.clone(), conn.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &user, &state, closed).await {
+            if let Err(e) = handle_stream(send, recv, &conn, &user, &state, closed).await {
                 debug!("{addr}: stream error: {e:#}");
             }
         });
@@ -210,12 +211,30 @@ async fn handle_conn(conn: &Conn, state: Arc<State>, startup: Startup) -> Result
 async fn handle_stream(
     mut send: SendHalf,
     mut recv: RecvHalf,
+    conn: &Arc<Conn>,
     user: &User,
     state: &State,
     closed: watch::Receiver<bool>,
 ) -> Result<()> {
-    match read_msg(&mut recv).await? {
-        Request::Exec { command, env, pty } => exec::run(send, recv, user, command, env, pty, closed).await,
+    let request = match read_msg(&mut recv).await {
+        Ok(r) => r,
+        // A request type from a newer client: say so instead of dropping the stream.
+        Err(e) if e.is::<crate::proto::Malformed>() => {
+            return write_msg(&mut send, &Reply::Err("request not supported by this qshd (update it)".into())).await;
+        }
+        Err(e) => return Err(e),
+    };
+    match request {
+        Request::Exec { command, env, pty } => {
+            exec::run(send, recv, user, exec::Launch::Shell(command), env, pty, closed).await
+        }
+        Request::Subsystem { name, env } => match subsystem_argv(&state.cfg, &name) {
+            Some(argv) => exec::run(send, recv, user, exec::Launch::Program(argv), env, None, closed).await,
+            None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
+        },
+        Request::RemoteForward { bind, port } => remote_forward(send, recv, conn.clone(), user, state, &bind, port).await,
+        Request::UploadTree { path, name } => files::upload_tree(send, recv, user, &path, &name).await,
+        Request::DownloadTree { path } => files::download_tree(send, user, &path).await,
         Request::DirectTcp { host, port } => {
             if !state.cfg.allow_tcp_forwarding {
                 return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
@@ -244,6 +263,123 @@ async fn handle_stream(
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
     }
+}
+
+/// Where OpenSSH's sftp-server usually lives.
+const SFTP_SERVERS: [&str; 5] = [
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+    "/usr/lib/ssh/sftp-server",
+    "/usr/libexec/sftp-server",
+    "/usr/lib/sftp-server",
+];
+
+/// Command line for a subsystem: from the config, or a detected sftp-server.
+fn subsystem_argv(cfg: &ServerConfig, name: &str) -> Option<Vec<String>> {
+    if let Some(cmd) = cfg.subsystems.get(name) {
+        let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+        return (!argv.is_empty()).then_some(argv);
+    }
+    if name == "sftp" {
+        return SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| vec![p.to_string()]);
+    }
+    None
+}
+
+/// Addresses to listen on for `-R`, following `gateway_ports` like sshd's GatewayPorts.
+fn remote_listen_addrs(gateway: GatewayPorts, bind: &str, port: u16) -> Vec<SocketAddr> {
+    let loopback = vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))];
+    let any = vec![SocketAddr::from(([0u8; 4], port)), SocketAddr::from(([0u16; 8], port))];
+    match gateway {
+        GatewayPorts::No => loopback,
+        GatewayPorts::Yes => any,
+        GatewayPorts::ClientSpecified => match bind {
+            "" | "*" => any,
+            "localhost" => loopback,
+            addr => addr.parse::<IpAddr>().map(|ip| vec![SocketAddr::new(ip, port)]).unwrap_or(loopback),
+        },
+    }
+}
+
+/// `-R`: listens on the server and hands each connection to the client on a
+/// server-opened stream, until the client closes the request stream.
+async fn remote_forward(
+    mut send: SendHalf,
+    mut recv: RecvHalf,
+    conn: Arc<Conn>,
+    user: &User,
+    state: &State,
+    bind: &str,
+    port: u16,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    if !state.cfg.allow_tcp_forwarding {
+        return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
+    }
+    if port != 0 && port < 1024 && user.uid != 0 {
+        return write_msg(&mut send, &Reply::Err(format!("only root may listen on port {port}"))).await;
+    }
+    let mut listeners = Vec::new();
+    let mut bound_port = port;
+    let mut last_err = None;
+    for mut addr in remote_listen_addrs(state.cfg.gateway_ports, bind, port) {
+        // With port 0, the first listener picks a port and the others reuse it.
+        addr.set_port(bound_port);
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                bound_port = l.local_addr()?.port();
+                listeners.push(l);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if listeners.is_empty() {
+        let e = last_err.map(|e| e.to_string()).unwrap_or_default();
+        return write_msg(&mut send, &Reply::Err(format!("cannot listen on port {port}: {e}"))).await;
+    }
+    write_msg(&mut send, &Reply::Bound { port: bound_port }).await?;
+    info!("{}: {} listens on port {bound_port} (-R)", conn.remote_addr(), user.name);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let acceptors: Vec<_> = listeners
+        .into_iter()
+        .map(|l| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Ok(accepted) = l.accept().await {
+                    if tx.send(accepted).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+    let mut probe = [0u8; 1];
+    loop {
+        tokio::select! {
+            Some((tcp, origin)) = rx.recv() => {
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    let _ = tcp.set_nodelay(true);
+                    let result = async {
+                        let (mut s, r) = conn.open_bi().await?;
+                        write_msg(&mut s, &crate::proto::Opened::Forwarded { port: bound_port, origin: origin.to_string() }).await?;
+                        crate::transport::splice(tcp, s, r).await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        debug!("-R connection from {origin}: {e:#}");
+                    }
+                });
+            }
+            // The client closed the request stream (or the connection is gone).
+            _ = recv.read(&mut probe) => break,
+        }
+    }
+    for a in acceptors {
+        a.abort();
+    }
+    Ok(())
 }
 
 /// Largest speed test transfer the server agrees to.
@@ -317,7 +453,7 @@ async fn run_helper(user: &User, args: &[&str]) -> Result<String> {
     }
 }
 
-async fn pair(conn: &Conn, state: &State, user: &User, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
+async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let code = match run_helper(user, &["internal-pair-take"]).await {
@@ -359,6 +495,16 @@ async fn pair(conn: &Conn, state: &State, user: &User, mut send: SendHalf, mut r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_forward_binds_loopback_by_default() {
+        let addrs = remote_listen_addrs(GatewayPorts::No, "0.0.0.0", 8080);
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "client asked for all, got {addrs:?}");
+        assert!(remote_listen_addrs(GatewayPorts::Yes, "", 1).iter().all(|a| a.ip().is_unspecified()));
+        let cs = remote_listen_addrs(GatewayPorts::ClientSpecified, "192.0.2.5", 1);
+        assert_eq!(cs, vec!["192.0.2.5:1".parse().unwrap()]);
+        assert!(remote_listen_addrs(GatewayPorts::ClientSpecified, "localhost", 1).iter().all(|a| a.ip().is_loopback()));
+    }
 
     #[test]
     fn startup_limits() {

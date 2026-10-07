@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"qsh/1";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Oldest client protocol version the server still accepts.
 pub const MIN_VERSION: u32 = 1;
 const MAX_MSG: usize = 1 << 20;
@@ -28,6 +28,9 @@ pub enum Reply {
     Err(String),
     /// Answer to [`Request::Download`]; `size` raw bytes follow.
     File { size: u64, mode: u32 },
+    // --- protocol version 3 ---
+    /// Answer to [`Request::RemoteForward`]: the port actually bound.
+    Bound { port: u16 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -55,6 +58,25 @@ pub enum Request {
     /// Speed test: after `Reply::Ok` the client sends up to `bytes` raw bytes and
     /// closes its side; the server answers `Reply::File { size: received, mode: 0 }`.
     SpeedUp { bytes: u64 },
+    // --- protocol version 3 ---
+    /// Run a subsystem (e.g. `sftp`) without a shell; then like `Exec` without a PTY.
+    Subsystem { name: String, env: Vec<(String, String)> },
+    /// Listen on the server (`-R`). Answered with `Reply::Bound`; connections then
+    /// arrive as server-opened streams starting with [`Opened::Forwarded`]. Closing
+    /// this stream cancels the forward.
+    RemoteForward { bind: String, port: u16 },
+    /// Recursive upload: a tar stream of the directory's contents follows
+    /// `Reply::Ok`; stored at `path`, or `path/name` if `path` is a directory.
+    UploadTree { path: String, name: String },
+    /// Recursive download: a tar stream of the directory's contents follows `Reply::Ok`.
+    DownloadTree { path: String },
+}
+
+/// First message on a stream the server opens to the client.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum Opened {
+    /// A connection to a `-R` listener on `port`, from `origin`; raw bytes follow.
+    Forwarded { port: u16, origin: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

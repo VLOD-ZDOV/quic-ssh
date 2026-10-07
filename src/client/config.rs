@@ -1,13 +1,19 @@
 //! Host aliases from `~/.config/qsh/config` and `~/.ssh/config` (ssh_config syntax).
 //!
-//! Supported: `Host` patterns (`*`, `?`, `!negation`), `HostName`, `User`,
-//! `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`,
-//! `ObscureKeystrokeTiming`, `Include`,
-//! `Match all`; the first value found wins (IdentityFile and LocalForward
-//! accumulate). Other `Match` blocks are skipped because their conditions are
-//! not evaluated. From `~/.ssh/config`, `Port`, `LocalForward` and
-//! `RequestTTY` are only used in `--full` mode (they describe the ssh session),
-//! and `ProxyJump`/`ProxyCommand` are noted so `--full` can hand such hosts to ssh.
+//! Precedence: `-o` options, then `~/.config/qsh/config`, then `~/.ssh/config`
+//! (or the `-F` file); within each the first value found wins (IdentityFile
+//! and the forwards accumulate). Supported keywords: `Host` patterns (`*`,
+//! `?`, `!`), `Match all`, `Include`, `HostName`, `User`, `Port`,
+//! `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`,
+//! `ProxyJump`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`,
+//! `UserKnownHostsFile`, `ClearAllForwardings`, `EscapeChar`,
+//! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`.
+//! Other `Match` blocks are skipped (their conditions are not evaluated).
+//!
+//! From `~/.ssh/config`, settings that describe the ssh session itself (`Port`,
+//! the forwards, `RequestTTY`) are only used in `--full` mode. Its
+//! `ProxyJump`/`ProxyCommand` make `--full` hand the host to ssh, and its
+//! `UserKnownHostsFile` is never used (that file holds ssh host keys, not qshd's).
 
 use std::path::{Path, PathBuf};
 
@@ -22,14 +28,34 @@ pub struct HostConfig {
     /// `Port` from `~/.ssh/config` (only read in `--full` mode).
     pub ssh_port: Option<u16>,
     pub identity_files: Vec<String>,
-    /// `LocalForward` entries as `-L` specs (`[bind:]port:host:hostport`).
+    /// `-L` specs (`[bind:]port:host:hostport`).
     pub local_forwards: Vec<String>,
+    /// `-R` specs (`[bind:]port:host:hostport`).
+    pub remote_forwards: Vec<String>,
+    /// `-D` specs (`[bind:]port`).
+    pub dynamic_forwards: Vec<String>,
+    /// Jump hosts for qsh (from qsh's config or `-o`).
+    pub proxy_jump: Option<String>,
     /// `RequestTTY` (`yes`, `no`, `force`, `auto`).
     pub request_tty: Option<String>,
-    /// The host goes through `ProxyJump`/`ProxyCommand`, which qsh cannot do.
+    /// ssh's config routes the host through ProxyJump/ProxyCommand (`--full` hands it to ssh).
     pub needs_proxy: bool,
+    pub batch_mode: Option<bool>,
+    /// `StrictHostKeyChecking` (`yes`, `ask`, `accept-new`, `no`).
+    pub strict_host_key_checking: Option<String>,
+    pub user_known_hosts_file: Option<String>,
+    pub clear_all_forwardings: Option<bool>,
+    pub escape_char: Option<String>,
+    /// `AddressFamily` (`any`, `inet`, `inet6`).
+    pub address_family: Option<String>,
+    pub log_level: Option<String>,
+    pub forward_agent: Option<bool>,
     /// `ObscureKeystrokeTiming` (`yes`, `no`, `interval:MS`).
     pub obscure_keystrokes: Option<String>,
+}
+
+fn yes(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "on")
 }
 
 /// `fnmatch`-style match supporting `*` and `?`.
@@ -119,8 +145,10 @@ struct Parser<'a> {
     host: &'a str,
     /// Directory relative `Include` paths are resolved against.
     base: &'a Path,
-    /// Read the ssh-session settings (`Port`, `LocalForward`, `RequestTTY`).
+    /// Read the ssh-session settings (`Port`, forwards, `RequestTTY`, `ProxyJump`).
     full: bool,
+    /// qsh's own config or `-o` (as opposed to ssh's config).
+    ours: bool,
     out: HostConfig,
 }
 
@@ -130,6 +158,8 @@ impl Parser<'_> {
         let mut active = true;
         for line in text.lines() {
             let Some((keyword, args)) = split_line(line) else { continue };
+            let first = args.first().cloned();
+            let o = &mut self.out;
             match keyword.as_str() {
                 "host" => active = host_matches(&args, self.host),
                 "match" => active = args.len() == 1 && args[0].eq_ignore_ascii_case("all"),
@@ -143,24 +173,37 @@ impl Parser<'_> {
                         }
                     }
                 }
-                "hostname" if self.out.hostname.is_none() => self.out.hostname = args.into_iter().next(),
-                "user" if self.out.user.is_none() => self.out.user = args.into_iter().next(),
-                "port" if self.full && self.out.port.is_none() => {
-                    self.out.port = args.first().and_then(|p| p.parse().ok());
-                }
-                "identityfile" => self.out.identity_files.extend(args.into_iter().take(1)),
+                "hostname" if o.hostname.is_none() => o.hostname = first,
+                "user" if o.user.is_none() => o.user = first,
+                "port" if self.full && o.port.is_none() => o.port = first.and_then(|p| p.parse().ok()),
+                "identityfile" => o.identity_files.extend(first),
                 // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
-                "localforward" if self.full && args.len() == 2 => {
-                    self.out.local_forwards.push(format!("{}:{}", args[0], args[1]));
+                "localforward" if self.full && args.len() == 2 => o.local_forwards.push(format!("{}:{}", args[0], args[1])),
+                "remoteforward" if self.full && args.len() == 2 => o.remote_forwards.push(format!("{}:{}", args[0], args[1])),
+                "dynamicforward" if self.full => o.dynamic_forwards.extend(first),
+                "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
+                "proxyjump" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                    if self.ours {
+                        if o.proxy_jump.is_none() {
+                            o.proxy_jump = first;
+                        }
+                    } else {
+                        o.needs_proxy = true;
+                    }
                 }
-                "requesttty" if self.full && self.out.request_tty.is_none() => {
-                    self.out.request_tty = args.into_iter().next().map(|v| v.to_ascii_lowercase());
+                "proxycommand" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => o.needs_proxy = true,
+                "batchmode" if o.batch_mode.is_none() => o.batch_mode = first.as_deref().map(yes),
+                "stricthostkeychecking" if o.strict_host_key_checking.is_none() => {
+                    o.strict_host_key_checking = first.map(|v| v.to_ascii_lowercase());
                 }
-                "obscurekeystroketiming" if self.out.obscure_keystrokes.is_none() => {
-                    self.out.obscure_keystrokes = args.into_iter().next().map(|v| v.to_ascii_lowercase());
-                }
-                "proxyjump" | "proxycommand" if args.first().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
-                    self.out.needs_proxy = true;
+                "userknownhostsfile" if self.ours && o.user_known_hosts_file.is_none() => o.user_known_hosts_file = first,
+                "clearallforwardings" if o.clear_all_forwardings.is_none() => o.clear_all_forwardings = first.as_deref().map(yes),
+                "escapechar" if o.escape_char.is_none() => o.escape_char = first,
+                "addressfamily" if o.address_family.is_none() => o.address_family = first.map(|v| v.to_ascii_lowercase()),
+                "loglevel" if o.log_level.is_none() => o.log_level = first.map(|v| v.to_ascii_lowercase()),
+                "forwardagent" if o.forward_agent.is_none() => o.forward_agent = first.as_deref().map(yes),
+                "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
+                    o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
                 _ => {}
             }
@@ -169,6 +212,11 @@ impl Parser<'_> {
 
     fn expand_include(&self, pattern: &str) -> Vec<PathBuf> {
         expand_include(self.base, pattern)
+    }
+
+    fn run(mut self, text: &str) -> HostConfig {
+        self.feed(text, 0);
+        self.out
     }
 }
 
@@ -235,7 +283,7 @@ pub fn host_aliases(home: &Path) -> Vec<String> {
 /// `~/.ssh/config` outside `--full`: its `Port`, `LocalForward` and
 /// `RequestTTY` belong to the ssh session.
 pub fn parse(text: &str, host: &str, base: &Path, full: bool) -> HostConfig {
-    let mut p = Parser { host, base, full, out: HostConfig::default() };
+    let mut p = Parser { host, base, full, ours: full, out: HostConfig::default() };
     p.feed(text, 0);
     p.out
 }
@@ -285,14 +333,28 @@ pub fn expand_path(s: &str, home: &Path, host: &str, remote_user: &str, local_us
     PathBuf::from(out)
 }
 
-/// Settings for `host` from `~/.config/qsh/config` (first) and `~/.ssh/config`.
-/// `full`: also take the ssh-session settings from `~/.ssh/config` (`qsh --full`).
-pub fn lookup(home: &Path, host: &str, full: bool) -> HostConfig {
-    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+/// Where settings come from besides the default files.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Sources {
+    /// `qsh --full`: also take the ssh-session settings from ssh's config.
+    pub full: bool,
+    /// Config lines from `-o` (and `-l`), highest precedence.
+    pub overrides: Vec<String>,
+    /// `-F`: use this file instead of `~/.ssh/config`.
+    pub ssh_config: Option<PathBuf>,
+}
+
+/// Settings for `host`: `-o` overrides, then `~/.config/qsh/config`, then
+/// `~/.ssh/config` (or the `-F` file).
+pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
-    let ssh_dir = home.join(".ssh");
-    let ours = parse(&read(qsh_dir.join("config")), host, &qsh_dir, true);
-    let ssh = parse(&read(ssh_dir.join("config")), host, &ssh_dir, full);
+    let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
+    let ssh_dir = ssh_file.parent().map(Path::to_path_buf).unwrap_or_else(|| home.join(".ssh"));
+    // -o lines come first: before any `Host` they apply to every host and win.
+    let ours_text = format!("{}\n{}", sources.overrides.join("\n"), read(&qsh_dir.join("config")));
+    let ours = Parser { host, base: &qsh_dir, full: true, ours: true, out: HostConfig::default() }.run(&ours_text);
+    let ssh = Parser { host, base: &ssh_dir, full: sources.full, ours: false, out: HostConfig::default() }.run(&read(&ssh_file));
     HostConfig {
         hostname: ours.hostname.or(ssh.hostname),
         user: ours.user.or(ssh.user),
@@ -300,8 +362,19 @@ pub fn lookup(home: &Path, host: &str, full: bool) -> HostConfig {
         ssh_port: ssh.port,
         identity_files: ours.identity_files.into_iter().chain(ssh.identity_files).collect(),
         local_forwards: ours.local_forwards.into_iter().chain(ssh.local_forwards).collect(),
+        remote_forwards: ours.remote_forwards.into_iter().chain(ssh.remote_forwards).collect(),
+        dynamic_forwards: ours.dynamic_forwards.into_iter().chain(ssh.dynamic_forwards).collect(),
+        proxy_jump: ours.proxy_jump,
         request_tty: ours.request_tty.or(ssh.request_tty),
-        needs_proxy: ours.needs_proxy || ssh.needs_proxy,
+        needs_proxy: ssh.needs_proxy || ours.needs_proxy,
+        batch_mode: ours.batch_mode.or(ssh.batch_mode),
+        strict_host_key_checking: ours.strict_host_key_checking.or(ssh.strict_host_key_checking),
+        user_known_hosts_file: ours.user_known_hosts_file,
+        clear_all_forwardings: ours.clear_all_forwardings.or(ssh.clear_all_forwardings),
+        escape_char: ours.escape_char.or(ssh.escape_char),
+        address_family: ours.address_family.or(ssh.address_family),
+        log_level: ours.log_level.or(ssh.log_level),
+        forward_agent: ours.forward_agent.or(ssh.forward_agent),
         // A privacy preference, so ssh's setting applies to qsh sessions as well.
         obscure_keystrokes: ours.obscure_keystrokes.or(ssh.obscure_keystrokes),
     }
@@ -371,6 +444,7 @@ Host *
         assert_eq!(c.request_tty.as_deref(), Some("force"));
         assert!(parse(text, "a", Path::new("/x"), false).local_forwards.is_empty());
         assert!(parse(text, "b", Path::new("/x"), false).needs_proxy);
+        assert_eq!(parse(text, "b", Path::new("/x"), true).proxy_jump.as_deref(), Some("bastion"));
         assert!(!parse(text, "c", Path::new("/x"), true).needs_proxy);
     }
 
@@ -423,13 +497,21 @@ Host *
         std::fs::create_dir_all(&ours).unwrap();
         std::fs::write(ssh.join("config"), "Host myserver\n HostName 192.0.2.1\n User root\n Port 22\n").unwrap();
         std::fs::write(ours.join("config"), "Host myserver\n Port 8080\n User admin\n").unwrap();
-        let c = lookup(home.path(), "myserver", false);
+        let c = lookup(home.path(), "myserver", &Sources::default());
         assert_eq!(c.hostname.as_deref(), Some("192.0.2.1"));
         assert_eq!(c.user.as_deref(), Some("admin"));
         assert_eq!(c.port, Some(8080));
         // --full: ssh's Port is used when qsh's config has none.
         std::fs::write(ours.join("config"), "Host other\n Port 1\n").unwrap();
-        assert_eq!(lookup(home.path(), "myserver", true).ssh_port, Some(22));
-        assert_eq!(lookup(home.path(), "myserver", false).ssh_port, None);
+        let full = Sources { full: true, ..Default::default() };
+        assert_eq!(lookup(home.path(), "myserver", &full).ssh_port, Some(22));
+        assert_eq!(lookup(home.path(), "myserver", &Sources::default()).ssh_port, None);
+        // -o wins over both files; ssh's known_hosts file is never used.
+        std::fs::write(ssh.join("config"), "Host myserver\n UserKnownHostsFile /x\n User root\n").unwrap();
+        let o = Sources { overrides: vec!["User override".into(), "UserKnownHostsFile ~/kh".into()], ..Default::default() };
+        let c = lookup(home.path(), "myserver", &o);
+        assert_eq!(c.user.as_deref(), Some("override"));
+        assert_eq!(c.user_known_hosts_file.as_deref(), Some("~/kh"));
+        assert_eq!(lookup(home.path(), "myserver", &Sources::default()).user_known_hosts_file, None);
     }
 }

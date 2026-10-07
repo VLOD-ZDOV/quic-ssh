@@ -1,6 +1,6 @@
 [package]
 name = "qsh"
-version = "0.3.0"
+version = "0.4.0-dev"
 edition = "2021"
 description = "Secure shell over QUIC with automatic TCP fallback"
 license = "GPL-3.0-only"
@@ -34,7 +34,8 @@ spake2 = "0.4"
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "encryption", "std"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-tokio-util = { version = "0.7", features = ["codec", "compat"] }
+tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
+tar = { version = "0.4", default-features = false }
 yamux = "0.13"
 toml = "0.9"
 tracing = "0.1"

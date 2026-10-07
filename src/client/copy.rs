@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::{expect_ok, write_msg, Reply, Request};
-use crate::transport::Conn;
+use crate::transport::{Conn, SendHalf};
 
 #[derive(Debug, PartialEq)]
 pub enum Location {
@@ -132,6 +132,64 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
         bail!("transfer interrupted ({got} of {size} bytes)");
     }
     Ok(())
+}
+
+/// `qsh cp -r` upload: sends the contents of `local` as a tar stream.
+pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
+    if !local.is_dir() {
+        return upload(conn, local, remote).await;
+    }
+    let name = local
+        .canonicalize()?
+        .file_name()
+        .context("source has no directory name")?
+        .to_string_lossy()
+        .into_owned();
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_msg(&mut send, &Request::UploadTree { path: remote.to_string(), name }).await?;
+    expect_ok(&mut recv).await?;
+    let root = local.to_path_buf();
+    let stats = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
+        let mut w = tokio_util::io::SyncIoBridge::new(send);
+        let stats = crate::tree::write_tree(&root, &mut w)?;
+        w.shutdown()?;
+        Ok((stats, w.into_inner()))
+    })
+    .await??;
+    expect_ok(&mut recv).await?;
+    report(&stats.0);
+    Ok(())
+}
+
+/// `qsh cp -r` download: receives the contents of remote directory `remote`.
+pub async fn download_tree(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_msg(&mut send, &Request::DownloadTree { path: remote.to_string() }).await?;
+    expect_ok(&mut recv).await?;
+    drop(send);
+    // The name comes from what we asked for, never from the server.
+    let name = Path::new(remote.trim_end_matches('/'))
+        .file_name()
+        .context("remote path has no directory name")?
+        .to_string_lossy()
+        .into_owned();
+    let target = crate::tree::tree_target(local, &name)?;
+    crate::tree::create_target(&target)?;
+    let stats = tokio::task::spawn_blocking(move || {
+        crate::tree::extract_tree(tokio_util::io::SyncIoBridge::new(recv), &target)
+    })
+    .await??;
+    report(&stats);
+    Ok(())
+}
+
+fn report(stats: &crate::tree::Stats) {
+    if std::io::stderr().is_terminal() {
+        eprintln!("{} files, {} directories, {}", stats.files, stats.dirs, human(stats.bytes));
+    }
+    if stats.skipped > 0 {
+        eprintln!("qsh: {} symlinks or special files were skipped", stats.skipped);
+    }
 }
 
 #[cfg(test)]

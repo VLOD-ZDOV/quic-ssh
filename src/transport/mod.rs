@@ -42,6 +42,8 @@ pub struct Conn {
     peer_key: PublicKey,
     exporter: [u8; 32],
     remote: SocketAddr,
+    /// Jump-host connections this one is tunnelled through (kept alive with it).
+    hops: Vec<Arc<Conn>>,
 }
 
 impl Conn {
@@ -74,7 +76,15 @@ impl Conn {
         self.remote
     }
 
+    /// Keeps the jump-host connections alive as long as this one.
+    pub fn set_hops(&mut self, hops: Vec<Arc<Conn>>) {
+        self.hops = hops;
+    }
+
     pub fn transport_name(&self) -> &'static str {
+        if !self.hops.is_empty() {
+            return "tcp via jump host";
+        }
         match &self.inner {
             Inner::Quic(_) => "quic",
             Inner::Tcp(_) => "tcp",
@@ -105,20 +115,54 @@ fn single_peer_cert(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Mode {
     /// QUIC first, TCP if UDP does not get through.
+    #[default]
     Auto,
     Quic,
     Tcp,
 }
 
 /// Connects to `host:port` using the given transport mode.
-pub async fn connect(host: &str, port: u16, mode: Mode, tls: rustls::ClientConfig) -> Result<Conn> {
+/// Which IP versions to use (`-4`, `-6`, `AddressFamily`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Family {
+    #[default]
+    Any,
+    V4,
+    V6,
+}
+
+impl Family {
+    fn allows(self, addr: &SocketAddr) -> bool {
+        match self {
+            Family::Any => true,
+            Family::V4 => addr.is_ipv4(),
+            Family::V6 => addr.is_ipv6(),
+        }
+    }
+}
+
+async fn resolve(host: &str, port: u16, family: Family) -> Result<Vec<SocketAddr>> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .with_context(|| format!("cannot resolve {host}"))?
+        .filter(|a| family.allows(a))
         .collect();
+    Ok(addrs)
+}
+
+/// TLS + yamux over an already open stream (see [`tcp::connect_stream`]).
+pub async fn connect_stream<S>(stream: S, tls: rustls::ClientConfig, remote: SocketAddr) -> Result<Conn>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tcp::connect_stream(Arc::new(tls), stream, remote).await
+}
+
+pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, tls: rustls::ClientConfig) -> Result<Conn> {
+    let addrs = resolve(host, port, family).await?;
     if addrs.is_empty() {
         bail!("{host} has no addresses");
     }
@@ -165,12 +209,15 @@ impl std::error::Error for Unreachable {}
 /// Tries every address and port in parallel and takes the first qshd that
 /// answers; gives up after [`PROBE_TIMEOUT`], or as soon as every UDP port
 /// turned out to be closed.
-pub async fn connect_probe(host: &str, ports: &[u16], tls: rustls::ClientConfig) -> Result<Conn> {
+pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: rustls::ClientConfig) -> Result<Conn> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut candidates = Vec::new();
     for &port in ports {
-        let addrs = tokio::net::lookup_host((host, port)).await.with_context(|| format!("cannot resolve {host}"))?;
-        candidates.extend(addrs);
+        // Not resolvable here does not mean ssh cannot reach it (its config may know better).
+        match resolve(host, port, family).await {
+            Ok(addrs) => candidates.extend(addrs),
+            Err(e) => return Err(Unreachable(format!("{e:#}")).into()),
+        }
     }
     let tls = Arc::new(tls);
     let mut attempts: FuturesUnordered<_> = candidates

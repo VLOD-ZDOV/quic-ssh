@@ -1,58 +1,21 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use qsh::client::cli::{SshArgs, USAGE, WITH_VALUE};
+use qsh::client::config::Sources;
 use qsh::client::copy::{self, Location};
 use qsh::client::forward::{self, Forward};
+use qsh::client::session::SessionOptions;
 use qsh::client::{self, session, ConnectOptions, Target};
 use qsh::keys::{home_dir, qsh_dir, Identity};
 use qsh::transport::{Mode, Unreachable};
 
-/// Secure shell over QUIC, with automatic fallback to TCP.
-#[derive(Parser)]
-#[command(
-    name = "qsh",
-    version,
-    after_help = "Other commands (see `qsh <command> --help`):\n  \
-                  qsh cp SRC DST                   copy a file, one side is [user@]host:path\n  \
-                  qsh pair [user@]host CODE        pair with a server using a code from `qshd pair`\n  \
-                  qsh keygen [FILE]                create a new key\n  \
-                  qsh speed [user@]host            measure latency and throughput\n  \
-                  qsh ui                           interactive host menu"
-)]
-struct Cli {
-    #[command(flatten)]
-    conn: ConnArgs,
-
-    /// Forward a local port: [bind_address:]port:host:hostport (repeatable)
-    #[arg(short = 'L', value_name = "SPEC")]
-    local_forward: Vec<String>,
-
-    /// Do not run a command or shell (just forward ports)
-    #[arg(short = 'N')]
-    no_command: bool,
-
-    /// Force a pseudo-terminal
-    #[arg(short = 't', conflicts_with = "no_tty")]
-    tty: bool,
-
-    /// Disable pseudo-terminal allocation
-    #[arg(short = 'T')]
-    no_tty: bool,
-
-    /// [user@]host[:port]
-    destination: Option<String>,
-
-    /// Command to run instead of a login shell
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    command: Vec<String>,
-}
-
-/// `qsh cp|pair|keygen ...`
+/// `qsh cp|pair|keygen|speed|ui ...`
 #[derive(Parser)]
 #[command(name = "qsh", version)]
 struct ToolCli {
@@ -74,13 +37,15 @@ fn is_tool_invocation(args: &[String]) -> bool {
             return false;
         }
         if let Some(long) = a.strip_prefix("--") {
-            if matches!(long, "port" | "identity" | "transport") {
+            if matches!(long, "port" | "identity" | "transport" | "login") {
                 it.next();
             }
         } else if let Some(short) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
-            // A value-taking flag at the end of a cluster consumes the next argument (`-p 22`, `-tL spec`).
-            if short.find(['p', 'i', 'L']) == Some(short.len() - 1) {
-                it.next();
+            // A value-taking option consumes the rest of the cluster or the next argument.
+            if let Some(i) = short.find(|c| WITH_VALUE.contains(c)) {
+                if i == short.len() - 1 {
+                    it.next();
+                }
             }
         } else {
             return TOOLS.contains(&a.as_str());
@@ -97,7 +62,7 @@ struct ConnArgs {
 
     /// Private key (default ~/.ssh/id_ed25519, then ~/.config/qsh/id_ed25519)
     #[arg(short = 'i', long, global = true, value_name = "FILE")]
-    identity: Option<PathBuf>,
+    identity: Vec<PathBuf>,
 
     /// Transport to use
     #[arg(long, value_enum, default_value = "auto", global = true)]
@@ -111,17 +76,22 @@ struct ConnArgs {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
-    /// OpenSSH compatibility: also use Port, LocalForward and RequestTTY from
-    /// ~/.ssh/config (default port 22), and if the host has no qshd on that
-    /// UDP port (or needs ProxyJump/ProxyCommand), run ssh/scp instead
-    #[arg(short = 'f', long, global = true)]
+    /// OpenSSH compatibility: use the ssh config fully, and fall back to
+    /// OpenSSH's scp/ssh where the host has no qshd
+    #[arg(long, global = true)]
     full: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Copy a file: qsh cp SRC DST, where one side is [user@]host:path
-    Cp { src: String, dst: String },
+    /// Copy files: qsh cp [-r] SRC DST, where one side is [user@]host:path
+    Cp {
+        /// Copy directories recursively
+        #[arg(short = 'r')]
+        recursive: bool,
+        src: String,
+        dst: String,
+    },
     /// Pair with a server using a code from `qshd pair` (adds your key there, pins its key here)
     Pair {
         /// [user@]host[:port]
@@ -149,7 +119,7 @@ enum Cmd {
 impl ConnArgs {
     fn options(&self) -> ConnectOptions {
         ConnectOptions {
-            identity: self.identity.clone(),
+            identities: self.identity.clone(),
             transport: self.transport,
             accept_new_host: self.accept_new_host,
             full: self.full,
@@ -157,36 +127,22 @@ impl ConnArgs {
     }
 }
 
-enum Invocation {
-    Session(Cli),
-    Tool(ToolCli),
+/// True when this binary was started as `ssh` (e.g. through a symlink).
+fn invoked_as_ssh(argv0: &str) -> bool {
+    Path::new(argv0).file_name().is_some_and(|n| n == "ssh")
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let inv = if is_tool_invocation(&args) {
-        Invocation::Tool(ToolCli::parse_from(args))
-    } else {
-        Invocation::Session(Cli::parse_from(args))
-    };
-    let verbose = match &inv {
-        Invocation::Session(c) => c.conn.verbose,
-        Invocation::Tool(c) => c.conn.verbose,
-    };
-    let filter = if verbose { "qsh=debug" } else { "qsh=warn" };
+fn init_logging(verbose: bool, quiet: bool) {
+    let filter = if verbose { "qsh=debug" } else if quiet { "qsh=error" } else { "qsh=warn" };
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_writer(std::io::stderr)
         .without_time()
         .with_target(false)
         .init();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let result = rt.block_on(async {
-        match inv {
-            Invocation::Session(cli) => session_main(cli).await,
-            Invocation::Tool(cli) => tool_main(cli).await,
-        }
-    });
+}
+
+fn finish(result: Result<i32>) -> ! {
     let code = match result {
         Ok(code) => code,
         Err(e) => {
@@ -198,6 +154,83 @@ fn main() {
     std::process::exit(code);
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let as_ssh = invoked_as_ssh(&args[0]);
+    // As `ssh`, every word is ssh's: `ssh cp` connects to a host named cp.
+    if !as_ssh && is_tool_invocation(&args) {
+        let cli = ToolCli::parse_from(args);
+        init_logging(cli.conn.verbose, false);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        finish(rt.block_on(tool_main(cli)));
+    }
+    let mut a = match SshArgs::parse(args[1..].iter().cloned()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("qsh: {e}\n{USAGE}");
+            std::process::exit(255);
+        }
+    };
+    if a.help {
+        println!("{USAGE}");
+        std::process::exit(0);
+    }
+    if a.print_version {
+        eprintln!("qsh {} (QUIC; OpenSSH-compatible options)", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    a.full |= as_ssh;
+    if a.background && std::env::var_os(DAEMON_FD).is_none() {
+        finish(run_in_background(&args));
+    }
+    init_logging(a.verbose > 0, a.quiet);
+    for ignored in &a.ignored {
+        tracing::debug!("ignoring {ignored}");
+    }
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    finish(rt.block_on(session_main(a)));
+}
+
+/// Environment variable carrying the readiness pipe to a backgrounded qsh.
+const DAEMON_FD: &str = "QSH_BACKGROUND_FD";
+
+/// `-f`: runs qsh again as a child that logs in (it may still ask questions on
+/// the terminal), then detaches; this process exits once the child is ready.
+fn run_in_background(args: &[String]) -> Result<i32> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let (read, write) = nix::unistd::pipe()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args(&args[1..])
+        .env(DAEMON_FD, write.as_raw_fd().to_string())
+        .spawn()?;
+    drop(write);
+    let mut status = String::new();
+    let _ = std::fs::File::from(read).read_to_string(&mut status);
+    if status.trim() == "ok" {
+        return Ok(0);
+    }
+    // The child failed before it was ready and has reported why.
+    Ok(child.wait()?.code().unwrap_or(255))
+}
+
+/// In a backgrounded child: tell the parent we are ready, then detach from the
+/// terminal (new session, stdin from /dev/null; output stays, like ssh -f).
+fn detach() -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let Some(fd) = std::env::var(DAEMON_FD).ok().and_then(|v| v.parse::<i32>().ok()) else {
+        return Ok(());
+    };
+    let null = std::fs::File::open("/dev/null")?;
+    nix::unistd::dup2_stdin(&null)?;
+    let _ = nix::unistd::setsid();
+    // SAFETY: the fd was created for us by the parent and is used only here.
+    let mut pipe = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    pipe.write_all(b"ok")?;
+    Ok(())
+}
+
 async fn tool_main(cli: ToolCli) -> Result<i32> {
     let opts = cli.conn.options();
     match cli.cmd {
@@ -207,9 +240,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             client::pair(&target, &opts, &code).await?;
             Ok(0)
         }
-        Cmd::Cp { src, dst } => {
-            cp(&src, &dst, &cli.conn).await
-        }
+        Cmd::Cp { recursive, src, dst } => cp(&src, &dst, recursive, &cli.conn).await,
         Cmd::Speed { destination, seconds } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
@@ -218,37 +249,104 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
     }
 }
 
-async fn session_main(cli: Cli) -> Result<i32> {
-    let opts = cli.conn.options();
-    let Some(dest) = cli.destination.as_deref() else {
-        bail!("missing destination; usage: qsh [OPTIONS] [user@]host[:port] [COMMAND]...  (see --help)");
+/// `-G`: prints the resolved settings, like ssh. Tools (e.g. git) also use it
+/// to detect an OpenSSH-compatible client.
+fn print_config(t: &Target) {
+    println!("user {}\nhostname {}\nport {}", t.user, t.host, t.port);
+    for f in &t.identity_files {
+        println!("identityfile {}", f.display());
+    }
+    for (name, list) in [("localforward", &t.local_forwards), ("remoteforward", &t.remote_forwards), ("dynamicforward", &t.dynamic_forwards)] {
+        for f in list {
+            println!("{name} {f}");
+        }
+    }
+    if let Some(j) = &t.proxy_jump {
+        println!("proxyjump {j}");
+    }
+    println!("batchmode {}", if t.batch_mode { "yes" } else { "no" });
+}
+
+async fn session_main(a: SshArgs) -> Result<i32> {
+    let Some(dest) = a.destination.clone() else {
+        bail!("missing destination\n{USAGE}");
     };
-    let target = Target::parse(dest, cli.conn.port, cli.conn.full)?;
-    if cli.conn.full && target.needs_proxy {
-        return exec_ssh(&cli, &target, "the config uses ProxyJump/ProxyCommand");
+    let mut overrides = Vec::new();
+    if let Some(j) = &a.jump {
+        overrides.push(format!("ProxyJump {j}"));
     }
-    let mut forwards = Vec::new();
-    for spec in &cli.local_forward {
-        forwards.push((Forward::parse(spec)?, true));
+    overrides.extend(a.override_lines());
+    let sources = Sources { full: a.full, overrides, ssh_config: a.config_file.clone() };
+    let target = Target::resolve(&dest, a.port, &sources)?;
+    if a.print_config {
+        print_config(&target);
+        return Ok(0);
     }
-    for spec in &target.local_forwards {
-        forwards.push((Forward::parse(spec)?, false));
+    if a.background && !a.no_command && a.command.is_empty() && a.stdio_forward.is_none() {
+        bail!("cannot go to the background (-f) without a command or -N");
     }
+    let opts = ConnectOptions {
+        identities: a.identities.clone(),
+        transport: a.transport,
+        accept_new_host: a.accept_new_host,
+        full: a.full,
+    };
+    if a.full && target.needs_proxy {
+        return exec_openssh("ssh", ssh_args(&a, &target), "the ssh config uses ProxyJump/ProxyCommand");
+    }
+    let quiet = a.quiet || target.quiet;
+    // ClearAllForwardings drops the forwards from the config and the command line.
+    let clear = target.clear_all_forwardings;
+    let mut locals = Vec::new();
+    let mut remotes = Vec::new();
+    let mut dynamics: Vec<(String, bool)> = Vec::new();
+    if !clear {
+        for (specs, required) in [(&a.local_forwards, true), (&target.local_forwards, false)] {
+            for s in specs {
+                locals.push((Forward::parse(s).with_context(|| format!("-L {s}"))?, required));
+            }
+        }
+        for s in a.remote_forwards.iter().chain(&target.remote_forwards) {
+            remotes.push(Forward::parse(s).with_context(|| format!("-R {s}"))?);
+        }
+        dynamics.extend(a.dynamic_forwards.iter().map(|s| (s.clone(), true)));
+        dynamics.extend(target.dynamic_forwards.iter().map(|s| (s.clone(), false)));
+    }
+
     let conn = match client::connect(&target, &opts).await {
         Ok(c) => Arc::new(c),
-        Err(e) if cli.conn.full && e.is::<Unreachable>() => return exec_ssh(&cli, &target, &format!("{e:#}")),
+        Err(e) if a.full && e.is::<Unreachable>() => {
+            return exec_openssh("ssh", ssh_args(&a, &target), &format!("{e:#}"));
+        }
         Err(e) => return Err(e),
     };
-    for (f, required) in forwards {
-        let spec = format!("{}:{}:{}", f.port, f.host, f.host_port);
-        match forward::start(conn.clone(), f).await {
+    if let Some(spec) = &a.stdio_forward {
+        forward::stdio(&conn, spec).await?;
+        conn.close().await;
+        return Ok(0);
+    }
+    for (f, required) in locals {
+        let spec = f.describe();
+        match forward::start_local(conn.clone(), f, a.gateway_ports).await {
             Ok(()) => {}
             // Like ssh: a forward from the config that cannot bind is only a warning.
             Err(e) if !required => eprintln!("qsh: warning: LocalForward {spec}: {e:#}"),
             Err(e) => return Err(e),
         }
     }
-    if cli.no_command {
+    for (spec, required) in dynamics {
+        match forward::start_dynamic(conn.clone(), &spec, a.gateway_ports).await {
+            Ok(()) => {}
+            Err(e) if !required => eprintln!("qsh: warning: DynamicForward {spec}: {e:#}"),
+            Err(e) => return Err(e),
+        }
+    }
+    let _remote = forward::start_remote(&conn, &remotes, quiet).await?;
+    if a.background {
+        detach()?;
+    }
+
+    if a.no_command {
         tokio::select! {
             _ = conn.closed() => bail!("connection closed"),
             _ = session::termination_signal(true) => {}
@@ -256,64 +354,80 @@ async fn session_main(cli: Cli) -> Result<i32> {
         conn.close().await;
         return Ok(0);
     }
-    let command = (!cli.command.is_empty()).then(|| cli.command.join(" "));
-    let want_pty = if cli.tty {
-        true
-    } else if cli.no_tty {
+    let command = (!a.command.is_empty()).then(|| a.command.join(" "));
+    let subsystem = a.subsystem.then(|| command.clone()).flatten();
+    if a.subsystem && subsystem.is_none() {
+        bail!("-s needs a subsystem name, e.g. `qsh -s host sftp`");
+    }
+    let stdin_tty = std::io::stdin().is_terminal() && !a.stdin_null && !a.background;
+    let pty = if subsystem.is_some() || a.no_tty {
         false
+    } else if a.tty >= 2 {
+        true
+    } else if a.tty == 1 {
+        if !stdin_tty && !quiet {
+            eprintln!("Pseudo-terminal will not be allocated because stdin is not a terminal.");
+        }
+        stdin_tty
     } else {
         match target.request_tty.as_deref() {
-            Some("yes" | "force") => true,
+            Some("force") => true,
+            Some("yes") => stdin_tty,
             Some("no") => false,
-            _ => command.is_none() && std::io::stdin().is_terminal(),
+            _ => command.is_none() && stdin_tty,
         }
     };
-    let code = session::run(&conn, command, want_pty, target.keystroke_interval).await?;
+    let escape_char = match &a.escape_char {
+        Some(e) => client::parse_escape(Some(e)),
+        None => target.escape_char,
+    };
+    let code = session::run(
+        &conn,
+        SessionOptions {
+            command,
+            subsystem,
+            pty,
+            keystroke_interval: target.keystroke_interval,
+            escape_char,
+            stdin_null: a.stdin_null || a.background,
+        },
+    )
+    .await?;
     conn.close().await;
     Ok(code)
 }
 
-/// `--full`: replaces this process with `ssh`, passing the same options.
-/// ssh then applies its whole config (agent, ProxyJump, its own known_hosts...).
-fn exec_ssh(cli: &Cli, target: &Target, reason: &str) -> Result<i32> {
-    use std::os::unix::process::CommandExt;
-    tracing::info!("using ssh: {reason}");
-    let mut cmd = std::process::Command::new("ssh");
+/// Arguments for OpenSSH's ssh: everything ssh understands, as given.
+fn ssh_args(a: &SshArgs, target: &Target) -> Vec<String> {
+    let mut args = a.passthrough.clone();
     if let Some(p) = target.cli_port {
-        cmd.arg("-p").arg(p.to_string());
-    }
-    if let Some(i) = &cli.conn.identity {
-        cmd.arg("-i").arg(i);
-    }
-    for spec in &cli.local_forward {
-        cmd.arg("-L").arg(spec);
-    }
-    for (set, flag) in [(cli.no_command, "-N"), (cli.tty, "-t"), (cli.no_tty, "-T"), (cli.conn.verbose, "-v")] {
-        if set {
-            cmd.arg(flag);
-        }
+        args.push("-p".into());
+        args.push(p.to_string());
     }
     // `--` so the destination can never be read as an option.
-    cmd.arg("--").arg(&target.ssh_dest).args(&cli.command);
-    Err(anyhow!("cannot run ssh: {}", cmd.exec()))
+    args.push("--".into());
+    args.push(target.ssh_dest.clone());
+    args.extend(a.command.iter().cloned());
+    args
 }
 
-/// `--full` for `cp`: replaces this process with `scp`.
-fn exec_scp(src: &str, dst: &str, conn: &ConnArgs, reason: &str) -> Result<i32> {
+/// Finds OpenSSH's `tool` in PATH, skipping qsh itself (when qsh is
+/// installed as `ssh`, a plain lookup would find qsh again).
+fn find_openssh(tool: &str) -> Result<PathBuf> {
+    let me = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|c| c.is_file() && c.canonicalize().ok() != me)
+        .with_context(|| format!("OpenSSH's {tool} was not found in PATH"))
+}
+
+/// `--full`: replaces this process with OpenSSH's `tool` (ssh or scp).
+fn exec_openssh(tool: &str, args: Vec<String>, reason: &str) -> Result<i32> {
     use std::os::unix::process::CommandExt;
-    tracing::info!("using scp: {reason}");
-    let mut cmd = std::process::Command::new("scp");
-    if let Some(p) = conn.port {
-        cmd.arg("-P").arg(p.to_string());
-    }
-    if let Some(i) = &conn.identity {
-        cmd.arg("-i").arg(i);
-    }
-    if conn.verbose {
-        cmd.arg("-v");
-    }
-    cmd.arg("--").arg(src).arg(dst);
-    Err(anyhow!("cannot run scp: {}", cmd.exec()))
+    tracing::info!("using {tool}: {reason}");
+    let program = find_openssh(tool)?;
+    Err(anyhow!("cannot run {}: {}", program.display(), std::process::Command::new(&program).args(args).exec()))
 }
 
 async fn speed_test(target: &Target, opts: &ConnectOptions, seconds: Duration) -> Result<i32> {
@@ -360,7 +474,7 @@ fn keygen(file: Option<PathBuf>) -> Result<i32> {
     Ok(0)
 }
 
-async fn cp(src: &str, dst: &str, args: &ConnArgs) -> Result<i32> {
+async fn cp(src: &str, dst: &str, recursive: bool, args: &ConnArgs) -> Result<i32> {
     enum Direction {
         Upload { local: PathBuf, remote: String },
         Download { remote: String, local: PathBuf },
@@ -372,17 +486,36 @@ async fn cp(src: &str, dst: &str, args: &ConnArgs) -> Result<i32> {
         (Location::Remote { .. }, Location::Remote { .. }) => bail!("remote-to-remote copies are not supported"),
     };
     let target = Target::parse(&dest, args.port, args.full)?;
+    let scp_args = || {
+        let mut v = Vec::new();
+        if let Some(p) = args.port {
+            v.extend(["-P".to_string(), p.to_string()]);
+        }
+        for i in &args.identity {
+            v.extend(["-i".to_string(), i.display().to_string()]);
+        }
+        if recursive {
+            v.push("-r".into());
+        }
+        if args.verbose {
+            v.push("-v".into());
+        }
+        v.extend(["--".to_string(), src.to_string(), dst.to_string()]);
+        v
+    };
     if args.full && target.needs_proxy {
-        return exec_scp(src, dst, args, "the config uses ProxyJump/ProxyCommand");
+        return exec_openssh("scp", scp_args(), "the ssh config uses ProxyJump/ProxyCommand");
     }
     let conn = match client::connect(&target, &args.options()).await {
         Ok(c) => c,
-        Err(e) if args.full && e.is::<Unreachable>() => return exec_scp(src, dst, args, &format!("{e:#}")),
+        Err(e) if args.full && e.is::<Unreachable>() => return exec_openssh("scp", scp_args(), &format!("{e:#}")),
         Err(e) => return Err(e),
     };
-    let result = match direction {
-        Direction::Upload { local, remote } => copy::upload(&conn, &local, &remote).await,
-        Direction::Download { remote, local } => copy::download(&conn, &remote, &local).await,
+    let result = match (direction, recursive) {
+        (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote).await,
+        (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote).await,
+        (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local).await,
+        (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local).await,
     };
     conn.close().await;
     result.map(|()| 0)
@@ -403,20 +536,29 @@ mod tests {
         assert!(tool("-p 2222 pair u@host code"));
         assert!(tool("--accept-new-host --transport tcp pair u@host code"));
         assert!(tool("-v keygen"));
-        assert!(tool("-f cp a host:b"));
+        assert!(tool("--full cp a host:b"));
+        assert!(tool("-oPort=1 speed h"));
         assert!(!tool("-f host"));
         assert!(!tool("host cp a b"));
         assert!(!tool("-p 22 host"));
         assert!(!tool("-L 8080:cp:80 host"));
         assert!(!tool("-tL 1:a:2 host pair"));
         assert!(!tool("-i cp host"));
+        assert!(!tool("-o cp host"));
         assert!(!tool("-- cp"));
     }
 
     #[test]
-    fn both_parsers_are_valid() {
+    fn tool_parser_is_valid() {
         use clap::CommandFactory;
-        Cli::command().debug_assert();
         ToolCli::command().debug_assert();
+    }
+
+    #[test]
+    fn recognizes_ssh_name() {
+        assert!(invoked_as_ssh("/usr/local/bin/ssh"));
+        assert!(invoked_as_ssh("ssh"));
+        assert!(!invoked_as_ssh("/usr/bin/qsh"));
+        assert!(!invoked_as_ssh("sshd"));
     }
 }

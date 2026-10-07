@@ -41,6 +41,10 @@ enum Cmd {
     InternalAddKey { line: String },
     #[command(hide = true)]
     InternalConnect { host: String, port: u16 },
+    #[command(hide = true)]
+    InternalUntar { path: String, name: String },
+    #[command(hide = true)]
+    InternalTar { path: String },
 }
 
 fn is_root() -> bool {
@@ -75,6 +79,8 @@ fn main() {
         Some(Cmd::InternalPairTake) => helpers::pair_take(),
         Some(Cmd::InternalAddKey { line }) => helpers::add_key(&line),
         Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),
+        Some(Cmd::InternalUntar { path, name }) => helpers::untar(&path, &name),
+        Some(Cmd::InternalTar { path }) => helpers::tar(&path),
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair) => pair(cli.config),
         Some(Cmd::Serve { listen }) => serve(cli.config, listen),

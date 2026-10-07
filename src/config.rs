@@ -1,5 +1,6 @@
 //! Server configuration (`config.toml`).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,21 @@ pub struct ServerConfig {
     pub max_startups: usize,
     /// Maximum unauthenticated connections from one IP address.
     pub max_startups_per_ip: usize,
+    /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
+    /// or whatever address the client asks for (`clientspecified`).
+    pub gateway_ports: GatewayPorts,
+    /// Subsystems (`qsh -s host NAME`): name → command line, run without a
+    /// shell. `sftp` is found automatically if OpenSSH's sftp-server is installed.
+    pub subsystems: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayPorts {
+    #[default]
+    No,
+    Yes,
+    ClientSpecified,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +55,8 @@ impl Default for ServerConfig {
             max_connections: 256,
             max_startups: 64,
             max_startups_per_ip: 8,
+            gateway_ports: GatewayPorts::No,
+            subsystems: BTreeMap::new(),
         }
     }
 }

@@ -81,3 +81,57 @@ pub async fn download(mut send: SendHalf, user: &User, path: &str) -> Result<()>
     let _ = child.wait().await;
     Ok(())
 }
+
+/// Reads the helper's "ok" line; on anything else answers with its stderr.
+async fn helper_ready(
+    send: &mut SendHalf,
+    child: &mut tokio::process::Child,
+) -> Result<Option<BufReader<tokio::process::ChildStdout>>> {
+    let mut out = BufReader::new(child.stdout.take().expect("piped"));
+    let mut ready = String::new();
+    out.read_line(&mut ready).await?;
+    if ready.trim() != "ok" {
+        let err = stderr_text(child).await;
+        write_msg(send, &Reply::Err(err)).await?;
+        return Ok(None);
+    }
+    write_msg(send, &Reply::Ok).await?;
+    Ok(Some(out))
+}
+
+pub async fn upload_tree(mut send: SendHalf, mut recv: RecvHalf, user: &User, path: &str, name: &str) -> Result<()> {
+    let mut child = user
+        .helper(&["internal-untar", path, name])?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if helper_ready(&mut send, &mut child).await?.is_none() {
+        return Ok(());
+    }
+    let mut stdin = child.stdin.take().expect("piped");
+    let copied = tokio::io::copy(&mut recv, &mut stdin).await;
+    drop(stdin);
+    let status = child.wait().await?;
+    let reply = match copied {
+        Ok(_) if status.success() => Reply::Ok,
+        _ => Reply::Err(stderr_text(&mut child).await),
+    };
+    write_msg(&mut send, &reply).await?;
+    send.shutdown().await?;
+    Ok(())
+}
+
+pub async fn download_tree(mut send: SendHalf, user: &User, path: &str) -> Result<()> {
+    let mut child = user
+        .helper(&["internal-tar", path])?
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(mut out) = helper_ready(&mut send, &mut child).await? else { return Ok(()) };
+    tokio::io::copy(&mut out, &mut send).await?;
+    send.shutdown().await?;
+    let _ = child.wait().await;
+    Ok(())
+}

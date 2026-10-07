@@ -23,11 +23,19 @@ fn accept_env(name: &str) -> bool {
     plain && (matches!(name, "LANG" | "COLORTERM") || name.starts_with("LC_"))
 }
 
+/// What to start for a session.
+pub enum Launch {
+    /// The user's shell: a login shell, or `$SHELL -c command`.
+    Shell(Option<String>),
+    /// A program run directly, without a shell (subsystems such as sftp-server).
+    Program(Vec<String>),
+}
+
 pub async fn run(
     mut send: SendHalf,
     recv: RecvHalf,
     user: &User,
-    command: Option<String>,
+    launch: Launch,
     client_env: Vec<(String, String)>,
     pty: Option<PtySpec>,
     closed: watch::Receiver<bool>,
@@ -37,9 +45,9 @@ pub async fn run(
     if let Some(p) = &pty {
         env.push(("TERM".into(), p.term.clone()));
     }
-    let spawned = match pty {
-        Some(spec) => spawn_pty(user, command, env, &spec),
-        None => spawn_pipes(user, command, env),
+    let spawned = match (pty, launch) {
+        (Some(spec), Launch::Shell(command)) => spawn_pty(user, command, env, &spec),
+        (_, launch) => spawn_pipes(user, launch, env),
     };
     let (child, io) = match spawned {
         Ok(x) => x,
@@ -62,19 +70,27 @@ enum Io {
     Pty(pty_process::Pty),
 }
 
-fn spawn_pipes(
-    user: &User,
-    command: Option<String>,
-    env: Vec<(String, String)>,
-) -> Result<(tokio::process::Child, Io)> {
-    let mut cmd = user.command(&user.shell);
+fn spawn_pipes(user: &User, launch: Launch, env: Vec<(String, String)>) -> Result<(tokio::process::Child, Io)> {
+    let mut cmd = match &launch {
+        Launch::Shell(_) => user.command(&user.shell),
+        Launch::Program(argv) => {
+            let mut c = user.command(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+    };
     cmd.envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);
-    match command {
-        Some(c) => cmd.arg("-c").arg(c),
-        None => cmd.arg0(user.login_arg0()),
-    };
+    match launch {
+        Launch::Shell(Some(c)) => {
+            cmd.arg("-c").arg(c);
+        }
+        Launch::Shell(None) => {
+            cmd.arg0(user.login_arg0());
+        }
+        Launch::Program(_) => {}
+    }
     let mut child = cmd.spawn()?;
     let io = Io::Pipes {
         stdin: child.stdin.take().expect("piped"),
