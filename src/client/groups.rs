@@ -33,14 +33,32 @@ pub fn save(home: &Path, groups: &Groups) -> Result<()> {
             bail!("bad group name {name:?}");
         }
     }
-    let file = path(home);
+    // Through a symlink (dotfile managers): replace the file it points to.
+    let file = std::fs::canonicalize(path(home)).unwrap_or_else(|_| path(home));
     crate::keys::create_private_dir(file.parent().context("bad path")?)?;
     let groups: Groups = groups.iter().filter(|(_, hosts)| !hosts.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let text = format!("# Host groups for `qsh multi -g NAME` and `qsh ui` (g sets a host's groups).\n{}", toml::to_string(&groups)?);
+    let text = format!("# Host groups for `qsh multi -g NAME` and `qsh ui` (e: a host's groups).\n{}", toml::to_string(&groups)?);
     let tmp = file.with_extension("new");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &file)?;
     Ok(())
+}
+
+/// Changes one host's groups in the file (`old`: its previous name, if it
+/// was renamed): reads the file again, so edits made meanwhile are kept,
+/// and writes it only if something changed. A file that cannot be read is
+/// never replaced. Returns the groups now in the file.
+pub fn update(home: &Path, host: &str, old: Option<&str>, names: &[String]) -> Result<Groups> {
+    let mut groups = load(home).context("fix it by hand first; it was not changed")?;
+    let before = groups.clone();
+    if let Some(old) = old.filter(|o| *o != host) {
+        rename(&mut groups, old, host);
+    }
+    set(&mut groups, host, names);
+    if groups != before {
+        save(home, &groups)?;
+    }
+    Ok(groups)
 }
 
 /// The groups `host` is in.
@@ -100,5 +118,13 @@ mod tests {
         assert!(!valid_name("two words") && !valid_name("") && valid_name("prod-eu_1"));
         std::fs::write(path(home.path()), "web = 5").unwrap();
         assert!(load(home.path()).is_err());
+        assert!(update(home.path(), "x", None, &["a".into()]).is_err(), "a broken file is never replaced");
+        assert_eq!(std::fs::read_to_string(path(home.path())).unwrap(), "web = 5");
+        // Unchanged groups: the file is not touched at all.
+        std::fs::write(path(home.path()), "# mine\nweb = [\"w1\"]\n").unwrap();
+        update(home.path(), "w1", None, &["web".into()]).unwrap();
+        assert!(std::fs::read_to_string(path(home.path())).unwrap().starts_with("# mine"));
+        let g = update(home.path(), "w2", None, &["web".into()]).unwrap();
+        assert_eq!(g["web"], ["w1", "w2"]);
     }
 }

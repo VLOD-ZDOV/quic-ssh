@@ -2188,3 +2188,52 @@ fn doctor_explains_problems() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stdout(&out).contains("is qshd running"), "{}", stdout(&out));
 }
+
+/// Findings of a review of connection sharing: `-f` does not wait for the
+/// background master, `ssh` (a symlink to qsh) finds the same master, and
+/// an attached `-N` client keeps the master beyond ControlPersist.
+#[test]
+fn connection_sharing_edge_cases() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(
+        c.home.path().join(".config/qsh/config"),
+        "Host *\n    ControlMaster auto\n    ControlPersist 2\n    ControlPath /tmp/qsh-test-%C\n",
+    )
+    .unwrap();
+    let port = s.port.to_string();
+    // -f returns once logged in, although the master lives on.
+    let started = Instant::now();
+    let status = c
+        .cmd(&["-f", "-p", &port, &dest(), "sleep", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(started.elapsed() < Duration::from_secs(10), "-f waited {:?}", started.elapsed());
+    // Started as `ssh`: the same master (same socket), --full kept.
+    let bin = c.home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(QSH, bin.join("ssh")).unwrap();
+    let out = Command::new(bin.join("ssh"))
+        .args(["-O", "check", "-p", &port, &dest()])
+        .env("HOME", c.home.path())
+        .output()
+        .unwrap();
+    assert!(stderr(&out).contains("Master running"), "{}", stderr(&out));
+    // An attached client with no stream open keeps the master alive.
+    let mut attached = c.cmd(&["-N", "-p", &port, &dest()]).stderr(Stdio::piped()).spawn().unwrap();
+    sleep(Duration::from_secs(4));
+    assert!(attached.try_wait().unwrap().is_none(), "the -N client lost its master");
+    let out = c.run(&["-O", "check", "-p", &port, &dest()]);
+    assert!(stderr(&out).contains("Master running"), "{}", stderr(&out));
+    let _ = attached.kill();
+    let _ = attached.wait();
+    // Then the master goes after ControlPersist.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.run(&["-O", "check", "-p", &port, &dest()]).status.success() {
+        assert!(Instant::now() < deadline, "the master did not end");
+        sleep(Duration::from_millis(200));
+    }
+}

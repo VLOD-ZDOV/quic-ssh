@@ -269,26 +269,52 @@ const DAEMON_FD: &str = "QSH_BACKGROUND_FD";
 #[cfg(unix)]
 const MASTER_FD: &str = "QSH_MASTER_FD";
 
-/// Runs qsh again as a child with a readiness pipe in `env`; the child logs
-/// in (it may still ask questions on the terminal) and then reports a status
-/// word. Returns that word and the child.
-#[cfg(unix)]
+/// Runs qsh again as a child that reports a status word once it is logged
+/// in (it may still ask questions on the terminal), over a Unix socket in a
+/// private directory named in `env`. Nothing is inherited, so a process the
+/// child starts later cannot keep this one waiting. Returns the word (empty
+/// if the child ended without one) and the child.
 fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process::Child)> {
     use std::io::Read;
-    use std::os::fd::AsRawFd;
-    // Only the write end is handed to the child (by number); the read end must not leak.
-    let (read, write) = nix::unistd::pipe()?;
-    nix::fcntl::fcntl(&read, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
-    let child = std::process::Command::new(std::env::current_exe()?)
-        .args(&args[1..])
-        .env_remove(DAEMON_FD)
-        .env_remove(MASTER_FD)
-        .env(env, write.as_raw_fd().to_string())
-        .spawn()?;
-    drop(write);
-    let mut status = String::new();
-    let _ = std::fs::File::from(read).read_to_string(&mut status);
-    Ok((status.trim().to_string(), child))
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::process::CommandExt;
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(std::env::temp_dir);
+    // A new directory only we can enter (creating it fails if the name exists).
+    let dir = base.join(format!("qsh-{}-{:08x}", std::process::id(), rand::random::<u32>()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let result = (|| {
+        let sock = dir.join("ready");
+        let listener = std::os::unix::net::UnixListener::bind(&sock)?;
+        listener.set_nonblocking(true)?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            // As typed: started as `ssh`, the child must know it too.
+            .arg0(&args[0])
+            .args(&args[1..])
+            .env_remove(DAEMON_FD)
+            .env_remove(MASTER_FD)
+            .env(env, &sock)
+            .spawn()?;
+        loop {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    s.set_nonblocking(false)?;
+                    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                    let mut status = String::new();
+                    let _ = s.read_to_string(&mut status);
+                    return Ok((status.trim().to_string(), child));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if child.try_wait()?.is_some() {
+                        return Ok((String::new(), child));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// `-f`: runs qsh again as a child that logs in, then detaches; this process
@@ -309,8 +335,7 @@ fn run_in_background(args: &[String]) -> Result<i32> {
 #[cfg(unix)]
 fn detach(env: &str, status: &str, quiet: bool) -> Result<()> {
     use std::io::Write;
-    use std::os::fd::{FromRawFd, OwnedFd};
-    let Some(fd) = std::env::var(env).ok().and_then(|v| v.parse::<i32>().ok()) else {
+    let Some(path) = std::env::var_os(env) else {
         return Ok(());
     };
     let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
@@ -320,9 +345,8 @@ fn detach(env: &str, status: &str, quiet: bool) -> Result<()> {
         nix::unistd::dup2_stderr(&null)?;
     }
     let _ = nix::unistd::setsid();
-    // SAFETY: the fd was created for us by the parent and is used only here.
-    let mut pipe = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    pipe.write_all(status.as_bytes())?;
+    let mut parent = std::os::unix::net::UnixStream::connect(path)?;
+    parent.write_all(status.as_bytes())?;
     Ok(())
 }
 
@@ -666,7 +690,7 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
             Box::pin(async move { client::connect(&target, &opts).await.map(Arc::new) }) as futures::future::BoxFuture<'static, _>
         }) as session::Reconnect
     });
-    let code = session::run(
+    let session = session::run(
         conn.clone(),
         SessionOptions {
             command,
@@ -679,8 +703,21 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
             server_alive: target.server_alive,
             predict: target.predict,
         },
-    )
-    .await?;
+    );
+    // `-O exit` ends a master that runs a session too, like ssh's.
+    #[cfg(unix)]
+    let code = match &master {
+        Some(m) => tokio::select! {
+            code = session => code?,
+            () = m.exit_requested() => {
+                eprintln!("\r\nqsh: the shared connection was ended (-O exit)");
+                255
+            }
+        },
+        None => session.await?,
+    };
+    #[cfg(not(unix))]
+    let code = session.await?;
     #[cfg(unix)]
     if let Some(m) = master {
         wait_for_shared(m, &conn, quiet).await;
@@ -716,7 +753,7 @@ fn start_master(conn: &Arc<qsh::transport::Conn>, target: &Target, quiet: bool) 
 /// connection, so it stays until they are done (or the user gives up).
 #[cfg(unix)]
 async fn wait_for_shared(master: qsh::transport::shared::Master, conn: &qsh::transport::Conn, quiet: bool) {
-    master.stop_accepting();
+    // Still listening: attached clients open new streams through the socket.
     if master.active() == 0 {
         return;
     }
@@ -784,14 +821,9 @@ fn exec_openssh(tool: &str, args: Vec<String>, reason: &str) -> Result<i32> {
 #[cfg(unix)]
 fn exec_unix(mut cmd: std::process::Command, program: &Path) -> Result<i32> {
     use std::os::unix::process::CommandExt;
-    if let Some(fd) = std::env::var(DAEMON_FD).ok().and_then(|v| v.parse::<i32>().ok()) {
-        // In a `-f` child: ssh gets `-f` too and goes to the background by itself.
-        // Closing the readiness pipe makes our parent wait for ssh's own exit
-        // instead of for the pipe, which ssh would otherwise keep open.
-        // SAFETY: the fd was created for this process by the parent and is not used elsewhere.
-        unsafe { libc::close(fd) };
-        cmd.env_remove(DAEMON_FD);
-    }
+    // In a `-f` child: ssh gets `-f` too and goes to the background by
+    // itself; our parent then waits for ssh's own exit.
+    cmd.env_remove(DAEMON_FD);
     Err(anyhow!("cannot run {}: {}", program.display(), cmd.exec()))
 }
 

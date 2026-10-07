@@ -40,6 +40,8 @@ pub enum MuxRequest {
     Exit,
     /// Stop accepting new clients (`-O stop`).
     Stop,
+    /// Like `Info`, but answered once and not counted as a client (`-O check`).
+    Check { version: u32 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -57,9 +59,21 @@ pub struct SharedConn {
     transport: &'static str,
 }
 
+/// Connects to a master's socket, and makes sure it belongs to this user:
+/// with a ControlPath in a shared directory, another user could otherwise
+/// put a listener there and see everything typed.
+async fn connect(path: &Path) -> Result<UnixStream> {
+    let sock = UnixStream::connect(path).await?;
+    let owner = sock.peer_cred()?.uid();
+    if owner != nix::unistd::geteuid().as_raw() {
+        bail!("the socket {} belongs to another user (uid {owner})", path.display());
+    }
+    Ok(sock)
+}
+
 impl SharedConn {
     pub async fn open_bi(&self) -> Result<(SendHalf, RecvHalf)> {
-        let mut sock = UnixStream::connect(&self.path).await.context("connection master is gone")?;
+        let mut sock = connect(&self.path).await.context("connection master is gone")?;
         write_msg(&mut sock, &MuxRequest::Open).await?;
         match tokio::time::timeout(ANSWER_TIMEOUT, read_msg(&mut sock)).await.context("connection master does not answer")?? {
             MuxReply::Opened => {}
@@ -96,7 +110,7 @@ pub async fn attach(path: &Path) -> Option<Conn> {
 }
 
 async fn try_attach(path: &Path) -> Result<Conn> {
-    let mut control = UnixStream::connect(path).await?;
+    let mut control = connect(path).await?;
     write_msg(&mut control, &MuxRequest::Info { version: MUX_VERSION }).await?;
     let MuxReply::Info { version, server_version, remote, transport, peer_key, pid } = read_msg(&mut control).await? else {
         bail!("unexpected answer");
@@ -140,15 +154,15 @@ pub enum Command {
 /// Sends a control command to the master at `path`; returns its process id.
 pub async fn control(path: &Path, command: Command) -> Result<u32> {
     let connect = async {
-        let mut sock = UnixStream::connect(path).await?;
-        write_msg(&mut sock, &MuxRequest::Info { version: MUX_VERSION }).await?;
+        let mut sock = connect(path).await?;
+        write_msg(&mut sock, &MuxRequest::Check { version: MUX_VERSION }).await?;
         let MuxReply::Info { pid, .. } = read_msg(&mut sock).await? else { bail!("unexpected answer") };
         let request = match command {
             Command::Check => return Ok(pid),
             Command::Exit => MuxRequest::Exit,
             Command::Stop => MuxRequest::Stop,
         };
-        let mut sock = UnixStream::connect(path).await?;
+        let mut sock = connect(path).await?;
         write_msg(&mut sock, &request).await?;
         match read_msg(&mut sock).await? {
             MuxReply::Ok => Ok(pid),
@@ -167,11 +181,16 @@ pub async fn control(path: &Path, command: Command) -> Result<u32> {
 struct SocketFile {
     path: PathBuf,
     ino: u64,
+    /// Removed once only: later, a new master's socket may have our inode number.
+    removed: std::sync::atomic::AtomicBool,
 }
 
 impl SocketFile {
     fn remove(&self) {
         use std::os::unix::fs::MetadataExt;
+        if self.removed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.ino) {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -181,11 +200,13 @@ impl SocketFile {
 /// Master side: serves the connection to other qsh runs.
 pub struct Master {
     file: Arc<SocketFile>,
-    /// Streams currently open for clients.
+    /// Clients attached plus streams open for them.
     active: Arc<AtomicUsize>,
     /// Signalled whenever a stream ends, and on `-O exit`.
     changed: Arc<Notify>,
     exit: Arc<watch::Sender<bool>>,
+    /// `-O stop`: no new clients; end once the current ones are done.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
     accepting: tokio::task::JoinHandle<()>,
 }
 
@@ -205,9 +226,13 @@ impl std::error::Error for InUse {}
 /// link to the real name, so two qsh starting at once cannot both win. A
 /// leftover socket whose master died is replaced.
 fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     // Short: socket paths are limited to about 100 bytes.
     let tmp = path.with_extension(format!("{:08x}", rand::random::<u32>()));
+    // Two qsh replacing the same stale socket at once must take turns.
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&lock_path)?;
+    lock.lock()?;
     let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
     let result = (|| {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
@@ -232,7 +257,7 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     let ino = std::fs::symlink_metadata(&tmp).map(|m| m.ino());
     let _ = std::fs::remove_file(&tmp);
     result?;
-    Ok((listener, SocketFile { path: path.to_path_buf(), ino: ino? }))
+    Ok((listener, SocketFile { path: path.to_path_buf(), ino: ino?, removed: Default::default() }))
 }
 
 impl Master {
@@ -245,8 +270,9 @@ impl Master {
         let changed = Arc::new(Notify::new());
         let (exit, exit_rx) = watch::channel(false);
         let exit = Arc::new(exit);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let accepting = {
-            let (active, changed, exit, file) = (active.clone(), changed.clone(), exit.clone(), file.clone());
+            let (active, changed, exit, file, stopped) = (active.clone(), changed.clone(), exit.clone(), file.clone(), stopped.clone());
             tokio::spawn(async move {
                 let me = nix::unistd::geteuid().as_raw();
                 loop {
@@ -263,9 +289,10 @@ impl Master {
                         _ => continue,
                     }
                     let (conn, active, changed, exit, exit_rx) = (conn.clone(), active.clone(), changed.clone(), exit.clone(), exit_rx.clone());
-                    let file = file.clone();
+                    let (file, stopped) = (file.clone(), stopped.clone());
                     tokio::spawn(async move {
-                        if let Err(e) = serve_client(sock, &conn, &active, &changed, &exit, exit_rx, &file).await {
+                        let shared = Shared { active: &active, changed: &changed, exit: &exit, stopped: &stopped, file: &file };
+                        if let Err(e) = serve_client(sock, &conn, shared, exit_rx).await {
                             debug!("shared connection client: {e:#}");
                         }
                     });
@@ -274,7 +301,7 @@ impl Master {
                 changed.notify_waiters();
             })
         };
-        Ok(Master { file, active, changed, exit, accepting })
+        Ok(Master { file, active, changed, exit, stopped, accepting })
     }
 
     /// Stops accepting new clients (streams already open keep working).
@@ -292,6 +319,8 @@ impl Master {
             if *exit.borrow() {
                 break;
             }
+            // After `-O stop` nobody new can come: end as soon as idle.
+            let linger = if self.stopped.load(Ordering::SeqCst) { None } else { linger };
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -323,7 +352,7 @@ impl Master {
         let _ = exit.wait_for(|e| *e).await;
     }
 
-    /// Streams clients have open right now.
+    /// Clients attached, and streams open for them, right now.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
@@ -355,18 +384,19 @@ async fn relay(sock: UnixStream, mut send: SendHalf, mut recv: RecvHalf) -> Resu
     Ok(result?)
 }
 
-async fn serve_client(
-    mut sock: UnixStream,
-    conn: &Arc<Conn>,
-    active: &Arc<AtomicUsize>,
-    changed: &Notify,
-    exit: &watch::Sender<bool>,
-    mut exit_rx: watch::Receiver<bool>,
-    file: &SocketFile,
-) -> Result<()> {
+/// What every client connection of a master shares.
+struct Shared<'a> {
+    active: &'a AtomicUsize,
+    changed: &'a Notify,
+    exit: &'a watch::Sender<bool>,
+    stopped: &'a std::sync::atomic::AtomicBool,
+    file: &'a SocketFile,
+}
+
+async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>, mut exit_rx: watch::Receiver<bool>) -> Result<()> {
     let request: MuxRequest = tokio::time::timeout(ANSWER_TIMEOUT, read_msg(&mut sock)).await.context("no request")??;
     match request {
-        MuxRequest::Info { .. } => {
+        MuxRequest::Info { .. } | MuxRequest::Check { .. } => {
             let transport = match conn.transport_name() {
                 "quic" => "quic",
                 "tcp" => "tcp",
@@ -381,14 +411,22 @@ async fn serve_client(
                 pid: std::process::id(),
             };
             write_msg(&mut sock, &info).await?;
-            // Held open until the connection (or the master) ends.
+            if matches!(request, MuxRequest::Check { .. }) {
+                return Ok(());
+            }
+            // Held open until the connection (or the master) ends. An
+            // attached client keeps the master, even with no stream open
+            // (a `-N -D` client waiting for connections).
             use tokio::io::AsyncReadExt;
+            shared.active.fetch_add(1, Ordering::SeqCst);
             let mut buf = [0u8; 1];
             tokio::select! {
                 () = conn.closed() => {}
                 _ = sock.read(&mut buf) => {}
                 _ = exit_rx.wait_for(|e| *e) => {}
             }
+            shared.active.fetch_sub(1, Ordering::SeqCst);
+            shared.changed.notify_waiters();
         }
         MuxRequest::Open => {
             let (send, recv) = match conn.open_bi().await {
@@ -396,21 +434,23 @@ async fn serve_client(
                 Err(e) => return write_msg(&mut sock, &MuxReply::Err(format!("{e:#}"))).await,
             };
             write_msg(&mut sock, &MuxReply::Opened).await?;
-            active.fetch_add(1, Ordering::SeqCst);
+            shared.active.fetch_add(1, Ordering::SeqCst);
             let result = relay(sock, send, recv).await;
-            active.fetch_sub(1, Ordering::SeqCst);
-            changed.notify_waiters();
+            shared.active.fetch_sub(1, Ordering::SeqCst);
+            shared.changed.notify_waiters();
             result?;
         }
         MuxRequest::Exit => {
             write_msg(&mut sock, &MuxReply::Ok).await?;
-            file.remove();
-            let _ = exit.send(true);
-            changed.notify_waiters();
+            shared.file.remove();
+            let _ = shared.exit.send(true);
+            shared.changed.notify_waiters();
         }
         MuxRequest::Stop => {
             write_msg(&mut sock, &MuxReply::Ok).await?;
-            file.remove();
+            shared.file.remove();
+            shared.stopped.store(true, Ordering::SeqCst);
+            shared.changed.notify_waiters();
         }
     }
     Ok(())

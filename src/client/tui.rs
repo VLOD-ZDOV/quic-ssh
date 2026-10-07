@@ -1231,8 +1231,9 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
         let name = form.original.clone().unwrap_or_else(|| form.name.clone());
         let prefs = Prefs { transport: TRANSPORTS[form.transport].to_string(), ssh_fallback: form.fallback };
         app.state.prefs.insert(name.clone(), prefs);
-        groups::set(&mut app.groups, &name, &member);
-        groups::save(&home, &app.groups)?;
+        if member != groups::of(&app.groups, &name) {
+            app.groups = groups::update(&home, &name, None, &member)?;
+        }
         return Ok(name);
     }
     let (entry, prefs) = form.result().map_err(anyhow::Error::msg)?;
@@ -1247,16 +1248,18 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
         if old != &entry.name {
             app.state.prefs.remove(old);
             app.state.probes.remove(old);
-            groups::rename(&mut app.groups, old, &entry.name);
         }
     }
     all.retain(|s| s.name != entry.name);
     let name = entry.name.clone();
+    // Groups first: if their file cannot be changed, nothing is saved.
+    let old = form.original.as_deref().unwrap_or(&name);
+    if member != groups::of(&app.groups, old) || old != name {
+        app.groups = groups::update(&home, &name, Some(old), &member)?;
+    }
     all.push(entry);
     saved::save(&home, &all)?;
     app.state.prefs.insert(name.clone(), prefs);
-    groups::set(&mut app.groups, &name, &member);
-    groups::save(&home, &app.groups)?;
     // The address may have changed: check it again.
     app.state.probes.remove(&name);
     Ok(name)
@@ -1267,8 +1270,9 @@ fn delete_saved(app: &mut App, name: &str) -> Result<()> {
     let mut all = saved::load(&home);
     all.retain(|s| s.name != name);
     saved::save(&home, &all)?;
-    groups::set(&mut app.groups, name, &[]);
-    groups::save(&home, &app.groups)?;
+    if !groups::of(&app.groups, name).is_empty() {
+        app.groups = groups::update(&home, name, None, &[])?;
+    }
     app.state.prefs.remove(name);
     app.state.probes.remove(name);
     Ok(())
