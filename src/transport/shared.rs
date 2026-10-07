@@ -335,6 +335,26 @@ impl Drop for Master {
     }
 }
 
+/// Copies a client's stream both ways. Unlike [`super::bridge`], a failed
+/// write towards the server does not cut the other direction short: the
+/// server may stop reading when its command is done, and the client must
+/// still get everything the server sent (the exit status above all).
+async fn relay(sock: UnixStream, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let (mut r, mut w) = sock.into_split();
+    let up = async {
+        if tokio::io::copy(&mut r, &mut send).await.is_ok() {
+            let _ = send.shutdown().await;
+        }
+    };
+    let down = async {
+        tokio::io::copy(&mut recv, &mut w).await?;
+        w.shutdown().await
+    };
+    let ((), result) = tokio::join!(up, down);
+    Ok(result?)
+}
+
 async fn serve_client(
     mut sock: UnixStream,
     conn: &Arc<Conn>,
@@ -377,8 +397,7 @@ async fn serve_client(
             };
             write_msg(&mut sock, &MuxReply::Opened).await?;
             active.fetch_add(1, Ordering::SeqCst);
-            let (r, w) = sock.into_split();
-            let result = super::bridge(r, w, send, recv).await;
+            let result = relay(sock, send, recv).await;
             active.fetch_sub(1, Ordering::SeqCst);
             changed.notify_waiters();
             result?;
