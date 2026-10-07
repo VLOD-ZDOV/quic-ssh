@@ -5,6 +5,7 @@ mod auth;
 mod exec;
 mod files;
 pub mod helpers;
+pub mod keys_command;
 mod persist;
 pub mod revoked;
 mod users;
@@ -207,14 +208,16 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     let entries = user.as_ref().map(|u| auth::authorized_entries(&state.cfg, u)).unwrap_or_default();
     let cas = auth::trusted_cas(&state.cfg);
     let revoked = revoked::Revocation::load(state.cfg.revoked_keys.as_deref());
+    let command = user.as_ref().and_then(|u| keys_command::KeysCommand::new(&state.cfg, u));
     let checker = auth::Checker {
         entries: &entries,
         cas: &cas,
         revoked: &revoked,
+        command: command.as_ref(),
         login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now() },
         exporter: conn.exporter(),
     };
-    let mut granted = checker.check(&auth::tls_key(key)).ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
+    let mut granted = checker.check(&auth::tls_key(key)).await.ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
     if granted.is_none() && version >= 4 {
         let attempt = auth::key_auth(&mut send, &mut recv, &checker, state.cfg.max_auth_tries);
         granted = tokio::time::timeout(auth::AUTH_TIMEOUT, attempt).await.context("login took too long")??;

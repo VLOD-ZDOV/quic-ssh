@@ -99,21 +99,27 @@ pub struct Checker<'a> {
     pub entries: &'a [AuthorizedKey],
     pub cas: &'a [KeyData],
     pub revoked: &'a super::revoked::Revocation,
+    /// `authorized_keys_command`, if configured.
+    pub command: Option<&'a super::keys_command::KeysCommand<'a>>,
     pub login: Login<'a>,
     pub exporter: [u8; 32],
 }
 
 impl Checker<'_> {
-    pub fn check(&self, offered: &Offered) -> Result<Grant, String> {
+    pub async fn check(&self, offered: &Offered) -> Result<Grant, String> {
         key_allowed(offered.signing_key()).map_err(|e| format!("{e:#}"))?;
         self.revoked.check(offered)?;
-        authkeys::check(offered, self.entries, self.cas, &self.login)
+        let from_files = authkeys::check(offered, self.entries, self.cas, &self.login);
+        match (from_files, self.command) {
+            (Err(_), Some(command)) => authkeys::check(offered, &command.entries(offered).await, self.cas, &self.login),
+            (result, _) => result,
+        }
     }
 
     /// Checks a proof: the key is authorized and `signature` signs this login.
-    fn verify(&self, key: &[u8], signature: &[u8]) -> Result<(Grant, Offered), String> {
+    async fn verify(&self, key: &[u8], signature: &[u8]) -> Result<(Grant, Offered), String> {
         let offered = Offered::from_bytes(key).map_err(|e| format!("{e:#}"))?;
-        let grant = self.check(&offered)?;
+        let grant = self.check(&offered).await?;
         let sig = ssh_key::Signature::try_from(signature).map_err(|e| format!("bad signature encoding: {e}"))?;
         let data = auth_data(&self.exporter, self.login.user, key);
         offered.signing_key().verify(&data, &sig).map_err(|_| "signature does not verify".to_string())?;
@@ -143,10 +149,13 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
                     warn!("{}: {} offered more than {MAX_QUERIES} keys; giving up", checker.login.ip, checker.login.user);
                     return Ok(None);
                 }
-                let ok = Offered::from_bytes(&key).is_ok_and(|o| checker.check(&o).is_ok());
+                let ok = match Offered::from_bytes(&key) {
+                    Ok(o) => checker.check(&o).await.is_ok(),
+                    Err(_) => false,
+                };
                 write_msg(send, if ok { &Reply::Ok } else { &Reply::AuthKey }).await?;
             }
-            Auth::PublicKey { key, signature } => match checker.verify(&key, &signature) {
+            Auth::PublicKey { key, signature } => match checker.verify(&key, &signature).await {
                 Ok((grant, offered)) => return Ok(Some((grant, offered.describe()))),
                 Err(reason) => {
                     warn!("{}: {} rejected: {reason}", checker.login.ip, checker.login.user);

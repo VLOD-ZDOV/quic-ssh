@@ -50,6 +50,11 @@ pub struct ServerConfig {
     /// KRL from `ssh-keygen -k` (like sshd's RevokedKeys). If the file
     /// cannot be read, no key is accepted.
     pub revoked_keys: Option<PathBuf>,
+    /// A program that prints more authorized keys for a user (like sshd's
+    /// AuthorizedKeysCommand); see `server::keys_command`.
+    pub authorized_keys_command: Option<String>,
+    /// The user it runs as when qshd runs as root (required then; not root).
+    pub authorized_keys_command_user: Option<String>,
     /// How long an interactive session survives without its client (seconds),
     /// so it can be resumed after a network outage. 0 turns this off.
     pub session_timeout: u64,
@@ -95,6 +100,8 @@ impl Default for ServerConfig {
             totp: Totp::Optional,
             host_certificate: None,
             revoked_keys: None,
+            authorized_keys_command: None,
+            authorized_keys_command_user: None,
             session_timeout: 3600,
         }
     }
@@ -123,6 +130,10 @@ impl ServerConfig {
             if value == 0 {
                 anyhow::bail!("{name} must be at least 1");
             }
+        }
+        #[cfg(unix)]
+        if let Some(cmd) = &self.authorized_keys_command {
+            crate::server::keys_command::validate(cmd)?;
         }
         Ok(())
     }

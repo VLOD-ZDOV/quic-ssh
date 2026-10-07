@@ -2085,3 +2085,47 @@ fn sharing_falls_back_when_the_socket_cannot_be_made() {
     assert_eq!(stdout(&out), "still works\n");
     assert!(stderr(&out).contains("not sharing"), "{}", stderr(&out));
 }
+
+/// A directory whose ancestors only root or this user can write to.
+fn safe_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let me = nix::unistd::geteuid().as_raw();
+    let candidates = [PathBuf::from(env!("CARGO_TARGET_TMPDIR")), std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cache")];
+    candidates.into_iter().find(|dir| {
+        std::fs::create_dir_all(dir).is_ok()
+            && dir.ancestors().all(|p| std::fs::metadata(p).is_ok_and(|m| (m.uid() == 0 || m.uid() == me) && m.mode() & 0o022 == 0))
+    })
+}
+
+/// `authorized_keys_command`: keys printed by a program, with tokens; an
+/// unsafe program (writable by others) is not run.
+#[test]
+fn keys_from_a_command() {
+    let c = Client::new();
+    let out = c.run(&["keygen"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let public = std::fs::read_to_string(c.home.path().join(".config/qsh/id_ed25519.pub")).unwrap();
+    // Not below a directory others can write to (like /tmp): those are refused.
+    let Some(base) = safe_dir() else {
+        return eprintln!("skipped: no directory here that only root and this user can write to");
+    };
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let keys = dir.path().join("keys");
+    std::fs::write(&keys, &public).unwrap();
+    let log = dir.path().join("log");
+    let prog = dir.path().join("prog");
+    std::fs::write(&prog, format!("#!/bin/sh\necho \"$@\" >> {}\ncat {}\n", log.display(), keys.display())).unwrap();
+    std::fs::set_permissions(&prog, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let s = Server::start_with("127.0.0.1", &format!("authorized_keys_command = \"{} %u %t %f\"\n", prog.display()));
+    let port = s.port.to_string();
+    let out = c.run(&["--accept-new-host", "-p", &port, &dest(), "echo", "via-command"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "via-command\n");
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(args.starts_with(&format!("{} ssh-ed25519 SHA256:", user())), "{args}");
+    // Writable by others: refused, so the login fails.
+    std::fs::set_permissions(&prog, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "an unsafe command was used");
+}
