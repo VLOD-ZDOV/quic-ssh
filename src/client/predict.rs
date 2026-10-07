@@ -114,8 +114,9 @@ struct Watch {
 }
 
 /// DEC private modes that do not change what is on the screen or where the
-/// cursor is (focus and mouse reports, blinking, synchronized output).
-const QUIET_MODES: [u16; 9] = [12, 1004, 1005, 1006, 1015, 1016, 2026, 2027, 2031];
+/// cursor is: mouse and focus reports, blinking, meta/alt key handling
+/// (macOS bash sends `?1034h`), urgency hints, synchronized output.
+const QUIET_MODES: [u16; 20] = [9, 12, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1034, 1035, 1036, 1039, 1042, 1043, 2026, 2027, 2031];
 
 impl vt100::Callbacks for Watch {
     fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, b: u8) {
@@ -578,6 +579,17 @@ mod tests {
         h.server("c");
         h.key("d");
         assert_eq!(h.line(), "$ cd", "trusted again after a full redraw");
+    }
+
+    /// Harmless mode switches (macOS bash's meta key mode) keep predictions on.
+    #[test]
+    fn harmless_modes() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("\x1b[?1034h\x1b[?2004h$ ");
+        h.key("a");
+        h.server("a");
+        h.key("b");
+        assert_eq!(h.line(), "$ ab");
     }
 
     /// Not over a colored background: erasing would leave a hole.

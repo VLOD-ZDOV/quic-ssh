@@ -286,8 +286,8 @@ fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process
     std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let result = (|| {
         let sock = dir.join("ready");
-        let listener = std::os::unix::net::UnixListener::bind(&sock)?;
-        listener.set_nonblocking(true)?;
+        let listener = std::os::unix::net::UnixListener::bind(&sock).with_context(|| format!("cannot listen on {}", sock.display()))?;
+        listener.set_nonblocking(true).context("readiness socket")?;
         let mut child = std::process::Command::new(std::env::current_exe()?)
             // As typed: started as `ssh`, the child must know it too.
             .arg0(&args[0])
@@ -295,12 +295,13 @@ fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process
             .env_remove(DAEMON_FD)
             .env_remove(MASTER_FD)
             .env(env, &sock)
-            .spawn()?;
+            .spawn()
+            .context("cannot start qsh again")?;
         loop {
             match listener.accept() {
                 Ok((mut s, _)) => {
-                    s.set_nonblocking(false)?;
-                    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                    s.set_nonblocking(false).context("readiness connection")?;
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
                     let mut status = String::new();
                     let _ = s.read_to_string(&mut status);
                     return Ok((status.trim().to_string(), child));
@@ -311,7 +312,7 @@ fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(anyhow::Error::from(e).context("waiting for the background qsh")),
             }
         }
     })();
@@ -340,15 +341,16 @@ fn detach(env: &str, status: &str, quiet: bool) -> Result<()> {
     let Some(path) = std::env::var_os(env) else {
         return Ok(());
     };
+    // Report first: once stderr is gone, an error could not be seen.
+    let mut parent = std::os::unix::net::UnixStream::connect(&path).with_context(|| format!("cannot reach {}", Path::new(&path).display()))?;
     let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
-    nix::unistd::dup2_stdin(&null)?;
+    nix::unistd::dup2_stdin(&null).context("detaching stdin")?;
     if quiet {
-        nix::unistd::dup2_stdout(&null)?;
-        nix::unistd::dup2_stderr(&null)?;
+        nix::unistd::dup2_stdout(&null).context("detaching stdout")?;
+        nix::unistd::dup2_stderr(&null).context("detaching stderr")?;
     }
     let _ = nix::unistd::setsid();
-    let mut parent = std::os::unix::net::UnixStream::connect(path)?;
-    parent.write_all(status.as_bytes())?;
+    parent.write_all(status.as_bytes()).context("reporting to the parent")?;
     Ok(())
 }
 
