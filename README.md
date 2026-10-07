@@ -363,6 +363,17 @@ Compared with OpenSSH 10 (`ssh`/`scp` with default settings). The network is emu
 | qsh (QUIC) | **309 ms** | 70 Mbit/s | **107 Mbit/s** |
 | qsh (TCP fallback) | 337 ms | **107 Mbit/s** | 94 Mbit/s |
 
+**Memory** (RSS, OpenSSH 10.5 vs qsh; one session running a command):
+
+| | ssh / sshd | qsh / qshd |
+|---|---:|---:|
+| Server, idle | 8.6 MB | 7.5 MB |
+| Server, extra per session | +23 MB | +3–5 MB |
+| Client during a session | 11–13 MB | 9 MB |
+| Client, peak while sending 1 GiB | 11 MB | 17 MB |
+
+sshd starts separate processes for each connection; qshd serves all sessions in one process. The per-session figures include the remote command itself (about 1–2 MB).
+
 Takeaways:
 
 - **Connecting** is 3–3.4× faster than ssh on any link with noticeable latency. QUIC combines the transport and TLS handshakes into 1 RTT, while ssh spends several RTTs on version exchange, key exchange and authentication.
