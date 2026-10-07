@@ -468,6 +468,7 @@ qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agen
 cargo test                        # unit tests and end-to-end tests (real qshd/qsh on loopback)
 tests/system-mode.sh              # system mode (qshd as root): real root via sudo, or a user namespace without it
 cargo clippy --all-targets -- -D warnings
+QSH_FUZZ_ITERS=200000 cargo test --release --test fuzz   # longer run of the mutation tests
 python3 bench/bench.py            # benchmark against OpenSSH
 ```
 

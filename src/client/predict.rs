@@ -343,6 +343,56 @@ mod tests {
         assert_eq!(h.line(), "$ a", "fast link: no prediction");
     }
 
+    /// Random typing and server output (echoes, other text, cursor moves,
+    /// erasures, colors): whatever was predicted, once the predictions are
+    /// cleared the terminal shows exactly the server's screen.
+    #[test]
+    fn random_sessions_end_as_the_server_drew_them() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut drawn = 0;
+        let pieces = ["\r\n", "\x08", "\x1b[K", "\x1b[2D", "\x1b[C", "\x1b[31m", "\x1b[0m", "\x1b[5;10H", "\x1b[?25l", "\x1b[?25h", "$ ", "\x1b[2J", "\t"];
+        for round in 0..300 {
+            let mut h = Harness::new(if round % 2 == 0 { Mode::Always } else { Mode::Auto });
+            let mut typed: Vec<u8> = Vec::new();
+            for _ in 0..60 {
+                match rnd(4) {
+                    0 => {
+                        let c = if rnd(6) == 0 { b'\r' } else { b'a' + rnd(26) as u8 };
+                        typed.push(c);
+                        h.key(std::str::from_utf8(&[c]).unwrap());
+                        drawn += h.p.drawn;
+                    }
+                    // The echo of what was typed (sometimes only part of it).
+                    1 if !typed.is_empty() => {
+                        let n = 1 + rnd(typed.len() as u64) as usize;
+                        let echo: Vec<u8> = typed.drain(..n).map(|c| if c == b'\r' { b'\n' } else { c }).collect();
+                        h.server(&String::from_utf8(echo).unwrap());
+                    }
+                    2 => h.server(pieces[rnd(pieces.len() as u64) as usize]),
+                    _ => {
+                        let text: String = (0..rnd(5)).map(|_| (b'A' + rnd(26) as u8) as char).collect();
+                        h.server(&text);
+                    }
+                }
+                if rnd(10) == 0 {
+                    let late = h.now + Duration::from_secs(10);
+                    let out = h.p.expire(late);
+                    h.term.process(&out);
+                }
+            }
+            let out = h.p.clear();
+            h.term.process(&out);
+            h.same_as_server();
+        }
+        assert!(drawn > 300, "predictions were hardly ever drawn ({drawn})");
+    }
+
     #[test]
     fn edges() {
         let mut h = Harness::new(Mode::Always);

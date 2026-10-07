@@ -468,6 +468,7 @@ qsh 0.5 работает с qshd 0.4 и новее. Ключам, кроме Ed2
 cargo test                        # юнит-тесты и сквозные тесты (реальные qshd/qsh на loopback)
 tests/system-mode.sh              # системный режим (qshd от root): через sudo или без него, в user namespace
 cargo clippy --all-targets -- -D warnings
+QSH_FUZZ_ITERS=200000 cargo test --release --test fuzz   # долгий прогон тестов с мутациями
 python3 bench/bench.py            # бенчмарк против OpenSSH
 ```
 

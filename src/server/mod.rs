@@ -6,7 +6,7 @@ mod exec;
 mod files;
 pub mod helpers;
 mod persist;
-mod revoked;
+pub mod revoked;
 mod users;
 
 use std::collections::HashMap;
