@@ -274,6 +274,7 @@ const MASTER_FD: &str = "QSH_MASTER_FD";
 /// private directory named in `env`. Nothing is inherited, so a process the
 /// child starts later cannot keep this one waiting. Returns the word (empty
 /// if the child ended without one) and the child.
+#[cfg(unix)]
 fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process::Child)> {
     use std::io::Read;
     use std::os::unix::fs::DirBuilderExt;
