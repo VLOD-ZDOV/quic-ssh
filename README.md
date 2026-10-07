@@ -21,7 +21,9 @@ Features:
 - port forwarding: local (`-L`), remote (`-R`), SOCKS proxy (`-D`), stdio (`-W`) and jump hosts (`-J`);
 - file copy, including directories (`qsh cp -r`);
 - the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
-- Ed25519 key login only (your existing `~/.ssh/id_ed25519` works);
+- **sessions that survive network outages:** after a lost connection, qsh reconnects by itself and the shell is still there, with the output you missed;
+- key login with any SSH key (Ed25519, ECDSA, RSA, security keys), ssh-agent and agent forwarding (`-A`), OpenSSH user and host certificates;
+- optional one-time codes (TOTP) as a second factor, without PAM;
 - pairing with a one-time code, so you never copy keys by hand;
 - host aliases from your existing `~/.ssh/config` (`qsh myserver`).
 
@@ -127,6 +129,7 @@ qsh -N -R 8080:localhost:3000 host     # remote forward: host's port 8080 -> you
 qsh -N -D 1080 host                    # SOCKS4/5 proxy on localhost:1080
 qsh -J bastion user@internal           # through a jump host (both run qshd)
 qsh -f -N -L 5432:db:5432 host         # log in, then go to the background
+qsh -A host                            # forward your ssh-agent
 qsh cp file.txt user@host:dir/         # upload
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
@@ -143,7 +146,32 @@ Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after t
 
 In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
 
-The client key is chosen in this order: `-i FILE`, then the first Ed25519 `IdentityFile` from the config (see below), then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
+### Keys, ssh-agent and certificates
+
+qsh logs in with the same keys as ssh, in this order:
+
+1. **The TLS handshake key:** the first Ed25519 key among `-i`, the config's `IdentityFile`s, `~/.ssh/id_ed25519` and `~/.config/qsh/id_ed25519`. If the server accepts it, the login takes no extra round trip.
+2. **Otherwise, as in ssh:**
+   - certificates (`<key>-cert.pub`, `CertificateFile`);
+   - the keys in your ssh-agent (`SSH_AUTH_SOCK`, `IdentityAgent`; `IdentitiesOnly` is honoured);
+   - key files of any type: `-i`/`IdentityFile`, or by default `~/.ssh/id_rsa`, `id_ecdsa`, `id_ed25519`.
+
+   qsh first asks the server which keys it would accept, so a security key is only touched for a key that works. The signature is bound to the TLS session.
+
+Security keys (`sk-ssh-ed25519`, `sk-ecdsa`) work through ssh-agent (`ssh-add ~/.ssh/id_ed25519_sk`). Encrypted keys prompt for their passphrase. `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE` work as in OpenSSH.
+
+`-A` (or `ForwardAgent yes`) makes your agent available on the server through `SSH_AUTH_SOCK`. The socket sits in a private directory owned by you.
+
+### Sessions that survive disconnects
+
+A terminal session (a login shell, or a command with `-t`) is kept by the server for an hour after the connection is lost:
+
+- qsh notices the loss within about 15 s, reconnects by itself, and shows the output you missed. Full-screen programs redraw.
+- Wi-Fi to mobile switches, laptop sleep and short outages no longer kill your shell. Over QUIC, a change of address (NAT rebinding) usually needs no reconnect at all.
+- Keys typed during an outage are dropped, and `~.` gives up waiting.
+- Quitting normally (exit, `~.`, closing the terminal) ends the session on the server as usual.
+- Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port or agent forwarding are not kept.
+- `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh.
 
 ### Host aliases (`~/.ssh/config`)
 
@@ -162,7 +190,7 @@ qsh myserver                        # = qsh -i ~/.ssh/work_key root@203.0.113.10
 qsh cp backup.tar myserver:/srv/
 ```
 
-From `~/.ssh/config` qsh takes `HostName`, `User` and `IdentityFile` (only Ed25519 keys; others are skipped). `Port` is ignored there, because it is the SSH port. For qsh-specific settings, including the port, use `~/.config/qsh/config` with the same syntax; its values take precedence:
+From `~/.ssh/config` qsh takes `HostName`, `User` and `IdentityFile`. `Port` is ignored there, because it is the SSH port. For qsh-specific settings, including the port, use `~/.config/qsh/config` with the same syntax; its values take precedence:
 
 ```
 # ~/.config/qsh/config
@@ -170,7 +198,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (qsh only), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -254,13 +282,33 @@ max_startups_per_ip = 8         # ... from one IP address
 tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`
 gateway_ports = "no"            # -R listens on loopback only; "yes": all addresses; "clientspecified"
 
+max_auth_tries = 6              # failed key proofs per connection
+allow_agent_forwarding = true
+totp = "optional"               # one-time codes: "off", "optional" (for users who set them up), "required"
+session_timeout = 3600          # seconds a disconnected terminal session is kept; 0 = off
+# trusted_user_ca_keys = "/etc/qsh/user_ca.pub"   # CAs that sign user certificates (principal = user name)
+# host_certificate = "/etc/qsh/host_ed25519-cert.pub"   # used automatically if it exists
+
 [subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
 # sftp = "/usr/lib/openssh/sftp-server"   # found automatically if installed
 ```
 
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
 
-User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. Only `ssh-ed25519` lines count. Lines with options (`from=`, `command=` and so on) are **ignored**, because qsh cannot enforce those restrictions.
+User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. All key types work, except DSA and RSA below 2048 bits. These options are enforced:
+
+- `command=` (the original command goes to `SSH_ORIGINAL_COMMAND`; file transfer is refused);
+- `from=` (addresses and CIDR);
+- `restrict`, `no-pty`/`pty`, `no-port-forwarding`/`port-forwarding`, `no-agent-forwarding`/`agent-forwarding`;
+- `permitopen=`, `permitlisten=`, `expiry-time=`;
+- `cert-authority` with `principals=`;
+- `no-touch-required`, `verify-required`.
+
+A line with any other option is **not used at all**: a restriction qsh cannot enforce never turns into access.
+
+**Certificates.** Sign keys with `ssh-keygen -s ca -I id -n USER key.pub`, then trust the CA either server-wide (`trusted_user_ca_keys`) or per user with a `cert-authority` line. `force-command`, `source-address` and the `permit-*` extensions are enforced. For host certificates, sign the host key (`ssh-keygen -s ca -I host -h -n host.example.com /etc/qsh/host_ed25519.pub`) and add `@cert-authority *.example.com <CA key>` to `~/.config/qsh/known_hosts` or `~/.ssh/known_hosts` on clients: hosts with a valid certificate are trusted without the first-connection question. `@revoked` lines are honoured.
+
+**One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once. `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again.
 
 Logs go to stderr (journald). Set the level with `QSHD_LOG`, for example `QSHD_LOG=qsh=debug`.
 
@@ -309,13 +357,14 @@ python3 bench/bench.py
 
 - **Encryption** is TLS 1.3 only (rustls with ring), over both QUIC and TCP. There is no custom cryptography.
 - **The server** presents a self-signed certificate carrying its Ed25519 key. The client checks that key against `known_hosts` (TOFU, like ssh). If the key changes, the connection is dropped before any data is sent.
-- **The client** logs in with mutual TLS using its Ed25519 key. The signature is checked inside the TLS handshake, so the login is bound to the channel. There are no passwords at all.
+- **The client** logs in with mutual TLS using its Ed25519 key, or after the handshake with a signature by any SSH key or certificate over data bound to the TLS session. Either way, the login cannot be relayed to another connection. There are no passwords at all. A second factor (TOTP) can be added.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code is single-use (burned after the first attempt, even a failed one) and expires after 10 minutes.
 - **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. Like sshd, file transfers and subsystems (sftp) start through the user's login shell, so `nologin` or `git-shell` also block them. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules.
 - **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout.
 - **Directory copy** (`cp -r`) unpacks only regular files and directories. Absolute paths, `..`, links and device files are refused, and setuid/setgid bits are dropped, so a malicious server cannot write outside the target directory.
 - **Port forwarding** in system mode connects as the user, not as root, so firewall rules based on uid apply. Accounts whose expiry date has passed (`chage -E`, `usermod -e`) are refused.
-- **Disconnects:** if the client goes away, the session's whole process group gets SIGHUP, then SIGKILL after 2 s. Unlike ssh, a command without a PTY does not keep running unattended. On SIGINT/SIGTERM/SIGHUP the client closes the connection cleanly, so the server knows right away instead of waiting for the timeout.
+- **Disconnects:** a command without a terminal is stopped when its client goes away: its whole process group gets SIGHUP, then SIGKILL after 2 s. Unlike ssh, it does not keep running unattended. A terminal session is kept for `session_timeout` so the client can resume it; only a client of the same user that holds the session's 128-bit token can do that. On SIGINT/SIGTERM/SIGHUP the client ends the session and closes the connection cleanly.
+- **Agent forwarding** uses a socket in a fresh private directory owned by the user. Connections from other users are refused (checked with `SO_PEERCRED`). The socket is removed when the client disconnects.
 
 All OpenSSH security advisories since 2006 have been checked against qsh. Each one is either not applicable, covered by a test that reproduces the attack, or fixed; see [docs/openssh-cve-review.md](docs/openssh-cve-review.md). Dependencies are checked with `cargo audit` in CI.
 
@@ -323,16 +372,16 @@ This is still a young project and has not had an external audit. For critical sy
 
 ## Limitations
 
-- No PAM (2FA, `pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login).
-- No agent forwarding (`-A`), X11, tunnels (`-w`) or connection sharing (`ControlMaster`).
-- Only Ed25519 keys, and authorized_keys lines with options are skipped.
+- No PAM (`pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP).
+- No X11, tunnels (`-w`) or connection sharing (`ControlMaster`).
+- Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.
 - Linux/Unix only.
 
 ### Upgrading
 
-qsh 0.4 needs qshd 0.4 or newer on the server; older servers reject it with "unsupported protocol version". Update qshd first. From 0.4 on, servers accept newer clients, and features the server lacks fail with a clear error.
+qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
 
 ## Development
 

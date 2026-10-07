@@ -16,11 +16,15 @@ use crate::transport::{Conn, RecvHalf, SendHalf};
 
 /// The forwarded agent socket of one connection, for its sessions' `SSH_AUTH_SOCK`.
 #[derive(Default)]
-pub struct AgentSocket(Mutex<Option<PathBuf>>);
+pub struct AgentSocket {
+    /// Set while a forwarding is being set up or active (one per connection).
+    active: std::sync::atomic::AtomicBool,
+    path: Mutex<Option<PathBuf>>,
+}
 
 impl AgentSocket {
     pub fn path(&self) -> Option<PathBuf> {
-        self.0.lock().unwrap().clone()
+        self.path.lock().unwrap().clone()
     }
 }
 
@@ -58,18 +62,29 @@ fn cleanup(path: &Path) {
 }
 
 /// Serves `Request::AgentForward` until the client closes the request stream.
-pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, user: &User, socket: &AgentSocket) -> Result<()> {
-    if socket.path().is_some() {
+pub async fn forward(mut send: SendHalf, recv: RecvHalf, conn: Arc<Conn>, user: &User, socket: &AgentSocket) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    if socket.active.swap(true, Ordering::SeqCst) {
         return write_msg(&mut send, &Reply::Err("agent forwarding is already active".into())).await;
     }
     let (listener, path) = match listen(user) {
         Ok(x) => x,
-        Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
+        Err(e) => {
+            socket.active.store(false, Ordering::SeqCst);
+            return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await;
+        }
     };
-    *socket.0.lock().unwrap() = Some(path.clone());
+    *socket.path.lock().unwrap() = Some(path.clone());
+    let result = serve(send, recv, conn, user, listener, &path).await;
+    *socket.path.lock().unwrap() = None;
+    cleanup(&path);
+    socket.active.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn serve(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, user: &User, listener: UnixListener, path: &Path) -> Result<()> {
     write_msg(&mut send, &Reply::Ok).await?;
     debug!("{}: agent forwarded at {}", user.name, path.display());
-
     let uid = user.uid;
     let mut probe = [0u8; 1];
     loop {
@@ -102,7 +117,5 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, us
             _ = recv.read(&mut probe) => break,
         }
     }
-    *socket.0.lock().unwrap() = None;
-    cleanup(&path);
     Ok(())
 }

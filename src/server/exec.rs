@@ -134,7 +134,7 @@ async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap:
 /// Stops a session whose client is gone: SIGHUP to its process group (like a
 /// terminal hangup), then SIGKILL if it is still running after a grace period.
 /// The child leads its own group (`process_group(0)` or `setsid` for a PTY).
-async fn hang_up(child: &mut tokio::process::Child) {
+pub(super) async fn hang_up(child: &mut tokio::process::Child) {
     let Some(pid) = child.id() else { return };
     let group = nix::unistd::Pid::from_raw(-(pid as i32));
     hang_up_group(group, child.wait()).await;

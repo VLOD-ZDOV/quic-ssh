@@ -154,7 +154,7 @@ impl Keyring {
             Signer::Tls => Ok(tls.ssh_sign(data)),
             Signer::Agent => self.agent.as_mut().context("agent went away")?.sign(&c.blob, data).await,
             Signer::File(path) => {
-                let key = load_private(path, batch)?;
+                let key = crate::keys::load_private_key(path, !batch)?;
                 let sig = sign_with(&key, data).with_context(|| format!("cannot sign with {}", path.display()))?;
                 Ok(Vec::try_from(sig)?)
             }
@@ -188,36 +188,21 @@ fn cert_key_blob(blob: &[u8]) -> Option<Vec<u8>> {
     ssh_key::PublicKey::from(cert.public_key().clone()).to_bytes().ok()
 }
 
-/// Key files this process has decrypted, so a reconnect does not ask again.
-fn decrypted() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
-fn load_private(path: &Path, batch: bool) -> Result<PrivateKey> {
-    if let Some(key) = decrypted().lock().unwrap().get(path) {
-        return Ok(key.clone());
-    }
-    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let key = PrivateKey::from_openssh(&text).with_context(|| format!("cannot parse {}", path.display()))?;
-    if !key.is_encrypted() {
-        return Ok(key);
-    }
-    if batch {
-        bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
-    }
-    let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
-    let key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
-    decrypted().lock().unwrap().insert(path.to_path_buf(), key.clone());
-    Ok(key)
+/// Server-chosen text, made safe to show: no control characters (no escape
+/// sequences that could redraw the terminal or fake a local prompt), at most
+/// 200 characters, and marked as coming from the server.
+fn server_text(text: &str) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
+    format!("(server) {clean}")
 }
 
 /// Answers a server question (a one-time code) on the terminal or through askpass.
 fn ask(text: &str, echo: bool, batch: bool) -> Result<String> {
+    let text = server_text(text);
     if batch {
-        bail!("the server asks {text:?}, but prompting is disabled (BatchMode)");
+        return Err(super::LoginRefused(format!("the server asks {text:?}, but prompting is disabled (BatchMode)")).into());
     }
-    if echo { crate::prompt::line(text) } else { crate::prompt::secret(text) }
+    if echo { crate::prompt::line(&text) } else { crate::prompt::secret(&text) }
 }
 
 /// What the login ended with.
@@ -235,7 +220,7 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
         reply = match reply {
             Reply::Ok => return Ok(Outcome::Welcome(3)),
             Reply::Welcome { version } => return Ok(Outcome::Welcome(version)),
-            Reply::Err(e) => return Ok(Outcome::Denied(e)),
+            Reply::Err(e) => return Ok(Outcome::Denied(server_text(&e).trim_start_matches("(server) ").to_string())),
             Reply::Prompt { text, echo } => {
                 let answer = ask(&text, echo, target.batch_mode)?;
                 write_msg(send, &Auth::Response(answer)).await?;
@@ -280,4 +265,15 @@ async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: 
     }
     write_msg(send, &Auth::Done).await?;
     read_msg(recv).await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn server_text_is_defused() {
+        let t = super::server_text("Code\x1b[2J\x1b]0;x\x07: \r\nEnter passphrase for ~/.ssh/id_ed25519:");
+        assert!(!t.chars().any(char::is_control), "{t:?}");
+        assert!(t.starts_with("(server) "));
+        assert!(super::server_text(&"x".repeat(1000)).len() < 220);
+    }
 }

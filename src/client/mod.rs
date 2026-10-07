@@ -92,6 +92,18 @@ pub struct Target {
     pub sources: config::Sources,
 }
 
+/// The server refused the login (as opposed to a network problem).
+#[derive(Debug)]
+pub struct LoginRefused(pub String);
+
+impl std::fmt::Display for LoginRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LoginRefused {}
+
 /// Host names and aliases: no option-looking names, whitespace or control
 /// characters (they could reach ssh's argument list or %-expansions).
 fn valid_host(host: &str) -> bool {
@@ -567,11 +579,14 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
         }
         Ok(auth::Outcome::Denied(e)) => {
             conn.close().await;
-            bail!(
+            if opts.resume.is_some() {
+                return Err(LoginRefused(e).into());
+            }
+            Err(LoginRefused(format!(
                 "{e} for {}@{}.\nAdd your key on the server with `qsh pair`, or to ~/.ssh/authorized_keys there (ssh-copy-id).",
-                target.user,
-                target.host,
-            );
+                target.user, target.host,
+            ))
+            .into())
         }
         Err(e) => {
             conn.close().await;

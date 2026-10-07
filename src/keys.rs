@@ -1,7 +1,10 @@
 //! Ed25519 identities, OpenSSH key formats and key-list files.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -106,27 +109,10 @@ impl Identity {
     /// Like [`Identity::load`]; without `prompt`, an encrypted key is an error
     /// unless this process already decrypted it (reconnects never prompt).
     pub fn load_with(path: &Path, prompt: bool) -> Result<Identity> {
-        if let Some(id) = decrypted_cache().lock().unwrap().get(path) {
-            return Ok(id.clone());
+        if !Identity::is_ed25519_file(path) && path.exists() {
+            bail!("{} is not an ed25519 key", path.display());
         }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("cannot read key {}", path.display()))?;
-        let mut key = PrivateKey::from_openssh(&text)
-            .with_context(|| format!("cannot parse key {}", path.display()))?;
-        if key.algorithm() != ssh_key::Algorithm::Ed25519 {
-            bail!("{} is not an ed25519 key (only ed25519 is supported)", path.display());
-        }
-        if key.is_encrypted() {
-            if !prompt {
-                bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
-            }
-            let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
-            key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
-            if let KeypairData::Ed25519(kp) = key.key_data() {
-                let id = Identity { signing: SigningKey::from_bytes(&kp.private.to_bytes()) };
-                decrypted_cache().lock().unwrap().insert(path.to_path_buf(), id);
-            }
-        }
+        let key = load_private_key(path, prompt)?;
         match key.key_data() {
             KeypairData::Ed25519(kp) => Ok(Identity {
                 signing: SigningKey::from_bytes(&kp.private.to_bytes()),
@@ -143,12 +129,7 @@ impl Identity {
         let kp = Ed25519Keypair::from(&self.signing);
         let key = PrivateKey::new(KeypairData::Ed25519(kp), comment)?;
         let text = key.to_openssh(LineEnding::LF)?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("cannot create {}", path.display()))?;
+        let mut f = crate::platform::create_private(path).with_context(|| format!("cannot create {}", path.display()))?;
         f.write_all(text.as_bytes())?;
         let mut pub_path = path.as_os_str().to_owned();
         pub_path.push(".pub");
@@ -167,17 +148,38 @@ impl Identity {
     }
 }
 
-/// Keys this process has decrypted, so a reconnect does not ask again.
-fn decrypted_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Identity>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Identity>>> = std::sync::OnceLock::new();
+/// Key files this process has decrypted, so a reconnect does not ask again.
+fn decrypted_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+
+/// Loads an OpenSSH private key of any type, asking for the passphrase of an
+/// encrypted one (unless `prompt` is false). Decrypted keys are remembered for
+/// the life of the process.
+pub fn load_private_key(path: &Path, prompt: bool) -> Result<PrivateKey> {
+    if let Some(key) = decrypted_cache().lock().unwrap().get(path) {
+        return Ok(key.clone());
+    }
+    let text = fs::read_to_string(path).with_context(|| format!("cannot read key {}", path.display()))?;
+    let key = PrivateKey::from_openssh(&text).with_context(|| format!("cannot parse key {}", path.display()))?;
+    if !key.is_encrypted() {
+        return Ok(key);
+    }
+    if !prompt {
+        bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
+    }
+    let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
+    let key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
+    decrypted_cache().lock().unwrap().insert(path.to_path_buf(), key.clone());
+    Ok(key)
 }
 
 /// Creates a directory (and parents) with mode 0700 for the leaf.
 pub fn create_private_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        crate::platform::set_mode(dir, 0o700)?;
     }
     Ok(())
 }
@@ -194,6 +196,7 @@ pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
         .collect()
 }
 
+#[cfg(unix)]
 /// Checks that `path` and every directory from it up to `top` is owned by
 /// `uid` or root and not group/world writable (otherwise someone else could
 /// swap the file).
@@ -222,6 +225,7 @@ fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Opens a file the way sshd's StrictModes reads authorized_keys: no symlink
 /// at the end, and the file and its directories up to `home` owned by `uid`
 /// (or root) and not group/world writable. `Ok(None)` if it does not exist.
@@ -242,6 +246,7 @@ fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
     Ok(Some(f))
 }
 
+#[cfg(unix)]
 fn read_limited(f: fs::File) -> Result<String> {
     use std::io::Read;
     let mut text = String::new();
@@ -249,6 +254,7 @@ fn read_limited(f: fs::File) -> Result<String> {
     Ok(text)
 }
 
+#[cfg(unix)]
 /// Reads an authorized_keys-style file with StrictModes checks (see
 /// [`open_strict`]). A missing file reads as empty.
 pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
@@ -258,6 +264,7 @@ pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
     }
 }
 
+#[cfg(unix)]
 /// Like [`read_strict`] for secrets: the file must also be private (no
 /// permissions for group or others). `Ok(None)` if it does not exist.
 pub fn read_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<String>> {
@@ -268,6 +275,7 @@ pub fn read_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<
     read_limited(f).map(Some)
 }
 
+#[cfg(unix)]
 /// The Ed25519 keys of an authorized_keys-style file read with [`read_strict`].
 pub fn read_key_list_strict(path: &Path, home: &Path, uid: u32) -> Result<Vec<PublicKey>> {
     Ok(parse_key_list(&read_strict(path, home, uid)?))
@@ -298,6 +306,7 @@ mod tests {
         assert_eq!(parse_key_list(&text), vec![a]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn strict_read_rejects_writable_dirs() {
         use std::os::unix::fs::PermissionsExt;
@@ -328,7 +337,7 @@ mod tests {
         let (again, created) = Identity::load_or_generate(&path, "c").unwrap();
         assert!(!created);
         assert_eq!(id.public(), again.public());
-        let mode = fs::metadata(&path).unwrap().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     }
 }

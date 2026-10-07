@@ -1605,3 +1605,50 @@ fn hangup_ends_a_persistent_session() {
         sleep(Duration::from_millis(50));
     }
 }
+
+/// A login with a resume token skips the one-time code, so it must not give
+/// more than the resumed session: no commands, files or forwarding.
+#[test]
+fn resume_login_can_only_resume() {
+    use qsh::client::{self, ConnectOptions, Target};
+    use qsh::proto::{read_msg, write_msg, PtySpec, Reply, Request};
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut target = Target::parse_with(&dest(), Some(s.port), Some(c.home.path()), false).unwrap();
+        target.identity_agent = Some(None);
+        target.known_hosts_file = Some(c.home.path().join(".config/qsh/known_hosts"));
+        let key = c.home.path().join(".config/qsh/id_ed25519");
+        let opts = ConnectOptions { identities: vec![key], ..Default::default() };
+        // A persistent session over a normal login.
+        let conn = client::connect(&target, &opts).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let pty = PtySpec { term: "xterm".into(), cols: 80, rows: 24 };
+        write_msg(&mut send, &Request::Persistent { command: Some("sleep 30".into()), env: vec![], pty }).await.unwrap();
+        let Reply::Session { token } = read_msg(&mut recv).await.unwrap() else { panic!("no session") };
+        // A resume login works, but only for Resume of that token.
+        let resumed = client::connect(&target, &ConnectOptions { resume: Some(token.clone()), ..opts.clone() }).await.unwrap();
+        for request in [
+            Request::Exec { command: Some("id".into()), env: vec![], pty: None },
+            Request::Download { path: ".config/qsh/authorized_keys".into() },
+            Request::DirectTcp { host: "127.0.0.1".into(), port: s.port },
+            Request::Resume { token: vec![0; 16], received: 0 },
+        ] {
+            let (mut send, mut recv) = resumed.open_bi().await.unwrap();
+            write_msg(&mut send, &request).await.unwrap();
+            match read_msg::<_, Reply>(&mut recv).await.unwrap() {
+                Reply::Err(e) => assert!(e.contains("only resume"), "{e}"),
+                other => panic!("{request:?} was answered with {other:?}"),
+            }
+        }
+        let (mut send, mut recv) = resumed.open_bi().await.unwrap();
+        write_msg(&mut send, &Request::Resume { token, received: 0 }).await.unwrap();
+        assert!(matches!(read_msg::<_, Reply>(&mut recv).await.unwrap(), Reply::Session { .. }));
+        // An unknown token is refused at login.
+        let refused = client::connect(&target, &ConnectOptions { resume: Some(vec![7; 16]), ..opts.clone() }).await;
+        let err = refused.err().expect("unknown token accepted");
+        assert!(format!("{err:#}").contains("session is gone"), "{err:#}");
+        drop(conn);
+    });
+}

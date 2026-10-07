@@ -141,6 +141,8 @@ pub type Reconnect = Arc<dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, 
 /// count the connection as lost after 3 unanswered pings.
 const DEFAULT_ALIVE: (Duration, u32) = (Duration::from_secs(5), 3);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// How long quitting waits for the server to confirm the hangup.
+const HANGUP_WAIT: Duration = Duration::from_secs(3);
 
 /// Why a resume attempt failed.
 enum ResumeError {
@@ -150,7 +152,12 @@ enum ResumeError {
 }
 
 async fn resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Result<(Arc<Conn>, SendHalf, RecvHalf), ResumeError> {
-    let conn = reconnect(token.to_vec()).await.map_err(ResumeError::Retry)?;
+    // A refused login (the session expired, or a question that cannot be
+    // asked now) will not get better by retrying.
+    let conn = reconnect(token.to_vec()).await.map_err(|e| match e.downcast_ref::<super::LoginRefused>() {
+        Some(refused) => ResumeError::Gone(refused.0.clone()),
+        None => ResumeError::Retry(e),
+    })?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(ResumeError::Retry)?;
     write_msg(&mut send, &Request::Resume { token: token.to_vec(), received }).await.map_err(ResumeError::Retry)?;
     match read_msg_opt::<_, Reply>(&mut recv).await {
@@ -200,11 +207,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // is no working stream are dropped (typing during an outage is lost).
     let (sink_tx, mut sink_rx) = mpsc::channel::<SendHalf>(1);
     sink_tx.send(send).await.ok();
-    let hung_up = Arc::new(tokio::sync::Notify::new());
     // Only a person typing into a terminal needs timing protection.
     let mut obfuscator = keystroke_interval.filter(|_| raw.is_some()).map(Obfuscator::new);
     let writer = {
-        let hung_up = hung_up.clone();
         tokio::spawn(async move {
             let mut sink: Option<SendHalf> = None;
             loop {
@@ -216,6 +221,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     }
                 };
                 let out: Vec<ClientMsg> = tokio::select! {
+                    // A new stream first, so messages queued after a reconnect go to it.
+                    biased;
                     new = sink_rx.recv() => match new {
                         Some(s) => {
                             sink = Some(s);
@@ -231,14 +238,10 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     () = tick => obfuscator.as_mut().and_then(|o| o.tick(std::time::Instant::now())).into_iter().collect(),
                 };
                 for msg in out {
-                    let hangup = matches!(msg, ClientMsg::Hangup);
                     if let Some(s) = sink.as_mut() {
                         if write_msg(s, &msg).await.is_err() {
                             sink = None;
                         }
-                    }
-                    if hangup {
-                        hung_up.notify_one();
                     }
                 }
             }
@@ -304,12 +307,24 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    // Ends a persistent session for good (not kept for a reconnect).
-    let hang_up = |tx: mpsc::Sender<ClientMsg>, hung_up: Arc<tokio::sync::Notify>| async move {
-        if tx.send(ClientMsg::Hangup).await.is_ok() {
-            let _ = tokio::time::timeout(Duration::from_secs(1), hung_up.notified()).await;
+    // Ends a persistent session for good (not kept for a reconnect), and
+    // waits for the server's exit report so the hangup is not lost when the
+    // connection closes right after it.
+    async fn hang_up(tx: &mpsc::Sender<ClientMsg>, recv: &mut RecvHalf) {
+        if tx.send(ClientMsg::Hangup).await.is_err() {
+            return;
         }
-    };
+        let _ = tokio::time::timeout(HANGUP_WAIT, async {
+            loop {
+                match read_msg_opt::<_, ServerMsg>(recv).await {
+                    Ok(Some(ServerMsg::Exit { .. })) | Ok(None) => break,
+                    Err(e) if !e.is::<crate::proto::Malformed>() => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+    }
     let mut received: u64 = 0;
     let mut last_heard = tokio::time::Instant::now();
     let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
@@ -344,13 +359,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             },
             code = &mut stop => {
                 if token.is_some() {
-                    hang_up(tx.clone(), hung_up.clone()).await;
+                    hang_up(&tx, &mut recv).await;
                 }
                 break code;
             }
             () = disconnect.notified() => {
                 if token.is_some() {
-                    hang_up(tx.clone(), hung_up.clone()).await;
+                    hang_up(&tx, &mut recv).await;
                 }
                 let _ = stderr.write_all(b"\r\nConnection closed.\r\n").await;
                 break 255;

@@ -222,10 +222,16 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         return Ok(());
     };
     // Resuming a session that this user started after a full login: the
-    // session token stands in for the second factor (so no prompt is needed).
-    let resuming = resume.is_some_and(|t| state.sessions.owns(&t, user.uid));
+    // session token stands in for the second factor, but such a connection
+    // can do nothing except resume that one session (see StreamCtx::resume_only).
+    if let Some(token) = &resume {
+        if !state.sessions.owns(token, user.uid) {
+            write_msg(&mut send, &Reply::Err(persist::GONE.into())).await?;
+            return Ok(());
+        }
+    }
     let second = async {
-        if resuming {
+        if resume.is_some() {
             return Ok(Ok(()));
         }
         auth::second_factor(&mut send, &mut recv, &user, state.cfg.totp, version, &state.totp_used).await
@@ -247,10 +253,10 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     // finished sending on their stream.
     let (closed_tx, closed_rx) = watch::channel(false);
     while let Some((send, recv)) = conn.accept_bi().await {
-        let (user, state, closed, conn, grant, agent) =
-            (user.clone(), state.clone(), closed_rx.clone(), conn.clone(), grant.clone(), agent.clone());
+        let (user, state, closed, conn, grant, agent, resume) =
+            (user.clone(), state.clone(), closed_rx.clone(), conn.clone(), grant.clone(), agent.clone(), resume.clone());
         tokio::spawn(async move {
-            let ctx = StreamCtx { conn: &conn, user: &user, grant: &grant, state: &state, agent: &agent };
+            let ctx = StreamCtx { conn: &conn, user: &user, grant: &grant, state: &state, agent: &agent, resume_only: resume.as_deref() };
             if let Err(e) = handle_stream(send, recv, ctx, closed).await {
                 debug!("{addr}: stream error: {e:#}");
             }
@@ -268,10 +274,12 @@ struct StreamCtx<'a> {
     grant: &'a Grant,
     state: &'a State,
     agent: &'a agent::AgentSocket,
+    /// Logged in with `Hello::Resume` (no second factor): only this session may be resumed.
+    resume_only: Option<&'a [u8]>,
 }
 
 async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_>, closed: watch::Receiver<bool>) -> Result<()> {
-    let StreamCtx { conn, user, grant, state, agent } = ctx;
+    let StreamCtx { conn, user, grant, state, agent, resume_only } = ctx;
     let request = match read_msg(&mut recv).await {
         Ok(r) => r,
         // A request type from a newer client: say so instead of dropping the stream.
@@ -280,6 +288,11 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         }
         Err(e) => return Err(e),
     };
+    if let Some(allowed) = resume_only {
+        if !matches!(&request, Request::Resume { token, .. } if token == allowed) {
+            return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
+        }
+    }
     let limits = &grant.restrictions;
     // A forced command (`command=`, a certificate's force-command) replaces
     // whatever the client asked to run, which is passed on like sshd does.
@@ -304,9 +317,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if spec.pty.is_none() || !state.sessions.enabled() {
                 return exec::run(send, recv, user, spec, closed).await;
             }
-            state.sessions.start(send, recv, user, spec, closed).await
+            state.sessions.start(send, recv, user, limits, spec, closed).await
         }
-        Request::Resume { token, received } => state.sessions.resume(send, recv, user, &token, received, closed).await,
+        Request::Resume { token, received } => state.sessions.resume(send, recv, user, limits, &token, received, closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
         Request::Subsystem { name, env } => match subsystem_command(&state.cfg, &name) {
             Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None), closed).await,

@@ -10,11 +10,17 @@
 //! this exact TLS session and both certificates; a man in the middle cannot
 //! relay it. The code is deleted after the first attempt, so it allows one guess.
 
+#[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
@@ -23,7 +29,9 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity as SpakeId, Password, Spake2};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::keys::{create_private_dir, qsh_dir, PublicKey};
+#[cfg(unix)]
+use crate::keys::{create_private_dir, qsh_dir};
+use crate::keys::PublicKey;
 use crate::proto::{read_msg, write_msg, Reply};
 
 pub const CODE_TTL: Duration = Duration::from_secs(600);
@@ -47,15 +55,18 @@ pub fn normalize(code: &str) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn pending_path(home: &Path) -> PathBuf {
     qsh_dir(home).join("pending_pair")
 }
 
+#[cfg(unix)]
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Creates a new pending code for the user owning `home`, replacing any older one.
+#[cfg(unix)]
 pub fn create_pending(home: &Path) -> Result<String> {
     let code = generate_code();
     let path = pending_path(home);
@@ -73,6 +84,7 @@ pub fn create_pending(home: &Path) -> Result<String> {
 }
 
 /// Reads and deletes the pending code. Runs as the target user.
+#[cfg(unix)]
 pub fn take_pending(home: &Path) -> Result<String> {
     let path = pending_path(home);
     let mut f = match OpenOptions::new()
