@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use signature::Verifier;
 use ssh_key::public::{Ed25519PublicKey, KeyData};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::users::User;
 use crate::authkeys::{self, AuthorizedKey, Grant, Login, Offered};
@@ -73,9 +73,17 @@ pub fn tls_key(key: PublicKey) -> Offered {
     Offered::Key(KeyData::Ed25519(Ed25519PublicKey(key.0)))
 }
 
+/// Exact bit length of a big-endian unsigned integer (leading zero bits do not count).
+fn bit_length(bytes: &[u8]) -> usize {
+    match bytes.iter().position(|&b| b != 0) {
+        Some(i) => (bytes.len() - i) * 8 - bytes[i].leading_zeros() as usize,
+        None => 0,
+    }
+}
+
 fn key_allowed(key: &KeyData) -> Result<()> {
     if let KeyData::Rsa(rsa) = key {
-        let bits = rsa.n.as_positive_bytes().map(|b| b.len() * 8).unwrap_or(0);
+        let bits = rsa.n.as_positive_bytes().map(bit_length).unwrap_or(0);
         if bits < MIN_RSA_BITS {
             bail!("RSA key too small ({bits} bits, at least {MIN_RSA_BITS} needed)");
         }
@@ -130,7 +138,7 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
             Auth::Query { key } => {
                 queries += 1;
                 if queries > MAX_QUERIES {
-                    debug!("too many keys offered");
+                    warn!("{}: {} offered more than {MAX_QUERIES} keys; giving up", checker.login.ip, checker.login.user);
                     return Ok(None);
                 }
                 let ok = Offered::from_bytes(&key).is_ok_and(|o| checker.check(&o).is_ok());
@@ -158,7 +166,35 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
 const TOTP_TRIES: u32 = 3;
 
 /// The last accepted time step per user, so a code works only once.
-pub type UsedCodes = std::sync::Mutex<std::collections::HashMap<u32, u64>>;
+/// Wrong one-time codes per user allowed within [`TOTP_WINDOW`], over all
+/// connections (one connection only allows [`TOTP_TRIES`]).
+const TOTP_MAX_FAILURES: usize = 10;
+const TOTP_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// One-time code bookkeeping per uid: the last accepted time step (so a code
+/// works once) and recent failures (so codes cannot be guessed by reconnecting).
+#[derive(Default)]
+pub struct TotpState {
+    used: std::collections::HashMap<u32, u64>,
+    failures: std::collections::HashMap<u32, std::collections::VecDeque<std::time::Instant>>,
+}
+
+impl TotpState {
+    /// Recent failures of `uid`, forgetting those older than the window.
+    fn recent_failures(&mut self, uid: u32) -> usize {
+        let Some(list) = self.failures.get_mut(&uid) else { return 0 };
+        while list.front().is_some_and(|t| t.elapsed() > TOTP_WINDOW) {
+            list.pop_front();
+        }
+        if list.is_empty() {
+            self.failures.remove(&uid);
+            return 0;
+        }
+        list.len()
+    }
+}
+
+pub type UsedCodes = std::sync::Mutex<TotpState>;
 
 /// Second factor after a key: asks for a one-time code if the user has set
 /// one up (or if the server requires it). `Err(message)` = deny with that answer.
@@ -196,6 +232,10 @@ pub async fn second_factor(
         return Ok(Err("this account needs a one-time code; update qsh to 0.5 or newer".into()));
     }
     for _ in 0..TOTP_TRIES {
+        if used.lock().unwrap().recent_failures(user.uid) >= TOTP_MAX_FAILURES {
+            warn!("{}: too many wrong one-time codes recently; refusing for now", user.name);
+            return Ok(Err("too many wrong one-time codes; try again later".into()));
+        }
         write_msg(send, &Reply::Prompt { text: "One-time code: ".into(), echo: false }).await?;
         let answer = match read_msg::<_, Auth>(recv).await? {
             Auth::Response(a) => a,
@@ -203,15 +243,51 @@ pub async fn second_factor(
             _ => bail!("unexpected message while asking for a one-time code"),
         };
         {
-            let mut used = used.lock().unwrap();
-            let last = used.get(&user.uid).copied();
+            let mut state = used.lock().unwrap();
+            let last = state.used.get(&user.uid).copied();
             if let Some(step) = crate::totp::verify(&secret, &answer, now(), last) {
-                used.insert(user.uid, step);
+                state.used.insert(user.uid, step);
+                state.failures.remove(&user.uid);
                 return Ok(Ok(()));
             }
+            state.failures.entry(user.uid).or_default().push_back(std::time::Instant::now());
         }
         warn!("{}: wrong one-time code", user.name);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(Err("access denied".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rsa_with_modulus(n: &[u8]) -> KeyData {
+        KeyData::Rsa(ssh_key::public::RsaPublicKey {
+            e: ssh_key::Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: ssh_key::Mpint::from_positive_bytes(n).unwrap(),
+        })
+    }
+
+    #[test]
+    fn rsa_size_counts_real_bits() {
+        assert_eq!(bit_length(&[0x01, 0xff]), 9);
+        assert_eq!(bit_length(&[0x80, 0x00]), 16);
+        assert_eq!(bit_length(&[0, 0]), 0);
+        for (first, bits, ok) in [(0x01u8, 2041, false), (0x7f, 2047, false), (0x80, 2048, true)] {
+            let mut n = vec![0xffu8; 256];
+            n[0] = first;
+            assert_eq!(bit_length(&n), bits);
+            assert_eq!(key_allowed(&rsa_with_modulus(&n)).is_ok(), ok, "{bits} bits");
+        }
+    }
+
+    #[test]
+    fn totp_failures_are_counted_per_user_and_expire() {
+        let mut state = TotpState::default();
+        let old = std::time::Instant::now() - TOTP_WINDOW - Duration::from_secs(1);
+        state.failures.entry(7).or_default().extend([old, old, std::time::Instant::now()]);
+        assert_eq!(state.recent_failures(7), 1, "old failures are forgotten");
+        assert_eq!(state.recent_failures(8), 0);
+    }
 }

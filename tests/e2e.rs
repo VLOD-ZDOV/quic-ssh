@@ -1699,3 +1699,31 @@ fn nonblocking_stdio_from_the_parent() {
     assert_eq!(text, "through a non-blocking socket\n");
     assert!(status.success());
 }
+
+/// Wrong one-time codes are counted over all connections, so reconnecting
+/// does not give a key thief unlimited guesses.
+#[test]
+fn one_time_code_guessing_is_limited_across_connections() {
+    use qsh::totp;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let secret = b"another secret bytes";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let port = s.port.to_string();
+    let login = |answers: &[String]| {
+        let script = askpass_script(dir.path(), answers);
+        c.cmd(&["-p", &port, &dest(), "true"]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap()
+    };
+    let wrong = vec!["000000".to_string(); 3];
+    for _ in 0..4 {
+        assert!(!login(&wrong).status.success());
+    }
+    // Even the right code is refused now, until the window passes.
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let out = login(&[format!("{:06}", totp::code(secret, step))]);
+    assert!(!out.status.success(), "the right code was accepted during the lockout");
+    assert!(stderr(&out).contains("too many wrong one-time codes"), "{}", stderr(&out));
+}

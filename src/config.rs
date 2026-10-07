@@ -98,10 +98,43 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Loads `path` if it exists, otherwise returns defaults.
     pub fn load(path: &Path) -> Result<ServerConfig> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ServerConfig::default()),
-            Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+        let cfg: ServerConfig = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServerConfig::default(),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        };
+        cfg.validate().with_context(|| format!("invalid {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Limits of 0 would silently refuse every connection or login.
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("max_connections", self.max_connections),
+            ("max_startups", self.max_startups),
+            ("max_startups_per_ip", self.max_startups_per_ip),
+            ("max_auth_tries", self.max_auth_tries as usize),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} must be at least 1");
+            }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_limits_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qshd.toml");
+        std::fs::write(&path, "max_startups = 0\n").unwrap();
+        assert!(format!("{:#}", ServerConfig::load(&path).unwrap_err()).contains("max_startups must be at least 1"));
+        std::fs::write(&path, "max_startups = 1\n").unwrap();
+        assert!(ServerConfig::load(&path).is_ok());
+        assert!(ServerConfig::load(&dir.path().join("missing.toml")).is_ok());
     }
 }
