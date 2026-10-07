@@ -270,15 +270,19 @@ pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply
 pub struct Reader<T> {
     rx: tokio::sync::mpsc::Receiver<Result<Option<T>>>,
     task: tokio::task::JoinHandle<()>,
+    last: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 impl<T: DeserializeOwned + Send + 'static> Reader<T> {
     pub fn spawn<R: AsyncRead + Unpin + Send + 'static>(mut r: R) -> Reader<T> {
         // A few messages ahead at most, so flow control still reaches the sender.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let last = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let heard = last.clone();
         let task = tokio::spawn(async move {
             loop {
                 let msg = read_msg_opt::<_, T>(&mut r).await;
+                *heard.lock().unwrap() = std::time::Instant::now();
                 let more = match &msg {
                     Ok(Some(_)) => true,
                     Ok(None) => false,
@@ -289,7 +293,12 @@ impl<T: DeserializeOwned + Send + 'static> Reader<T> {
                 }
             }
         });
-        Reader { rx, task }
+        Reader { rx, task, last }
+    }
+
+    /// When the last message (or the end of the stream) arrived.
+    pub fn last_received(&self) -> std::time::Instant {
+        *self.last.lock().unwrap()
     }
 
     /// Like [`read_msg_opt`]; `Ok(None)` also after the end was reported once.

@@ -411,7 +411,6 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         .await;
     }
     let mut received: u64 = 0;
-    let mut last_heard = tokio::time::Instant::now();
     let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
     let (alive_interval, alive_max) = alive.unwrap_or(DEFAULT_ALIVE);
     let mut heartbeat = tokio::time::interval(alive_interval);
@@ -420,10 +419,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     async fn show<W: AsyncWriteExt + Unpin>(w: &mut W, predictor: &mut Option<Predictor>, data: &[u8]) -> std::io::Result<()> {
         match predictor {
             Some(p) => {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    p.resize(rows, cols);
-                }
-                w.write_all(&p.output(data, std::time::Instant::now())).await?;
+                let mut out = match crossterm::terminal::size() {
+                    Ok((cols, rows)) => p.resize(rows, cols),
+                    Err(_) => Vec::new(),
+                };
+                out.extend(p.output(data, std::time::Instant::now()));
+                w.write_all(&out).await?;
             }
             None => w.write_all(data).await?,
         }
@@ -442,7 +443,11 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let lost = tokio::select! {
             Some(data) = typed_rx.recv() => {
                 if let Some(p) = predictor.as_mut() {
-                    let out = p.typed(&data, std::time::Instant::now());
+                    let mut out = match crossterm::terminal::size() {
+                        Ok((cols, rows)) => p.resize(rows, cols),
+                        Err(_) => Vec::new(),
+                    };
+                    out.extend(p.typed(&data, std::time::Instant::now()));
                     if !out.is_empty() {
                         stdout.write_all(&out).await?;
                         stdout.flush().await?;
@@ -461,7 +466,6 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 // Unknown message type from a newer server: skip it.
                 Err(e) if e.is::<crate::proto::Malformed>() => continue,
                 Ok(Some(msg)) => {
-                    last_heard = tokio::time::Instant::now();
                     match msg {
                         ServerMsg::Stdout(d) => {
                             received += d.len() as u64;
@@ -492,7 +496,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 break 255;
             }
             _ = heartbeat.tick(), if alive.is_some() => {
-                let quiet = last_heard.elapsed();
+                // When a message last arrived, not when the loop got to it
+                // (writing to a stalled terminal must not look like silence).
+                let quiet = incoming.last_received().elapsed();
                 if quiet >= alive_interval {
                     // Chaff gets a Pong back; it looks like a keystroke on the wire.
                     let _ = tx.send(ClientMsg::Typed { data: Vec::new(), pad: vec![0; super::keystroke::PAD_TO] }).await;
@@ -543,7 +549,6 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         conn = new_conn;
         incoming = Reader::spawn(new_recv);
         let _ = sink_tx.send(new_send).await;
-        last_heard = tokio::time::Instant::now();
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
         // Two size changes make full-screen programs redraw what was lost.
         if let Ok((cols, rows)) = crossterm::terminal::size() {
@@ -553,6 +558,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             let _ = tx.send(ClientMsg::Resize { cols, rows }).await;
         }
     };
+    clear(&mut predictor).await;
     drop(tx);
     writer.abort();
     drop(raw);

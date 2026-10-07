@@ -340,7 +340,8 @@ In interactive sessions qsh hides the rhythm of your typing from anyone watching
 Like mosh, qsh shows what you type before the server's echo arrives, when echoes take longer than about 30 ms:
 
 - qsh keeps a copy of the screen as the server drew it. A typed character is drawn at the cursor only on an empty cell, and only after an earlier keystroke on the same line came back exactly as predicted.
-- Enter, arrows, Ctrl keys and the like start over: after a password prompt nothing is shown until the server itself echoes a character, so a hidden password is never drawn.
+- Enter, arrows, Ctrl keys and the like start over, and so does any output your typing did not cause (a prompt appearing): after a password prompt nothing is shown until the server itself echoes a character, so a hidden password is never drawn. A wrong guess, or a `*` echo of a masked prompt, confirms nothing until the next Enter or control key.
+- Output the emulator does not model (insert mode, repeated characters, saved cursor positions) pauses prediction until the screen is redrawn. Colored backgrounds and other scripts than Latin are not predicted.
 - When the server's output differs, the predicted characters are erased before it is shown, so the screen always ends up exactly as the server drew it.
 - `PredictiveEcho auto` (default), `yes` (also on fast links) or `no`, in `~/.config/qsh/config` or with `-o`.
 

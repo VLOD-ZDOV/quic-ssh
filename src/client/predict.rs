@@ -5,8 +5,11 @@
 //! screen is known. A typed printable character is predicted at the cursor
 //! when that cell is empty, and drawn once the current "epoch" is confirmed:
 //! an earlier prediction of it showed up on the server's screen. Every
-//! control key (Enter, arrows, ^C...) starts a new epoch, so after a
-//! password prompt nothing is drawn until the server echoes something.
+//! control key (Enter, arrows, ^C...) starts a new epoch, and so does
+//! output that typing did not cause, so after a password prompt nothing is
+//! drawn until the server echoes something. A wrong prediction (or a `*`
+//! echo) confirms nothing until the next control key, and output the
+//! emulator does not model stops predictions until the screen is redrawn.
 //!
 //! Before the server's output is written, drawn predictions are erased (they
 //! only ever cover empty cells), so what the terminal shows is the server's
@@ -102,6 +105,43 @@ impl Parse {
     }
 }
 
+/// Notices output the emulator does not model (insert mode, REP, saving
+/// the cursor, character sets...): after it, the emulator's screen may
+/// differ from the real terminal's.
+#[derive(Default)]
+struct Watch {
+    drifted: bool,
+}
+
+/// DEC private modes that do not change what is on the screen or where the
+/// cursor is (focus and mouse reports, blinking, synchronized output).
+const QUIET_MODES: [u16; 9] = [12, 1004, 1005, 1006, 1015, 1016, 2026, 2027, 2031];
+
+impl vt100::Callbacks for Watch {
+    fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, b: u8) {
+        // ST, and switching (back) to the ASCII character set.
+        let harmless = matches!((i1, b), (None, b'\\') | (Some(b'(' | b')' | b'*' | b'+'), b'B'));
+        self.drifted |= !harmless;
+    }
+
+    fn unhandled_csi(&mut self, _: &mut vt100::Screen, i1: Option<u8>, i2: Option<u8>, params: &[&[u16]], c: char) {
+        let harmless = match (i1, c) {
+            // Reports and window operations.
+            (None, 'c' | 'n' | 't' | 'x') => true,
+            // Keyboard protocols and terminal queries.
+            (Some(b'>' | b'=' | b'<'), _) => true,
+            // Cursor shape (CSI n SP q).
+            (Some(b' '), 'q') => true,
+            (Some(b'?'), 'n' | 'u') => true,
+            (Some(b'?'), 'h' | 'l') => params.iter().all(|p| p.iter().all(|m| QUIET_MODES.contains(m))),
+            // Mode queries (DECRQM, CSI ? n $ p).
+            (_, 'p') => i2 == Some(b'$'),
+            _ => false,
+        };
+        self.drifted |= !harmless;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Prediction {
     ch: u8,
@@ -114,7 +154,7 @@ struct Prediction {
 pub struct Predictor {
     mode: Mode,
     /// The screen as the server drew it (without predictions).
-    screen: vt100::Parser,
+    screen: vt100::Parser<Watch>,
     pending: VecDeque<Prediction>,
     /// How many of `pending` (from the front) are drawn on the terminal.
     drawn: usize,
@@ -124,35 +164,39 @@ pub struct Predictor {
     /// A control key was typed and the server has not answered since:
     /// where the next character goes is unknown.
     unsettled: bool,
+    /// A prediction was wrong: nothing counts as confirmed again until the
+    /// next control key (a masked prompt echoing `*` must not confirm).
+    burned: bool,
+    /// The emulator's screen matches the real terminal's (see [`Watch`]);
+    /// false from output it does not model until the screen is redrawn.
+    trusted: bool,
     srtt: Option<Duration>,
     slow: bool,
     /// The terminal is big enough (see [`usable_size`]); otherwise output
     /// passes through untouched and nothing is predicted.
     active: bool,
     parse: Parse,
-    /// Parameters of the CSI sequence being read, to follow insert mode.
+    /// Parameters of the CSI sequence being read.
     csi: Vec<u8>,
-    /// Insert mode (CSI 4 h) is on: a drawn character would push text
-    /// aside, and the emulator does not model that, so nothing is drawn.
-    insert: bool,
 }
 
 impl Predictor {
     pub fn new(mode: Mode, rows: u16, cols: u16) -> Predictor {
         Predictor {
             mode,
-            screen: vt100::Parser::new(rows.max(MIN_ROWS), cols.max(MIN_COLS), 0),
+            screen: vt100::Parser::new_with_callbacks(rows.max(MIN_ROWS), cols.max(MIN_COLS), 0, Watch::default()),
             pending: VecDeque::new(),
             drawn: 0,
             epoch: 1,
             confirmed: 0,
             unsettled: false,
+            burned: false,
+            trusted: true,
             srtt: None,
             slow: false,
             active: usable_size(rows, cols),
             parse: Parse::Ground,
             csi: Vec::new(),
-            insert: false,
         }
     }
 
@@ -160,17 +204,19 @@ impl Predictor {
     fn erase(&mut self, out: &mut Vec<u8>) {
         if self.drawn > 0 {
             // Back to where the server's cursor is, and blank what we drew
-            // (those cells are empty on the server's screen).
+            // (those cells are empty on the server's screen, in the current
+            // background color).
             out.extend_from_slice(format!("\x1b[{n}D\x1b[{n}X", n = self.drawn).as_bytes());
             self.drawn = 0;
         }
     }
 
-    /// Forgets all predictions (a new epoch must be confirmed first).
+    /// Forgets all predictions; nothing is trusted until the next control key.
     fn fail(&mut self, out: &mut Vec<u8>) {
         self.erase(out);
         self.pending.clear();
         self.epoch += 1;
+        self.burned = true;
     }
 
     fn may_draw(&self, p: &Prediction) -> bool {
@@ -179,7 +225,7 @@ impl Predictor {
             Mode::Always => true,
             Mode::Auto => self.slow,
         };
-        fast_enough && p.epoch <= self.confirmed && self.parse == Parse::Ground && !self.insert && !self.screen.screen().hide_cursor()
+        fast_enough && p.epoch <= self.confirmed && self.trusted && self.parse == Parse::Ground && !self.screen.screen().hide_cursor()
     }
 
     /// Draws pending predictions after the drawn ones, as far as allowed.
@@ -190,27 +236,40 @@ impl Predictor {
         }
     }
 
-    /// Whether `(row, col)` is empty on the server's screen and leaves room
-    /// for the cursor after it (no line wrap).
+    /// Whether `(row, col)` is empty on the server's screen, in the color
+    /// an erase would leave, with room for the cursor after it (no wrap).
     fn free(&self, row: u16, col: u16) -> bool {
         let screen = self.screen.screen();
         let (_, cols) = screen.size();
         // The second half of a wide character looks empty, but drawing there
         // would destroy the character.
-        col + 1 < cols && screen.cell(row, col).is_some_and(|c| !c.has_contents() && !c.is_wide_continuation())
+        col + 1 < cols
+            && !screen.inverse()
+            && screen
+                .cell(row, col)
+                // A space (as `\b \b` leaves) looks the same as an empty cell.
+                .is_some_and(|c| matches!(c.contents(), "" | " ") && !c.is_wide_continuation() && c.bgcolor() == screen.bgcolor())
     }
 
     /// Handles typed input (as sent to the server); returns bytes to write
     /// to the terminal.
     pub fn typed(&mut self, data: &[u8], now: Instant) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.mode == Mode::Never || !self.active {
+        // Unknown positions (see `trusted`): nothing to predict.
+        if self.mode == Mode::Never || !self.active || !self.trusted {
             return out;
         }
         // Control keys (and anything with them, like escape sequences) move
-        // the cursor in ways only the server knows.
-        if !data.iter().all(|b| (0x20..0x7f).contains(b)) {
+        // the cursor in ways only the server knows, and may answer a prompt.
+        if data.iter().any(|&b| b < 0x20 || b == 0x7f) {
             self.epoch += 1;
+            self.unsettled = true;
+            self.burned = false;
+            return out;
+        }
+        // Other scripts (UTF-8) are not predicted; where the cursor ends up
+        // is known again from the echo.
+        if !data.is_ascii() {
             self.unsettled = true;
             return out;
         }
@@ -231,6 +290,24 @@ impl Predictor {
         out
     }
 
+    /// Feeds output to the emulator a sequence at a time, so that output it
+    /// does not model and a full redraw are seen in their order.
+    fn process(&mut self, data: &[u8]) {
+        let mut rest = data;
+        while !rest.is_empty() {
+            let cut = rest[1..].iter().position(|&b| b == 0x1b).map_or(rest.len(), |i| i + 1);
+            let (part, tail) = rest.split_at(cut);
+            self.screen.process(part);
+            let redrawn = self.follow(part);
+            if std::mem::take(&mut self.screen.callbacks_mut().drifted) {
+                self.trusted = false;
+            } else if redrawn {
+                self.trusted = true;
+            }
+            rest = tail;
+        }
+    }
+
     /// Handles output from the server; returns the bytes to write instead.
     pub fn output(&mut self, data: &[u8], now: Instant) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len() + 16);
@@ -240,10 +317,15 @@ impl Predictor {
         }
         self.erase(&mut out);
         out.extend_from_slice(data);
-        self.screen.process(data);
-        self.follow_modes(data);
+        self.process(data);
         self.unsettled = false;
+        if !self.trusted {
+            self.pending.clear();
+            self.epoch += 1;
+            return out;
+        }
         // Predictions that are now on the server's screen are confirmed.
+        let mut explained = false;
         while let Some(p) = self.pending.front().copied() {
             let screen = self.screen.screen();
             let shown = screen.cell(p.row, p.col).is_some_and(|c| c.contents().as_bytes() == [p.ch]);
@@ -253,7 +335,11 @@ impl Predictor {
                 break;
             }
             self.pending.pop_front();
-            self.confirmed = self.confirmed.max(p.epoch);
+            explained = true;
+            // A `*` may be a masked password prompt answering any key.
+            if p.ch != b'*' && !self.burned {
+                self.confirmed = self.confirmed.max(p.epoch);
+            }
             self.sample(now.saturating_duration_since(p.typed));
         }
         // The rest must still start at the cursor, on empty cells.
@@ -263,30 +349,45 @@ impl Predictor {
             if !fits {
                 self.pending.clear();
                 self.epoch += 1;
+                self.burned = true;
             }
+        }
+        // Output that typing did not cause (a prompt, say) makes what comes
+        // next uncertain: it needs a confirmation of its own.
+        if !explained && !data.is_empty() {
+            self.epoch += 1;
         }
         self.draw(&mut out);
         out
     }
 
-    /// Follows the parser state and insert mode through server output.
-    fn follow_modes(&mut self, data: &[u8]) {
+    /// Follows the parser state through server output; returns whether the
+    /// screen was redrawn as a whole (cleared, reset, or the alternate
+    /// screen switched), after which the emulator matches the terminal again.
+    fn follow(&mut self, data: &[u8]) -> bool {
+        let mut redrawn = false;
         for &b in data {
             let before = self.parse;
             self.parse = self.parse.feed(&[b]);
             match (before, self.parse) {
                 (Parse::Escape, Parse::Csi) => self.csi.clear(),
                 (Parse::Csi, Parse::Csi) if self.csi.len() < 64 => self.csi.push(b),
-                (Parse::Csi, Parse::Ground) if b == b'h' || b == b'l' => {
-                    if !self.csi.starts_with(b"?") && self.csi.split(|&c| c == b';').any(|p| p == b"4") {
-                        self.insert = b == b'h';
-                    }
+                (Parse::Csi, Parse::Ground) => {
+                    let params = |p: &[u8]| self.csi.split(|&c| c == b';').any(|x| x == p);
+                    let private = self.csi.starts_with(b"?");
+                    let cleared = b == b'J' && !private && (params(b"2") || params(b"3"));
+                    let csi_private = self.csi.strip_prefix(b"?").unwrap_or(&[]).to_vec();
+                    let switched = matches!(b, b'h' | b'l')
+                        && private
+                        && csi_private.split(|&c| c == b';').any(|x| matches!(x, b"47" | b"1047" | b"1049"));
+                    redrawn |= cleared || switched;
                 }
                 // ESC c: a full reset.
-                (Parse::Escape, Parse::Ground) if b == b'c' => self.insert = false,
+                (Parse::Escape, Parse::Ground) if b == b'c' => redrawn = true,
                 _ => {}
             }
         }
+        redrawn
     }
 
     fn sample(&mut self, rtt: Duration) {
@@ -317,26 +418,31 @@ impl Predictor {
         out
     }
 
-    /// The terminal changed size: predictions are dropped (lines may reflow).
-    pub fn resize(&mut self, rows: u16, cols: u16) {
+    /// The terminal changed size: predictions are erased (while the cursor
+    /// is still where they were drawn) and dropped, as lines may reflow.
+    /// Returns the bytes for that.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Vec<u8> {
+        let mut out = Vec::new();
         let active = usable_size(rows, cols);
         if active == self.active && (!active || self.screen.screen().size() == (rows, cols)) {
-            return;
+            return out;
         }
+        self.erase(&mut out);
         if active && !self.active {
             // What the screen showed meanwhile is unknown: start from a blank one.
-            self.screen = vt100::Parser::new(rows, cols, 0);
+            self.screen = vt100::Parser::new_with_callbacks(rows, cols, 0, Watch::default());
+            self.parse = Parse::Ground;
         } else if active {
             self.screen.screen_mut().set_size(rows, cols);
         }
         self.active = active;
         self.pending.clear();
-        self.drawn = 0;
         self.epoch += 1;
+        out
     }
 
     /// Erases predictions before something else is written to the terminal
-    /// (qsh's own messages, a reconnect).
+    /// (qsh's own messages, a reconnect, the end of the session).
     pub fn clear(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         self.fail(&mut out);
@@ -413,11 +519,91 @@ mod tests {
         h.server("B");
         assert_eq!(h.line(), "> aB");
         h.same_as_server();
-        // Colored echo still confirms (the screen is compared, not the bytes).
+        // After a wrong guess, nothing is confirmed until a control key.
         h.key("d");
-        h.server("\x1b[31md\x1b[0m");
+        h.server("d");
         h.key("e");
-        assert_eq!(h.line(), "> aBde");
+        assert_eq!(h.line(), "> aBd");
+        h.server("e");
+        h.key("\x7f");
+        h.server("\x08 \x08");
+        h.key("x");
+        // Colored echo confirms (the screen is compared, not the bytes).
+        h.server("\x1b[31mx\x1b[0m");
+        h.key("y");
+        assert_eq!(h.line(), "> aBdxy");
+    }
+
+    /// Typed ahead, then a password prompt appears without a control key in
+    /// between (sudo after `make` finished): nothing is shown.
+    #[test]
+    fn prompt_after_type_ahead() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ make && sudo make install\r\n");
+        h.key("l");
+        h.server("l");
+        h.server("[sudo] password for u: ");
+        h.key("hunter2");
+        assert!(!h.term.screen().contents().contains("hunter"), "{}", h.term.screen().contents());
+    }
+
+    /// A masked prompt (sudo with pwfeedback) answers every key with `*`.
+    #[test]
+    fn masked_prompts() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("Password: ");
+        h.key("\r"); // whatever happened before
+        h.server("\r\nPassword: ");
+        for c in "a*sec".chars() {
+            h.key(&c.to_string());
+            let screen = h.term.screen().contents();
+            assert!(!screen.contains("*s") && !screen.contains("*e") && !screen.contains("*c"), "{screen}");
+            h.server("*");
+        }
+    }
+
+    /// Output the emulator does not model (REP, insert mode) stops
+    /// predictions until the screen is redrawn.
+    #[test]
+    fn unmodelled_output() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ ");
+        h.key("a");
+        h.server("a");
+        h.server("\x1b[5b");
+        h.key("b");
+        assert_eq!(h.line(), "$ a", "after REP the cursor position is unknown");
+        h.server("\x1b[2J\x1b[H$ ");
+        h.key("c");
+        h.server("c");
+        h.key("d");
+        assert_eq!(h.line(), "$ cd", "trusted again after a full redraw");
+    }
+
+    /// Not over a colored background: erasing would leave a hole.
+    #[test]
+    fn colored_lines() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("\x1b[44m\x1b[2K\x1b[0m$ ");
+        h.key("a");
+        h.server("a");
+        h.key("b");
+        assert_eq!(h.line(), "$ a");
+    }
+
+    /// A resize erases what is drawn while the cursor is still there.
+    #[test]
+    fn resize_erases() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ ");
+        h.key("a");
+        h.server("a");
+        h.key("bc");
+        assert_eq!(h.line(), "$ abc");
+        let out = h.p.resize(24, 60);
+        h.term.process(&out);
+        assert_eq!(h.line(), "$ a");
+        h.same_as_server();
     }
 
     #[test]
@@ -503,7 +689,7 @@ mod tests {
             h.term.process(&out);
             h.same_as_server();
         }
-        assert!(drawn > 300, "predictions were hardly ever drawn ({drawn})");
+        assert!(drawn > 30, "predictions were hardly ever drawn ({drawn})");
     }
 
     /// Server output made of random escape-sequence material (modes,
@@ -554,8 +740,7 @@ mod tests {
         h.key("b");
         assert_eq!(h.line(), "$ a", "drawn inside an escape sequence");
         h.server("1m");
-        h.key("c");
-        assert_eq!(h.line(), "$ abc", "drawn once the sequence is over");
+        assert_eq!(h.line(), "$ ab", "drawn once the sequence is over");
         let out = h.p.clear();
         h.term.process(&out);
         h.same_as_server();
@@ -571,10 +756,7 @@ mod tests {
         assert_eq!(h.line(), "$ a");
         h.server("b\x1b[4;12l");
         h.key("c");
-        assert_eq!(h.line(), "$ abc");
-        h.server("\x1b[?4h");
-        h.key("d");
-        assert_eq!(h.line(), "$ abcd", "private mode 4 is something else");
+        assert_eq!(h.line(), "$ ab", "the screen may differ until it is redrawn");
     }
 
     #[test]
