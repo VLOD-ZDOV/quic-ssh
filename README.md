@@ -107,6 +107,8 @@ On the client:
 qsh pair user@server k7f3-9qxm
 ```
 
+For a phone, `qshd pair --qr --host 203.0.113.10` also shows the command as a QR code: scan it with the camera and paste the text into Termux. `--host` sets the address in the command (by default the server's host name).
+
 `pair` adds the client key on the server (`~/.config/qsh/authorized_keys`) and pins the server key on the client (`~/.config/qsh/known_hosts`). If the client has no key yet, one is created at `~/.config/qsh/id_ed25519`.
 
 **3. Log in.**

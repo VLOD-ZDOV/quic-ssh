@@ -31,7 +31,14 @@ enum Cmd {
     /// Create the host key if needed and print its fingerprint
     Init,
     /// Create a one-time pairing code for the current user
-    Pair,
+    Pair {
+        /// Also show the client's command as a QR code (to scan with a phone)
+        #[arg(long)]
+        qr: bool,
+        /// Address clients should use (default: this machine's host name)
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+    },
     /// Set up one-time codes (TOTP) as a second factor for the current user
     Totp {
         /// Replace an existing secret
@@ -109,7 +116,7 @@ pub fn main() {
         Some(Cmd::InternalUntar { path, name }) => helpers::untar(&path, &name),
         Some(Cmd::InternalTar { path }) => helpers::tar(&path),
         Some(Cmd::Init) => init(cli.config),
-        Some(Cmd::Pair) => pair(cli.config),
+        Some(Cmd::Pair { qr, host }) => pair(cli.config, qr, host),
         Some(Cmd::Totp { force, disable }) => totp(force, disable),
         Some(Cmd::Serve { listen }) => serve(cli.config, listen),
         None => serve(cli.config, None),
@@ -129,18 +136,31 @@ fn init(config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn pair(config: Option<PathBuf>) -> Result<()> {
+fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
     let (cfg, _) = load_config(config)?;
+    let host = match host {
+        Some(h) if h.is_empty() || h.starts_with('-') || h.chars().any(|c| c.is_whitespace() || c.is_control()) => {
+            anyhow::bail!("invalid host {h:?}")
+        }
+        Some(h) => h,
+        None => nix::unistd::gethostname()?.to_string_lossy().into_owned(),
+    };
     let code = qsh::pair::create_pending(&home_dir()?)?;
     let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name;
-    let host = nix::unistd::gethostname()?.to_string_lossy().into_owned();
     let port = match cfg.listen.port() {
         qsh::DEFAULT_PORT => String::new(),
         p => format!(" -p {p}"),
     };
+    let command = format!("qsh pair{port} {user}@{host} {code}");
     println!("Pairing code: {code}  (single use, valid {} minutes)", qsh::pair::CODE_TTL.as_secs() / 60);
     println!("On the client run:");
-    println!("  qsh pair{port} {user}@{host} {code}");
+    println!("  {command}");
+    if qr {
+        // The QR code holds just the command: a phone's camera shows it as
+        // text to copy into a terminal (e.g. Termux).
+        println!("\nOr scan this and paste the text into a terminal:\n");
+        print!("{}", qsh::totp::qr_text(&command)?);
+    }
     Ok(())
 }
 
