@@ -118,8 +118,7 @@ check "HOME, USER and cwd are alice's" test "$OUT" = "$ALICE_HOME|qsh-alice|$ALI
 
 # --- authorization ----------------------------------------------------------------
 check "alice's key cannot log in as bob" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-bob@127.0.0.1 true </dev/null 2>/dev/null"
-mkdir -p "$BOB_HOME/.config/qsh"
-chown -R "$BOB_UID:$BOB_UID" "$BOB_HOME/.config"
+install -d -m 700 -o "$BOB_UID" -g "$BOB_UID" "$BOB_HOME/.config" "$BOB_HOME/.config/qsh"
 # A symlink to a file that contains the key must not be followed.
 cp "$AK" "$T/linked_keys"
 chmod 644 "$T/linked_keys"
@@ -151,14 +150,17 @@ check "no file was created locally" test ! -e "$T/stolen"
 check "alice cannot read bob's home" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-alice@127.0.0.1:$BOB_HOME/.config/qsh/authorized_keys' '$T/x' 2>/dev/null"
 
 # --- PTY ------------------------------------------------------------------------------
-OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'stat -c %u \$(tty); id -u'" /dev/null < /dev/null | tr -d '\r\0' || true)
+# `script` gives qsh a terminal; markers keep the values apart from terminal noise.
+OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'echo TTY=\$(stat -c %u:%g:%a \$(tty)) UID=\$(id -u)'" /dev/null < /dev/null || true)
+[[ -n ${QSH_DEBUG:-} ]] && { echo "PTY OUTPUT:"; cat -v <<<"$OUT"; }
 if [[ -n ${QSH_TEST_NS:-} ]]; then
     # devpts belongs to the host namespace, so the terminal cannot be chowned here.
-    echo "  skip pty belongs to alice (needs real root)"
+    echo "  skip pty owned by alice, group tty, mode 620 (needs real root)"
 else
-    check "pty belongs to alice" test "$(head -1 <<<"$OUT")" = "$ALICE_UID"
+    TTY_GID=$(getent group tty | cut -d: -f3)
+    check "pty owned by alice, group tty, mode 620" grep -q "TTY=$ALICE_UID:$TTY_GID:620 " <<<"$OUT"
 fi
-check "pty session runs as alice" test "$(sed -n 2p <<<"$OUT")" = "$ALICE_UID"
+check "pty session runs as alice" grep -qE "UID=$ALICE_UID\b" <<<"$OUT"
 
 # --- pairing hardening ------------------------------------------------------------------
 as_user qsh-bob ln -s /nonexistent "$BOB_HOME/.config/qsh/pending_pair"
