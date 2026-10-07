@@ -206,7 +206,8 @@ impl std::error::Error for InUse {}
 /// leftover socket whose master died is replaced.
 fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let tmp = path.with_extension(format!("tmp{:x}", rand::random::<u64>()));
+    // Short: socket paths are limited to about 100 bytes.
+    let tmp = path.with_extension(format!("{:08x}", rand::random::<u32>()));
     let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
     let result = (|| {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;

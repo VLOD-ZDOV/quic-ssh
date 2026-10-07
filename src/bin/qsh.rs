@@ -334,7 +334,8 @@ async fn start_background_master(target: &Target, args: &[String]) -> Result<Opt
     let (status, mut child) = spawn_with_status(args, MASTER_FD)?;
     match status.as_str() {
         "ok" => Ok(None),
-        // No qshd there (`--full`): go on as usual, which hands over to ssh.
+        // No qshd there (`--full`), or no socket: go on as usual (with
+        // `--full` that hands over to ssh).
         "none" => {
             let _ = child.wait();
             Ok(None)
@@ -378,7 +379,13 @@ async fn master_main(a: SshArgs) -> Result<i32> {
             conn.close().await;
             return Ok(0);
         }
-        Err(e) => return Err(e),
+        // E.g. a socket path that is too long: go on without sharing.
+        Err(e) => {
+            eprintln!("qsh: not sharing the connection: {e:#}");
+            detach(MASTER_FD, "none", true)?;
+            conn.close().await;
+            return Ok(255);
+        }
     };
     detach(MASTER_FD, "ok", true)?;
     let linger = match target.sharing.persist {

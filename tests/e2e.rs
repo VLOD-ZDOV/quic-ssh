@@ -1773,7 +1773,7 @@ fn one_time_code_guessing_is_limited_across_connections() {
 fn connection_sharing_with_a_background_master() {
     let s = Server::start();
     let c = Client::paired(&s);
-    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n").unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath /tmp/qsh-test-%C\n").unwrap();
     let port = s.port.to_string();
     let out = c.run(&["-p", &port, &dest(), "echo", "one"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -1842,7 +1842,7 @@ fn connection_sharing_with_an_explicit_socket() {
 fn shared_session_survives_the_master() {
     let s = Server::start();
     let c = Client::paired(&s);
-    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n").unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath /tmp/qsh-test-%C\n").unwrap();
     let port = s.port.to_string();
     assert!(c.run(&["-p", &port, &dest(), "true"]).status.success());
     let mut child = c
@@ -2068,4 +2068,20 @@ fn compressed_copies() {
         return; // root reads it anyway
     }
     assert!(!out.status.success(), "unreadable directory not reported");
+}
+
+/// A control socket that cannot be made (here: a path longer than Unix
+/// sockets allow) only means no sharing; the command still runs.
+#[test]
+fn sharing_falls_back_when_the_socket_cannot_be_made() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let long = c.home.path().join("x".repeat(120));
+    std::fs::create_dir_all(&long).unwrap();
+    let config = format!("Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath {}/%C\n", long.display());
+    std::fs::write(c.home.path().join(".config/qsh/config"), config).unwrap();
+    let out = c.run(&["-p", &s.port.to_string(), &dest(), "echo", "still works"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "still works\n");
+    assert!(stderr(&out).contains("not sharing"), "{}", stderr(&out));
 }
