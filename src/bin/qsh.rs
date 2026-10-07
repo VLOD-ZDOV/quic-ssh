@@ -13,11 +13,15 @@ use qsh::transport::Mode;
 
 /// Secure shell over QUIC, with automatic fallback to TCP.
 #[derive(Parser)]
-#[command(name = "qsh", version, args_conflicts_with_subcommands = true)]
+#[command(
+    name = "qsh",
+    version,
+    after_help = "Other commands (see `qsh <command> --help`):\n  \
+                  qsh cp SRC DST                   copy a file, one side is [user@]host:path\n  \
+                  qsh pair [user@]host CODE        pair with a server using a code from `qshd pair`\n  \
+                  qsh keygen [-f FILE]             create a new key"
+)]
 struct Cli {
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-
     #[command(flatten)]
     conn: ConnArgs,
 
@@ -43,6 +47,43 @@ struct Cli {
     /// Command to run instead of a login shell
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+/// `qsh cp|pair|keygen ...`
+#[derive(Parser)]
+#[command(name = "qsh", version)]
+struct ToolCli {
+    #[command(subcommand)]
+    cmd: Cmd,
+
+    #[command(flatten)]
+    conn: ConnArgs,
+}
+
+const TOOLS: [&str; 3] = ["cp", "pair", "keygen"];
+
+/// True when the first positional argument names a tool command. Only the
+/// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
+fn is_tool_invocation(args: &[String]) -> bool {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return false;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            if matches!(long, "port" | "identity" | "transport") {
+                it.next();
+            }
+        } else if let Some(short) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
+            // A value-taking flag at the end of a cluster consumes the next argument (`-p 22`, `-tL spec`).
+            if short.find(['p', 'i', 'L']) == Some(short.len() - 1) {
+                it.next();
+            }
+        } else {
+            return TOOLS.contains(&a.as_str());
+        }
+    }
+    false
 }
 
 #[derive(Args, Clone)]
@@ -96,9 +137,23 @@ impl ConnArgs {
     }
 }
 
+enum Invocation {
+    Session(Cli),
+    Tool(ToolCli),
+}
+
 fn main() {
-    let cli = Cli::parse();
-    let filter = if cli.conn.verbose { "qsh=debug" } else { "qsh=warn" };
+    let args: Vec<String> = std::env::args().collect();
+    let inv = if is_tool_invocation(&args) {
+        Invocation::Tool(ToolCli::parse_from(args))
+    } else {
+        Invocation::Session(Cli::parse_from(args))
+    };
+    let verbose = match &inv {
+        Invocation::Session(c) => c.conn.verbose,
+        Invocation::Tool(c) => c.conn.verbose,
+    };
+    let filter = if verbose { "qsh=debug" } else { "qsh=warn" };
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_writer(std::io::stderr)
@@ -106,7 +161,13 @@ fn main() {
         .with_target(false)
         .init();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let code = match rt.block_on(run(cli)) {
+    let result = rt.block_on(async {
+        match inv {
+            Invocation::Session(cli) => session_main(cli).await,
+            Invocation::Tool(cli) => tool_main(cli).await,
+        }
+    });
+    let code = match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("qsh: {e:#}");
@@ -117,50 +178,52 @@ fn main() {
     std::process::exit(code);
 }
 
-async fn run(cli: Cli) -> Result<i32> {
+async fn tool_main(cli: ToolCli) -> Result<i32> {
     let opts = cli.conn.options();
     match cli.cmd {
-        Some(Cmd::Keygen { file }) => keygen(file),
-        Some(Cmd::Pair { destination, code }) => {
+        Cmd::Keygen { file } => keygen(file),
+        Cmd::Pair { destination, code } => {
             let target = Target::parse(&destination, cli.conn.port)?;
             client::pair(&target, &opts, &code).await?;
             Ok(0)
         }
-        Some(Cmd::Cp { src, dst }) => {
+        Cmd::Cp { src, dst } => {
             cp(&src, &dst, cli.conn.port, &opts).await?;
             Ok(0)
         }
-        None => {
-            let Some(dest) = cli.destination else {
-                bail!("missing destination; usage: qsh [OPTIONS] [user@]host[:port] [COMMAND]...  (see --help)");
-            };
-            let target = Target::parse(&dest, cli.conn.port)?;
-            let forwards = cli.local_forward.iter().map(|s| Forward::parse(s)).collect::<Result<Vec<_>>>()?;
-            let conn = Arc::new(client::connect(&target, &opts).await?);
-            for f in forwards {
-                forward::start(conn.clone(), f).await?;
-            }
-            if cli.no_command {
-                tokio::select! {
-                    _ = conn.closed() => bail!("connection closed"),
-                    _ = session::termination_signal(true) => {}
-                }
-                conn.close().await;
-                return Ok(0);
-            }
-            let command = (!cli.command.is_empty()).then(|| cli.command.join(" "));
-            let want_pty = if cli.tty {
-                true
-            } else if cli.no_tty {
-                false
-            } else {
-                command.is_none() && std::io::stdin().is_terminal()
-            };
-            let code = session::run(&conn, command, want_pty).await?;
-            conn.close().await;
-            Ok(code)
-        }
     }
+}
+
+async fn session_main(cli: Cli) -> Result<i32> {
+    let opts = cli.conn.options();
+    let Some(dest) = cli.destination else {
+        bail!("missing destination; usage: qsh [OPTIONS] [user@]host[:port] [COMMAND]...  (see --help)");
+    };
+    let target = Target::parse(&dest, cli.conn.port)?;
+    let forwards = cli.local_forward.iter().map(|s| Forward::parse(s)).collect::<Result<Vec<_>>>()?;
+    let conn = Arc::new(client::connect(&target, &opts).await?);
+    for f in forwards {
+        forward::start(conn.clone(), f).await?;
+    }
+    if cli.no_command {
+        tokio::select! {
+            _ = conn.closed() => bail!("connection closed"),
+            _ = session::termination_signal(true) => {}
+        }
+        conn.close().await;
+        return Ok(0);
+    }
+    let command = (!cli.command.is_empty()).then(|| cli.command.join(" "));
+    let want_pty = if cli.tty {
+        true
+    } else if cli.no_tty {
+        false
+    } else {
+        command.is_none() && std::io::stdin().is_terminal()
+    };
+    let code = session::run(&conn, command, want_pty).await?;
+    conn.close().await;
+    Ok(code)
 }
 
 fn keygen(file: Option<PathBuf>) -> Result<i32> {
@@ -194,5 +257,36 @@ async fn cp(src: &str, dst: &str, port: Option<u16>, opts: &ConnectOptions) -> R
         }
         (Location::Local(_), Location::Local(_)) => bail!("one of SRC/DST must be remote ([user@]host:path)"),
         (Location::Remote { .. }, Location::Remote { .. }) => bail!("remote-to-remote copies are not supported"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(args: &str) -> bool {
+        let v: Vec<String> = std::iter::once("qsh").chain(args.split_whitespace()).map(String::from).collect();
+        is_tool_invocation(&v)
+    }
+
+    #[test]
+    fn tool_commands_only_in_first_position() {
+        assert!(tool("cp a host:b"));
+        assert!(tool("-p 2222 pair u@host code"));
+        assert!(tool("--accept-new-host --transport tcp pair u@host code"));
+        assert!(tool("-v keygen"));
+        assert!(!tool("host cp a b"));
+        assert!(!tool("-p 22 host"));
+        assert!(!tool("-L 8080:cp:80 host"));
+        assert!(!tool("-tL 1:a:2 host pair"));
+        assert!(!tool("-i cp host"));
+        assert!(!tool("-- cp"));
+    }
+
+    #[test]
+    fn both_parsers_are_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        ToolCli::command().debug_assert();
     }
 }

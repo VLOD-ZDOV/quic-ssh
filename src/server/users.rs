@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use nix::unistd::{geteuid, getgrouplist, Gid, User as PwUser};
+use nix::unistd::{geteuid, getgrouplist, Gid, Group, User as PwUser};
 
 /// A user sessions run as.
 #[derive(Clone, Debug)]
@@ -75,17 +75,26 @@ impl User {
 
     /// Closure for `pre_exec` that switches to this user. Only calls
     /// async-signal-safe syscalls; the group list is resolved beforehand.
-    /// With `own_tty`, the terminal on stdin is handed to the user first (as sshd does).
+    /// With `own_tty`, the terminal on stdin is first handed to the user like
+    /// sshd does: group `tty` with mode 0620 (only `write`/`wall` may write to
+    /// it), or mode 0600 if there is no `tty` group.
     pub fn drop_privileges(&self, own_tty: bool) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
         let (switch, uid, gid, groups) = (self.switch, self.uid, self.gid, self.groups.clone());
+        let (tty_gid, tty_mode) = match Group::from_name("tty").ok().flatten() {
+            Some(g) => (g.gid.as_raw(), 0o620),
+            None => (libc::gid_t::MAX, 0o600), // -1: keep the group
+        };
         move || {
             if !switch {
                 return Ok(());
             }
             // SAFETY: plain syscalls with valid pointers; no allocation happens here.
             unsafe {
-                if own_tty && (libc::fchown(0, uid, gid) != 0 || libc::fchmod(0, 0o620) != 0) {
-                    return Err(std::io::Error::last_os_error());
+                // Best effort: if the terminal cannot be chowned (e.g. a devpts
+                // owned by another user namespace), it stays root-owned, which is
+                // stricter; the session still works through its open descriptors.
+                if own_tty && libc::fchown(0, uid, tty_gid) == 0 {
+                    libc::fchmod(0, tty_mode);
                 }
                 if libc::setgroups(groups.len(), groups.as_ptr()) != 0
                     || libc::setgid(gid) != 0

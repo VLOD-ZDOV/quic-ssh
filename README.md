@@ -194,6 +194,7 @@ This is a young project and has not had an external audit. For critical systems,
 
 ```sh
 cargo test                        # unit tests and end-to-end tests (real qshd/qsh on loopback)
+tests/system-mode.sh              # system mode (qshd as root): real root via sudo, or a user namespace without it
 cargo clippy --all-targets -- -D warnings
 python3 bench/bench.py            # benchmark against OpenSSH
 ```

@@ -194,6 +194,7 @@ python3 bench/bench.py
 
 ```sh
 cargo test                        # юнит-тесты и сквозные тесты (реальные qshd/qsh на loopback)
+tests/system-mode.sh              # системный режим (qshd от root): через sudo или без него, в user namespace
 cargo clippy --all-targets -- -D warnings
 python3 bench/bench.py            # бенчмарк против OpenSSH
 ```

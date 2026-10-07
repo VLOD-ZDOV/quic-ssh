@@ -19,3 +19,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # qshd as real root: creates temporary users and checks privilege dropping,
+  # file ownership, PTY ownership, StrictModes and pairing (tests/system-mode.sh).
+  system-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: sudo tests/system-mode.sh target/debug
