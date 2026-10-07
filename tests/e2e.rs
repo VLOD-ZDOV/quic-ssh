@@ -1510,6 +1510,37 @@ struct Relay {
 }
 
 fn udp_relay(target: u16) -> Relay {
+    udp_relay_with_delay(target, Duration::ZERO)
+}
+
+/// Sends each datagram on after `delay` (in order), like a long link.
+fn delayed_sender(sock: UdpSocket, delay: Duration) -> std::sync::mpsc::Sender<(Vec<u8>, Option<std::net::SocketAddr>)> {
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Option<std::net::SocketAddr>)>();
+    std::thread::spawn(move || {
+        let mut queue: std::collections::VecDeque<(Instant, Vec<u8>, Option<std::net::SocketAddr>)> = std::collections::VecDeque::new();
+        loop {
+            let next = match queue.front() {
+                Some((due, _, _)) => rx.recv_timeout(due.saturating_duration_since(Instant::now())),
+                None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match next {
+                Ok((data, to)) => queue.push_back((Instant::now() + delay, data, to)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            while queue.front().is_some_and(|(due, _, _)| *due <= Instant::now()) {
+                let (_, data, to) = queue.pop_front().unwrap();
+                let _ = match to {
+                    Some(to) => sock.send_to(&data, to),
+                    None => sock.send(&data),
+                };
+            }
+        }
+    });
+    tx
+}
+
+fn udp_relay_with_delay(target: u16, delay: Duration) -> Relay {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     let front = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1519,25 +1550,27 @@ fn udp_relay(target: u16) -> Relay {
     let blackhole = Arc::new(AtomicBool::new(false));
     let client = Arc::new(Mutex::new(None));
     {
-        let (front, back, blackhole, client) = (front.try_clone().unwrap(), back.try_clone().unwrap(), blackhole.clone(), client.clone());
+        let (front, blackhole, client) = (front.try_clone().unwrap(), blackhole.clone(), client.clone());
+        let to_server = delayed_sender(back.try_clone().unwrap(), delay);
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while let Ok((n, from)) = front.recv_from(&mut buf) {
                 *client.lock().unwrap() = Some(from);
                 if !blackhole.load(Ordering::SeqCst) {
-                    let _ = back.send(&buf[..n]);
+                    let _ = to_server.send((buf[..n].to_vec(), None));
                 }
             }
         });
     }
     let hole = blackhole.clone();
+    let to_client = delayed_sender(front, delay);
     std::thread::spawn(move || {
         let blackhole = hole;
         let mut buf = [0u8; 65536];
         while let Ok(n) = back.recv(&mut buf) {
             let to = *client.lock().unwrap();
             if let (Some(to), false) = (to, blackhole.load(Ordering::SeqCst)) {
-                let _ = front.send_to(&buf[..n], to);
+                let _ = to_client.send((buf[..n].to_vec(), Some(to)));
             }
         }
     });
@@ -1841,4 +1874,62 @@ fn shared_session_survives_the_master() {
     wait_for_output(&rx, &mut seen, "af6ter", 10);
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(7), "{seen}");
+}
+
+/// On a slow link, typed characters show up before the server's echo, and
+/// the screen ends up exactly as the server drew it.
+#[test]
+fn typing_is_predicted_on_a_slow_link() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let relay = udp_relay_with_delay(s.port, Duration::from_millis(150));
+    let pty = nix::pty::openpty(Some(&nix::pty::Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }), None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "--accept-new-host", "--transport", "quic", "-p", &relay.port.to_string(), &dest(), "env PS1=\'$ \' sh"])
+        .env("HOME", c.home.path())
+        .env("TERM", "xterm-256color")
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    let read_until = |master: &mut std::fs::File, screen: &mut vt100::Parser, what: &dyn Fn(&str) -> bool, secs: f64| {
+        let deadline = Instant::now() + Duration::from_secs_f64(secs);
+        loop {
+            let mut buf = [0u8; 65536];
+            match master.read(&mut buf) {
+                Ok(n) if n > 0 => screen.process(&buf[..n]),
+                _ => sleep(Duration::from_millis(5)),
+            }
+            if what(&screen.screen().contents()) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+        }
+    };
+    assert!(read_until(&mut master, &mut screen, &|t| t.contains("$ "), 15.0), "no prompt: {}", screen.screen().contents());
+    // The first character confirms that the server echoes; it takes a round trip.
+    master.write_all(b"e").unwrap();
+    assert!(read_until(&mut master, &mut screen, &|t| t.contains("$ e"), 5.0));
+    let started = Instant::now();
+    master.write_all(b"c").unwrap();
+    assert!(read_until(&mut master, &mut screen, &|t| t.contains("$ ec"), 5.0));
+    let shown = started.elapsed();
+    assert!(shown < Duration::from_millis(200), "the typed character took {shown:?} to show up");
+    master.write_all(b"ho pre$((1+1))dicted\r").unwrap();
+    assert!(read_until(&mut master, &mut screen, &|t| t.contains("\npre2dicted"), 10.0), "{}", screen.screen().contents());
+    assert!(screen.screen().contents().contains("$ echo pre$((1+1))dicted\n"), "{}", screen.screen().contents());
+    master.write_all(b"exit\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "qsh did not exit");
+        let _ = master.read(&mut [0u8; 65536]);
+        sleep(Duration::from_millis(20));
+    }
 }

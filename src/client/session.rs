@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::client::keystroke::Obfuscator;
+use crate::client::predict::{Mode, Predictor};
 use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, Request, ServerMsg};
 use crate::transport::{Conn, RecvHalf, SendHalf};
 
@@ -151,6 +152,8 @@ pub struct SessionOptions {
     pub reconnect: Option<Reconnect>,
     /// `ServerAliveInterval`/`ServerAliveCountMax` (persistent sessions default to 5 s × 3).
     pub server_alive: Option<(Duration, u32)>,
+    /// Local echo prediction for a person typing into a terminal.
+    pub predict: super::predict::Mode,
 }
 
 /// Local handling of escape sequences (`~.`, `~?`, `~~`) typed at the start of a line.
@@ -328,6 +331,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
 
     // Escapes only apply when a person types into a terminal (as in ssh).
     let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(Escapes::new);
+    // Echo prediction, likewise; it sees what is typed and what comes back.
+    let mut predictor = (raw.is_some() && opts.predict != Mode::Never).then(|| {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        Predictor::new(opts.predict, rows, cols)
+    });
+    let (typed_tx, mut typed_rx) = mpsc::channel::<Vec<u8>>(64);
+    let typed_tx = predictor.is_some().then_some(typed_tx);
     let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
     let stdin_tx = tx.clone();
     if opts.stdin_null {
@@ -348,8 +358,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                             Some(e) => e.process(&buf[..n]),
                             None => (buf[..n].to_vec(), None),
                         };
-                        if !data.is_empty() && stdin_tx.send(ClientMsg::Stdin(data)).await.is_err() {
-                            break;
+                        if !data.is_empty() {
+                            if let Some(t) = &typed_tx {
+                                let _ = t.try_send(data.clone());
+                            }
+                            if stdin_tx.send(ClientMsg::Stdin(data)).await.is_err() {
+                                break;
+                            }
                         }
                         match action {
                             Some(EscapeAction::Disconnect) => {
@@ -398,8 +413,47 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let (alive_interval, alive_max) = alive.unwrap_or(DEFAULT_ALIVE);
     let mut heartbeat = tokio::time::interval(alive_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Writes to the terminal, with predictions erased first and redrawn after.
+    async fn show<W: AsyncWriteExt + Unpin>(w: &mut W, predictor: &mut Option<Predictor>, data: &[u8]) -> std::io::Result<()> {
+        match predictor {
+            Some(p) => {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    p.resize(rows, cols);
+                }
+                w.write_all(&p.output(data, std::time::Instant::now())).await?;
+            }
+            None => w.write_all(data).await?,
+        }
+        w.flush().await
+    }
+    // qsh's own messages: predictions must not be in the way.
+    async fn clear(predictor: &mut Option<Predictor>) {
+        if let Some(p) = predictor {
+            let mut out = tokio::io::stdout();
+            let _ = out.write_all(&p.clear()).await;
+            let _ = out.flush().await;
+        }
+    }
     let code = loop {
+        let deadline = predictor.as_ref().and_then(Predictor::deadline);
         let lost = tokio::select! {
+            Some(data) = typed_rx.recv() => {
+                if let Some(p) = predictor.as_mut() {
+                    let out = p.typed(&data, std::time::Instant::now());
+                    if !out.is_empty() {
+                        stdout.write_all(&out).await?;
+                        stdout.flush().await?;
+                    }
+                }
+                false
+            }
+            () = async { tokio::time::sleep_until(deadline.expect("checked").into()).await }, if deadline.is_some() => {
+                if let Some(p) = predictor.as_mut() {
+                    stdout.write_all(&p.expire(std::time::Instant::now())).await?;
+                    stdout.flush().await?;
+                }
+                false
+            }
             msg = read_msg_opt::<_, ServerMsg>(&mut recv) => match msg {
                 // Unknown message type from a newer server: skip it.
                 Err(e) if e.is::<crate::proto::Malformed>() => continue,
@@ -408,13 +462,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     match msg {
                         ServerMsg::Stdout(d) => {
                             received += d.len() as u64;
-                            stdout.write_all(&d).await?;
-                            stdout.flush().await?;
+                            show(&mut stdout, &mut predictor, &d).await?;
                         }
-                        ServerMsg::Stderr(d) => {
-                            stderr.write_all(&d).await?;
-                            stderr.flush().await?;
-                        }
+                        ServerMsg::Stderr(d) => show(&mut stderr, &mut predictor, &d).await?,
                         ServerMsg::Exit { code, signal } => break code.or(signal.map(|s| 128 + s)).unwrap_or(255),
                         ServerMsg::Pong(_) => {}
                     }
@@ -434,6 +484,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 if token.is_some() {
                     hang_up(&tx, &mut recv).await;
                 }
+                clear(&mut predictor).await;
                 let _ = stderr.write_all(b"\r\nConnection closed.\r\n").await;
                 break 255;
             }
@@ -449,6 +500,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         if !lost {
             continue;
         }
+        clear(&mut predictor).await;
         if token.is_none() {
             let _ = stderr.write_all(b"\r\nTimeout, server not responding.\r\n").await;
             break 255;

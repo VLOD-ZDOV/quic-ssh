@@ -7,6 +7,7 @@ pub mod control;
 pub mod copy;
 pub mod forward;
 pub mod keystroke;
+pub mod predict;
 mod known_hosts;
 pub mod session;
 mod socks;
@@ -93,6 +94,8 @@ pub struct Target {
     pub server_alive: Option<(std::time::Duration, u32)>,
     /// Connection sharing (`ControlMaster` and friends).
     pub sharing: control::Sharing,
+    /// `PredictiveEcho`: local echo prediction in terminal sessions.
+    pub predict: predict::Mode,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
 }
@@ -261,6 +264,7 @@ impl Target {
                 .filter(|&s| s > 0)
                 .map(|s| (std::time::Duration::from_secs(s), cfg.server_alive_count_max.unwrap_or(3).max(1))),
             sharing,
+            predict: cfg.predictive_echo.as_deref().map(predict::parse_mode).unwrap_or_default(),
             sources: sources.clone(),
             host,
             port,

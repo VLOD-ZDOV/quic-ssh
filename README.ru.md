@@ -232,7 +232,7 @@ Host myserver
     Port 8080
 ```
 
-Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (только qsh), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
+Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
 
 ### Режим совместимости с OpenSSH (`--full`)
 
@@ -302,6 +302,15 @@ upload        70.1 Mbit/s  (41.8 MiB in 5.0 s)
 - **Зачем:** без этого интервалы между нажатиями видны в сети. Накопив много сессий, по ним можно сузить перебор паролей, набранных внутри сессии (`sudo`, `su`), и понять, какие команды набираются.
 - **Цена (измерено):** нажатие доходит до сервера **в среднем на 10 мс позже, максимум на 20 мс**. Первое нажатие после паузы уходит сразу. Пока печатаешь, мелких пакетов примерно в 6 раз больше (≈50/с в каждую сторону, единицы КБ/с). В простое и при передаче данных цены нет.
 - **Настройка:** `ObscureKeystrokeTiming no` или `ObscureKeystrokeTiming interval:40` в `~/.config/qsh/config` (или `~/.ssh/config`). Действует только на интерактивные сессии с PTY.
+
+### Набор на медленном канале (предсказание эха)
+
+Как mosh, qsh показывает набранное до того, как придёт эхо сервера, если эхо идёт дольше примерно 30 мс:
+
+- qsh держит копию экрана в том виде, как его нарисовал сервер. Набранный символ рисуется у курсора, только если клетка пуста и только после того, как предыдущее нажатие в этой строке вернулось ровно таким, как предсказано.
+- Enter, стрелки, Ctrl-комбинации и т.п. начинают отсчёт заново: после запроса пароля ничего не показывается, пока сервер сам не вернёт символ, поэтому скрытый пароль на экран не попадёт.
+- Если вывод сервера отличается, предсказанные символы стираются до его показа, так что экран всегда в итоге такой, каким его нарисовал сервер.
+- `PredictiveEcho auto` (по умолчанию), `yes` (и на быстрых каналах) или `no` — в `~/.config/qsh/config` или через `-o`.
 
 ## Настройка сервера
 

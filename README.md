@@ -232,7 +232,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (qsh only), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -302,6 +302,15 @@ In interactive sessions qsh hides the rhythm of your typing from anyone watching
 - **Why it matters:** without it, the gaps between keystrokes are visible on the wire. Measured over many sessions, they can narrow down passwords typed inside the session (`sudo`, `su`) and show which commands are being typed.
 - **Cost (measured):** keystrokes reach the server **10 ms later on average, at most 20 ms**. The first key after a pause is sent at once. While typing, about 6× more small packets (≈50/s each way, a few KB/s). There is no cost when idle and for bulk data.
 - **Settings:** `ObscureKeystrokeTiming no` or `ObscureKeystrokeTiming interval:40` in `~/.config/qsh/config` (or `~/.ssh/config`). Only interactive sessions with a PTY are affected.
+
+### Typing on slow links (echo prediction)
+
+Like mosh, qsh shows what you type before the server's echo arrives, when echoes take longer than about 30 ms:
+
+- qsh keeps a copy of the screen as the server drew it. A typed character is drawn at the cursor only on an empty cell, and only after an earlier keystroke on the same line came back exactly as predicted.
+- Enter, arrows, Ctrl keys and the like start over: after a password prompt nothing is shown until the server itself echoes a character, so a hidden password is never drawn.
+- When the server's output differs, the predicted characters are erased before it is shown, so the screen always ends up exactly as the server drew it.
+- `PredictiveEcho auto` (default), `yes` (also on fast links) or `no`, in `~/.config/qsh/config` or with `-o`.
 
 ## Server configuration
 

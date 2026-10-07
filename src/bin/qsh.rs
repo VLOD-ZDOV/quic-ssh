@@ -608,6 +608,7 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
             stdin_null: a.stdin_null || a.background,
             reconnect,
             server_alive: target.server_alive,
+            predict: target.predict,
         },
     )
     .await?;
