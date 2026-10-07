@@ -1,0 +1,14 @@
+# System-wide qshd: runs as root, every user logs in as themselves with their own keys.
+# Install: sudo cp contrib/qshd.service /etc/systemd/system/ && sudo systemctl enable --now qshd
+[Unit]
+Description=qsh server (secure shell over QUIC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/qshd serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

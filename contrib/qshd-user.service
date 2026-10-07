@@ -1,0 +1,15 @@
+# Per-user qshd: no root needed, only this user can log in.
+# Install: mkdir -p ~/.config/systemd/user && cp contrib/qshd-user.service ~/.config/systemd/user/qshd.service
+#          systemctl --user enable --now qshd
+#          loginctl enable-linger "$USER"   # keep running after logout
+# Adjust ExecStart if qshd is installed elsewhere (e.g. %h/.cargo/bin/qshd).
+[Unit]
+Description=qsh server for this user (secure shell over QUIC)
+
+[Service]
+ExecStart=/usr/local/bin/qshd serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

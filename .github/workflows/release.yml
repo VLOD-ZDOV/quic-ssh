@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      NAME: qsh-${{ matrix.arch }}-linux
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - name: Build static binaries
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Package
+        run: |
+          mkdir "$NAME"
+          cp "target/$TARGET/release/qsh" "target/$TARGET/release/qshd" README.md LICENSE "$NAME/"
+          cp -r contrib "$NAME/"
+          file "$NAME/qsh"
+          tar czf "$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS
+          cat > notes.md <<NOTES
+          Static Linux binaries (musl) for x86_64 and aarch64.
+
+          \`\`\`sh
+          ARCH=\$(uname -m)   # x86_64 or aarch64
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/$TAG/qsh-\$ARCH-linux.tar.gz | tar xz
+          sudo install -m755 qsh-\$ARCH-linux/qsh qsh-\$ARCH-linux/qshd /usr/local/bin/
+          \`\`\`
+
+          See the README for setup.
+          NOTES
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz SHA256SUMS

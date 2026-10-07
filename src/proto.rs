@@ -1,0 +1,130 @@
+//! Application protocol: length-prefixed postcard messages on QUIC/yamux streams.
+//!
+//! Every operation runs on its own bidirectional stream. The first stream of a
+//! connection carries [`Hello`]; each later stream starts with a [`Request`].
+
+use anyhow::{bail, Context, Result};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const ALPN: &[u8] = b"qsh/1";
+pub const VERSION: u32 = 1;
+const MAX_MSG: usize = 1 << 20;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Hello {
+    /// Log in as `user`; the key is the one from the TLS client certificate.
+    Login { version: u32, user: String },
+    /// Pair a new client key with `user` using a one-time code (see `pair`).
+    Pair { version: u32, user: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum Reply {
+    Ok,
+    Err(String),
+    /// Answer to [`Request::Download`]; `size` raw bytes follow.
+    File { size: u64, mode: u32 },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PtySpec {
+    pub term: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Request {
+    /// Run a command (`None` = login shell). Followed by [`ClientMsg`]/[`ServerMsg`] frames.
+    Exec { command: Option<String>, env: Vec<(String, String)>, pty: Option<PtySpec> },
+    /// Connect to `host:port` from the server; after `Reply::Ok` the stream carries raw bytes.
+    DirectTcp { host: String, port: u16 },
+    /// Store `size` raw bytes at `path` (a directory means `path/name`). A final `Reply` follows.
+    Upload { path: String, name: String, size: u64, mode: u32 },
+    /// Fetch a file; answered with `Reply::File` and raw bytes.
+    Download { path: String },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ClientMsg {
+    Stdin(Vec<u8>),
+    StdinEof,
+    Resize { cols: u16, rows: u16 },
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum ServerMsg {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit { code: Option<i32>, signal: Option<i32> },
+}
+
+pub async fn write_msg<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
+    let body = postcard::to_stdvec(msg)?;
+    let mut buf = Vec::with_capacity(body.len() + 4);
+    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&body);
+    w.write_all(&buf).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Reads one message; `Ok(None)` on a clean end of stream before a new frame.
+pub async fn read_msg_opt<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
+    r: &mut R,
+) -> Result<Option<T>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_MSG {
+        bail!("message too large ({len} bytes)");
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    Ok(Some(postcard::from_bytes(&body).context("malformed message")?))
+}
+
+pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mut R) -> Result<T> {
+    read_msg_opt(r).await?.context("stream closed unexpectedly")
+}
+
+/// Reads a `Reply` and turns `Reply::Err` into an error.
+pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply> {
+    match read_msg(r).await? {
+        Reply::Err(e) => bail!("{e}"),
+        other => Ok(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frames_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            write_msg(&mut a, &ServerMsg::Stdout(vec![7; 1000])).await.unwrap();
+            write_msg(&mut a, &ServerMsg::Exit { code: Some(3), signal: None }).await.unwrap();
+        });
+        let m: ServerMsg = read_msg(&mut b).await.unwrap();
+        assert_eq!(m, ServerMsg::Stdout(vec![7; 1000]));
+        let m: ServerMsg = read_msg(&mut b).await.unwrap();
+        assert_eq!(m, ServerMsg::Exit { code: Some(3), signal: None });
+        writer.await.unwrap();
+        assert!(read_msg_opt::<_, ServerMsg>(&mut b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        assert!(read_msg::<_, Reply>(&mut b).await.is_err());
+    }
+}
