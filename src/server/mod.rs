@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
 use crate::keys::{qsh_dir, read_key_list_strict, Identity, PublicKey};
-use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, VERSION};
+use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, MIN_VERSION, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use users::User;
 
@@ -155,7 +155,7 @@ async fn handle_conn(conn: &Conn, state: Arc<State>, startup: Startup) -> Result
     .context("no hello in time")??;
 
     let (name, pairing) = match hello {
-        Hello::Login { version, user } | Hello::Pair { version, user } if version != VERSION => {
+        Hello::Login { version, user } | Hello::Pair { version, user } if !(MIN_VERSION..=VERSION).contains(&version) => {
             write_msg(&mut send, &Reply::Err(format!("unsupported protocol version {version}"))).await?;
             bail!("client {user:?} uses protocol version {version}");
         }
@@ -240,7 +240,38 @@ async fn handle_stream(
             files::upload(send, recv, user, &path, &name, size, mode).await
         }
         Request::Download { path } => files::download(send, user, &path).await,
+        Request::Ping => write_msg(&mut send, &Reply::Ok).await,
+        Request::SpeedDown { bytes } => speed_down(send, bytes).await,
+        Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
     }
+}
+
+/// Largest speed test transfer the server agrees to.
+const SPEED_TEST_MAX: u64 = 4 << 30;
+
+async fn speed_down(mut send: SendHalf, bytes: u64) -> Result<()> {
+    write_msg(&mut send, &Reply::Ok).await?;
+    let chunk = vec![0u8; 64 * 1024];
+    let mut left = bytes.min(SPEED_TEST_MAX);
+    while left > 0 {
+        let n = left.min(chunk.len() as u64) as usize;
+        // The client may stop reading early; that ends the test.
+        if send.write_all(&chunk[..n]).await.is_err() {
+            return Ok(());
+        }
+        left -= n as u64;
+    }
+    send.shutdown().await?;
+    Ok(())
+}
+
+async fn speed_up(mut send: SendHalf, mut recv: RecvHalf, bytes: u64) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    write_msg(&mut send, &Reply::Ok).await?;
+    let received = tokio::io::copy(&mut (&mut recv).take(bytes.min(SPEED_TEST_MAX)), &mut tokio::io::sink()).await?;
+    write_msg(&mut send, &Reply::File { size: received, mode: 0 }).await?;
+    send.shutdown().await?;
+    Ok(())
 }
 
 /// Port forwarding through `qshd internal-connect`, which runs as the user.

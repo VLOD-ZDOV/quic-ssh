@@ -6,9 +6,16 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use nix::unistd::{geteuid, getgrouplist, Gid, Group, User as PwUser};
 
+/// Android has no shadow database (and no other user accounts to expire).
+#[cfg(target_os = "android")]
+fn account_expired(_name: &str) -> bool {
+    false
+}
+
 /// Whether the account's expiry date (`chage -E`, `usermod -e`) has passed,
 /// checked the way pam_unix does: `sp_expire` is set and today is on or after
 /// it. Without a readable shadow entry the account counts as not expired.
+#[cfg(not(target_os = "android"))]
 fn account_expired(name: &str) -> bool {
     let Ok(cname) = CString::new(name) else { return true };
     // SAFETY: getspnam_r fills `entry` using `buf`; both outlive the call and

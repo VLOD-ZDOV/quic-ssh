@@ -147,15 +147,27 @@ enum Input {
 
 /// Applies client input to the child. Sends on `gone` if the client vanished
 /// (stream error), as opposed to a clean end of its input.
-async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>) {
+async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>) {
     loop {
         let msg = match read_msg_opt::<_, ClientMsg>(&mut recv).await {
             Ok(Some(msg)) => msg,
             Ok(None) => return,
+            // Unknown message type from a newer client: skip it.
+            Err(e) if e.is::<crate::proto::Malformed>() => continue,
             Err(_) => {
                 let _ = gone.send(());
                 return;
             }
+        };
+        // Obfuscated keystrokes: chaff gets an echo-sized reply so that, on the
+        // wire, it looks like a real keystroke and its echo.
+        let msg = match msg {
+            ClientMsg::Typed { data, .. } if data.is_empty() => {
+                let _ = tx.send(ServerMsg::Pong(vec![0])).await;
+                continue;
+            }
+            ClientMsg::Typed { data, .. } => ClientMsg::Stdin(data),
+            other => other,
         };
         match (msg, &mut input) {
             (ClientMsg::Stdin(data), Input::Pipe(stdin)) => {
@@ -178,6 +190,7 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>) {
             }
             // EOF on a terminal is the user's ^D; resize without a PTY is meaningless.
             (ClientMsg::StdinEof, Input::Pty(_)) | (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
+            (ClientMsg::Typed { .. }, _) => unreachable!("converted above"),
         }
     }
 }
@@ -197,12 +210,12 @@ async fn supervise(
         Io::Pipes { stdin, stdout, stderr } => {
             readers.push(tokio::spawn(pump(stdout, tx.clone(), ServerMsg::Stdout)));
             readers.push(tokio::spawn(pump(stderr, tx.clone(), ServerMsg::Stderr)));
-            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx))
+            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone()))
         }
         Io::Pty(pty) => {
             let (r, w) = pty.into_split();
             readers.push(tokio::spawn(pump(r, tx.clone(), ServerMsg::Stdout)));
-            tokio::spawn(feed(recv, Input::Pty(w), gone_tx))
+            tokio::spawn(feed(recv, Input::Pty(w), gone_tx, tx.clone()))
         }
     };
 

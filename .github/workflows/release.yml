@@ -43,8 +43,35 @@ jobs:
           name: ${{ env.NAME }}
           path: ${{ env.NAME }}.tar.gz
 
+  android:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: aarch64-linux-android
+      NAME: qsh-aarch64-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Build for Android (Termux)
+        run: |
+          TC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$TC/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$TC/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android24-clang"
+          cargo build --release --locked --target "$TARGET"
+      - name: Package
+        run: |
+          mkdir "$NAME"
+          cp "target/$TARGET/release/qsh" "target/$TARGET/release/qshd" README.md README.ru.md LICENSE "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.tar.gz
+
   release:
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -57,7 +84,7 @@ jobs:
         run: |
           sha256sum *.tar.gz > SHA256SUMS
           cat > notes.md <<NOTES
-          Static Linux binaries (musl) for x86_64 and aarch64.
+          Static Linux binaries (musl) for x86_64 and aarch64, and a native Android build for Termux (qsh-aarch64-android).
 
           \`\`\`sh
           ARCH=\$(uname -m)   # x86_64 or aarch64

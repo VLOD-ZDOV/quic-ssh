@@ -38,6 +38,15 @@ impl KnownHosts {
         }))
     }
 
+    /// All host ids in the file, in order.
+    pub fn ids(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
     pub fn add(&self, id: &str, key: PublicKey) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             create_private_dir(dir)?;

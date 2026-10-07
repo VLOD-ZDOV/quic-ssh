@@ -40,3 +40,21 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  # Native Android build for Termux (bionic libc, so DNS and users work).
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Build for aarch64-linux-android
+        run: |
+          TC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$TC/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$TC/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android24-clang"
+          cargo build --release --locked --target aarch64-linux-android
+          file target/aarch64-linux-android/release/qsh

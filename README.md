@@ -38,6 +38,19 @@ sudo install -m755 qsh-$ARCH-linux/qsh qsh-$ARCH-linux/qshd /usr/local/bin/
 
 The same archive works for both client and server. Checksums are in `SHA256SUMS`.
 
+### Android (Termux)
+
+A native Android build (bionic libc, so DNS works) is in the releases as `qsh-aarch64-android`:
+
+```sh
+pkg install curl
+curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/qsh-aarch64-android.tar.gz | tar xz
+install -m755 qsh-aarch64-android/qsh qsh-aarch64-android/qshd $PREFIX/bin/
+qsh pair user@server CODE      # then: qsh ui
+```
+
+Termux sends taps as mouse clicks, so `qsh ui` works by touch: tap a host to select it, tap it again to connect.
+
 ### From source
 
 You need a recent stable Rust toolchain. No C libraries are required.
@@ -116,6 +129,7 @@ qsh --transport tcp user@host          # force TCP (or quic)
 qsh -v user@host                       # show which transport is used
 qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
 qsh -f myserver                        # OpenSSH-compatible mode, see below
+qsh ui                                 # host menu with status and speed test
 ```
 
 The client key is chosen in this order: `-i FILE`, then the first Ed25519 `IdentityFile` from the config (see below), then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
@@ -162,6 +176,35 @@ qsh -f myserver                 # QUIC if qshd is there, otherwise plain ssh
 qsh -f -v myserver              # prints which one was used
 alias ssh='qsh -f'              # if you want it everywhere
 ```
+
+### Host menu and speed test (`qsh ui`, `qsh speed`)
+
+`qsh ui` opens an interactive menu of every host from `~/.ssh/config`, `~/.config/qsh/config` and known_hosts:
+
+- **Live status:** each host is checked in the background for qshd (TLS handshake with a throwaway key, no login). The list shows `● quic 42 ms`, `● tcp` (UDP blocked) or `○ ssh` (no qshd), and whether the host key is known, new or changed.
+- **⏎ / tap** connects with `qsh -f`, so hosts without qshd open with plain ssh. When the session ends you return to the menu.
+- **`s`** runs a speed test with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
+- **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`r`** re-checks, **`q`** quits.
+- The layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
+
+`qsh speed host` runs the same test in plain text:
+
+```
+$ qsh speed myserver
+root@203.0.113.10:4422 over quic
+ping          79.3 ms  (min 78.9, max 81.2)
+download     107.2 Mbit/s  (64.0 MiB in 5.0 s)
+upload        70.1 Mbit/s  (41.8 MiB in 5.0 s)
+```
+
+### Keystroke timing protection
+
+In interactive sessions qsh hides the rhythm of your typing from anyone watching the network, like OpenSSH's `ObscureKeystrokeTiming`:
+
+- **How it works:** while you type, packets leave on a fixed 20 ms clock and all have the same size. Ticks with nothing to send carry fake keystrokes ("chaff"), which also continue for a random 1–2 s after you stop, and the server answers chaff like a real echo. Pastes and command output are not affected.
+- **Why it matters:** without it, the gaps between keystrokes are visible on the wire. Measured over many sessions, they can narrow down passwords typed inside the session (`sudo`, `su`) and show which commands are being typed.
+- **Cost (measured):** keystrokes reach the server **10 ms later on average, at most 20 ms**. The first key after a pause is sent at once. While typing, about 6× more small packets (≈50/s each way, a few KB/s). There is no cost when idle and for bulk data.
+- **Settings:** `ObscureKeystrokeTiming no` or `ObscureKeystrokeTiming interval:40` in `~/.config/qsh/config` (or `~/.ssh/config`). Only interactive sessions with a PTY are affected.
 
 ## Server configuration
 
@@ -246,7 +289,6 @@ This is still a young project and has not had an external audit. For critical sy
 ## Limitations
 
 - No PAM (2FA, `pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login).
-- No keystroke timing obfuscation in interactive sessions (OpenSSH has had it since 9.5).
 - No agent forwarding, X11, `-R` or recursive `cp -r`.
 - Linux/Unix only.
 

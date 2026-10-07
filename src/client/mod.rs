@@ -3,8 +3,11 @@
 pub mod config;
 pub mod copy;
 pub mod forward;
+pub mod keystroke;
 mod known_hosts;
 pub mod session;
+pub mod speed;
+pub mod tui;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +41,8 @@ pub struct Target {
     pub request_tty: Option<String>,
     /// The config routes this host through ProxyJump/ProxyCommand.
     pub needs_proxy: bool,
+    /// Keystroke timing obfuscation interval (`None` = off).
+    pub keystroke_interval: Option<std::time::Duration>,
 }
 
 /// Host names and aliases: no option-looking names, whitespace or control
@@ -131,6 +136,7 @@ impl Target {
             local_forwards: cfg.local_forwards,
             request_tty: cfg.request_tty,
             needs_proxy: cfg.needs_proxy,
+            keystroke_interval: config::keystroke_interval(cfg.obscure_keystrokes.as_deref()),
         })
     }
 }
@@ -233,6 +239,16 @@ pub fn load_identity(explicit: Option<&Path>, configured: &[PathBuf], create: bo
         paths[0].display(),
         paths[1].display()
     )
+}
+
+/// The pinned key for `host:port`, if any.
+pub fn known_host_key(host: &str, port: u16) -> Result<Option<PublicKey>> {
+    known_hosts()?.lookup(&host_id(host, port))
+}
+
+/// Host ids from known_hosts (`host` or `[host]:port`), usable as destinations.
+pub fn known_host_ids() -> Vec<String> {
+    known_hosts().map(|k| k.ids()).unwrap_or_default()
 }
 
 fn known_hosts() -> Result<KnownHosts> {

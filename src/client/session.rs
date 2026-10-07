@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::client::keystroke::Obfuscator;
 use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Request, ServerMsg};
 use crate::transport::Conn;
 
@@ -49,7 +50,14 @@ pub async fn termination_signal(watch_sigint: bool) -> i32 {
 }
 
 /// Runs `command` (or a login shell) and returns the remote exit code.
-pub async fn run(conn: &Conn, command: Option<String>, want_pty: bool) -> Result<i32> {
+/// `keystroke_interval`: obfuscate keystroke timing in interactive sessions
+/// with this packet interval (`None` disables it).
+pub async fn run(
+    conn: &Conn,
+    command: Option<String>,
+    want_pty: bool,
+    keystroke_interval: Option<std::time::Duration>,
+) -> Result<i32> {
     let pty = if want_pty {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
@@ -69,10 +77,29 @@ pub async fn run(conn: &Conn, command: Option<String>, want_pty: bool) -> Result
     tokio::pin!(stop);
 
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(32);
+    // Only a person typing into a terminal needs timing protection.
+    let mut obfuscator = keystroke_interval.filter(|_| raw.is_some()).map(Obfuscator::new);
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write_msg(&mut send, &msg).await.is_err() {
-                break;
+        loop {
+            let deadline = obfuscator.as_ref().and_then(Obfuscator::deadline);
+            let tick = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let out: Vec<ClientMsg> = tokio::select! {
+                msg = rx.recv() => match (msg, obfuscator.as_mut()) {
+                    (None, _) => break,
+                    (Some(ClientMsg::Stdin(data)), Some(o)) => o.input(std::time::Instant::now(), &data),
+                    (Some(msg), _) => vec![msg],
+                },
+                () = tick => obfuscator.as_mut().and_then(|o| o.tick(std::time::Instant::now())).into_iter().collect(),
+            };
+            for msg in out {
+                if write_msg(&mut send, &msg).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -116,7 +143,11 @@ pub async fn run(conn: &Conn, command: Option<String>, want_pty: bool) -> Result
     let mut stderr = tokio::io::stderr();
     let code = loop {
         let msg = tokio::select! {
-            msg = read_msg_opt::<_, ServerMsg>(&mut recv) => msg?,
+            msg = read_msg_opt::<_, ServerMsg>(&mut recv) => match msg {
+                // Unknown message type from a newer server: skip it.
+                Err(e) if e.is::<crate::proto::Malformed>() => continue,
+                other => other?,
+            },
             code = &mut stop => break code,
         };
         match msg {
@@ -129,6 +160,7 @@ pub async fn run(conn: &Conn, command: Option<String>, want_pty: bool) -> Result
                 stderr.flush().await?;
             }
             Some(ServerMsg::Exit { code, signal }) => break code.or(signal.map(|s| 128 + s)).unwrap_or(255),
+            Some(ServerMsg::Pong(_)) => {}
             None => bail!("connection closed without exit status"),
         }
     };

@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Parser, Subcommand};
@@ -19,7 +20,9 @@ use qsh::transport::{Mode, Unreachable};
     after_help = "Other commands (see `qsh <command> --help`):\n  \
                   qsh cp SRC DST                   copy a file, one side is [user@]host:path\n  \
                   qsh pair [user@]host CODE        pair with a server using a code from `qshd pair`\n  \
-                  qsh keygen [FILE]                create a new key"
+                  qsh keygen [FILE]                create a new key\n  \
+                  qsh speed [user@]host            measure latency and throughput\n  \
+                  qsh ui                           interactive host menu"
 )]
 struct Cli {
     #[command(flatten)]
@@ -60,7 +63,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 3] = ["cp", "pair", "keygen"];
+const TOOLS: [&str; 5] = ["cp", "pair", "keygen", "speed", "ui"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -131,6 +134,16 @@ enum Cmd {
         #[arg(value_name = "FILE")]
         file: Option<PathBuf>,
     },
+    /// Measure latency and throughput to a server
+    Speed {
+        /// [user@]host[:port]
+        destination: String,
+        /// Seconds per direction
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+    },
+    /// Interactive host menu with status and speed test
+    Ui,
 }
 
 impl ConnArgs {
@@ -197,6 +210,11 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
         Cmd::Cp { src, dst } => {
             cp(&src, &dst, &cli.conn).await
         }
+        Cmd::Speed { destination, seconds } => {
+            let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
+            speed_test(&target, &opts, Duration::from_secs(seconds)).await
+        }
+        Cmd::Ui => qsh::client::tui::run(opts).await,
     }
 }
 
@@ -250,7 +268,7 @@ async fn session_main(cli: Cli) -> Result<i32> {
             _ => command.is_none() && std::io::stdin().is_terminal(),
         }
     };
-    let code = session::run(&conn, command, want_pty).await?;
+    let code = session::run(&conn, command, want_pty, target.keystroke_interval).await?;
     conn.close().await;
     Ok(code)
 }
@@ -296,6 +314,35 @@ fn exec_scp(src: &str, dst: &str, conn: &ConnArgs, reason: &str) -> Result<i32> 
     }
     cmd.arg("--").arg(src).arg(dst);
     Err(anyhow!("cannot run scp: {}", cmd.exec()))
+}
+
+async fn speed_test(target: &Target, opts: &ConnectOptions, seconds: Duration) -> Result<i32> {
+    use std::io::Write;
+    use qsh::client::speed;
+    let conn = client::connect(target, opts).await?;
+    println!("{}@{} over {}", target.user, conn.remote_addr(), conn.transport_name());
+    let mut pings = Vec::new();
+    for _ in 0..5 {
+        pings.push(speed::ping(&conn).await?);
+    }
+    pings.sort();
+    println!("ping      {:>8.1} ms  (min {:.1}, max {:.1})", ms(pings[2]), ms(pings[0]), ms(pings[4]));
+    let live = |label: &'static str| {
+        move |bytes: u64, elapsed: Duration| {
+            print!("\r{label}  {:>8.1} Mbit/s ", speed::mbps(bytes, elapsed));
+            let _ = std::io::stdout().flush();
+        }
+    };
+    let (bytes, t) = speed::download(&conn, seconds, live("download")).await?;
+    println!("\rdownload  {:>8.1} Mbit/s  ({:.1} MiB in {:.1} s)", speed::mbps(bytes, t), bytes as f64 / 1048576.0, t.as_secs_f64());
+    let (bytes, t) = speed::upload(&conn, seconds, live("upload  ")).await?;
+    println!("\rupload    {:>8.1} Mbit/s  ({:.1} MiB in {:.1} s)", speed::mbps(bytes, t), bytes as f64 / 1048576.0, t.as_secs_f64());
+    conn.close().await;
+    Ok(0)
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 fn keygen(file: Option<PathBuf>) -> Result<i32> {

@@ -1,7 +1,8 @@
 //! Host aliases from `~/.config/qsh/config` and `~/.ssh/config` (ssh_config syntax).
 //!
 //! Supported: `Host` patterns (`*`, `?`, `!negation`), `HostName`, `User`,
-//! `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`, `Include`,
+//! `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`,
+//! `ObscureKeystrokeTiming`, `Include`,
 //! `Match all`; the first value found wins (IdentityFile and LocalForward
 //! accumulate). Other `Match` blocks are skipped because their conditions are
 //! not evaluated. From `~/.ssh/config`, `Port`, `LocalForward` and
@@ -27,6 +28,8 @@ pub struct HostConfig {
     pub request_tty: Option<String>,
     /// The host goes through `ProxyJump`/`ProxyCommand`, which qsh cannot do.
     pub needs_proxy: bool,
+    /// `ObscureKeystrokeTiming` (`yes`, `no`, `interval:MS`).
+    pub obscure_keystrokes: Option<String>,
 }
 
 /// `fnmatch`-style match supporting `*` and `?`.
@@ -153,6 +156,9 @@ impl Parser<'_> {
                 "requesttty" if self.full && self.out.request_tty.is_none() => {
                     self.out.request_tty = args.into_iter().next().map(|v| v.to_ascii_lowercase());
                 }
+                "obscurekeystroketiming" if self.out.obscure_keystrokes.is_none() => {
+                    self.out.obscure_keystrokes = args.into_iter().next().map(|v| v.to_ascii_lowercase());
+                }
                 "proxyjump" | "proxycommand" if args.first().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
                     self.out.needs_proxy = true;
                 }
@@ -161,27 +167,68 @@ impl Parser<'_> {
         }
     }
 
-    /// Resolves an `Include` argument (relative to the config dir, `~`, `*` in the file name).
     fn expand_include(&self, pattern: &str) -> Vec<PathBuf> {
-        let path = match pattern.strip_prefix("~/") {
-            Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
-            None => self.base.join(pattern), // join keeps absolute paths as they are
-        };
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if !name.contains(['*', '?']) {
-            return vec![path];
-        }
-        let dir = path.parent().unwrap_or(Path::new("."));
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| wildcard(&name, &e.file_name().to_string_lossy()))
-            .map(|e| e.path())
-            .collect();
-        files.sort();
-        files
+        expand_include(self.base, pattern)
     }
+}
+
+/// Resolves an `Include` argument (relative to the config dir, `~`, `*` in the file name).
+fn expand_include(base: &Path, pattern: &str) -> Vec<PathBuf> {
+    let path = match pattern.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => base.join(pattern), // join keeps absolute paths as they are
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !name.contains(['*', '?']) {
+        return vec![path];
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| wildcard(&name, &e.file_name().to_string_lossy()))
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Concrete host names (no patterns) declared with `Host` in a config text.
+fn collect_aliases(text: &str, base: &Path, depth: usize, out: &mut Vec<String>) {
+    for line in text.lines() {
+        let Some((keyword, args)) = split_line(line) else { continue };
+        match keyword.as_str() {
+            "host" => {
+                for a in args {
+                    if !a.contains(['*', '?', '!']) && !out.contains(&a) {
+                        out.push(a);
+                    }
+                }
+            }
+            "include" if depth < MAX_INCLUDE_DEPTH => {
+                for pattern in &args {
+                    for file in expand_include(base, pattern) {
+                        if let Ok(t) = std::fs::read_to_string(&file) {
+                            collect_aliases(&t, base, depth + 1, out);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Host aliases from `~/.config/qsh/config` and `~/.ssh/config`, in file order.
+pub fn host_aliases(home: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in [crate::keys::qsh_dir(home), home.join(".ssh")] {
+        if let Ok(text) = std::fs::read_to_string(dir.join("config")) {
+            collect_aliases(&text, &dir, 0, &mut out);
+        }
+    }
+    out
 }
 
 /// Collects the settings for `host` from config `text`. `full` is false for
@@ -191,6 +238,21 @@ pub fn parse(text: &str, host: &str, base: &Path, full: bool) -> HostConfig {
     let mut p = Parser { host, base, full, out: HostConfig::default() };
     p.feed(text, 0);
     p.out
+}
+
+/// Parses `ObscureKeystrokeTiming`: `yes` (default 20 ms), `no`, `interval:MS`.
+/// `None` (unset) means the default.
+pub fn keystroke_interval(value: Option<&str>) -> Option<std::time::Duration> {
+    let default = Some(crate::client::keystroke::DEFAULT_INTERVAL);
+    match value {
+        None | Some("yes") => default,
+        Some("no") => None,
+        Some(v) => match v.strip_prefix("interval:").and_then(|ms| ms.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => default,
+        },
+    }
 }
 
 /// Expands `~`, `%d` (home), `%h` (host name), `%r` (remote user), `%u` (local user), `%%`.
@@ -240,6 +302,8 @@ pub fn lookup(home: &Path, host: &str, full: bool) -> HostConfig {
         local_forwards: ours.local_forwards.into_iter().chain(ssh.local_forwards).collect(),
         request_tty: ours.request_tty.or(ssh.request_tty),
         needs_proxy: ours.needs_proxy || ssh.needs_proxy,
+        // A privacy preference, so ssh's setting applies to qsh sessions as well.
+        obscure_keystrokes: ours.obscure_keystrokes.or(ssh.obscure_keystrokes),
     }
 }
 
@@ -308,6 +372,27 @@ Host *
         assert!(parse(text, "a", Path::new("/x"), false).local_forwards.is_empty());
         assert!(parse(text, "b", Path::new("/x"), false).needs_proxy);
         assert!(!parse(text, "c", Path::new("/x"), true).needs_proxy);
+    }
+
+    #[test]
+    fn keystroke_setting() {
+        use std::time::Duration;
+        assert_eq!(keystroke_interval(None), Some(Duration::from_millis(20)));
+        assert_eq!(keystroke_interval(Some("no")), None);
+        assert_eq!(keystroke_interval(Some("interval:80")), Some(Duration::from_millis(80)));
+        assert_eq!(keystroke_interval(Some("interval:0")), None);
+        let c = parse("Host *\n ObscureKeystrokeTiming interval:50\n", "x", Path::new("/x"), false);
+        assert_eq!(c.obscure_keystrokes.as_deref(), Some("interval:50"));
+    }
+
+    #[test]
+    fn aliases_for_the_menu() {
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
+        std::fs::write(ssh.join("config"), "Host a b *.x !c\n Port 1\nInclude conf.d/*\nHost *\n").unwrap();
+        std::fs::write(ssh.join("conf.d/more"), "Host d a\n").unwrap();
+        assert_eq!(host_aliases(home.path()), vec!["a", "b", "d"]);
     }
 
     #[test]

@@ -709,3 +709,112 @@ fn cve_preauth_flood_is_contained() {
     }
     drop(flood);
 }
+
+/// Typing into a real terminal with keystroke timing obfuscation (on by
+/// default): every character arrives, in order, and chaff never leaks into
+/// the session.
+#[test]
+fn interactive_typing_with_keystroke_obfuscation() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "-p", &s.port.to_string(), &dest(), "cat"])
+        .env("HOME", c.home.path())
+        .env("TERM", "xterm")
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    sleep(Duration::from_millis(800));
+    let typed = "hello-qsh";
+    for ch in typed.bytes() {
+        master.write_all(&[ch]).unwrap();
+        sleep(Duration::from_millis(30));
+    }
+    // Wait through the chaff tail, collecting the echo.
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 4096];
+        match master.read(&mut buf) {
+            Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
+            _ => sleep(Duration::from_millis(20)),
+        }
+    }
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains(typed), "echo was {text:?}");
+    assert!(!text.contains('\0'), "chaff leaked into the terminal: {text:?}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn speed_test_command() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    for t in ["quic", "tcp"] {
+        let out = c.run(&["speed", "--transport", t, "--seconds", "1", "-p", &s.port.to_string(), &dest()]);
+        assert!(out.status.success(), "{t}: {}", stderr(&out));
+        let text = stdout(&out);
+        for label in ["ping", "download", "upload", "Mbit/s"] {
+            assert!(text.contains(label), "{t}: {text}");
+        }
+    }
+}
+
+/// `qsh ui` in a real terminal: lists the configured host, finds qshd on it, quits on `q`.
+#[test]
+fn ui_lists_hosts_and_quits() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(
+        c.home.path().join(".config/qsh/config"),
+        format!("Host box\n  HostName 127.0.0.1\n  Port {}\n  User {}\n", s.port, user()),
+    )
+    .unwrap();
+    let pty = nix::pty::openpty(Some(&nix::pty::Winsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }), None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .arg("ui")
+        .env("HOME", c.home.path())
+        .env("TERM", "xterm-256color")
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    let mut screen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 65536];
+        match master.read(&mut buf) {
+            Ok(n) if n > 0 => screen.extend_from_slice(&buf[..n]),
+            _ => sleep(Duration::from_millis(50)),
+        }
+        let text = String::from_utf8_lossy(&screen);
+        if text.contains("box") && text.contains("quic") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&screen).into_owned();
+    assert!(text.contains("box"), "host missing from the menu");
+    assert!(text.contains("quic"), "qshd was not detected over QUIC");
+    master.write_all(b"q").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "ui did not quit on q");
+        let _ = master.read(&mut [0u8; 65536]);
+        sleep(Duration::from_millis(50));
+    }
+}

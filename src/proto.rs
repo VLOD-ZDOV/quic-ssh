@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"qsh/1";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+/// Oldest client protocol version the server still accepts.
+pub const MIN_VERSION: u32 = 1;
 const MAX_MSG: usize = 1 << 20;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -45,6 +47,14 @@ pub enum Request {
     Upload { path: String, name: String, size: u64, mode: u32 },
     /// Fetch a file; answered with `Reply::File` and raw bytes.
     Download { path: String },
+    // --- protocol version 2 ---
+    /// Answered with `Reply::Ok` (round-trip time measurement).
+    Ping,
+    /// Speed test: after `Reply::Ok` the server sends `bytes` raw bytes.
+    SpeedDown { bytes: u64 },
+    /// Speed test: after `Reply::Ok` the client sends up to `bytes` raw bytes and
+    /// closes its side; the server answers `Reply::File { size: received, mode: 0 }`.
+    SpeedUp { bytes: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -52,6 +62,10 @@ pub enum ClientMsg {
     Stdin(Vec<u8>),
     StdinEof,
     Resize { cols: u16, rows: u16 },
+    // --- protocol version 2 ---
+    /// Keystrokes with timing obfuscation: `data` padded with `pad` to a fixed
+    /// size. Empty `data` is chaff, which the server answers with `ServerMsg::Pong`.
+    Typed { data: Vec<u8>, pad: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -59,6 +73,9 @@ pub enum ServerMsg {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit { code: Option<i32>, signal: Option<i32> },
+    // --- protocol version 2 ---
+    /// Reply to chaff, sized like a one-character echo.
+    Pong(Vec<u8>),
 }
 
 /// Accepted user names: 1–64 of `[A-Za-z0-9._-]`, not starting with `-`.
@@ -96,8 +113,24 @@ pub async fn read_msg_opt<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(Some(postcard::from_bytes(&body).context("malformed message")?))
+    match postcard::from_bytes(&body) {
+        Ok(msg) => Ok(Some(msg)),
+        Err(_) => Err(Malformed.into()),
+    }
 }
+
+/// A frame that arrived intact but could not be decoded, e.g. a message type
+/// from a newer peer. Inside a session it can be skipped; the stream is still in sync.
+#[derive(Debug)]
+pub struct Malformed;
+
+impl std::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("malformed or unknown message")
+    }
+}
+
+impl std::error::Error for Malformed {}
 
 pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mut R) -> Result<T> {
     read_msg_opt(r).await?.context("stream closed unexpectedly")
