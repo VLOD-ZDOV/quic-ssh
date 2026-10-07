@@ -48,7 +48,7 @@ where
     let mut buf = vec![0u8; 256 * 1024];
     let draw = |done: u64, final_line: bool| {
         let secs = start.elapsed().as_secs_f64().max(0.001);
-        let pct = if total == 0 { 100 } else { done * 100 / total };
+        let pct = (done * 100).checked_div(total).unwrap_or(100);
         eprint!(
             "\r{label}  {pct:3}%  {:>10}  {:>10}/s{}",
             human(done),
