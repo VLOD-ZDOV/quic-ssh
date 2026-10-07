@@ -2023,3 +2023,49 @@ fn command_on_several_hosts() {
     let out = c.run(&["multi", "-g", "nope", "--", "true"]);
     assert!(!out.status.success());
 }
+
+/// `qsh cp -C`: zstd-compressed copies, files and trees, both ways.
+#[test]
+fn compressed_copies() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let text: Vec<u8> = (0..200_000).flat_map(|i| format!("line {i}: the same old text again\n").into_bytes()).collect();
+    let random = pseudo_random(1_000_000);
+    let src = c.home.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("text.txt"), &text).unwrap();
+    std::fs::write(src.join("sub/random.bin"), &random).unwrap();
+    for (t, file, data) in [("quic", "text.txt", &text), ("tcp", "sub/random.bin", &random)] {
+        let local = src.join(file);
+        let out = c.run(&["cp", "-C", "--transport", t, "-p", &port, local.to_str().unwrap(), &format!("{}:up-{t}", dest())]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(&std::fs::read(s.home.path().join(format!("up-{t}"))).unwrap(), data, "upload over {t}");
+        let back = c.home.path().join(format!("down-{t}"));
+        let out = c.run(&["cp", "-C", "--transport", t, "-p", &port, &format!("{}:up-{t}", dest()), back.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(&std::fs::read(&back).unwrap(), data, "download over {t}");
+    }
+    let out = c.run(&["cp", "-v", "-C", "-p", &port, &format!("{}:up-quic", dest()), c.home.path().join("v").to_str().unwrap()]);
+    assert!(out.status.success() && !stderr(&out).contains("without compression"), "{}", stderr(&out));
+    // `Compression yes` in the config works like -C.
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    Compression yes\n").unwrap();
+    let out = c.run(&["cp", "-r", "-p", &port, src.to_str().unwrap(), &format!("{}:tree", dest())]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(s.home.path().join("tree/text.txt")).unwrap(), text);
+    let back = c.home.path().join("back");
+    std::fs::create_dir(&back).unwrap();
+    let out = c.run(&["cp", "-r", "-p", &port, &format!("{}:tree", dest()), back.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(back.join("tree/sub/random.bin")).unwrap(), random);
+    assert_eq!(std::fs::read(back.join("tree/text.txt")).unwrap(), text);
+    // A failure inside a compressed tree download still reaches the client.
+    let locked = s.home.path().join("tree/sub");
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    let out = c.run(&["cp", "-r", "-p", &port, &format!("{}:tree", dest()), c.home.path().join("again").to_str().unwrap()]);
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    if nix::unistd::geteuid().is_root() {
+        return; // root reads it anyway
+    }
+    assert!(!out.status.success(), "unreadable directory not reported");
+}

@@ -10,7 +10,7 @@ use tokio::process::{Child, ChildStdout};
 
 use super::users::User;
 use crate::proto::{write_msg, Reply};
-use crate::transport::{RecvHalf, SendHalf};
+use crate::transport::{compress, decompress, RecvHalf, SendHalf};
 
 /// Size of the chunks a tree download is framed in (see [`crate::tree::Unchunk`]).
 const CHUNK: usize = 64 * 1024;
@@ -71,16 +71,17 @@ async fn start(send: &mut SendHalf, user: &User, args: &[&str], stdin: bool) -> 
 
 pub async fn upload(
     mut send: SendHalf,
-    mut recv: RecvHalf,
+    recv: RecvHalf,
     user: &User,
     path: &str,
     name: &str,
-    size: u64,
-    mode: u32,
+    (size, mode): (u64, u32),
+    compressed: bool,
 ) -> Result<()> {
     let args = ["internal-recv", path, name, &size.to_string(), &format!("{:o}", mode & 0o777)];
     let Some((mut child, _)) = start(&mut send, user, &args, true).await? else { return Ok(()) };
     write_msg(&mut send, &Reply::Ok).await?;
+    let mut recv = if compressed { decompress(recv) } else { recv };
 
     let mut stdin = child.stdin.take().expect("piped");
     let copied = tokio::io::copy(&mut (&mut recv).take(size), &mut stdin).await;
@@ -96,7 +97,7 @@ pub async fn upload(
     Ok(())
 }
 
-pub async fn download(mut send: SendHalf, user: &User, path: &str) -> Result<()> {
+pub async fn download(mut send: SendHalf, user: &User, path: &str, compressed: bool) -> Result<()> {
     let Some((mut child, mut out)) = start(&mut send, user, &["internal-send", path], false).await? else {
         return Ok(());
     };
@@ -110,17 +111,19 @@ pub async fn download(mut send: SendHalf, user: &User, path: &str) -> Result<()>
     let size = u64::from_be_bytes(header[..8].try_into().unwrap());
     let mode = u32::from_be_bytes(header[8..].try_into().unwrap());
     write_msg(&mut send, &Reply::File { size, mode }).await?;
+    let mut send = if compressed { compress(send) } else { send };
     tokio::io::copy(&mut out.take(size), &mut send).await?;
     send.shutdown().await?;
     let _ = child.wait().await;
     Ok(())
 }
 
-pub async fn upload_tree(mut send: SendHalf, mut recv: RecvHalf, user: &User, path: &str, name: &str) -> Result<()> {
+pub async fn upload_tree(mut send: SendHalf, recv: RecvHalf, user: &User, path: &str, name: &str, compressed: bool) -> Result<()> {
     let Some((mut child, _)) = start(&mut send, user, &["internal-untar", path, name], true).await? else {
         return Ok(());
     };
     write_msg(&mut send, &Reply::Ok).await?;
+    let mut recv = if compressed { decompress(recv) } else { recv };
     let mut stdin = child.stdin.take().expect("piped");
     // The helper may exit right after the end-of-archive marker, before the
     // rest of the trailer arrives, so a failed write alone is not an error:
@@ -142,11 +145,12 @@ pub async fn upload_tree(mut send: SendHalf, mut recv: RecvHalf, user: &User, pa
 
 /// Sends the helper's tar stream in chunks, then a final status: a tar stream
 /// alone ends cleanly even if the helper failed half-way (unreadable files).
-pub async fn download_tree(mut send: SendHalf, user: &User, path: &str) -> Result<()> {
+pub async fn download_tree(mut send: SendHalf, user: &User, path: &str, compressed: bool) -> Result<()> {
     let Some((mut child, mut out)) = start(&mut send, user, &["internal-tar", path], false).await? else {
         return Ok(());
     };
     write_msg(&mut send, &Reply::Ok).await?;
+    let mut send = if compressed { compress(send) } else { send };
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = out.read(&mut buf).await?;

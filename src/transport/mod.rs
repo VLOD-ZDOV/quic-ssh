@@ -405,6 +405,22 @@ impl Incoming {
     }
 }
 
+/// Largest zstd window accepted from the peer (8 MiB): bounds the memory a
+/// compressed transfer can make the receiver use.
+const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
+/// Compresses everything written with zstd; shutting down ends the
+/// compressed data and then the stream (see `Request::Compressed`).
+pub fn compress(send: SendHalf) -> SendHalf {
+    Box::new(async_compression::tokio::write::ZstdEncoder::new(send))
+}
+
+/// Reads what [`compress`] wrote on the other side.
+pub fn decompress(recv: RecvHalf) -> RecvHalf {
+    let params = [async_compression::zstd::DParameter::window_log_max(ZSTD_WINDOW_LOG_MAX)];
+    Box::new(async_compression::tokio::bufread::ZstdDecoder::with_params(tokio::io::BufReader::new(recv), &params))
+}
+
 /// Copies bytes both ways between a TCP socket and a stream, propagating half-closes.
 pub async fn splice(tcp: tokio::net::TcpStream, send: SendHalf, recv: RecvHalf) -> Result<()> {
     let (tr, tw) = tcp.into_split();
@@ -428,4 +444,26 @@ where
     };
     tokio::try_join!(up, down)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn compression_roundtrip() {
+        let text: Vec<u8> = (0..20_000).flat_map(|i| format!("row {i} of a log file\n").into_bytes()).collect();
+        let (a, mut wire) = tokio::io::duplex(1 << 20);
+        let mut w = compress(Box::new(a));
+        w.write_all(&text).await.unwrap();
+        w.shutdown().await.unwrap();
+        let mut packed = Vec::new();
+        wire.read_to_end(&mut packed).await.unwrap();
+        assert!(packed.len() * 10 < text.len(), "{} -> {} bytes", text.len(), packed.len());
+        let mut r = decompress(Box::new(std::io::Cursor::new(packed)));
+        let mut back = Vec::new();
+        r.read_to_end(&mut back).await.unwrap();
+        assert_eq!(back, text);
+    }
 }

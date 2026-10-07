@@ -72,6 +72,8 @@ pub struct HostConfig {
     pub control_persist: Option<String>,
     /// qsh's `PredictiveEcho` (`auto`, `yes`, `no`).
     pub predictive_echo: Option<String>,
+    /// `Compression` (used by `qsh cp`).
+    pub compression: Option<bool>,
 }
 
 fn yes(v: &str) -> bool {
@@ -194,6 +196,7 @@ impl Parser<'_> {
                 "controlpath" if self.ours && o.control_path.is_none() => o.control_path = first,
                 "controlpersist" if o.control_persist.is_none() => o.control_persist = first,
                 "predictiveecho" if o.predictive_echo.is_none() => o.predictive_echo = first,
+                "compression" if o.compression.is_none() => o.compression = first.as_deref().map(yes),
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -392,6 +395,7 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         control_path: ours.control_path,
         control_persist: ours.control_persist.or(ssh.control_persist),
         predictive_echo: ours.predictive_echo.or(ssh.predictive_echo),
+        compression: ours.compression.or(ssh.compression),
     }
 }
 

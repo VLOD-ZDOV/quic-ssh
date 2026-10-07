@@ -98,6 +98,8 @@ pub struct Target {
     pub sharing: control::Sharing,
     /// `PredictiveEcho`: local echo prediction in terminal sessions.
     pub predict: predict::Mode,
+    /// `Compression`: compress file copies.
+    pub compression: bool,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
 }
@@ -267,6 +269,7 @@ impl Target {
                 .map(|s| (std::time::Duration::from_secs(s), cfg.server_alive_count_max.unwrap_or(3).max(1))),
             sharing,
             predict: cfg.predictive_echo.as_deref().map(predict::parse_mode).unwrap_or_default(),
+            compression: cfg.compression.unwrap_or(false),
             sources: sources.clone(),
             host,
             port,

@@ -296,6 +296,16 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
         }
     }
+    // Compression only wraps file transfers.
+    let (request, compressed) = match request {
+        Request::Compressed(inner)
+            if matches!(*inner, Request::Upload { .. } | Request::Download { .. } | Request::UploadTree { .. } | Request::DownloadTree { .. }) =>
+        {
+            (*inner, true)
+        }
+        Request::Compressed(_) => return write_msg(&mut send, &Reply::Err("only file transfers can be compressed".into())).await,
+        other => (other, false),
+    };
     let limits = &grant.restrictions;
     // A forced command (`command=`, a certificate's force-command) replaces
     // whatever the client asked to run, which is passed on like sshd does.
@@ -339,8 +349,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         {
             write_msg(&mut send, &files_denied()).await
         }
-        Request::UploadTree { path, name } => files::upload_tree(send, recv, user, &path, &name).await,
-        Request::DownloadTree { path } => files::download_tree(send, user, &path).await,
+        Request::UploadTree { path, name } => files::upload_tree(send, recv, user, &path, &name, compressed).await,
+        Request::DownloadTree { path } => files::download_tree(send, user, &path, compressed).await,
         Request::DirectTcp { host, port } => {
             if !state.cfg.allow_tcp_forwarding {
                 return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
@@ -365,9 +375,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
         }
         Request::Upload { path, name, size, mode } => {
-            files::upload(send, recv, user, &path, &name, size, mode).await
+            files::upload(send, recv, user, &path, &name, (size, mode), compressed).await
         }
-        Request::Download { path } => files::download(send, user, &path).await,
+        Request::Download { path } => files::download(send, user, &path, compressed).await,
         Request::AgentForward => {
             if !state.cfg.allow_agent_forwarding || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
@@ -377,6 +387,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         Request::Ping => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
+        Request::Compressed(_) => unreachable!("unwrapped above"),
     }
 }
 

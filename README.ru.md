@@ -151,6 +151,8 @@ qsh -A host                            # пробросить ssh-agent
 qsh cp file.txt user@host:dir/         # загрузить
 qsh cp user@host:logs/app.log .        # скачать
 qsh cp -r project/ user@host:src/      # скопировать каталог (в любую сторону)
+qsh cp -C logs.txt host:               # со сжатием (zstd), для текста на медленном канале
+qsh multi -g web -- uptime             # одна команда на нескольких хостах
 qsh -p 2222 user@host                  # другой порт (или user@host:2222)
 qsh --transport tcp user@host          # принудительно TCP (или quic)
 qsh -v user@host                       # покажет, какой транспорт выбран
@@ -158,9 +160,10 @@ qsh -G myserver                        # показать итоговые на�
 qsh keygen                             # создать ~/.config/qsh/id_ed25519 (или: qsh keygen FILE)
 qsh --full myserver                    # режим совместимости с OpenSSH, см. ниже
 qsh ui                                 # меню хостов со статусом и замером скорости
+qsh -O check myserver                  # общее соединение (см. ниже)
 ```
 
-Опции работают как в `ssh`: их можно склеивать (`-tt`, `-NL…`), ставить после хоста и писать со значением слитно (`-p22`). Также поддерживаются `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (подсистема), `-g` (пускать другие хосты на локальные пробросы), `-e` (escape-символ), `-T`/`-t`/`-tt`. Остальные флаги ssh принимаются и игнорируются (`-v` их перечислит).
+Опции работают как в `ssh`: их можно склеивать (`-tt`, `-NL…`), ставить после хоста и писать со значением слитно (`-p22`). Также поддерживаются `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (подсистема), `-g` (пускать другие хосты на локальные пробросы), `-e` (escape-символ), `-T`/`-t`/`-tt`. Остальные флаги ssh принимаются и игнорируются (`-v` их перечислит); `-C` сжимает только `qsh cp`, сессии не сжимаются.
 
 В сессии `~.` в начале строки разрывает соединение, даже если сервер уже не отвечает; `~?` показывает список escape-последовательностей, `~~` отправляет сам символ `~`.
 
@@ -234,7 +237,7 @@ Host myserver
     Port 8080
 ```
 
-Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
+Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `Compression` (для `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
 
 ### Режим совместимости с OpenSSH (`--full`)
 

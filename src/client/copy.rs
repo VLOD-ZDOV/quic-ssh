@@ -8,7 +8,20 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::{expect_ok, write_msg, Reply, Request};
-use crate::transport::{Conn, SendHalf};
+use crate::transport::{compress, decompress, Conn, RecvHalf, SendHalf};
+
+/// Opens a stream for a transfer request, compressed if asked for and the
+/// server can (protocol version 5); returns whether it is compressed.
+async fn open(conn: &Conn, request: Request, compressed: bool) -> Result<(SendHalf, RecvHalf, bool)> {
+    let compressed = compressed && conn.server_version() >= 5;
+    if !compressed {
+        tracing::debug!("copying without compression");
+    }
+    let (mut send, recv) = conn.open_bi().await?;
+    let request = if compressed { Request::Compressed(Box::new(request)) } else { request };
+    write_msg(&mut send, &request).await?;
+    Ok((send, recv, compressed))
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Location {
@@ -86,7 +99,7 @@ fn human(n: u64) -> String {
     if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }
 
-pub async fn upload(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
+pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -> Result<()> {
     let mut file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("cannot open {}", local.display()))?;
@@ -96,10 +109,10 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
     }
     let name = local.file_name().context("source has no file name")?.to_string_lossy().into_owned();
     let size = meta.len();
-    let (mut send, mut recv) = conn.open_bi().await?;
     let req = Request::Upload { path: remote.to_string(), name: name.clone(), size, mode: crate::platform::mode(&meta) & 0o777 };
-    write_msg(&mut send, &req).await?;
+    let (send, mut recv, compressed) = open(conn, req, compressed).await?;
     expect_ok(&mut recv).await?;
+    let mut send = if compressed { compress(send) } else { send };
     let sent = transfer(&mut file, &mut send, size, &name).await?;
     send.shutdown().await?;
     if sent != size {
@@ -109,9 +122,8 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn download(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &Request::Download { path: remote.to_string() }).await?;
+pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool) -> Result<()> {
+    let (_send, mut recv, compressed) = open(conn, Request::Download { path: remote.to_string() }, compressed).await?;
     let (size, mode) = match expect_ok(&mut recv).await? {
         Reply::File { size, mode } => (size, mode),
         other => bail!("unexpected reply {other:?}"),
@@ -125,6 +137,7 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     let mut file = opts.open(&target).await.with_context(|| format!("cannot create {}", target.display()))?;
+    let mut recv = if compressed { decompress(recv) } else { recv };
     let got = transfer(&mut recv, &mut file, size, &name.to_string_lossy()).await?;
     if got != size {
         bail!("transfer interrupted ({got} of {size} bytes)");
@@ -133,9 +146,9 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
 }
 
 /// `qsh cp -r` upload: sends the contents of `local` as a tar stream.
-pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str) -> Result<()> {
+pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str, compressed: bool) -> Result<()> {
     if !local.is_dir() {
-        return upload(conn, local, remote).await;
+        return upload(conn, local, remote, compressed).await;
     }
     let name = local
         .canonicalize()?
@@ -143,9 +156,9 @@ pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str) -> Result<()> 
         .context("source has no directory name")?
         .to_string_lossy()
         .into_owned();
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &Request::UploadTree { path: remote.to_string(), name }).await?;
+    let (send, mut recv, compressed) = open(conn, Request::UploadTree { path: remote.to_string(), name }, compressed).await?;
     expect_ok(&mut recv).await?;
+    let send = if compressed { compress(send) } else { send };
     let root = local.to_path_buf();
     let sent = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
         let mut w = tokio_util::io::SyncIoBridge::new(send);
@@ -169,11 +182,12 @@ pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str) -> Result<()> 
 }
 
 /// `qsh cp -r` download: receives the contents of remote directory `remote`.
-pub async fn download_tree(conn: &Conn, remote: &str, local: &Path) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &Request::DownloadTree { path: remote.to_string() }).await?;
+pub async fn download_tree(conn: &Conn, remote: &str, local: &Path, compressed: bool) -> Result<()> {
+    let (send, mut recv, compressed) = open(conn, Request::DownloadTree { path: remote.to_string() }, compressed).await?;
     expect_ok(&mut recv).await?;
     drop(send);
+    // The rest of the stream, the final status included, is compressed.
+    let recv = if compressed { decompress(recv) } else { recv };
     // The name comes from what we asked for, never from the server. Without
     // one (`host:`, `host:.`), the contents go straight into `local`.
     let target = match Path::new(remote.trim_end_matches('/')).file_name() {

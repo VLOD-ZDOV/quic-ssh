@@ -89,6 +89,9 @@ enum Cmd {
         /// Copy directories recursively
         #[arg(short = 'r')]
         recursive: bool,
+        /// Compress the data (zstd); worth it for text on slow links
+        #[arg(short = 'C')]
+        compress: bool,
         src: String,
         dst: String,
     },
@@ -454,7 +457,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             client::pair(&target, &opts, &code).await?;
             Ok(0)
         }
-        Cmd::Cp { recursive, src, dst } => cp(&src, &dst, recursive, &cli.conn).await,
+        Cmd::Cp { recursive, compress, src, dst } => cp(&src, &dst, (recursive, compress), &cli.conn).await,
         Cmd::Speed { destination, seconds } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
@@ -813,7 +816,7 @@ fn keygen(file: Option<PathBuf>) -> Result<i32> {
     Ok(0)
 }
 
-async fn cp(src: &str, dst: &str, recursive: bool, args: &ConnArgs) -> Result<i32> {
+async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &ConnArgs) -> Result<i32> {
     enum Direction {
         Upload { local: PathBuf, remote: String },
         Download { remote: String, local: PathBuf },
@@ -836,6 +839,9 @@ async fn cp(src: &str, dst: &str, recursive: bool, args: &ConnArgs) -> Result<i3
         if recursive {
             v.push("-r".into());
         }
+        if compress {
+            v.push("-C".into());
+        }
         if args.verbose {
             v.push("-v".into());
         }
@@ -850,11 +856,13 @@ async fn cp(src: &str, dst: &str, recursive: bool, args: &ConnArgs) -> Result<i3
         Err(e) if args.full && e.is::<Unreachable>() => return exec_openssh("scp", scp_args(), &format!("{e:#}")),
         Err(e) => return Err(e),
     };
+    // `-C`, or `Compression yes` in the config (as for ssh).
+    let compress = compress || target.compression;
     let result = match (direction, recursive) {
-        (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote).await,
-        (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote).await,
-        (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local).await,
-        (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local).await,
+        (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote, compress).await,
+        (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote, compress).await,
+        (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local, compress).await,
+        (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local, compress).await,
     };
     conn.close().await;
     result.map(|()| 0)

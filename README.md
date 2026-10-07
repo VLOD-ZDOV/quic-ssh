@@ -151,6 +151,8 @@ qsh -A host                            # forward your ssh-agent
 qsh cp file.txt user@host:dir/         # upload
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
+qsh cp -C logs.txt host:               # compressed (zstd), for text on slow links
+qsh multi -g web -- uptime             # one command on several hosts
 qsh -p 2222 user@host                  # another port (or user@host:2222)
 qsh --transport tcp user@host          # force TCP (or quic)
 qsh -v user@host                       # show which transport is used
@@ -158,9 +160,10 @@ qsh -G myserver                        # print the resolved settings for a host
 qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
 qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
+qsh -O check myserver                  # the shared connection (see below)
 ```
 
-Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them).
+Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them); `-C` only compresses `qsh cp`, sessions are not compressed.
 
 In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
 
@@ -234,7 +237,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 

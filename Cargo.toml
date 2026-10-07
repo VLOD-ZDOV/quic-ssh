@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x509-parser = "0.18"
 libc = "0.2"
 vt100 = "0.16.2"
+async-compression = { version = "0.4.50", features = ["tokio", "zstd"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname"] }

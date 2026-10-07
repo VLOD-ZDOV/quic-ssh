@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -133,6 +133,12 @@ pub enum Request {
     /// Reattach to a persistent session after a lost connection. Output from
     /// byte `received` on is sent again (as far as the server still has it).
     Resume { token: Vec<u8>, received: u64 },
+    // --- protocol version 5 ---
+    /// A file transfer (`Upload`, `Download`, `UploadTree`, `DownloadTree`)
+    /// with zstd compression: after the first reply, the side that sends the
+    /// data compresses everything it sends on the stream, to its end
+    /// (including a final reply after a tree download).
+    Compressed(Box<Request>),
 }
 
 /// First message on a stream the server opens to the client.
