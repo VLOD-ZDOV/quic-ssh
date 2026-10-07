@@ -97,14 +97,14 @@ enum Io {
 }
 
 fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>) -> Result<(tokio::process::Child, Io)> {
-    let mut cmd = user.command(&user.shell);
+    let arg0 = command.is_none().then(|| user.login_arg0());
+    let mut cmd = user.command_as(&user.shell, arg0.as_deref());
     cmd.envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);
-    match command {
-        Some(c) => cmd.arg("-c").arg(c),
-        None => cmd.arg0(user.login_arg0()),
-    };
+    if let Some(c) = command {
+        cmd.arg("-c").arg(c);
+    }
     let mut child = cmd.spawn()?;
     let io = Io::Pipes {
         stdin: child.stdin.take().expect("piped"),
@@ -123,17 +123,11 @@ pub(super) fn spawn_pty(
     let (pty, pts) = pty_process::open()?;
     pty.resize(pty_process::Size::new(spec.rows, spec.cols))?;
     let tty = nix::unistd::ttyname(&pts).ok().map(|p| p.to_string_lossy().into_owned());
-    let mut cmd = pty_process::Command::new(&user.shell)
-        .env_clear()
-        .envs(env)
-        .current_dir(&user.home)
-        .kill_on_drop(true);
-    cmd = match command {
-        Some(c) => cmd.arg("-c").arg(c),
-        None => cmd.arg0(user.login_arg0()),
-    };
-    // SAFETY: the closure only performs async-signal-safe syscalls.
-    cmd = unsafe { cmd.pre_exec(user.drop_privileges(true)) };
+    let arg0 = command.is_none().then(|| user.login_arg0());
+    let mut cmd = user.pty_command(&user.shell, arg0.as_deref(), env);
+    if let Some(c) = command {
+        cmd = cmd.arg("-c").arg(c);
+    }
     let child = cmd.spawn(pts)?;
     Ok((child, pty, tty))
 }

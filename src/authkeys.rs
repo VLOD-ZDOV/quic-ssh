@@ -148,19 +148,12 @@ fn parse_expiry(v: &str) -> Result<u64> {
     if !matches!(digits.len(), 8 | 12 | 14) || !digits.bytes().all(|b| b.is_ascii_digit()) {
         bail!("bad expiry-time {v:?}");
     }
-    let n = |r: std::ops::Range<usize>| digits.get(r).map(|s| s.parse::<i32>().unwrap()).unwrap_or(0);
-    // SAFETY: `tm` is fully initialised (zeroed, then set) and only read by libc.
-    let t = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        tm.tm_year = n(0..4) - 1900;
-        tm.tm_mon = n(4..6) - 1;
-        tm.tm_mday = n(6..8);
-        tm.tm_hour = n(8..10);
-        tm.tm_min = n(10..12);
-        tm.tm_sec = n(12..14);
-        tm.tm_isdst = -1;
-        if utc { libc::timegm(&mut tm) } else { libc::mktime(&mut tm) }
-    };
+    let n = |r: std::ops::Range<usize>| digits.get(r).map(|s| s.parse::<i8>().unwrap_or(-1)).unwrap_or(0);
+    let year: i16 = digits[0..4].parse()?;
+    let time = jiff::civil::DateTime::new(year, n(4..6), n(6..8), n(8..10), n(10..12), n(12..14), 0)
+        .with_context(|| format!("bad expiry-time {v:?}"))?;
+    let zone = if utc { jiff::tz::TimeZone::UTC } else { jiff::tz::TimeZone::system() };
+    let t = time.to_zoned(zone).context("bad expiry-time")?.timestamp().as_second();
     u64::try_from(t).context("bad expiry-time")
 }
 
@@ -441,6 +434,14 @@ mod tests {
         assert!(check(&offered, std::slice::from_ref(&e), &[], &login("198.51.100.5", 1_800_000_000)).is_err());
         assert!(check(&offered, std::slice::from_ref(&e), &[], &login("192.0.2.5", 1_900_000_000)).is_err(), "expired");
         assert_eq!(parse_expiry("20300101Z").unwrap(), 1_893_456_000);
+        assert_eq!(parse_expiry("203001011230Z").unwrap(), 1_893_456_000 + 12 * 3600 + 30 * 60);
+        assert_eq!(parse_expiry("20300101123045z").unwrap(), 1_893_456_000 + 12 * 3600 + 30 * 60 + 45);
+        for bad in ["20301301", "20300132", "203001012500", "2030", "2030010a", "-0300101"] {
+            assert!(parse_expiry(bad).is_err(), "{bad}");
+        }
+        // Local time: within a day of UTC midnight.
+        let local = parse_expiry("20300101").unwrap() as i64;
+        assert!((local - 1_893_456_000).abs() <= 14 * 3600, "{local}");
     }
 
     #[test]

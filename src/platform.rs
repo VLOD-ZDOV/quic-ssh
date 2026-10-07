@@ -71,12 +71,16 @@ pub fn terminal() -> io::Result<(File, File)> {
 /// with "would block" instead of waiting for data.
 pub fn blocking_stdio() {
     #[cfg(unix)]
-    for fd in 0..=2 {
-        // SAFETY: fcntl on the standard descriptors only reads and updates their flags.
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+    {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::os::fd::AsFd;
+        let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+        for fd in [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()] {
+            if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+                let flags = OFlag::from_bits_truncate(flags);
+                if flags.contains(OFlag::O_NONBLOCK) {
+                    let _ = fcntl(fd, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK));
+                }
             }
         }
     }

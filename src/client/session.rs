@@ -26,35 +26,11 @@ struct RawMode;
 impl RawMode {
     fn enable() -> Result<RawMode> {
         crossterm::terminal::enable_raw_mode()?;
+        // Windows consoles: interpret the remote side's VT output (colors,
+        // cursor movement). Keys are encoded by `keys_vt`.
         #[cfg(windows)]
-        windows_vt::enable();
+        crossterm::ansi_support::supports_ansi();
         Ok(RawMode)
-    }
-}
-
-/// Windows consoles: keys as VT escape sequences (arrows, function keys), and
-/// the remote side's VT output (colours, cursor movement) interpreted.
-#[cfg(windows)]
-mod windows_vt {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-
-    fn add(handle: u32, flag: CONSOLE_MODE) {
-        // SAFETY: plain console API calls on the process's standard handles.
-        unsafe {
-            let h = GetStdHandle(handle);
-            let mut mode: CONSOLE_MODE = 0;
-            if GetConsoleMode(h, &mut mode) != 0 {
-                SetConsoleMode(h, mode | flag);
-            }
-        }
-    }
-
-    pub fn enable() {
-        add(STD_INPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_INPUT);
-        add(STD_OUTPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
 }
 
@@ -97,6 +73,50 @@ pub fn termination_signal(watch_sigint: bool) -> impl std::future::Future<Output
                 _ = brk.recv() => 128 + 3,
                 _ = int.recv(), if watch_sigint => 128 + 2,
             }
+        }
+    }
+}
+
+/// What the user types: stdin, or on a Windows console the key presses,
+/// encoded as a terminal would send them.
+enum Input {
+    Stdin(tokio::io::Stdin, Vec<u8>),
+    #[cfg(windows)]
+    Keys(mpsc::Receiver<Vec<u8>>),
+}
+
+impl Input {
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn new(console: bool, cursor_keys: Arc<std::sync::Mutex<super::keys_vt::CursorKeys>>) -> Input {
+        #[cfg(windows)]
+        if console {
+            let (tx, rx) = mpsc::channel(64);
+            std::thread::spawn(move || loop {
+                use crossterm::event::Event;
+                let bytes = match crossterm::event::read() {
+                    Ok(Event::Key(k)) => super::keys_vt::encode(k, cursor_keys.lock().unwrap().app),
+                    Ok(Event::Paste(text)) => text.into_bytes(),
+                    Ok(_) => continue,
+                    Err(_) => break,
+                };
+                if !bytes.is_empty() && tx.blocking_send(bytes).is_err() {
+                    break;
+                }
+            });
+            return Input::Keys(rx);
+        }
+        Input::Stdin(tokio::io::stdin(), vec![0u8; 16 * 1024])
+    }
+
+    /// The next chunk; `None` at the end.
+    async fn next(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Input::Stdin(stdin, buf) => match stdin.read(buf).await {
+                Ok(0) | Err(_) => None,
+                Ok(n) => Some(buf[..n].to_vec()),
+            },
+            #[cfg(windows)]
+            Input::Keys(rx) => rx.recv().await,
         }
     }
 }
@@ -340,6 +360,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         Predictor::new(opts.predict, rows, cols)
     });
     let (typed_tx, mut typed_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Whether the remote program wants application cursor keys (followed on
+    // Windows, where qsh encodes the keys itself).
+    let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::CursorKeys::default()));
     let typed_tx = predictor.is_some().then_some(typed_tx);
     let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
     let stdin_tx = tx.clone();
@@ -347,19 +370,18 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let _ = stdin_tx.send(ClientMsg::StdinEof).await;
     } else {
         let disconnect = disconnect.clone();
+        let mut input = Input::new(raw.is_some(), cursor_keys.clone());
         tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let mut buf = vec![0u8; 16 * 1024];
             loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => {
+                match input.next().await {
+                    None => {
                         let _ = stdin_tx.send(ClientMsg::StdinEof).await;
                         break;
                     }
-                    Ok(n) => {
+                    Some(chunk) => {
                         let (data, action) = match escapes.as_mut() {
-                            Some(e) => e.process(&buf[..n]),
-                            None => (buf[..n].to_vec(), None),
+                            Some(e) => e.process(&chunk),
+                            None => (chunk, None),
                         };
                         if !data.is_empty() {
                             if let Some(t) = &typed_tx {
@@ -469,6 +491,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     match msg {
                         ServerMsg::Stdout(d) => {
                             received += d.len() as u64;
+                            if cfg!(windows) {
+                                cursor_keys.lock().unwrap().feed(&d);
+                            }
                             show(&mut stdout, &mut predictor, &d).await?;
                         }
                         ServerMsg::Stderr(d) => show(&mut stderr, &mut predictor, &d).await?,

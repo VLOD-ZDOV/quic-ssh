@@ -1,4 +1,5 @@
 //! qsh — secure shell over QUIC with automatic TCP fallback.
+#![forbid(unsafe_code)]
 
 pub mod agent;
 #[cfg(unix)]

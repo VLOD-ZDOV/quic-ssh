@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! qshd needs a Unix system (Linux, macOS, BSD): user switching, PTYs and
 //! process groups. On Windows, only the client (qsh) is available.
 

@@ -1,10 +1,9 @@
 //! Target-user lookup and privilege dropping for spawned processes.
 
-use std::ffi::CString;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use nix::unistd::{geteuid, Gid, Group, User as PwUser};
+use nix::unistd::{geteuid, Gid, User as PwUser};
 
 /// Only Linux has the shadow database (Android has no other accounts to expire;
 /// macOS keeps account policy in Directory Services, which PAM would consult).
@@ -14,55 +13,41 @@ fn account_expired(_name: &str) -> bool {
 }
 
 /// Whether the account's expiry date (`chage -E`, `usermod -e`) has passed,
-/// checked the way pam_unix does: `sp_expire` is set and today is on or after
-/// it. Without a readable shadow entry the account counts as not expired.
+/// checked the way pam_unix does: the shadow entry's expiry day is set and
+/// today is on or after it. Without a readable entry the account counts as
+/// not expired. (Read from /etc/shadow, as static builds' libc does too.)
 #[cfg(target_os = "linux")]
 fn account_expired(name: &str) -> bool {
-    let Ok(cname) = CString::new(name) else { return true };
-    // SAFETY: getspnam_r fills `entry` using `buf`; both outlive the call and
-    // `found` is checked before `entry` is used.
-    let entry = unsafe {
-        let mut entry: libc::spwd = std::mem::zeroed();
-        let mut buf = vec![0 as libc::c_char; 16 * 1024];
-        let mut found: *mut libc::spwd = std::ptr::null_mut();
-        let rc = libc::getspnam_r(cname.as_ptr(), &mut entry, buf.as_mut_ptr(), buf.len(), &mut found);
-        if rc != 0 || found.is_null() {
-            return false;
-        }
-        entry.sp_expire
-    };
+    let Ok(text) = std::fs::read_to_string("/etc/shadow") else { return false };
     let today = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86400)
-        .unwrap_or(0) as libc::c_long;
-    entry != -1 && today >= entry
+        .map(|d| (d.as_secs() / 86400) as i64)
+        .unwrap_or(0);
+    shadow_expired(&text, name, today)
 }
 
-/// The user's groups, including `gid` (resolved before forking).
+#[cfg(target_os = "linux")]
+fn shadow_expired(shadow: &str, name: &str, today: i64) -> bool {
+    shadow
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|f| f.first() == Some(&name))
+        .and_then(|f| f.get(7).and_then(|e| e.parse::<i64>().ok()))
+        .is_some_and(|expire| expire >= 0 && today >= expire)
+}
+
+/// The user's groups, including `gid` (resolved before starting processes).
 #[cfg(not(target_vendor = "apple"))]
 fn group_list(name: &str, gid: Gid) -> Result<Vec<libc::gid_t>> {
-    let cname = CString::new(name)?;
+    let cname = std::ffi::CString::new(name)?;
     Ok(nix::unistd::getgrouplist(&cname, gid)?.into_iter().map(Gid::as_raw).collect())
 }
 
-/// macOS: `getgrouplist` takes `int` group IDs and nix does not wrap it.
+/// macOS resolves group membership dynamically (Directory Services): a
+/// process does not need its supplementary groups for access checks.
 #[cfg(target_vendor = "apple")]
-fn group_list(name: &str, gid: Gid) -> Result<Vec<libc::gid_t>> {
-    let cname = CString::new(name)?;
-    let mut n: libc::c_int = 64;
-    loop {
-        let mut groups = vec![0 as libc::c_int; n as usize];
-        // SAFETY: `groups` has room for `n` entries; libc updates `n` to the count.
-        let rc = unsafe { libc::getgrouplist(cname.as_ptr(), gid.as_raw() as libc::c_int, groups.as_mut_ptr(), &mut n) };
-        if rc >= 0 {
-            groups.truncate(n as usize);
-            return Ok(groups.into_iter().map(|g| g as libc::gid_t).collect());
-        }
-        if n >= 65536 {
-            bail!("too many groups for {name}");
-        }
-        n *= 2;
-    }
+fn group_list(_name: &str, _gid: Gid) -> Result<Vec<libc::gid_t>> {
+    Ok(Vec::new())
 }
 
 /// A user sessions run as.
@@ -135,50 +120,61 @@ impl User {
         format!("-{base}")
     }
 
-    /// Closure for `pre_exec` that switches to this user. Only calls
-    /// async-signal-safe syscalls; the group list is resolved beforehand.
-    /// With `own_tty`, the terminal on stdin is first handed to the user like
-    /// sshd does: group `tty` with mode 0620 (only `write`/`wall` may write to
-    /// it), or mode 0600 if there is no `tty` group.
-    pub fn drop_privileges(&self, own_tty: bool) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
-        let (switch, uid, gid, groups) = (self.switch, self.uid, self.gid, self.groups.clone());
-        let (tty_gid, tty_mode) = match Group::from_name("tty").ok().flatten() {
-            Some(g) => (g.gid.as_raw(), 0o620),
-            None => (libc::gid_t::MAX, 0o600), // -1: keep the group
-        };
-        move || {
-            if !switch {
-                return Ok(());
-            }
-            // SAFETY: plain syscalls with valid pointers; no allocation happens here.
-            unsafe {
-                // Best effort: if the terminal cannot be chowned (e.g. a devpts
-                // owned by another user namespace), it stays root-owned, which is
-                // stricter; the session still works through its open descriptors.
-                if own_tty && libc::fchown(0, uid, tty_gid) == 0 {
-                    libc::fchmod(0, tty_mode);
-                }
-                if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0
-                    || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Refuse to continue if root privileges could be regained.
-                if uid != 0 && libc::setuid(0) == 0 {
-                    return Err(std::io::Error::other("failed to drop privileges"));
-                }
-            }
-            Ok(())
+    /// How to start `program` as this user: itself, or, when the server
+    /// runs as root, through `qshd internal-become` (see
+    /// [`super::helpers::become_user`]), which switches to the user in a
+    /// process of its own and then runs it. `arg0` replaces the program's
+    /// argv[0] (a login shell's `-bash`); `tty` hands the terminal on stdin
+    /// to the user.
+    fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+        if !self.switch {
+            return (program.to_owned(), Vec::new());
         }
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+        let groups: Vec<String> = self.groups.iter().map(|g| g.to_string()).collect();
+        let mut args: Vec<std::ffi::OsString> = vec![
+            BECOME.into(),
+            self.uid.to_string().into(),
+            self.gid.to_string().into(),
+            if groups.is_empty() { "-".into() } else { groups.join(",").into() },
+            self.home.clone().into_os_string(),
+            if tty { "tty" } else { "-" }.into(),
+            arg0.unwrap_or("").into(),
+            "--".into(),
+        ];
+        args.push(program.to_owned());
+        (exe.into_os_string(), args)
     }
 
     /// A command that runs as this user with a clean environment in their home.
     pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.env_clear().envs(self.env()).current_dir(&self.home).kill_on_drop(true);
-        // SAFETY: the closure only performs async-signal-safe syscalls.
-        unsafe { cmd.pre_exec(self.drop_privileges(false)) };
+        self.command_as(program, None)
+    }
+
+    /// Like [`User::command`], with `arg0` as the program's argv[0].
+    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>) -> tokio::process::Command {
+        let (exe, args) = self.launch(program.as_ref(), arg0, false);
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.args(args).env_clear().envs(self.env()).kill_on_drop(true);
+        if !self.switch {
+            cmd.current_dir(&self.home);
+            if let Some(a) = arg0 {
+                cmd.arg0(a);
+            }
+        }
+        cmd
+    }
+
+    /// A command on a terminal, as this user (the terminal is handed to them).
+    pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>) -> pty_process::Command {
+        let (exe, args) = self.launch(program.as_ref(), arg0, true);
+        let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(env).kill_on_drop(true);
+        if !self.switch {
+            cmd = cmd.current_dir(&self.home);
+            if let Some(a) = arg0 {
+                cmd = cmd.arg0(a);
+            }
+        }
         cmd
     }
 
@@ -206,6 +202,8 @@ impl User {
     }
 }
 
+/// Subcommand that switches to a user and runs a program (see `User::launch`).
+pub const BECOME: &str = "internal-become";
 /// Subcommand that takes its arguments from [`HELPER_ARGS`].
 pub const HELPER_FROM_ENV: &str = "internal-env";
 /// Environment variable with a helper's arguments, hex-encoded and NUL-separated.
@@ -248,6 +246,17 @@ fn shell_quote(word: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shadow_expiry() {
+        let shadow = "root:*:19000:0:99999:7:::\nold:$6$x:19000:0:99999:7::19500:\nzero:x:1:::::0:\n";
+        assert!(!shadow_expired(shadow, "root", 20000), "no expiry set");
+        assert!(shadow_expired(shadow, "old", 19500));
+        assert!(!shadow_expired(shadow, "old", 19499));
+        assert!(shadow_expired(shadow, "zero", 1), "0 is a date too (1970-01-01)");
+        assert!(!shadow_expired(shadow, "missing", 1));
+    }
 
     #[test]
     fn helper_args_roundtrip() {

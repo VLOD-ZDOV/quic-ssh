@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
-pub use super::users::{decode_args, HELPER_ARGS, HELPER_FROM_ENV};
+pub use super::users::{decode_args, BECOME, HELPER_ARGS, HELPER_FROM_ENV};
 
 /// Where an upload goes: `path`, or `path/name` if `path` is a directory.
 fn upload_target(path: &str, name: &str) -> Result<PathBuf> {
@@ -117,6 +117,67 @@ pub fn tar(path: &str) -> Result<()> {
     crate::tree::write_tree(dir, &mut out)?;
     out.flush()?;
     Ok(())
+}
+
+/// `qshd internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]`,
+/// run as root (see `User::launch`): hands the terminal on stdin to the user
+/// if TTY is `tty` (group `tty`, mode 0620, like sshd), switches to the
+/// user's groups, group and user, changes to HOME (or `/`), and runs PROGRAM
+/// with ARG0 (if not empty) as its argv[0]. Nothing here can raise
+/// privileges: as anyone but root, switching users fails.
+pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
+    use nix::sys::stat::{fchmod, Mode};
+    use nix::unistd::{fchown, Gid, Group, Uid};
+    use std::os::unix::process::CommandExt;
+    let [uid, gid, groups, home, tty, arg0, dashes, program, rest @ ..] = args else {
+        bail!("usage: internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]")
+    };
+    if dashes != "--" {
+        bail!("bad arguments");
+    }
+    let (uid, gid) = (Uid::from_raw(uid.parse()?), Gid::from_raw(gid.parse()?));
+    if tty == "tty" {
+        let (group, mode) = match Group::from_name("tty") {
+            Ok(Some(g)) => (Some(g.gid), 0o620),
+            _ => (None, 0o600),
+        };
+        // Best effort: a terminal of another user namespace cannot be
+        // chowned; it then stays root's, which is stricter.
+        if fchown(io::stdin(), Some(uid), group).is_ok() {
+            let _ = fchmod(io::stdin(), Mode::from_bits_truncate(mode));
+        }
+    }
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(rest);
+    if !arg0.is_empty() {
+        cmd.arg0(arg0);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let groups: Vec<Gid> = match groups.as_str() {
+            "-" => Vec::new(),
+            list => list.split(',').map(|g| g.parse().map(Gid::from_raw)).collect::<Result<_, _>>()?,
+        };
+        nix::unistd::setgroups(&groups)?;
+        nix::unistd::setgid(gid)?;
+        nix::unistd::setuid(uid)?;
+        // Refuse to go on if root privileges could be regained.
+        if !uid.is_root() && nix::unistd::setuid(Uid::from_raw(0)).is_ok() {
+            bail!("failed to drop privileges");
+        }
+        if std::env::set_current_dir(home).is_err() {
+            std::env::set_current_dir("/")?;
+        }
+    }
+    // macOS: the system drops root's supplementary groups when it switches
+    // the user (membership is looked up dynamically there).
+    #[cfg(target_vendor = "apple")]
+    {
+        let _ = groups;
+        cmd.uid(uid.as_raw()).gid(gid.as_raw());
+        cmd.current_dir(if std::path::Path::new(home).is_dir() { home.as_str() } else { "/" });
+    }
+    Err(anyhow::Error::from(cmd.exec()).context(format!("cannot run {program}")))
 }
 
 /// Prints and consumes the pending pairing code.

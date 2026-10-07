@@ -8,6 +8,7 @@ pub mod copy;
 pub mod doctor;
 pub mod forward;
 pub mod groups;
+pub mod keys_vt;
 pub mod keystroke;
 pub mod multi;
 pub mod predict;

@@ -95,6 +95,13 @@ fn host_key(path: &std::path::Path) -> Result<Identity> {
 }
 
 pub fn main() {
+    // Switching to a user before running their program (see `User::launch`).
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(helpers::BECOME) {
+        let Err(e) = helpers::become_user(&argv[2..]);
+        eprintln!("qshd: {e:#}");
+        std::process::exit(126);
+    }
     let cli = match std::env::args().nth(1).as_deref() {
         // A helper started through the user's shell: the real arguments are in the environment.
         Some(helpers::HELPER_FROM_ENV) => {
