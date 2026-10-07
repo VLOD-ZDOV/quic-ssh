@@ -251,13 +251,19 @@ fn collect_aliases(text: &str, base: &Path, depth: usize, out: &mut Vec<String>)
 /// Host aliases from `~/.config/qsh/config` and `~/.ssh/config`, in file order.
 pub fn host_aliases(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for dir in [crate::keys::qsh_dir(home), home.join(".ssh")] {
-        if let Ok(text) = std::fs::read_to_string(dir.join("config")) {
+    let qsh_dir = crate::keys::qsh_dir(home);
+    for (dir, file) in [(qsh_dir.clone(), "config"), (home.join(".ssh"), "config"), (qsh_dir, UI_HOSTS)] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(file)) {
             collect_aliases(&text, &dir, 0, &mut out);
         }
     }
     out
 }
+
+/// Connections saved from `qsh ui` (ssh_config syntax), in `~/.config/qsh`.
+/// Read after the user's own config files, and the menu only saves names
+/// that are not in them, so it never overrides what the user wrote.
+pub const UI_HOSTS: &str = "ui-hosts";
 
 /// Collects the settings for `host` from config `text`. `full` is false for
 /// `~/.ssh/config` outside `--full`: its `Port`, `LocalForward` and
@@ -332,7 +338,14 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
     let ssh_dir = ssh_file.parent().map(Path::to_path_buf).unwrap_or_else(|| home.join(".ssh"));
     // -o lines come first: before any `Host` they apply to every host and win.
-    let ours_text = format!("{}\n{}", sources.overrides.join("\n"), read(&qsh_dir.join("config")));
+    // `Match all` ends the last `Host` block of each part, so settings in the
+    // next one are not taken as part of it.
+    let ours_text = format!(
+        "{}\nMatch all\n{}\nMatch all\n{}",
+        sources.overrides.join("\n"),
+        read(&qsh_dir.join("config")),
+        read(&qsh_dir.join(UI_HOSTS))
+    );
     let ours = Parser { host, base: &qsh_dir, full: true, ours: true, out: HostConfig::default() }.run(&ours_text);
     let ssh = Parser { host, base: &ssh_dir, full: sources.full, ours: false, out: HostConfig::default() }.run(&read(&ssh_file));
     HostConfig {

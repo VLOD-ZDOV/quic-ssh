@@ -10,7 +10,9 @@ mod known_hosts;
 pub mod session;
 mod socks;
 pub mod speed;
+pub mod saved;
 pub mod tui;
+pub mod ui_state;
 
 use std::io::{BufRead, Write};
 use std::net::SocketAddr;

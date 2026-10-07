@@ -456,6 +456,11 @@ static STANDARD_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn full_mode_uses_qshd_on_ssh_port_and_config() {
     let _port = STANDARD_PORT.lock().unwrap_or_else(|e| e.into_inner());
+    // --full also looks on 4422; a qshd running there (e.g. this machine's own) would answer first.
+    if UdpSocket::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() || TcpListener::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() {
+        eprintln!("skipped: port {} is in use on this machine", qsh::DEFAULT_PORT);
+        return;
+    }
     // qshd on UDP only, as it would run on port 22 next to sshd.
     let s = Server::start_with("127.0.0.1", "tcp = false\n");
     let c = Client::paired(&s);

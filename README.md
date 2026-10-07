@@ -251,13 +251,20 @@ ln -s "$(command -v qsh)" ~/.local/bin/ssh
 
 ### Host menu and speed test (`qsh ui`, `qsh speed`)
 
-`qsh ui` opens an interactive menu of every host from `~/.ssh/config`, `~/.config/qsh/config` and known_hosts:
+`qsh ui` opens a connection menu with every host from `~/.ssh/config`, `~/.config/qsh/config`, known_hosts and the connections you saved in it:
 
-- **Live status:** each host is checked in the background for qshd (TLS handshake with a throwaway key, no login). The list shows `● quic 42 ms`, `● tcp` (UDP blocked) or `○ ssh` (no qshd), and whether the host key is known, new or changed.
-- **⏎ / tap** connects with `qsh --full`, so hosts without qshd open with plain ssh. When the session ends you return to the menu.
-- **`s`** runs a speed test with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
-- **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`r`** re-checks, **`q`** quits.
-- The layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
+- **Status:** each host is checked in the background for qshd (TLS handshake with a throwaway key, no login). The list shows `● quic 42 ms`, `● tcp` (UDP blocked) or `○ ssh` (no qshd), and whether the host key is known, new or changed. Results are cached for 10 minutes in `~/.config/qsh/ui-state.toml`, so reopening the menu does not contact every server again; **`r`** checks everything now.
+- **Connecting:** **⏎ / tap** connects (with `--full` by default, so hosts without qshd open with plain ssh). When the session ends you return to the menu. Recently used hosts move to the top.
+- **One-off connection:** **`c`** connects once to `user@host[:port]` without saving anything.
+- **Saved connections:**
+  - **`n`** adds one: name, address, user, port, key file, transport (auto/QUIC/TCP), and whether to fall back to ssh.
+  - **`e`** edits a saved connection, and **`d`** deletes it.
+  - They are stored in `~/.config/qsh/ui-hosts` (ssh_config syntax), so `qsh NAME` works on the command line too.
+  - Your own config files are never written. For a host from them, **`e`** only changes the menu's settings (transport, ssh fallback), and a saved name cannot clash with a host of yours.
+- **History:** **`Tab`** shows the history with the result of each connection. **⏎** connects again, **`a`** saves an entry as a connection, **`d`** removes it.
+- **Speed test:** **`s`** runs it with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
+- **Other keys:** **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`q`** quits.
+- **Screens:** the layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
 
 `qsh speed host` runs the same test in plain text:
 
