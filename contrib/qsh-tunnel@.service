@@ -1,0 +1,20 @@
+# Keeps this host reachable through a public qshd without an open port here.
+# Install as a user unit on the hidden host:
+#   cp qsh-tunnel@.service ~/.config/systemd/user/
+#   systemctl --user enable --now qsh-tunnel@user@public.example.com
+#   loginctl enable-linger "$USER"   # keep it running after logout
+# Then from anywhere:  qsh -J user@public.example.com you@localhost:14422
+# Change the port with `systemctl --user edit qsh-tunnel@...` (Environment=PORT=...).
+[Unit]
+Description=qsh tunnel through %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PORT=14422
+ExecStart=/usr/local/bin/qsh -N -o BatchMode=yes -R ${PORT}:127.0.0.1:4422 %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

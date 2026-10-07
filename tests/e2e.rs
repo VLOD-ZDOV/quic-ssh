@@ -2129,3 +2129,37 @@ fn keys_from_a_command() {
     let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
     assert!(!out.status.success(), "an unsafe command was used");
 }
+
+/// A host without an open port: it keeps `qsh -N -R` to a public qshd, and
+/// clients reach it with `-J public`. The session is encrypted end to end
+/// (the public host only relays the bytes).
+#[test]
+fn reaching_a_host_without_an_open_port() {
+    let public = Server::start();
+    let hidden = Server::start();
+    let c = Client::paired(&public);
+    // The client's key is accepted on the hidden host too.
+    std::fs::create_dir_all(hidden.authorized_keys().parent().unwrap()).unwrap();
+    std::fs::copy(public.authorized_keys(), hidden.authorized_keys()).unwrap();
+    // The hidden host's tunnel (here run with the same key, as its own user would).
+    let relay_port = free_port();
+    let mut tunnel = c
+        .cmd(&["-N", "-R", &format!("{relay_port}:127.0.0.1:{}", hidden.port), "-p", &public.port.to_string(), &dest()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let jump = format!("{}:{}", dest(), public.port);
+    let target = format!("{}@localhost:{relay_port}", user());
+    let out = loop {
+        let out = c.run(&["--accept-new-host", "-J", &jump, &target, "echo", "behind-nat"]);
+        if out.status.success() || Instant::now() > deadline {
+            break out;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    let _ = tunnel.kill();
+    let _ = tunnel.wait();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "behind-nat\n");
+}

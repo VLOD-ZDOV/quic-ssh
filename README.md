@@ -272,6 +272,19 @@ To make every program use qsh, install it as `ssh` earlier in your `PATH`. Run a
 ln -s "$(command -v qsh)" ~/.local/bin/ssh
 ```
 
+### Hosts without an open port
+
+A host behind NAT, or one you cannot open a port on, can keep a tunnel to any host with qshd that you can reach:
+
+```sh
+# on the hidden host (as the user who will log in there):
+qsh -N -R 14422:127.0.0.1:4422 user@public.example.com
+# from anywhere:
+qsh -J user@public.example.com you@localhost:14422
+```
+
+The session stays encrypted end to end: the public host only passes the bytes on, and the hidden host's key is checked as usual. The port on the public host listens on loopback only. To keep the tunnel up, use `contrib/qsh-tunnel@.service` (a systemd user unit; instructions inside).
+
 ### Host menu and speed test (`qsh ui`, `qsh speed`)
 
 `qsh ui` opens a connection menu with every host from `~/.ssh/config`, `~/.config/qsh/config`, known_hosts and the connections you saved in it:
