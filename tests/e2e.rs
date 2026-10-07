@@ -2019,7 +2019,7 @@ fn command_on_several_hosts() {
     assert_eq!(out.status.code(), Some(255), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains(&format!("{host_a}: exit code 3")), "{err}");
-    assert!(err.contains(&format!("{dead}: could not connect")), "{err}");
+    assert!(err.contains(&format!("{dead}: exit code 255")) && err.contains("qsh doctor"), "{err}");
     let out = c.run(&["multi", "-g", "nope", "--", "true"]);
     assert!(!out.status.success());
 }

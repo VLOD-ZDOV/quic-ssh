@@ -86,6 +86,11 @@ async fn local(r: &mut Report) -> Result<()> {
     Ok(())
 }
 
+/// `host:port`, with IPv6 addresses in brackets.
+fn endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
+}
+
 async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptions) -> Result<()> {
     println!();
     let target = match Target::parse(dest, port, opts.full) {
@@ -95,75 +100,30 @@ async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptio
             return Ok(());
         }
     };
-    println!("{} → {}@{}:{}", dest, target.user, target.host, target.port);
+    println!("{} → {}@{}", dest, target.user, endpoint(&target.host, target.port));
     if target.needs_proxy {
         r.line(Level::Note, "proxy", "~/.ssh/config sends this host through ProxyJump/ProxyCommand");
         r.hint("qsh does not connect directly; `qsh --full` hands it to ssh, or set ProxyJump in ~/.config/qsh/config");
         return Ok(());
     }
-    let addrs = match tokio::time::timeout(STEP_TIMEOUT, tokio::net::lookup_host((target.host.as_str(), target.port))).await {
-        Ok(Ok(a)) => a.map(|a| a.ip().to_string()).collect::<Vec<_>>(),
-        Ok(Err(e)) => {
-            r.line(Level::Bad, "name", format!("{}: {e}", target.host));
-            r.hint("check the host name (and HostName in your config)");
-            return Ok(());
-        }
-        Err(_) => {
-            r.line(Level::Bad, "name", "DNS does not answer");
-            return Ok(());
-        }
-    };
-    let mut unique = addrs.clone();
-    unique.dedup();
-    r.line(Level::Ok, "name", unique.join(", "));
-
-    // Handshakes with a throwaway key: is qshd there, over which transport?
-    let tls = crate::tls::client_config(&Identity::generate())?;
-    let mut peer = None;
-    let mut reachable = Vec::new();
-    for (mode, name) in [(Mode::Quic, "quic"), (Mode::Tcp, "tcp")] {
-        let start = Instant::now();
-        match tokio::time::timeout(STEP_TIMEOUT, transport::connect(&target.host, target.port, mode, target.family, tls.clone())).await {
-            Ok(Ok(conn)) => {
-                r.line(Level::Ok, name, format!("qshd answers on {} {} ({})", if mode == Mode::Quic { "udp" } else { "tcp" }, target.port, ms(start.elapsed())));
-                peer = Some(conn.peer_key());
-                reachable.push(mode);
-                conn.close().await;
-            }
-            Ok(Err(e)) => r.line(Level::Bad, name, format!("{e:#}").lines().last().unwrap_or_default().trim()),
-            Err(_) => r.line(Level::Bad, name, "no answer"),
-        }
+    let mut fingerprint = None;
+    match &target.proxy_jump {
+        // Only reachable through the jump hosts: the login step follows them.
+        Some(jumps) => r.line(Level::Note, "route", format!("through {jumps} (checked by the login below)")),
+        None => match reachability(r, &target).await {
+            Some(f) => fingerprint = Some(f),
+            None => return Ok(()),
+        },
     }
-    match reachable.as_slice() {
-        [] => {
-            r.hint(format!("is qshd running there (`systemctl status qshd`), listening on {}, and let through the firewall?", target.port));
-            r.hint("a host with only sshd: `qsh --full` uses ssh there");
-            return Ok(());
-        }
-        [Mode::Tcp] => r.hint(format!("UDP {} is blocked on the way: qsh works over TCP (slower on lossy links); open UDP {} for QUIC", target.port, target.port)),
-        [Mode::Quic] => r.hint("TCP fallback is off or blocked; fine while UDP gets through"),
-        _ => {}
-    }
-    let Some(key) = peer else { return Ok(()) };
-    match super::known_host_key(&target.host, target.port) {
-        Ok(Some(k)) if k == key => r.line(Level::Ok, "host key", format!("known ({})", key.fingerprint())),
-        Ok(Some(k)) => {
-            r.line(Level::Bad, "host key", format!("CHANGED: now {}, known as {}", key.fingerprint(), k.fingerprint()));
-            r.hint("if the server was reinstalled, remove its line from ~/.config/qsh/known_hosts; otherwise do not connect");
-            return Ok(());
-        }
-        _ => {
-            r.line(Level::Note, "host key", format!("not known yet ({})", key.fingerprint()));
-            r.hint(format!("`qsh pair {dest} CODE` (code from `qshd pair` there) confirms it, or connect once and compare"));
-            return Ok(());
-        }
-    }
+    // The login decides about the host key exactly as `qsh` does (known
+    // hosts, certificates, revocations), and never saves a new key.
     let quiet = Target { batch_mode: true, quiet: true, ..target.clone() };
+    let opts = ConnectOptions { share: false, accept_new_host: false, ..opts.clone() };
     let start = Instant::now();
-    let login = tokio::time::timeout(STEP_TIMEOUT * 4, super::connect(&quiet, &ConnectOptions { share: false, ..opts.clone() })).await;
-    match login {
+    match tokio::time::timeout(STEP_TIMEOUT * 4, super::connect(&quiet, &opts)).await {
         Ok(Ok(conn)) => {
             let took = start.elapsed();
+            r.line(Level::Ok, "host key", format!("trusted ({})", conn.peer_key().fingerprint()));
             let ping = super::speed::ping(&conn).await.map(ms).unwrap_or_else(|e| format!("{e:#}"));
             r.line(Level::Ok, "login", format!("as {} over {} in {} (round trip {ping})", target.user, conn.transport_name(), ms(took)));
             if conn.server_version() < crate::proto::VERSION {
@@ -173,16 +133,95 @@ async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptio
         }
         Ok(Err(e)) => {
             let text = format!("{e:#}");
-            r.line(Level::Bad, "login", text.lines().next().unwrap_or_default());
-            if e.is::<super::LoginRefused>() || text.contains("access denied") {
+            let first = text.lines().next().unwrap_or_default().to_string();
+            if text.contains("host key verification failed") {
+                let f = fingerprint.map(|f| format!(" ({f})")).unwrap_or_default();
+                r.line(Level::Note, "host key", format!("not known yet{f}; the login was not tried"));
+                r.hint(format!("`qsh pair {dest} CODE` (code from `qshd pair` there) confirms it, or connect once and compare"));
+            } else if text.contains("HAS CHANGED") || text.contains("revoked") {
+                r.line(Level::Bad, "host key", text.lines().find(|l| l.contains("now presents") || l.contains("revoked")).unwrap_or(&first));
+                r.hint("if the server was reinstalled, remove its old line from known_hosts; otherwise do not connect");
+            } else if e.is::<super::LoginRefused>() || text.contains("access denied") {
+                r.line(Level::Bad, "login", first);
                 r.hint(format!("add your key there: `qshd pair` on the server, then `qsh pair {dest} CODE`, or ssh-copy-id"));
             } else if text.contains("one-time code") || text.contains("passphrase") || text.contains("terminal") {
+                r.line(Level::Note, "login", first);
                 r.hint("the login asks a question; that is fine when you connect yourself");
+            } else {
+                r.line(Level::Bad, "login", first);
             }
         }
         Err(_) => r.line(Level::Bad, "login", "took too long"),
     }
     Ok(())
+}
+
+/// Name, QUIC and TCP checks (handshakes with a throwaway key, no login).
+/// Returns the host key's fingerprint, or `None` if qshd is not reachable.
+async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
+    let addrs = match tokio::time::timeout(STEP_TIMEOUT, tokio::net::lookup_host((target.host.as_str(), target.port))).await {
+        Ok(Ok(a)) => a.map(|a| a.ip().to_string()).collect::<Vec<_>>(),
+        Ok(Err(e)) => {
+            r.line(Level::Bad, "name", format!("{}: {e}", target.host));
+            r.hint("check the host name (and HostName in your config)");
+            return None;
+        }
+        Err(_) => {
+            r.line(Level::Bad, "name", "DNS does not answer");
+            return None;
+        }
+    };
+    let mut unique = addrs;
+    unique.dedup();
+    r.line(Level::Ok, "name", unique.join(", "));
+    let tls = crate::tls::client_config(&Identity::generate()).ok()?;
+    // With --full, qshd may answer on the ssh port or on its own.
+    let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
+    let tcp_port = target.alt_ports.first().copied().unwrap_or(target.port);
+    let mut found = Vec::new();
+    let start = Instant::now();
+    let quic = tokio::time::timeout(STEP_TIMEOUT, transport::connect_probe(&target.host, &ports, target.family, tls.clone())).await;
+    let quic = match quic {
+        Ok(Ok(conn)) => {
+            found.push(("quic", format!("qshd answers on udp {} ({})", conn.remote_addr().port(), ms(start.elapsed())), conn.peer_key()));
+            conn.close().await;
+            None
+        }
+        Ok(Err(e)) => Some(format!("{e:#}").lines().last().unwrap_or_default().trim().to_string()),
+        Err(_) => Some("no answer".to_string()),
+    };
+    let start = Instant::now();
+    let tcp = match tokio::time::timeout(STEP_TIMEOUT, transport::connect(&target.host, tcp_port, Mode::Tcp, target.family, tls)).await {
+        Ok(Ok(conn)) => {
+            found.push(("tcp", format!("qshd answers on tcp {tcp_port} ({})", ms(start.elapsed())), conn.peer_key()));
+            conn.close().await;
+            None
+        }
+        Ok(Err(e)) => Some(format!("{e:#}").lines().last().unwrap_or_default().trim().to_string()),
+        Err(_) => Some("no answer".to_string()),
+    };
+    // One transport is enough: the other one failing is only a note.
+    let level = if found.is_empty() { Level::Bad } else { Level::Note };
+    for (name, ok, _) in &found {
+        r.line(Level::Ok, name, ok);
+    }
+    if let Some(e) = &quic {
+        r.line(level, "quic", e);
+    }
+    if let Some(e) = &tcp {
+        r.line(level, "tcp", e);
+    }
+    match (quic.is_none(), tcp.is_none()) {
+        (false, false) => {
+            r.hint(format!("is qshd running there (`systemctl status qshd`), listening on {}, and let through the firewall?", target.port));
+            r.hint("a host with only sshd: `qsh --full` uses ssh there");
+            return None;
+        }
+        (false, true) => r.hint(format!("UDP {} is blocked on the way: qsh works over TCP (slower on lossy links); open UDP {} for QUIC", target.port, target.port)),
+        (true, false) => r.hint("the TCP fallback is off or blocked; fine while UDP gets through"),
+        _ => {}
+    }
+    found.first().map(|(_, _, key)| key.fingerprint())
 }
 
 /// Runs the checks; the exit code is 1 if something is broken.

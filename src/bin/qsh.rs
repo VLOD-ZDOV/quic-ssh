@@ -492,7 +492,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
         Cmd::Keygen { file } => keygen(file),
         Cmd::Pair { destination, code } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
-            client::pair(&target, &opts, &code).await?;
+            client::pair(&target, &opts, &code).await.map_err(|e| with_doctor_hint(e, &target))?;
             Ok(0)
         }
         Cmd::Cp { recursive, compress, src, dst } => cp(&src, &dst, (recursive, compress), &cli.conn).await,
@@ -770,8 +770,8 @@ async fn wait_for_shared(master: qsh::transport::shared::Master, conn: &qsh::tra
 
 /// When no qshd answered, points to `qsh doctor`, which finds out why.
 fn with_doctor_hint(e: anyhow::Error, target: &Target) -> anyhow::Error {
-    if e.is::<Unreachable>() {
-        let port = target.cli_port.map(|p| format!("-p {p} ")).unwrap_or_default();
+    if e.is::<Unreachable>() && std::env::var_os("QSH_NO_DOCTOR_HINT").is_none() {
+        let port = if target.port != qsh::DEFAULT_PORT { format!("-p {} ", target.port) } else { String::new() };
         anyhow!("{e:#}\n`qsh doctor {port}{}` checks each step and says what to fix", target.ssh_dest)
     } else {
         e
@@ -832,7 +832,7 @@ fn exec_unix(mut cmd: std::process::Command, program: &Path) -> Result<i32> {
 async fn speed_test(target: &Target, opts: &ConnectOptions, seconds: Duration) -> Result<i32> {
     use std::io::Write;
     use qsh::client::speed;
-    let conn = client::connect(target, opts).await?;
+    let conn = client::connect(target, opts).await.map_err(|e| with_doctor_hint(e, target))?;
     println!("{}@{} over {}", target.user, conn.remote_addr(), conn.transport_name());
     let mut pings = Vec::new();
     for _ in 0..5 {
@@ -914,6 +914,9 @@ async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &Co
         Err(e) => return Err(with_doctor_hint(e, &target)),
     };
     // `-C`, or `Compression yes` in the config (as for ssh).
+    if compress && conn.server_version() < 5 {
+        eprintln!("qsh: the server's qshd is too old for compression (-C); copying without it");
+    }
     let compress = compress || target.compression;
     let result = match (direction, recursive) {
         (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote, compress).await,

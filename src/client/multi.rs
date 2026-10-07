@@ -19,14 +19,18 @@ pub fn destinations(groups: &super::groups::Groups, names: &[String], hosts: &[S
     for g in names {
         match groups.get(g) {
             Some(members) => out.extend(members.iter().cloned()),
-            None => bail!("no group {g:?} (groups are set in `qsh ui` with g, or in ~/.config/qsh/groups)"),
+            None => {
+                let known: Vec<&str> = groups.keys().map(String::as_str).collect();
+                let have = if known.is_empty() { "there are none yet".to_string() } else { format!("there are: {}", known.join(", ")) };
+                bail!("no group {g:?}; {have} (set them in `qsh ui` with e, or in ~/.config/qsh/groups)")
+            }
         }
     }
     out.extend(hosts.iter().cloned());
     let mut seen = std::collections::HashSet::new();
     out.retain(|h| seen.insert(h.clone()));
     if out.is_empty() {
-        bail!("no hosts given");
+        bail!("no hosts given (qsh multi [-g GROUP] [HOST...] -- COMMAND)");
     }
     Ok(out)
 }
@@ -34,6 +38,15 @@ pub fn destinations(groups: &super::groups::Groups, names: &[String], hosts: &[S
 enum Line {
     Out(usize, String),
     Err(usize, String),
+}
+
+/// How one host's run ended.
+#[derive(Clone, Copy, PartialEq)]
+enum End {
+    Code(i32),
+    Signal,
+    /// qsh could not even be started.
+    NotStarted,
 }
 
 async fn pump<R: AsyncRead + Unpin>(r: R, i: usize, err: bool, tx: mpsc::UnboundedSender<Line>) {
@@ -68,6 +81,8 @@ pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(flags)
             .args(["-T", "-n", "-o", "BatchMode=yes", "--", dest])
+            // One hint in the summary instead of one per host.
+            .env("QSH_NO_DOCTOR_HINT", "1")
             .args(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -80,14 +95,18 @@ pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(Line::Err(i, format!("cannot start qsh: {e}")));
-                    return 255;
+                    return End::NotStarted;
                 }
             };
             let out = tokio::spawn(pump(child.stdout.take().expect("piped"), i, false, tx.clone()));
             let err = tokio::spawn(pump(child.stderr.take().expect("piped"), i, true, tx));
             let status = child.wait().await;
             let _ = tokio::join!(out, err);
-            status.ok().and_then(|s| s.code()).unwrap_or(255)
+            match status.ok().map(|s| s.code()) {
+                Some(Some(code)) => End::Code(code),
+                Some(None) => End::Signal,
+                None => End::NotStarted,
+            }
         }));
     }
     drop(tx);
@@ -99,17 +118,25 @@ pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &
             format!("{name} | ")
         }
     };
-    while let Some(line) = rx.recv().await {
-        match line {
-            Line::Out(i, text) => println!("{}{text}", prefix(i)),
-            Line::Err(i, text) => eprintln!("{}{text}", prefix(i)),
+    {
+        use std::io::Write;
+        let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+        while let Some(line) = rx.recv().await {
+            let written = match line {
+                Line::Out(i, text) => writeln!(out, "{}{text}", prefix(i)),
+                Line::Err(i, text) => writeln!(err, "{}{text}", prefix(i)),
+            };
+            // The reader went away (`| head`): stop; the children end with us.
+            if written.is_err() {
+                return Ok(1);
+            }
         }
     }
-    let mut codes = Vec::new();
+    let mut ends = Vec::new();
     for t in tasks {
-        codes.push(t.await.unwrap_or(255));
+        ends.push(t.await.unwrap_or(End::NotStarted));
     }
-    let failed: Vec<(usize, i32)> = codes.iter().copied().enumerate().filter(|&(_, c)| c != 0).collect();
+    let failed: Vec<(usize, End)> = ends.iter().copied().enumerate().filter(|&(_, e)| e != End::Code(0)).collect();
     if failed.is_empty() {
         if dests.len() > 1 {
             eprintln!("ok on all {} hosts", dests.len());
@@ -117,11 +144,21 @@ pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &
         return Ok(0);
     }
     eprintln!("\nfailed on {} of {} hosts:", failed.len(), dests.len());
-    for &(i, code) in &failed {
-        let what = if code == 255 { "could not connect or log in".to_string() } else { format!("exit code {code}") };
+    for &(i, end) in &failed {
+        let what = match end {
+            End::Code(255) => "exit code 255: could not connect or log in (or the command itself exited 255)".to_string(),
+            End::Code(code) => format!("exit code {code}"),
+            End::Signal => "qsh was killed by a signal".to_string(),
+            End::NotStarted => "qsh could not be started".to_string(),
+        };
         eprintln!("  {}: {what}", dests[i]);
     }
-    Ok(if failed.iter().any(|&(_, c)| c == 255) { 255 } else { 1 })
+    // Not the command failing, but qsh: the host may not be reachable.
+    let broken = |e: End| matches!(e, End::Code(255) | End::Signal | End::NotStarted);
+    if let Some(&(i, _)) = failed.iter().find(|&&(_, e)| broken(e)) {
+        eprintln!("`qsh doctor {}` shows why a host cannot be reached", dests[i]);
+    }
+    Ok(if failed.iter().any(|&(_, e)| broken(e)) { 255 } else { 1 })
 }
 
 #[cfg(test)]

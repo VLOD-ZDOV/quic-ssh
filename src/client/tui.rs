@@ -336,6 +336,10 @@ impl App {
                 let mut rows: Vec<usize> = (0..self.hosts.len())
                     .filter(|&i| {
                         let h = &self.hosts[i];
+                        // `#web`: exactly the hosts of group web, as the tags show.
+                        if let Some(group) = self.filter.strip_prefix('#') {
+                            return groups::of(&self.groups, &h.alias).iter().any(|g| g.eq_ignore_ascii_case(group));
+                        }
                         self.matches(&h.alias)
                             || h.target.as_ref().is_some_and(|t| self.matches(&t.host))
                             || groups::of(&self.groups, &h.alias).iter().any(|g| self.matches(g))
@@ -479,7 +483,9 @@ impl App {
                 KeyCode::Enter => {
                     let cmd = std::mem::take(cmd).trim().to_string();
                     self.mode = InputMode::Normal;
-                    let dests: Vec<String> = self.visible().iter().map(|&i| self.hosts[i].alias.clone()).collect();
+                    // Names that look like options cannot be passed on safely.
+                    let dests: Vec<String> =
+                        self.visible().iter().map(|&i| self.hosts[i].alias.clone()).filter(|a| !a.starts_with('-')).collect();
                     if cmd.is_empty() || dests.is_empty() { Action::None } else { Action::RunAll(cmd, dests) }
                 }
                 KeyCode::Backspace => {
@@ -610,7 +616,11 @@ impl App {
                         let dest = &self.state.history[i].dest;
                         match self.hosts.iter().find(|h| &h.alias == dest) {
                             Some(h) => Form::from_host(h, &self.state.prefs(dest), &self.groups),
-                            None => Form::from_dest(dest),
+                            None => {
+                                let mut f = Form::from_dest(dest);
+                                f.groups = groups::of(&self.groups, dest).join(" ");
+                                f
+                            }
                         }
                     }
                     (_, None) => return Action::None,
@@ -865,7 +875,11 @@ impl App {
             InputMode::Quick(dest) => format!("connect once to user@host[:port]: {dest}▏  (⏎ go, Esc cancel)"),
             InputMode::Form(_) => "Tab next field · ←→ change · ⏎ save · Esc cancel".to_string(),
             InputMode::ConfirmDelete(name) => format!("delete the saved connection {name}? y/n"),
-            InputMode::RunAll(cmd) => format!("run on the {} hosts shown: {cmd}▏  (⏎ run, Esc cancel)", self.visible().len()),
+            InputMode::RunAll(cmd) => {
+                let n = self.visible().len();
+                let which = if self.filter.is_empty() { format!("ALL {n} hosts") } else { format!("the {n} hosts shown") };
+                format!("run on {which}: {cmd}▏  (⏎ run, Esc cancel; / filters first)")
+            }
             InputMode::Normal if wide => {
                 "⏎ connect · c once · n new · e edit · d delete · Tab history · s speed · p pair · / find · x run on all · r refresh · q quit"
                     .to_string()
@@ -1378,7 +1392,12 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
             }
             Action::RunAll(cmd, dests) => {
                 leave();
-                let mut args = vec!["multi".to_string(), "--full".into()];
+                let mut args = vec!["multi".to_string()];
+                // Like a session from the menu: plain ssh where there is no
+                // qshd, unless every host was set not to.
+                if dests.iter().any(|d| app.state.prefs(d).ssh_fallback) {
+                    args.push("--full".into());
+                }
                 args.extend(child_flags(&opts));
                 args.extend(dests.iter().cloned());
                 args.push("--".into());
@@ -1646,6 +1665,8 @@ mod tests {
         typing(&mut app, "uptime");
         assert!(render(&mut app, 110, 24).contains("run on the 2 hosts shown: uptime"));
         assert_eq!(app.on_event(key(KeyCode::Enter)), Action::RunAll("uptime".into(), vec!["alpha".into(), "gamma".into()]));
+        app.filter = "#db".into();
+        assert_eq!(app.visible(), vec![2], "#name: exactly that group");
     }
 
     #[test]

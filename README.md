@@ -164,7 +164,7 @@ qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
 ```
 
-Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them); `-C` only compresses `qsh cp`, sessions are not compressed.
+Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them). `-C` on a session is ignored too; for compressed copies use `qsh cp -C`.
 
 In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
 
@@ -299,7 +299,7 @@ The session stays encrypted end to end: the public host only passes the bytes on
   - They are stored in `~/.config/qsh/ui-hosts` (ssh_config syntax), so `qsh NAME` works on the command line too.
   - Your own config files are never written. For a host from them, **`e`** only changes the menu's settings (transport, ssh fallback), and a saved name cannot clash with a host of yours.
 - **History:** **`Tab`** shows the history with the result of each connection. **⏎** connects again, **`a`** saves an entry as a connection, **`d`** removes it.
-- **Groups:** the **`e`** form has a *groups* field (e.g. `web prod`), for any host. Groups show as `#web` tags, **`/web`** filters by them, and **`x`** runs one command on every host shown (`qsh multi`). They are kept in `~/.config/qsh/groups`.
+- **Groups:** the **`e`** form has a *groups* field (e.g. `web prod`), for any host. Groups show as `#web` tags. **`/#web`** shows exactly that group (plain `/web` matches names, addresses and groups containing "web"), and **`x`** runs one command on every host shown (`qsh multi`; without a filter, on all of them). They are kept in `~/.config/qsh/groups`.
 - **Speed test:** **`s`** runs it with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
 - **Other keys:** **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`q`** quits.
 - **Screens:** the layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
@@ -314,7 +314,7 @@ db1  | 10:21:07 up 3 days,  load average: 1.02, 0.97, 0.90
 ok on all 3 hosts
 ```
 
-Hosts run in parallel (`-P 16` by default) with `BatchMode`, so nothing can stop to ask a question: use keys that need no passphrase prompt (or an agent) and hosts already in known_hosts (or `--accept-new-host`). The exit code is 0 if the command succeeded everywhere, 1 if it failed somewhere and 255 if a host could not be reached.
+Hosts run in parallel (`-P 16` by default) with `BatchMode`, so nothing can stop to ask a question: use keys that need no passphrase prompt (or an agent) and hosts already in known_hosts (or `--accept-new-host`). The words after `--` are joined and run by the remote shell, as with ssh: `qsh multi -g web -- 'cd /srv && git pull'`. The exit code is 0 if the command succeeded everywhere, 1 if it failed somewhere, and 255 if qsh itself failed on a host (it could not connect or log in, or the command exited with 255).
 
 `qsh speed host` runs the same test in plain text:
 

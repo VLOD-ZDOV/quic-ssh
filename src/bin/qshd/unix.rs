@@ -145,13 +145,18 @@ fn init(config: Option<PathBuf>) -> Result<()> {
 
 fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
     let (cfg, _) = load_config(config)?;
+    let given = host.is_some();
     let host = match host {
-        Some(h) if h.is_empty() || h.starts_with('-') || h.chars().any(|c| c.is_whitespace() || c.is_control()) => {
-            anyhow::bail!("invalid host {h:?}")
+        // Only what a host name or address can contain: the command below is
+        // meant to be pasted into a shell.
+        Some(h) if h.is_empty() || h.starts_with('-') || !h.chars().all(|c| c.is_ascii_alphanumeric() || ".-:[]%".contains(c)) => {
+            anyhow::bail!("invalid host {h:?} (a host name or IP address)")
         }
         Some(h) => h,
         None => nix::unistd::gethostname()?.to_string_lossy().into_owned(),
     };
+    // An IPv6 address needs brackets, or its colons would read as a port.
+    let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host };
     let code = qsh::pair::create_pending(&home_dir()?)?;
     let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name;
     let port = match cfg.listen.port() {
@@ -162,6 +167,9 @@ fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
     println!("Pairing code: {code}  (single use, valid {} minutes)", qsh::pair::CODE_TTL.as_secs() / 60);
     println!("On the client run:");
     println!("  {command}");
+    if !given && (!host.contains('.') || host == "localhost") {
+        println!("(If the client cannot find {host:?} by that name, use --host with this machine's address.)");
+    }
     if qr {
         // The QR code holds just the command: a phone's camera shows it as
         // text to copy into a terminal (e.g. Termux).
