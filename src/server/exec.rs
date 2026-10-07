@@ -64,19 +64,26 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
     supervise(send, recv, child, io, closed).await
 }
 
-/// Child I/O, either three pipes or one PTY master.
+type Writer = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+type Reader = Box<dyn AsyncRead + Send + Unpin>;
+
+/// Child I/O: stdin/stdout and a stderr pipe, or one PTY master.
 enum Io {
-    Pipes {
-        stdin: tokio::process::ChildStdin,
-        stdout: tokio::process::ChildStdout,
-        stderr: tokio::process::ChildStderr,
-    },
+    Pipes { stdin: Writer, stdout: Reader, stderr: tokio::process::ChildStderr },
     Pty(pty_process::Pty),
 }
 
 fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>) -> Result<(tokio::process::Child, Io)> {
+    use std::os::fd::OwnedFd;
     let mut cmd = user.command(&user.shell);
-    cmd.envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Like sshd (without USE_PIPES): stdin and stdout are one socket pair, and
+    // end of input is a shutdown of our side. Some programs (openrsync) need that.
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let theirs_out = theirs.try_clone()?;
+    cmd.envs(env)
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::from(OwnedFd::from(theirs_out)))
+        .stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);
     match command {
@@ -84,11 +91,11 @@ fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>)
         None => cmd.arg0(user.login_arg0()),
     };
     let mut child = cmd.spawn()?;
-    let io = Io::Pipes {
-        stdin: child.stdin.take().expect("piped"),
-        stdout: child.stdout.take().expect("piped"),
-        stderr: child.stderr.take().expect("piped"),
-    };
+    // The child's end must not stay open here, or its output never ends.
+    drop(cmd);
+    ours.set_nonblocking(true)?;
+    let (stdout, stdin) = tokio::net::UnixStream::from_std(ours)?.into_split();
+    let io = Io::Pipes { stdin: Box::new(stdin), stdout: Box::new(stdout), stderr: child.stderr.take().expect("piped") };
     Ok((child, io))
 }
 
@@ -155,7 +162,7 @@ pub(super) async fn hang_up_group<F: std::future::Future>(group: nix::unistd::Pi
 
 /// Where client input goes.
 enum Input {
-    Pipe(Option<tokio::process::ChildStdin>),
+    Pipe(Option<Writer>),
     Pty(pty_process::OwnedWritePty),
 }
 
