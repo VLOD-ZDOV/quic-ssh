@@ -26,7 +26,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 6] = ["cp", "pair", "keygen", "speed", "ui", "multi"];
+const TOOLS: [&str; 7] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -117,6 +117,11 @@ enum Cmd {
     },
     /// Interactive host menu with status and speed test
     Ui,
+    /// Check this computer's setup and, for a host, each step of connecting
+    Doctor {
+        /// [user@]host[:port] or an alias
+        destination: Option<String>,
+    },
     /// Run a command on several hosts at once: qsh multi [-g GROUP] [HOST...] -- COMMAND
     Multi {
         /// Hosts of this group (from `qsh ui` or ~/.config/qsh/groups); repeatable
@@ -470,6 +475,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
         }
         Cmd::Ui => qsh::client::tui::run(opts).await,
+        Cmd::Doctor { destination } => qsh::client::doctor::run(destination.as_deref(), cli.conn.port, &opts).await,
         Cmd::Multi { groups, parallel, hosts, command } => {
             use qsh::client::{groups as host_groups, multi};
             let all = if groups.is_empty() { Default::default() } else { host_groups::load(&home_dir()?)? };
@@ -570,7 +576,7 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
         Err(e) if a.full && e.is::<Unreachable>() => {
             return exec_openssh("ssh", ssh_args(&a, &target), &format!("{e:#}"));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(with_doctor_hint(e, &target)),
     };
     if let Some(spec) = &a.stdio_forward {
         forward::stdio(&conn, spec).await?;
@@ -723,6 +729,16 @@ async fn wait_for_shared(master: qsh::transport::shared::Master, conn: &qsh::tra
     }
 }
 
+/// When no qshd answered, points to `qsh doctor`, which finds out why.
+fn with_doctor_hint(e: anyhow::Error, target: &Target) -> anyhow::Error {
+    if e.is::<Unreachable>() {
+        let port = target.cli_port.map(|p| format!("-p {p} ")).unwrap_or_default();
+        anyhow!("{e:#}\n`qsh doctor {port}{}` checks each step and says what to fix", target.ssh_dest)
+    } else {
+        e
+    }
+}
+
 /// Arguments for OpenSSH's ssh: everything ssh understands, as given.
 fn ssh_args(a: &SshArgs, target: &Target) -> Vec<String> {
     let mut args = a.passthrough.clone();
@@ -861,7 +877,7 @@ async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &Co
     let conn = match client::connect(&target, &args.options()).await {
         Ok(c) => c,
         Err(e) if args.full && e.is::<Unreachable>() => return exec_openssh("scp", scp_args(), &format!("{e:#}")),
-        Err(e) => return Err(e),
+        Err(e) => return Err(with_doctor_hint(e, &target)),
     };
     // `-C`, or `Compression yes` in the config (as for ssh).
     let compress = compress || target.compression;

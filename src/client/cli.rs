@@ -247,6 +247,7 @@ usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfil
        qsh keygen [FILE]          create a new key
        qsh speed [user@]host      measure latency and throughput
        qsh ui                     interactive host menu
+       qsh doctor [HOST]          find out why something does not connect
        qsh multi [-g GROUP] [HOST...] -- COMMAND   run on several hosts
 
 Options as in ssh(1); the default port is 4422. --full (automatic when qsh is

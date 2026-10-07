@@ -161,6 +161,7 @@ qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qs
 qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
 qsh -O check myserver                  # the shared connection (see below)
+qsh doctor myserver                    # does not connect? checks each step and says what to fix
 ```
 
 Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them); `-C` only compresses `qsh cp`, sessions are not compressed.

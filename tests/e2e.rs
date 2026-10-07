@@ -2163,3 +2163,28 @@ fn reaching_a_host_without_an_open_port() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), "behind-nat\n");
 }
+
+/// `qsh doctor`: every step for a working host; a hint where it breaks.
+#[test]
+fn doctor_explains_problems() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let host = format!("{}:{}", dest(), s.port);
+    let out = c.run(&["doctor", &host]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    for step in ["✓ quic", "✓ tcp", "✓ host key", "✓ login"] {
+        assert!(text.contains(step), "{step} missing:\n{text}");
+    }
+    // A client whose key the server does not know.
+    let stranger = Client::new();
+    std::fs::create_dir_all(stranger.home.path().join(".config/qsh")).unwrap();
+    std::fs::copy(c.home.path().join(".config/qsh/known_hosts"), stranger.home.path().join(".config/qsh/known_hosts")).unwrap();
+    let out = stranger.run(&["doctor", &host]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("qsh pair"), "{}", stdout(&out));
+    // Nothing listening.
+    let out = c.run(&["doctor", &format!("{}:{}", dest(), free_port())]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("is qshd running"), "{}", stdout(&out));
+}
