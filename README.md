@@ -338,6 +338,7 @@ totp = "optional"               # one-time codes: "off", "optional" (for users w
 session_timeout = 3600          # seconds a disconnected terminal session is kept; 0 = off
 # trusted_user_ca_keys = "/etc/qsh/user_ca.pub"   # CAs that sign user certificates (principal = user name)
 # host_certificate = "/etc/qsh/host_ed25519-cert.pub"   # used automatically if it exists
+# revoked_keys = "/etc/qsh/revoked_keys"   # keys that may not log in: a key list or a KRL (ssh-keygen -k)
 
 [subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
 # sftp = "/usr/lib/openssh/sftp-server"   # found automatically if installed
@@ -357,6 +358,8 @@ User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/autho
 A line with any other option is **not used at all**: a restriction qsh cannot enforce never turns into access.
 
 **Certificates.** Sign keys with `ssh-keygen -s ca -I id -n USER key.pub`, then trust the CA either server-wide (`trusted_user_ca_keys`) or per user with a `cert-authority` line. `force-command`, `source-address` and the `permit-*` extensions are enforced. For host certificates, sign the host key (`ssh-keygen -s ca -I host -h -n host.example.com /etc/qsh/host_ed25519.pub`) and add `@cert-authority *.example.com <CA key>` to `~/.config/qsh/known_hosts` or `~/.ssh/known_hosts` on clients: hosts with a valid certificate are trusted without the first-connection question. `@revoked` lines are honoured.
+
+**Revoking keys.** `revoked_keys` names a file with public keys (one per line) or a KRL made with `ssh-keygen -k`, which can also revoke certificates by serial number or key ID, and whole CAs. It is read at every login, so changes apply at once. If the file is set but cannot be read, no key is accepted.
 
 **One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once. `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again.
 

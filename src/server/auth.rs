@@ -98,6 +98,7 @@ fn key_allowed(key: &KeyData) -> Result<()> {
 pub struct Checker<'a> {
     pub entries: &'a [AuthorizedKey],
     pub cas: &'a [KeyData],
+    pub revoked: &'a super::revoked::Revocation,
     pub login: Login<'a>,
     pub exporter: [u8; 32],
 }
@@ -105,6 +106,7 @@ pub struct Checker<'a> {
 impl Checker<'_> {
     pub fn check(&self, offered: &Offered) -> Result<Grant, String> {
         key_allowed(offered.signing_key()).map_err(|e| format!("{e:#}"))?;
+        self.revoked.check(offered)?;
         authkeys::check(offered, self.entries, self.cas, &self.login)
     }
 

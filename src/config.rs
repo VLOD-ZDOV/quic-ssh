@@ -46,6 +46,10 @@ pub struct ServerConfig {
     /// OpenSSH host certificate for the host key; defaults to
     /// `<host_key>-cert.pub` if that exists.
     pub host_certificate: Option<PathBuf>,
+    /// Keys and certificates that may not log in: a list of public keys or a
+    /// KRL from `ssh-keygen -k` (like sshd's RevokedKeys). If the file
+    /// cannot be read, no key is accepted.
+    pub revoked_keys: Option<PathBuf>,
     /// How long an interactive session survives without its client (seconds),
     /// so it can be resumed after a network outage. 0 turns this off.
     pub session_timeout: u64,
@@ -90,6 +94,7 @@ impl Default for ServerConfig {
             allow_agent_forwarding: true,
             totp: Totp::Optional,
             host_certificate: None,
+            revoked_keys: None,
             session_timeout: 3600,
         }
     }

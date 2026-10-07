@@ -1933,3 +1933,62 @@ fn typing_is_predicted_on_a_slow_link() {
         sleep(Duration::from_millis(20));
     }
 }
+
+/// `revoked_keys`: a key list or a KRL from `ssh-keygen -k` (keys,
+/// certificate serials and key IDs); an unreadable list refuses everyone.
+#[test]
+fn revoked_keys_and_krl() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let ca = keygen(keys.path(), "ca", "ed25519");
+    let certified = keygen(keys.path(), "certified", "ed25519");
+    let out = Command::new("ssh-keygen")
+        .args(["-q", "-s", ca.to_str().unwrap(), "-I", "laptop", "-z", "42", "-n", &user(), "-V", "-5m:+1h"])
+        .arg(format!("{}.pub", certified.display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let ec = keygen(keys.path(), "ec", "ecdsa");
+    let ed = keygen(keys.path(), "ed", "ed25519");
+    let list = keys.path().join("revoked");
+    std::fs::write(&list, "").unwrap();
+    let ca_file = keys.path().join("user_ca.pub");
+    std::fs::copy(format!("{}.pub", ca.display()), &ca_file).unwrap();
+    let config = format!("trusted_user_ca_keys = \"{}\"\nrevoked_keys = \"{}\"\n", ca_file.display(), list.display());
+    let (s, c) = server_with_keys(&config, &[public(&ec), public(&ed)]);
+    let port = s.port.to_string();
+    let works = |key: &PathBuf| {
+        let out = c.run(&["--accept-new-host", "-o", "BatchMode=yes", "-p", &port, "-i", key.to_str().unwrap(), &dest(), "true"]);
+        if !out.status.success() {
+            eprintln!("{}: {}", key.display(), stderr(&out));
+        }
+        out.status.success()
+    };
+    let krl = |extra: &[&str], input: &str| {
+        let spec = keys.path().join("spec");
+        std::fs::write(&spec, input).unwrap();
+        let _ = std::fs::remove_file(&list);
+        let out = Command::new("ssh-keygen").args(["-q", "-k", "-f", list.to_str().unwrap()]).args(extra).arg(&spec).output().unwrap();
+        assert!(out.status.success(), "ssh-keygen -k: {}", stderr(&out));
+    };
+    assert!(works(&ec) && works(&ed) && works(&certified), "nothing is revoked yet");
+    std::fs::write(&list, public(&ec) + "\n").unwrap();
+    assert!(!works(&ec), "revoked by the text list");
+    assert!(works(&ed));
+    krl(&[], &public(&ed));
+    assert!(!works(&ed), "revoked by a KRL");
+    assert!(works(&ec));
+    let ca_pub = format!("{}.pub", ca.display());
+    krl(&["-s", &ca_pub], "serial: 40-45\n");
+    assert!(!works(&certified), "certificate serial revoked");
+    krl(&["-s", &ca_pub], "id: laptop\n");
+    assert!(!works(&certified), "certificate key ID revoked");
+    krl(&["-s", &ca_pub], "serial: 43\n");
+    assert!(works(&certified), "another serial");
+    krl(&[], &public(&ca));
+    assert!(!works(&certified), "the CA itself revoked");
+    std::fs::write(&list, "garbage\n").unwrap();
+    assert!(!works(&ec) && !works(&ed), "a damaged list must refuse everyone");
+}

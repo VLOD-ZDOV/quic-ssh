@@ -6,6 +6,7 @@ mod exec;
 mod files;
 pub mod helpers;
 mod persist;
+mod revoked;
 mod users;
 
 use std::collections::HashMap;
@@ -205,9 +206,11 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     // An unknown user goes through the same steps with no keys, so names cannot be probed.
     let entries = user.as_ref().map(|u| auth::authorized_entries(&state.cfg, u)).unwrap_or_default();
     let cas = auth::trusted_cas(&state.cfg);
+    let revoked = revoked::Revocation::load(state.cfg.revoked_keys.as_deref());
     let checker = auth::Checker {
         entries: &entries,
         cas: &cas,
+        revoked: &revoked,
         login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now() },
         exporter: conn.exporter(),
     };
