@@ -697,7 +697,11 @@ fn cve_preauth_flood_is_contained() {
     let c = Client::paired(&s);
     let port = s.port;
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // 60 TCP connections from 127.0.0.2 that never start TLS.
+    // 60 TCP connections from 127.0.0.2 that never start TLS. (macOS only
+    // has 127.0.0.1 on loopback unless an alias is added.)
+    if std::net::TcpListener::bind("127.0.0.2:0").is_err() {
+        return eprintln!("skipped: 127.0.0.2 is not available");
+    }
     let flood: Vec<tokio::net::TcpStream> = rt.block_on(async {
         let mut v = Vec::new();
         for _ in 0..60 {
@@ -944,10 +948,18 @@ fn openssh_tools_over_qsh() {
         let src = c.home.path().join("rsync-src");
         tree(&src);
         let mut cmd = Command::new("rsync");
-        cmd.args(["-a", "-e", &format!("{QSH} -p {port}"), &format!("{}/", src.display()), &format!("{}:rsync-dst/", dest())]);
+        cmd.args(["-a", "-e", &format!("{QSH} -v -p {port}"), &format!("{}/", src.display()), &format!("{}:rsync-dst/", dest())]);
         env(&mut cmd);
         let out = cmd.output().unwrap();
-        assert!(out.status.success(), "rsync: {}", stderr(&out));
+        let version = Command::new("rsync").arg("--version").output().map(|o| stdout(&o)).unwrap_or_default();
+        let remote = Command::new("/usr/bin/rsync").arg("--version").output().map(|o| stdout(&o)).unwrap_or_default();
+        assert!(
+            out.status.success(),
+            "rsync: {}\nlocal: {}\n/usr/bin/rsync: {}",
+            stderr(&out),
+            version.lines().next().unwrap_or_default(),
+            remote.lines().next().unwrap_or_default()
+        );
         same_tree(&src, &s.home.path().join("rsync-dst"));
     }
     if have("git") {
