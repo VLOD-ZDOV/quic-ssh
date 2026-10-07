@@ -64,3 +64,20 @@ pub fn terminal() -> io::Result<(File, File)> {
         Ok((input, output))
     }
 }
+
+/// Makes stdin, stdout and stderr blocking. qsh reads and writes them from
+/// blocking threads, but a parent may hand over non-blocking descriptors
+/// (openrsync does, with its socket pair), and a read would then fail at once
+/// with "would block" instead of waiting for data.
+pub fn blocking_stdio() {
+    #[cfg(unix)]
+    for fd in 0..=2 {
+        // SAFETY: fcntl on the standard descriptors only reads and updates their flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+    }
+}

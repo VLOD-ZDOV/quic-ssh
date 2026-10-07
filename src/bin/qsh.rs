@@ -156,6 +156,7 @@ fn finish(result: Result<i32>) -> ! {
 }
 
 fn main() {
+    qsh::platform::blocking_stdio();
     let args: Vec<String> = std::env::args().collect();
     let as_ssh = invoked_as_ssh(&args[0]);
     // As `ssh`, every word is ssh's: `ssh cp` connects to a host named cp.

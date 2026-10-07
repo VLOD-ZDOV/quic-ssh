@@ -948,7 +948,7 @@ fn openssh_tools_over_qsh() {
         let src = c.home.path().join("rsync-src");
         tree(&src);
         let mut cmd = Command::new("rsync");
-        cmd.args(["-a", "-e", &format!("{QSH} -v -p {port}"), &format!("{}/", src.display()), &format!("{}:rsync-dst/", dest())]);
+        cmd.args(["-a", "-e", &format!("{QSH} -p {port}"), &format!("{}/", src.display()), &format!("{}:rsync-dst/", dest())]);
         env(&mut cmd);
         let out = cmd.output().unwrap();
         let version = Command::new("rsync").arg("--version").output().map(|o| stdout(&o)).unwrap_or_default();
@@ -1670,4 +1670,32 @@ fn resume_login_can_only_resume() {
         assert!(format!("{err:#}").contains("session is gone"), "{err:#}");
         drop(conn);
     });
+}
+
+/// Like openrsync: stdin and stdout are one non-blocking socket.
+#[test]
+fn nonblocking_stdio_from_the_parent() {
+    use std::os::fd::OwnedFd;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    theirs.set_nonblocking(true).unwrap();
+    let out = theirs.try_clone().unwrap();
+    let mut child = c
+        .cmd(&["-p", &s.port.to_string(), &dest(), "cat"])
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::from(OwnedFd::from(out)))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Give qsh time to start reading before any data is there.
+    sleep(Duration::from_millis(500));
+    ours.write_all(b"through a non-blocking socket\n").unwrap();
+    ours.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut text = String::new();
+    ours.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let _ = ours.read_to_string(&mut text);
+    let status = child.wait().unwrap();
+    assert_eq!(text, "through a non-blocking socket\n");
+    assert!(status.success());
 }
