@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::client::keystroke::Obfuscator;
 use crate::client::predict::{Mode, Predictor};
-use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, Request, ServerMsg};
+use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reader, Reply, Request, ServerMsg};
 use crate::transport::{Conn, RecvHalf, SendHalf};
 
 /// Local variables forwarded to the server (the server filters them again).
@@ -276,6 +276,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         Reply::Session { token } => Some(token),
         _ => None,
     };
+    // The loop below waits for keys and timers too: read the server's messages
+    // in a task, so a frame is never cut short by another event.
+    let mut incoming = Reader::<ServerMsg>::spawn(recv);
     let keystroke_interval = opts.keystroke_interval;
 
     let raw = match raw_wanted {
@@ -392,13 +395,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // Ends a persistent session for good (not kept for a reconnect), and
     // waits for the server's exit report so the hangup is not lost when the
     // connection closes right after it.
-    async fn hang_up(tx: &mpsc::Sender<ClientMsg>, recv: &mut RecvHalf) {
+    async fn hang_up(tx: &mpsc::Sender<ClientMsg>, incoming: &mut Reader<ServerMsg>) {
         if tx.send(ClientMsg::Hangup).await.is_err() {
             return;
         }
         let _ = tokio::time::timeout(HANGUP_WAIT, async {
             loop {
-                match read_msg_opt::<_, ServerMsg>(recv).await {
+                match incoming.next().await {
                     Ok(Some(ServerMsg::Exit { .. })) | Ok(None) => break,
                     Err(e) if !e.is::<crate::proto::Malformed>() => break,
                     _ => {}
@@ -454,7 +457,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 }
                 false
             }
-            msg = read_msg_opt::<_, ServerMsg>(&mut recv) => match msg {
+            msg = incoming.next() => match msg {
                 // Unknown message type from a newer server: skip it.
                 Err(e) if e.is::<crate::proto::Malformed>() => continue,
                 Ok(Some(msg)) => {
@@ -476,13 +479,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             },
             code = &mut stop => {
                 if token.is_some() {
-                    hang_up(&tx, &mut recv).await;
+                    hang_up(&tx, &mut incoming).await;
                 }
                 break code;
             }
             () = disconnect.notified() => {
                 if token.is_some() {
-                    hang_up(&tx, &mut recv).await;
+                    hang_up(&tx, &mut incoming).await;
                 }
                 clear(&mut predictor).await;
                 let _ = stderr.write_all(b"\r\nConnection closed.\r\n").await;
@@ -538,7 +541,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             break 255;
         };
         conn = new_conn;
-        recv = new_recv;
+        incoming = Reader::spawn(new_recv);
         let _ = sink_tx.send(new_send).await;
         last_heard = tokio::time::Instant::now();
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;

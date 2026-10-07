@@ -42,6 +42,14 @@ const FAST: Duration = Duration::from_millis(20);
 const MAX_PENDING: usize = 64;
 /// Drawn predictions not confirmed within this time (plus a few round trips) are erased.
 const EXPIRE: Duration = Duration::from_millis(1000);
+/// Smaller terminals (or an unknown size, reported as 0×0) get no
+/// predictions: too little room to be useful, and the emulator wants some.
+const MIN_COLS: u16 = 20;
+const MIN_ROWS: u16 = 2;
+
+fn usable_size(rows: u16, cols: u16) -> bool {
+    rows >= MIN_ROWS && cols >= MIN_COLS
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Prediction {
@@ -67,13 +75,16 @@ pub struct Predictor {
     unsettled: bool,
     srtt: Option<Duration>,
     slow: bool,
+    /// The terminal is big enough (see [`usable_size`]); otherwise output
+    /// passes through untouched and nothing is predicted.
+    active: bool,
 }
 
 impl Predictor {
     pub fn new(mode: Mode, rows: u16, cols: u16) -> Predictor {
         Predictor {
             mode,
-            screen: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+            screen: vt100::Parser::new(rows.max(MIN_ROWS), cols.max(MIN_COLS), 0),
             pending: VecDeque::new(),
             drawn: 0,
             epoch: 1,
@@ -81,6 +92,7 @@ impl Predictor {
             unsettled: false,
             srtt: None,
             slow: false,
+            active: usable_size(rows, cols),
         }
     }
 
@@ -123,14 +135,16 @@ impl Predictor {
     fn free(&self, row: u16, col: u16) -> bool {
         let screen = self.screen.screen();
         let (_, cols) = screen.size();
-        col + 1 < cols && screen.cell(row, col).is_some_and(|c| !c.has_contents())
+        // The second half of a wide character looks empty, but drawing there
+        // would destroy the character.
+        col + 1 < cols && screen.cell(row, col).is_some_and(|c| !c.has_contents() && !c.is_wide_continuation())
     }
 
     /// Handles typed input (as sent to the server); returns bytes to write
     /// to the terminal.
     pub fn typed(&mut self, data: &[u8], now: Instant) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.mode == Mode::Never {
+        if self.mode == Mode::Never || !self.active {
             return out;
         }
         // Control keys (and anything with them, like escape sequences) move
@@ -160,7 +174,7 @@ impl Predictor {
     /// Handles output from the server; returns the bytes to write instead.
     pub fn output(&mut self, data: &[u8], now: Instant) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len() + 16);
-        if self.mode == Mode::Never {
+        if self.mode == Mode::Never || !self.active {
             out.extend_from_slice(data);
             return out;
         }
@@ -224,12 +238,20 @@ impl Predictor {
 
     /// The terminal changed size: predictions are dropped (lines may reflow).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        if self.screen.screen().size() != (rows, cols) {
-            self.screen.screen_mut().set_size(rows.max(1), cols.max(1));
-            self.pending.clear();
-            self.drawn = 0;
-            self.epoch += 1;
+        let active = usable_size(rows, cols);
+        if active == self.active && (!active || self.screen.screen().size() == (rows, cols)) {
+            return;
         }
+        if active && !self.active {
+            // What the screen showed meanwhile is unknown: start from a blank one.
+            self.screen = vt100::Parser::new(rows, cols, 0);
+        } else if active {
+            self.screen.screen_mut().set_size(rows, cols);
+        }
+        self.active = active;
+        self.pending.clear();
+        self.drawn = 0;
+        self.epoch += 1;
     }
 
     /// Erases predictions before something else is written to the terminal
@@ -249,12 +271,14 @@ mod tests {
     struct Harness {
         p: Predictor,
         term: vt100::Parser,
+        /// Only what the server wrote.
+        server: vt100::Parser,
         now: Instant,
     }
 
     impl Harness {
         fn new(mode: Mode) -> Harness {
-            Harness { p: Predictor::new(mode, 24, 80), term: vt100::Parser::new(24, 80, 0), now: Instant::now() }
+            Harness { p: Predictor::new(mode, 24, 80), term: vt100::Parser::new(24, 80, 0), server: vt100::Parser::new(24, 80, 0), now: Instant::now() }
         }
 
         fn key(&mut self, s: &str) {
@@ -266,6 +290,7 @@ mod tests {
             self.now += Duration::from_millis(100);
             let out = self.p.output(s.as_bytes(), self.now);
             self.term.process(&out);
+            self.server.process(s.as_bytes());
         }
 
         fn line(&self) -> String {
@@ -273,8 +298,8 @@ mod tests {
         }
 
         fn same_as_server(&self) {
-            assert_eq!(self.term.screen().contents(), self.p.screen.screen().contents());
-            assert_eq!(self.term.screen().cursor_position(), self.p.screen.screen().cursor_position());
+            assert_eq!(self.term.screen().contents(), self.server.screen().contents());
+            assert_eq!(self.term.screen().cursor_position(), self.server.screen().cursor_position());
         }
     }
 
@@ -356,9 +381,16 @@ mod tests {
             x % n
         };
         let mut drawn = 0;
-        let pieces = ["\r\n", "\x08", "\x1b[K", "\x1b[2D", "\x1b[C", "\x1b[31m", "\x1b[0m", "\x1b[5;10H", "\x1b[?25l", "\x1b[?25h", "$ ", "\x1b[2J", "\t"];
+        let pieces = ["界", "😀", "é", "\r\n", "\x08", "\x1b[K", "\x1b[2D", "\x1b[C", "\x1b[31m", "\x1b[0m", "\x1b[5;10H", "\x1b[?25l", "\x1b[?25h", "$ ", "\x1b[2J", "\t"];
         for round in 0..300 {
             let mut h = Harness::new(if round % 2 == 0 { Mode::Always } else { Mode::Auto });
+            if round % 3 == 0 {
+                // Narrow terminals, down to sizes that switch prediction off.
+                let cols = [MIN_COLS, 21, 25, 3, 0][rnd(5) as usize];
+                h.p.resize(24, cols);
+                h.term = vt100::Parser::new(24, cols.max(MIN_COLS), 0);
+                h.server = vt100::Parser::new(24, cols.max(MIN_COLS), 0);
+            }
             let mut typed: Vec<u8> = Vec::new();
             for _ in 0..60 {
                 match rnd(4) {

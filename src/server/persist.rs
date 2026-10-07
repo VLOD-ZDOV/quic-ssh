@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use super::exec::{self, Session};
 use super::users::User;
 use crate::authkeys::Restrictions;
-use crate::proto::{read_msg_opt, write_msg, ClientMsg, Reply, ServerMsg};
+use crate::proto::{write_msg, ClientMsg, Reader, Reply, ServerMsg};
 use crate::transport::{RecvHalf, SendHalf};
 
 /// Output kept for a reconnecting client.
@@ -350,13 +350,16 @@ impl Sessions {
     async fn serve(
         &self,
         mut send: SendHalf,
-        mut recv: RecvHalf,
+        recv: RecvHalf,
         token: Token,
         sess: &Detachable,
         generation: u64,
         from: u64,
         mut closed: watch::Receiver<bool>,
     ) -> Result<Detach> {
+        // Output wakes the loop below all the time: client messages are read
+        // in a task, so a frame is never cut short (see `Reader`).
+        let mut incoming = Reader::<ClientMsg>::spawn(recv);
         let mut changed = sess.changed.subscribe();
         changed.mark_changed();
         write_msg(&mut send, &Reply::Session { token: token.to_vec() }).await?;
@@ -392,7 +395,7 @@ impl Sessions {
                         return Ok(Detach::Done);
                     }
                 }
-                msg = read_msg_opt::<_, ClientMsg>(&mut recv) => match msg {
+                msg = incoming.next() => match msg {
                     Ok(Some(ClientMsg::Stdin(data))) => sess.send_input(Input::Data(data)),
                     // Chaff gets an echo-sized reply, like in other sessions.
                     Ok(Some(ClientMsg::Typed { data, .. })) if data.is_empty() => write_msg(&mut send, &ServerMsg::Pong(vec![0])).await?,

@@ -235,9 +235,75 @@ pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply
     }
 }
 
+/// Messages read by a task of their own, for loops that wait on other
+/// events too. A frame read inside `select!` is dropped half-way when
+/// another branch wins, which loses bytes and with them the framing; taking
+/// a message from a channel can be cancelled safely. The task stops at the
+/// end of the stream or an error, and when this is dropped.
+pub struct Reader<T> {
+    rx: tokio::sync::mpsc::Receiver<Result<Option<T>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl<T: DeserializeOwned + Send + 'static> Reader<T> {
+    pub fn spawn<R: AsyncRead + Unpin + Send + 'static>(mut r: R) -> Reader<T> {
+        // A few messages ahead at most, so flow control still reaches the sender.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            loop {
+                let msg = read_msg_opt::<_, T>(&mut r).await;
+                let more = match &msg {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(e) => e.is::<Malformed>(),
+                };
+                if tx.send(msg).await.is_err() || !more {
+                    break;
+                }
+            }
+        });
+        Reader { rx, task }
+    }
+
+    /// Like [`read_msg_opt`]; `Ok(None)` also after the end was reported once.
+    pub async fn next(&mut self) -> Result<Option<T>> {
+        self.rx.recv().await.unwrap_or(Ok(None))
+    }
+}
+
+impl<T> Drop for Reader<T> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Waiting for a message can be given up (e.g. in `select!`) at any time
+    /// without losing a frame, even one that arrives in pieces.
+    #[tokio::test]
+    async fn reader_survives_cancellation() {
+        let (mut a, b) = tokio::io::duplex(1 << 16);
+        let mut reader = Reader::<ServerMsg>::spawn(b);
+        let mut frame = Vec::new();
+        write_msg(&mut frame, &ServerMsg::Stdout(vec![5; 3000])).await.unwrap();
+        let mut got = Vec::new();
+        for piece in frame.chunks(7) {
+            a.write_all(piece).await.unwrap();
+            // Give up waiting right away, as select! does when another branch wins.
+            if let Ok(msg) = tokio::time::timeout(std::time::Duration::ZERO, reader.next()).await {
+                got.extend(msg.unwrap());
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(a);
+        while let Some(msg) = reader.next().await.unwrap() {
+            got.push(msg);
+        }
+        assert!(got.contains(&ServerMsg::Stdout(vec![5; 3000])), "{} messages", got.len());
+    }
 
     #[tokio::test]
     async fn frames_roundtrip() {

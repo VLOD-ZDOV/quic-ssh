@@ -196,6 +196,14 @@ fn finish(result: Result<i32>) -> ! {
 }
 
 fn main() {
+    // A bug must not leave the terminal raw, or the process hanging on a
+    // thread blocked reading stdin: restore the terminal and exit.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        default_hook(info);
+        std::process::exit(101);
+    }));
     qsh::platform::blocking_stdio();
     let args: Vec<String> = std::env::args().collect();
     let as_ssh = invoked_as_ssh(&args[0]);
