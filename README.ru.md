@@ -458,7 +458,7 @@ python3 bench/bench.py
 
 ## Ограничения
 
-- Нет PAM (`pam_access`, `pam_limits`), utmp/wtmp и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP).
+- Нет PAM (`pam_access`, `pam_limits`) и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
 - Нет X11 и туннелей (`-w`).
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.

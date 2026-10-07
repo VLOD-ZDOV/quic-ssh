@@ -458,7 +458,7 @@ This is still a young project and has not had an external audit. For critical sy
 
 ## Limitations
 
-- No PAM (`pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP).
+- No PAM (`pam_access`, `pam_limits`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
 - No X11 or tunnels (`-w`).
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.

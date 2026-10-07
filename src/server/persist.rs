@@ -169,13 +169,14 @@ impl Sessions {
         }
         let env = session.env(user);
         let spec = session.pty.clone().expect("persistent sessions have a terminal");
-        let (mut child, pty) = match exec::spawn_pty(user, session.command.take(), env, &spec) {
+        let (mut child, pty, tty) = match exec::spawn_pty(user, session.command.take(), env, &spec) {
             Ok(x) => x,
             Err(e) => {
                 self.map.lock().unwrap().release(user.uid);
                 return write_msg(&mut send, &Reply::Err(format!("cannot start session: {e:#}"))).await;
             }
         };
+        let record = exec::login_record(user, &tty, &child, session.remote);
         let (mut reader, mut writer) = pty.into_split();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = oneshot::channel();
@@ -241,6 +242,7 @@ impl Sessions {
                         None
                     }
                 };
+                drop(record); // the logout
                 let _ = tokio::time::timeout(exec::DRAIN_GRACE, collector).await;
                 let attached = {
                     let mut out = sess.out.lock().unwrap();

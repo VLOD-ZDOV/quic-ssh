@@ -31,6 +31,9 @@ pub struct Session {
     /// Variables set by the server (e.g. `SSH_ORIGINAL_COMMAND`).
     pub extra_env: Vec<(String, String)>,
     pub pty: Option<PtySpec>,
+    /// Where the client connects from: in system mode, terminal sessions get
+    /// a login record (utmp/wtmp/lastlog) for it.
+    pub remote: Option<std::net::IpAddr>,
 }
 
 impl Session {
@@ -49,8 +52,12 @@ impl Session {
 
 pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: Session, closed: watch::Receiver<bool>) -> Result<()> {
     let env = session.env(user);
+    let mut record = None;
     let spawned = match session.pty {
-        Some(spec) => spawn_pty(user, session.command, env, &spec).map(|(c, p)| (c, Io::Pty(p))),
+        Some(spec) => spawn_pty(user, session.command, env, &spec).map(|(c, p, tty)| {
+            record = login_record(user, &tty, &c, session.remote);
+            (c, Io::Pty(p))
+        }),
         None => spawn_pipes(user, session.command, env),
     };
     let (child, io) = match spawned {
@@ -61,7 +68,22 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
         }
     };
     write_msg(&mut send, &Reply::Ok).await?;
-    supervise(send, recv, child, io, closed).await
+    let result = supervise(send, recv, child, io, closed).await;
+    drop(record); // the logout
+    result
+}
+
+/// A login record for a terminal session in system mode (see `login_record`).
+pub(super) fn login_record(
+    user: &User,
+    tty: &Option<String>,
+    child: &tokio::process::Child,
+    remote: Option<std::net::IpAddr>,
+) -> Option<super::login_record::LoginRecord> {
+    match (user.switches(), tty, child.id(), remote) {
+        (true, Some(tty), Some(pid), Some(ip)) => Some(super::login_record::login(&user.name, tty, pid, ip)),
+        _ => None,
+    }
 }
 
 /// Child I/O, either three pipes or one PTY master.
@@ -97,9 +119,10 @@ pub(super) fn spawn_pty(
     command: Option<String>,
     env: Vec<(String, String)>,
     spec: &PtySpec,
-) -> Result<(tokio::process::Child, pty_process::Pty)> {
+) -> Result<(tokio::process::Child, pty_process::Pty, Option<String>)> {
     let (pty, pts) = pty_process::open()?;
     pty.resize(pty_process::Size::new(spec.rows, spec.cols))?;
+    let tty = nix::unistd::ttyname(&pts).ok().map(|p| p.to_string_lossy().into_owned());
     let mut cmd = pty_process::Command::new(&user.shell)
         .env_clear()
         .envs(env)
@@ -112,7 +135,7 @@ pub(super) fn spawn_pty(
     // SAFETY: the closure only performs async-signal-safe syscalls.
     cmd = unsafe { cmd.pre_exec(user.drop_privileges(true)) };
     let child = cmd.spawn(pts)?;
-    Ok((child, pty))
+    Ok((child, pty, tty))
 }
 
 /// Forwards a child output stream as `ServerMsg`s until EOF.

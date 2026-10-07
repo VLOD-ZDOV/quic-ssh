@@ -5,6 +5,7 @@ mod auth;
 mod exec;
 mod files;
 pub mod helpers;
+mod login_record;
 pub mod keys_command;
 mod persist;
 pub mod revoked;
@@ -323,6 +324,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         .collect(),
         client_env,
         pty: pty.filter(|_| !limits.no_pty),
+        remote: Some(conn.remote_addr().ip().to_canonical()),
     };
     let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
     match request {

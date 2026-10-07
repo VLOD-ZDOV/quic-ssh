@@ -244,6 +244,11 @@ else
     check "pty owned by alice, group tty, mode 620" grep -q "TTY=$ALICE_UID:$TTY_GID:620 " <<<"$OUT"
 fi
 check "pty session runs as alice" grep -qE "UID=$ALICE_UID\b" <<<"$OUT"
+if [[ -z ${QSH_TEST_NS:-} && -f /var/log/wtmp ]] && command -v last >/dev/null; then
+    check "the terminal login is in wtmp (last)" bash -c "last -w | grep -q '^qsh-alice '"
+else
+    echo "  skip login records (need real root and /var/log/wtmp)"
+fi
 
 # --- pairing hardening ------------------------------------------------------------------
 as_user qsh-bob ln -s /nonexistent "$BOB_HOME/.config/qsh/pending_pair"
