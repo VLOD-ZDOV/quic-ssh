@@ -26,7 +26,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 5] = ["cp", "pair", "keygen", "speed", "ui"];
+const TOOLS: [&str; 6] = ["cp", "pair", "keygen", "speed", "ui", "multi"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -114,9 +114,48 @@ enum Cmd {
     },
     /// Interactive host menu with status and speed test
     Ui,
+    /// Run a command on several hosts at once: qsh multi [-g GROUP] [HOST...] -- COMMAND
+    Multi {
+        /// Hosts of this group (from `qsh ui` or ~/.config/qsh/groups); repeatable
+        #[arg(short = 'g', long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
+        /// How many hosts at a time
+        #[arg(short = 'P', long, default_value_t = 16)]
+        parallel: usize,
+        /// [user@]host[:port] or an alias
+        hosts: Vec<String>,
+        /// The command (after --)
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 impl ConnArgs {
+    /// The same options as `qsh` arguments, for child processes.
+    fn as_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(p) = self.port {
+            args.extend(["-p".to_string(), p.to_string()]);
+        }
+        for i in &self.identity {
+            args.extend(["-i".to_string(), i.display().to_string()]);
+        }
+        if self.transport != Mode::Auto {
+            let name = if self.transport == Mode::Quic { "quic" } else { "tcp" };
+            args.extend(["--transport".to_string(), name.to_string()]);
+        }
+        if self.accept_new_host {
+            args.push("--accept-new-host".into());
+        }
+        if self.verbose {
+            args.push("-v".into());
+        }
+        if self.full {
+            args.push("--full".into());
+        }
+        args
+    }
+
     fn options(&self) -> ConnectOptions {
         ConnectOptions {
             identities: self.identity.clone(),
@@ -413,6 +452,12 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
         }
         Cmd::Ui => qsh::client::tui::run(opts).await,
+        Cmd::Multi { groups, parallel, hosts, command } => {
+            use qsh::client::{groups as host_groups, multi};
+            let all = if groups.is_empty() { Default::default() } else { host_groups::load(&home_dir()?)? };
+            let dests = multi::destinations(&all, &groups, &hosts)?;
+            multi::run(&dests, &command, parallel, &cli.conn.as_args()).await
+        }
     }
 }
 

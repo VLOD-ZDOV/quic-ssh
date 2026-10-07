@@ -1992,3 +1992,34 @@ fn revoked_keys_and_krl() {
     std::fs::write(&list, "garbage\n").unwrap();
     assert!(!works(&ec) && !works(&ed), "a damaged list must refuse everyone");
 }
+
+/// `qsh multi`: a command on several hosts (named or from a group), output
+/// prefixed per host, failures summed up at the end.
+#[test]
+fn command_on_several_hosts() {
+    let a = Server::start();
+    let b = Server::start();
+    let c = Client::paired(&a);
+    // The same client key on the second server.
+    std::fs::create_dir_all(b.authorized_keys().parent().unwrap()).unwrap();
+    std::fs::copy(a.authorized_keys(), b.authorized_keys()).unwrap();
+    let host_a = format!("{}:{}", dest(), a.port);
+    let host_b = format!("{}:{}", dest(), b.port);
+    std::fs::write(c.home.path().join(".config/qsh/groups"), format!("both = [{host_a:?}, {host_b:?}]\n")).unwrap();
+    let out = c.run(&["multi", "--accept-new-host", "-g", "both", "--", "echo", "hello", "from", "$HOME"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for (host, server) in [(&host_a, &a), (&host_b, &b)] {
+        let line = format!("{host} | hello from {}", server.home.path().display());
+        assert!(text.lines().any(|l| l.trim_end() == line), "missing {line:?} in\n{text}");
+    }
+    // A failing command and an unreachable host are reported, and set the exit code.
+    let dead = format!("{}:{}", dest(), free_port());
+    let out = c.run(&["multi", "--transport", "tcp", &host_a, &dead, "--", "exit", "3"]);
+    assert_eq!(out.status.code(), Some(255), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains(&format!("{host_a}: exit code 3")), "{err}");
+    assert!(err.contains(&format!("{dead}: could not connect")), "{err}");
+    let out = c.run(&["multi", "-g", "nope", "--", "true"]);
+    assert!(!out.status.success());
+}

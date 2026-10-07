@@ -7,6 +7,8 @@
 //! are cached in `~/.config/qsh/ui-state.toml` for a few minutes, so opening the
 //! menu again does not contact every server. Sessions run as a child `qsh`
 //! (with `--full` by default, so hosts without qshd open with plain ssh).
+//! Hosts can be put into groups (`~/.config/qsh/groups`), and a command can
+//! run on every host shown (`qsh multi`).
 //! Works with the keyboard and with a mouse or touch screen (e.g. Termux).
 
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
+use super::groups::{self, Groups};
 use super::saved::{self, Saved};
 use super::ui_state::{ago, now, CachedProbe, Prefs, UiState};
 use super::{speed, ConnectOptions, Target};
@@ -128,6 +131,8 @@ struct Form {
     user: String,
     port: String,
     key: String,
+    /// Space-separated group names (a menu setting, kept in `groups`).
+    groups: String,
     transport: usize,
     fallback: bool,
     focus: usize,
@@ -137,7 +142,13 @@ struct Form {
     locked: bool,
 }
 
-const FORM_FIELDS: [&str; 7] = ["name", "host", "user", "port", "key file", "transport", "no qshd"];
+const FORM_FIELDS: [&str; 8] = ["name", "host", "user", "port", "key file", "groups", "transport", "no qshd"];
+/// Form fields that are text.
+const TEXT_FIELDS: usize = 6;
+/// The first field of a locked form (the menu's own settings).
+const FIRST_MENU_FIELD: usize = 5;
+const TRANSPORT_FIELD: usize = 6;
+const FALLBACK_FIELD: usize = 7;
 
 impl Form {
     fn new() -> Form {
@@ -148,6 +159,7 @@ impl Form {
             user: String::new(),
             port: String::new(),
             key: String::new(),
+            groups: String::new(),
             transport: 0,
             fallback: true,
             focus: 0,
@@ -180,13 +192,14 @@ impl Form {
     }
 
     /// A form for editing a host from any source.
-    fn from_host(h: &Host, prefs: &Prefs) -> Form {
+    fn from_host(h: &Host, prefs: &Prefs, groups: &Groups) -> Form {
         let mut f = Form::new().with_prefs(prefs);
         f.original = (h.source != Source::KnownHost).then(|| h.alias.clone());
         f.locked = h.source == Source::Config;
         if f.locked {
-            f.focus = 5;
+            f.focus = FIRST_MENU_FIELD;
         }
+        f.groups = groups::of(groups, &h.alias).join(" ");
         f.name = h.alias.clone();
         if let Some(t) = &h.target {
             f.host = t.host.clone();
@@ -200,10 +213,11 @@ impl Form {
     }
 
     fn text_mut(&mut self) -> Option<&mut String> {
-        if self.locked {
+        if self.locked && self.focus < FIRST_MENU_FIELD {
             return None;
         }
         match self.focus {
+            5 => Some(&mut self.groups),
             0 => Some(&mut self.name),
             1 => Some(&mut self.host),
             2 => Some(&mut self.user),
@@ -213,8 +227,18 @@ impl Form {
         }
     }
 
+    /// The group names, or what is wrong with them.
+    fn group_list(&self) -> Result<Vec<String>, String> {
+        let list: Vec<String> = self.groups.split([' ', ',']).filter(|g| !g.is_empty()).map(str::to_string).collect();
+        match list.iter().find(|g| !groups::valid_name(g)) {
+            Some(bad) => Err(format!("groups: {bad:?} is not a name (letters, digits, - _ .)")),
+            None => Ok(list),
+        }
+    }
+
     /// The saved connection and preferences, or what is wrong with the input.
     fn result(&self) -> Result<(Saved, Prefs), String> {
+        self.group_list()?;
         let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
         let port = match opt(&self.port) {
             None => None,
@@ -240,6 +264,8 @@ enum InputMode {
     Quick(String),
     Form(Box<Form>),
     ConfirmDelete(String),
+    /// A command for every host shown.
+    RunAll(String),
 }
 
 /// What the event loop must do after an input event.
@@ -254,11 +280,14 @@ enum Action {
     Refresh,
     Save(Box<Form>),
     Delete(String),
+    /// Run a command on these hosts (`qsh multi`).
+    RunAll(String, Vec<String>),
 }
 
 struct App {
     hosts: Vec<Host>,
     state: UiState,
+    groups: Groups,
     view: View,
     /// Position in the visible list.
     selected: usize,
@@ -274,7 +303,7 @@ struct App {
 }
 
 impl App {
-    fn new(hosts: Vec<Host>, state: UiState) -> App {
+    fn new(hosts: Vec<Host>, state: UiState, groups: Groups) -> App {
         let status = if hosts.is_empty() {
             "No hosts yet: press n to add one, or c to connect once".to_string()
         } else {
@@ -283,6 +312,7 @@ impl App {
         App {
             hosts,
             state,
+            groups,
             view: View::Hosts,
             selected: 0,
             filter: String::new(),
@@ -306,7 +336,9 @@ impl App {
                 let mut rows: Vec<usize> = (0..self.hosts.len())
                     .filter(|&i| {
                         let h = &self.hosts[i];
-                        self.matches(&h.alias) || h.target.as_ref().is_some_and(|t| self.matches(&t.host))
+                        self.matches(&h.alias)
+                            || h.target.as_ref().is_some_and(|t| self.matches(&t.host))
+                            || groups::of(&self.groups, &h.alias).iter().any(|g| self.matches(g))
                     })
                     .collect();
                 // Stable: hosts never used keep their config order.
@@ -439,6 +471,27 @@ impl App {
                 self.selected = 0;
                 Action::None
             }
+            InputMode::RunAll(cmd) => match k.code {
+                KeyCode::Esc => {
+                    self.mode = InputMode::Normal;
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    let cmd = std::mem::take(cmd).trim().to_string();
+                    self.mode = InputMode::Normal;
+                    let dests: Vec<String> = self.visible().iter().map(|&i| self.hosts[i].alias.clone()).collect();
+                    if cmd.is_empty() || dests.is_empty() { Action::None } else { Action::RunAll(cmd, dests) }
+                }
+                KeyCode::Backspace => {
+                    cmd.pop();
+                    Action::None
+                }
+                KeyCode::Char(c) => {
+                    cmd.push(c);
+                    Action::None
+                }
+                _ => Action::None,
+            },
             InputMode::PairCode(code) | InputMode::Quick(code) => match k.code {
                 KeyCode::Esc => {
                     self.mode = InputMode::Normal;
@@ -469,8 +522,8 @@ impl App {
                 match k.code {
                     KeyCode::Esc => self.mode = InputMode::Normal,
                     KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1).min(last),
-                    // Locked forms only have the two preference fields.
-                    KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.saturating_sub(1).max(if form.locked { 5 } else { 0 }),
+                    // Locked forms only have the menu's own fields.
+                    KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.saturating_sub(1).max(if form.locked { FIRST_MENU_FIELD } else { 0 }),
                     KeyCode::Enter => match form.result() {
                         Ok(_) => {
                             let InputMode::Form(form) = std::mem::replace(&mut self.mode, InputMode::Normal) else { unreachable!() };
@@ -478,11 +531,11 @@ impl App {
                         }
                         Err(e) => form.error = Some(e),
                     },
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focus == 5 => {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focus == TRANSPORT_FIELD => {
                         let step = if k.code == KeyCode::Left { TRANSPORTS.len() - 1 } else { 1 };
                         form.transport = (form.transport + step) % TRANSPORTS.len();
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focus == 6 => form.fallback = !form.fallback,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focus == FALLBACK_FIELD => form.fallback = !form.fallback,
                     KeyCode::Backspace => {
                         if let Some(t) = form.text_mut() {
                             t.pop();
@@ -552,11 +605,11 @@ impl App {
             // Edit a host, or save a history entry as a connection.
             KeyCode::Char('e') | KeyCode::Char('a') => {
                 let form = match (self.view, self.current()) {
-                    (View::Hosts, Some(i)) => Form::from_host(&self.hosts[i], &self.state.prefs(&self.hosts[i].alias)),
+                    (View::Hosts, Some(i)) => Form::from_host(&self.hosts[i], &self.state.prefs(&self.hosts[i].alias), &self.groups),
                     (View::History, Some(i)) => {
                         let dest = &self.state.history[i].dest;
                         match self.hosts.iter().find(|h| &h.alias == dest) {
-                            Some(h) => Form::from_host(h, &self.state.prefs(dest)),
+                            Some(h) => Form::from_host(h, &self.state.prefs(dest), &self.groups),
                             None => Form::from_dest(dest),
                         }
                     }
@@ -593,6 +646,10 @@ impl App {
                 Action::None
             }
             KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Char('x') if self.view == View::Hosts && !self.visible().is_empty() => {
+                self.mode = InputMode::RunAll(String::new());
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -647,6 +704,9 @@ impl App {
         let mut spans = vec![Span::styled(format!("{dot} "), Style::new().fg(color)), Span::styled(h.alias.clone(), Style::new().bold())];
         if h.source == Source::Saved {
             spans.push(Span::styled(" ★", Style::new().fg(Color::Yellow)));
+        }
+        for g in groups::of(&self.groups, &h.alias) {
+            spans.push(Span::styled(format!(" #{g}"), Style::new().fg(Color::Magenta)));
         }
         if let Some(t) = &h.target {
             if t.host != h.alias {
@@ -741,6 +801,10 @@ impl App {
             (t, false) => format!("{t}, qsh only"),
         };
         lines.push(field("connect", Span::raw(via)));
+        let member = groups::of(&self.groups, &h.alias);
+        if !member.is_empty() {
+            lines.push(field("groups", Span::styled(member.join(", "), Style::new().fg(Color::Magenta))));
+        }
         if let Some(t) = self.state.last_used(&h.alias) {
             lines.push(field("last used", Span::raw(ago(t, self.now))));
         }
@@ -801,8 +865,10 @@ impl App {
             InputMode::Quick(dest) => format!("connect once to user@host[:port]: {dest}▏  (⏎ go, Esc cancel)"),
             InputMode::Form(_) => "Tab next field · ←→ change · ⏎ save · Esc cancel".to_string(),
             InputMode::ConfirmDelete(name) => format!("delete the saved connection {name}? y/n"),
+            InputMode::RunAll(cmd) => format!("run on the {} hosts shown: {cmd}▏  (⏎ run, Esc cancel)", self.visible().len()),
             InputMode::Normal if wide => {
-                "⏎ connect · c once · n new · e edit · d delete · Tab history · s speed · p pair · / find · r refresh · q quit".to_string()
+                "⏎ connect · c once · n new · e edit · d delete · Tab history · s speed · p pair · / find · x run on all · r refresh · q quit"
+                    .to_string()
             }
             InputMode::Normal => "⏎ go · c once · n new · e edit · Tab history · q quit".to_string(),
         };
@@ -828,6 +894,7 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
         form.user.clone(),
         if form.port.is_empty() && form.focus != 3 { "4422 (default)".into() } else { form.port.clone() },
         form.key.clone(),
+        form.groups.clone(),
         format!("‹ {} ›", TRANSPORTS[form.transport]),
         if form.fallback { "[x] use plain ssh".into() } else { "[ ] fail".into() },
     ];
@@ -838,8 +905,8 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
         .map(|(i, (name, value))| {
             let focused = i == form.focus;
             let label = Span::styled(format!("{name:>9}  "), Style::new().fg(if focused { Color::Cyan } else { Color::DarkGray }));
-            let cursor = if focused && i < 5 { "▏" } else { "" };
-            let style = match (focused, form.locked && i < 5) {
+            let cursor = if focused && i < TEXT_FIELDS { "▏" } else { "" };
+            let style = match (focused, form.locked && i < FIRST_MENU_FIELD) {
                 (_, true) => Style::new().fg(Color::DarkGray),
                 (true, false) => Style::new().bold().bg(Color::Rgb(40, 60, 90)),
                 (false, false) => Style::new(),
@@ -1159,10 +1226,13 @@ fn session_args(opts: &ConnectOptions, prefs: &Prefs, dest: &str) -> Vec<String>
 /// their files are never written.
 fn save_form(app: &mut App, form: &Form) -> Result<String> {
     let home = home_dir()?;
+    let member = form.group_list().map_err(anyhow::Error::msg)?;
     if form.locked {
         let name = form.original.clone().unwrap_or_else(|| form.name.clone());
         let prefs = Prefs { transport: TRANSPORTS[form.transport].to_string(), ssh_fallback: form.fallback };
         app.state.prefs.insert(name.clone(), prefs);
+        groups::set(&mut app.groups, &name, &member);
+        groups::save(&home, &app.groups)?;
         return Ok(name);
     }
     let (entry, prefs) = form.result().map_err(anyhow::Error::msg)?;
@@ -1177,6 +1247,7 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
         if old != &entry.name {
             app.state.prefs.remove(old);
             app.state.probes.remove(old);
+            groups::rename(&mut app.groups, old, &entry.name);
         }
     }
     all.retain(|s| s.name != entry.name);
@@ -1184,6 +1255,8 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
     all.push(entry);
     saved::save(&home, &all)?;
     app.state.prefs.insert(name.clone(), prefs);
+    groups::set(&mut app.groups, &name, &member);
+    groups::save(&home, &app.groups)?;
     // The address may have changed: check it again.
     app.state.probes.remove(&name);
     Ok(name)
@@ -1194,6 +1267,8 @@ fn delete_saved(app: &mut App, name: &str) -> Result<()> {
     let mut all = saved::load(&home);
     all.retain(|s| s.name != name);
     saved::save(&home, &all)?;
+    groups::set(&mut app.groups, name, &[]);
+    groups::save(&home, &app.groups)?;
     app.state.prefs.remove(name);
     app.state.probes.remove(name);
     Ok(())
@@ -1216,7 +1291,14 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
     #[cfg(windows)]
     let _sigint = tokio::signal::windows::ctrl_c()?;
     let home = home_dir()?;
-    let mut app = App::new(load_hosts(), UiState::load(&home));
+    let (host_groups, groups_error) = match groups::load(&home) {
+        Ok(g) => (g, None),
+        Err(e) => (Groups::new(), Some(format!("{e:#}"))),
+    };
+    let mut app = App::new(load_hosts(), UiState::load(&home), host_groups);
+    if let Some(e) = groups_error {
+        app.status = e;
+    }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let probe_key = Arc::new(Identity::generate());
     start_probes(&mut app, None, false, &tx, &probe_key);
@@ -1289,6 +1371,22 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                     Err(e) => format!("cannot start session: {e}"),
                 };
                 start_probes(&mut app, Some(&dest), true, &tx, &probe_key);
+            }
+            Action::RunAll(cmd, dests) => {
+                leave();
+                let mut args = vec!["multi".to_string(), "--full".into()];
+                args.extend(child_flags(&opts));
+                args.extend(dests.iter().cloned());
+                args.push("--".into());
+                args.push(cmd.clone());
+                let status = run_child(&args).await;
+                wait_for_enter();
+                terminal = enter()?;
+                app.status = match status {
+                    Ok(s) if s.success() => format!("`{cmd}` ran on {} hosts", dests.len()),
+                    Ok(_) => format!("`{cmd}` failed on some hosts"),
+                    Err(e) => format!("cannot run: {e}"),
+                };
             }
             Action::Pair(i, code) => {
                 leave();
@@ -1387,6 +1485,7 @@ mod tests {
                 host("gamma", Probe::Pending, Source::KnownHost),
             ],
             UiState::default(),
+            Groups::new(),
         )
     }
 
@@ -1470,10 +1569,15 @@ mod tests {
         typing(&mut app, "2222");
         app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Tab));
+        typing(&mut app, "web prod!");
+        assert_eq!(app.on_event(key(KeyCode::Enter)), Action::None, "bad group name");
+        app.on_event(key(KeyCode::Backspace));
+        app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Right)); // transport: quic
         app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Char(' '))); // no ssh fallback
         let Action::Save(form) = app.on_event(key(KeyCode::Enter)) else { panic!("not saved") };
+        assert_eq!(form.group_list().unwrap(), ["web", "prod"]);
         let (saved, prefs) = form.result().unwrap();
         assert_eq!(saved, Saved { name: "box".into(), host: "192.0.2.5".into(), user: Some("admin".into()), port: Some(2222), identity: None });
         assert_eq!(prefs, Prefs { transport: "quic".into(), ssh_fallback: false });
@@ -1507,17 +1611,37 @@ mod tests {
         // alpha comes from a config file: its address cannot be changed here.
         app.on_event(key(KeyCode::Char('e')));
         let InputMode::Form(form) = &app.mode else { panic!("no form") };
-        assert!(form.locked && form.focus == 5);
+        assert!(form.locked && form.focus == FIRST_MENU_FIELD);
         typing(&mut app, "x");
         app.on_event(key(KeyCode::BackTab));
         app.on_event(key(KeyCode::BackTab));
         typing(&mut app, "evil");
         let InputMode::Form(form) = &app.mode else { panic!("no form") };
-        assert_eq!((form.name.as_str(), form.host.as_str(), form.focus), ("alpha", "alpha", 5));
+        assert_eq!((form.name.as_str(), form.host.as_str(), form.focus), ("alpha", "alpha", FIRST_MENU_FIELD));
+        // Groups are a menu setting: they can be typed in.
+        assert_eq!(form.groups, "xevil");
+        app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Right));
         let Action::Save(form) = app.on_event(key(KeyCode::Enter)) else { panic!("not saved") };
         assert!(form.locked && form.transport == 1);
         assert!(render(&mut app, 100, 30).contains("alpha"));
+    }
+
+    #[test]
+    fn groups_filter_and_run_on_all() {
+        let mut app = sample();
+        groups::set(&mut app.groups, "alpha", &["web".into()]);
+        groups::set(&mut app.groups, "gamma", &["web".into(), "db".into()]);
+        let screen = render(&mut app, 110, 24);
+        assert!(screen.contains("alpha #web") && screen.contains("gamma #db #web"), "{screen}");
+        app.on_event(key(KeyCode::Char('/')));
+        typing(&mut app, "web");
+        app.on_event(key(KeyCode::Enter));
+        assert_eq!(app.visible(), vec![0, 2]);
+        app.on_event(key(KeyCode::Char('x')));
+        typing(&mut app, "uptime");
+        assert!(render(&mut app, 110, 24).contains("run on the 2 hosts shown: uptime"));
+        assert_eq!(app.on_event(key(KeyCode::Enter)), Action::RunAll("uptime".into(), vec!["alpha".into(), "gamma".into()]));
     }
 
     #[test]

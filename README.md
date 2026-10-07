@@ -282,9 +282,22 @@ ln -s "$(command -v qsh)" ~/.local/bin/ssh
   - They are stored in `~/.config/qsh/ui-hosts` (ssh_config syntax), so `qsh NAME` works on the command line too.
   - Your own config files are never written. For a host from them, **`e`** only changes the menu's settings (transport, ssh fallback), and a saved name cannot clash with a host of yours.
 - **History:** **`Tab`** shows the history with the result of each connection. **⏎** connects again, **`a`** saves an entry as a connection, **`d`** removes it.
+- **Groups:** the **`e`** form has a *groups* field (e.g. `web prod`), for any host. Groups show as `#web` tags, **`/web`** filters by them, and **`x`** runs one command on every host shown (`qsh multi`). They are kept in `~/.config/qsh/groups`.
 - **Speed test:** **`s`** runs it with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
 - **Other keys:** **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`q`** quits.
 - **Screens:** the layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
+
+`qsh multi` runs a command on several hosts at once, each line prefixed with the host, and lists the hosts where it failed:
+
+```
+$ qsh multi -g web db1 -- uptime
+web1 | 10:21:07 up 12 days,  load average: 0.08, 0.03, 0.01
+web2 | 10:21:07 up 40 days,  load average: 0.31, 0.25, 0.20
+db1  | 10:21:07 up 3 days,  load average: 1.02, 0.97, 0.90
+ok on all 3 hosts
+```
+
+Hosts run in parallel (`-P 16` by default) with `BatchMode`, so nothing can stop to ask a question: use keys that need no passphrase prompt (or an agent) and hosts already in known_hosts (or `--accept-new-host`). The exit code is 0 if the command succeeded everywhere, 1 if it failed somewhere and 255 if a host could not be reached.
 
 `qsh speed host` runs the same test in plain text:
 
