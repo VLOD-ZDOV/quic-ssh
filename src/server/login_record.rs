@@ -214,7 +214,9 @@ mod imp {
 
 #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod imp {
-    pub(super) fn write(_: &super::Job) -> std::io::Result<()> {
+    /// Nothing is written here (no known layout).
+    pub(super) fn write(job: &super::Job) -> std::io::Result<()> {
+        let _ = (job.pid, &job.who, job.at);
         Ok(())
     }
 }
