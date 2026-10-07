@@ -41,6 +41,22 @@ sudo install -m755 qsh-$ARCH-linux/qsh qsh-$ARCH-linux/qshd /usr/local/bin/
 
 The same archive works for both client and server. Checksums are in `SHA256SUMS`.
 
+### macOS
+
+Client and server, for Apple Silicon (`aarch64`) and Intel (`x86_64`):
+
+```sh
+ARCH=$(uname -m | sed s/arm64/aarch64/)
+curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/qsh-$ARCH-macos.tar.gz | tar xz
+sudo install -m755 qsh-$ARCH-macos/qsh qsh-$ARCH-macos/qshd /usr/local/bin/
+```
+
+Downloaded with curl, the binaries carry no quarantine flag. If you download them with a browser, clear it with `xattr -d com.apple.quarantine qsh qshd`. To run qshd as a service, see `contrib/qshd.plist`. On macOS, account expiry is not checked, because macOS has no shadow database.
+
+### Windows
+
+The client, `qsh.exe`, is in `qsh-x86_64-windows.zip`. Unzip it to a folder on your `PATH`. qsh uses `%USERPROFILE%\.ssh` (keys, `config`, `known_hosts` markers) and `%USERPROFILE%\.config\qsh`, and it talks to the Windows OpenSSH agent service (`ssh-agent`) on its own. All features except `-f` are available. `--full` runs `ssh.exe` and waits for it. The Windows build is new and tested automatically; interactive use has seen less real-world testing than on Linux, so please report problems. The server, qshd, needs Linux, macOS or another Unix system.
+
 ### Android (Termux)
 
 A native Android build (bionic libc, so DNS works) is in the releases as `qsh-aarch64-android`:
@@ -377,7 +393,7 @@ This is still a young project and has not had an external audit. For critical sy
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.
-- Linux/Unix only.
+- qshd runs on Linux, macOS and other Unix systems; on Windows there is only the client.
 
 ### Upgrading
 

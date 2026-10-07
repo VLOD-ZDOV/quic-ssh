@@ -89,6 +89,7 @@ jobs:
         run: |
           mkdir "$NAME"
           cp "target/$TARGET/release/qsh" "target/$TARGET/release/qshd" README.md README.ru.md LICENSE "$NAME/"
+          cp -r contrib "$NAME/"
           file "$NAME/qsh"
           tar czf "$NAME.tar.gz" "$NAME"
       - uses: actions/upload-artifact@v4

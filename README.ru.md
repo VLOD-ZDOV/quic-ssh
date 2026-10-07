@@ -41,6 +41,22 @@ sudo install -m755 qsh-$ARCH-linux/qsh qsh-$ARCH-linux/qshd /usr/local/bin/
 
 Один и тот же архив подходит и для клиента, и для сервера. Контрольные суммы лежат в `SHA256SUMS`.
 
+### macOS
+
+Клиент и сервер для Apple Silicon (`aarch64`) и Intel (`x86_64`):
+
+```sh
+ARCH=$(uname -m | sed s/arm64/aarch64/)
+curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/qsh-$ARCH-macos.tar.gz | tar xz
+sudo install -m755 qsh-$ARCH-macos/qsh qsh-$ARCH-macos/qshd /usr/local/bin/
+```
+
+При скачивании через curl у бинарников нет флага карантина. Если скачиваешь браузером, сними его командой `xattr -d com.apple.quarantine qsh qshd`. Чтобы запускать qshd как службу, смотри `contrib/qshd.plist`. На macOS срок действия аккаунта не проверяется: базы shadow там нет.
+
+### Windows
+
+Клиент `qsh.exe` лежит в `qsh-x86_64-windows.zip`. Распакуй его в папку из `PATH`. qsh использует `%USERPROFILE%\.ssh` (ключи, `config`, отметки `known_hosts`) и `%USERPROFILE%\.config\qsh` и сам работает со службой агента OpenSSH для Windows (`ssh-agent`). Доступно всё, кроме `-f`. `--full` запускает `ssh.exe` и ждёт его завершения. Сборка под Windows новая и проверяется автоматически, но интерактивную работу с ней проверяли меньше, чем под Linux; если что-то не так, сообщи. Серверу qshd нужен Linux, macOS или другая Unix-система.
+
 ### Android (Termux)
 
 Нативная сборка под Android (на bionic libc, поэтому DNS работает) лежит в релизах как `qsh-aarch64-android`:
@@ -377,7 +393,7 @@ python3 bench/bench.py
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.
 - `-J` работает, только если на всех промежуточных хостах есть qshd; с `--full` хосты с `ProxyJump`/`ProxyCommand` отдаются ssh.
-- Только Linux/Unix.
+- qshd работает на Linux, macOS и других Unix-системах; под Windows есть только клиент.
 
 ### Обновление
 
