@@ -17,7 +17,7 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, Signat
 use x509_parser::oid_registry::OID_SIG_ED25519;
 
 use crate::keys::{Identity, PublicKey};
-use crate::proto::ALPN;
+use crate::proto::{ALPN, ALPN_HOST_CERT};
 
 /// Server name sent in SNI; certificates are pinned by key, so it is not checked.
 pub const SERVER_NAME: &str = "qsh";
@@ -95,7 +95,8 @@ impl ServerCertVerifier for HostKeyVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        if !intermediates.is_empty() {
+        // At most the SSH host certificate, checked after the handshake.
+        if intermediates.len() > 1 {
             return Err(TlsError::General("unexpected certificate chain".into()));
         }
         cert_key(end_entity).map_err(bad_cert)?;
@@ -174,13 +175,38 @@ impl ClientCertVerifier for ClientKeyVerifier {
     }
 }
 
-pub fn server_config(host: &Identity) -> Result<rustls::ServerConfig> {
+/// Presents the host certificate (SSH format, as a second chain entry) only
+/// to clients that ask for it with [`ALPN_HOST_CERT`]; older clients accept
+/// exactly one certificate.
+#[derive(Debug)]
+struct HostCertResolver {
+    plain: Arc<rustls::sign::CertifiedKey>,
+    with_cert: Arc<rustls::sign::CertifiedKey>,
+}
+
+impl rustls::server::ResolvesServerCert for HostCertResolver {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let wants = hello.alpn().is_some_and(|mut a| a.any(|p| p == ALPN_HOST_CERT));
+        Some(if wants { self.with_cert.clone() } else { self.plain.clone() })
+    }
+}
+
+/// `host_cert`: an OpenSSH host certificate for `host`'s key, in wire format.
+pub fn server_config(host: &Identity, host_cert: Option<Vec<u8>>) -> Result<rustls::ServerConfig> {
     let provider = provider();
     let (cert, key) = self_signed(host)?;
-    let mut cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(Arc::new(ClientKeyVerifier { provider }))
-        .with_single_cert(vec![cert], key)?;
+        .with_client_cert_verifier(Arc::new(ClientKeyVerifier { provider: provider.clone() }));
+    let mut cfg = match host_cert {
+        None => builder.with_single_cert(vec![cert], key)?,
+        Some(ssh_cert) => {
+            let signer = provider.key_provider.load_private_key(key)?;
+            let plain = rustls::sign::CertifiedKey::new(vec![cert.clone()], signer.clone());
+            let with_cert = rustls::sign::CertifiedKey::new(vec![cert, CertificateDer::from(ssh_cert)], signer);
+            builder.with_cert_resolver(Arc::new(HostCertResolver { plain: Arc::new(plain), with_cert: Arc::new(with_cert) }))
+        }
+    };
     cfg.alpn_protocols = vec![ALPN.to_vec()];
     Ok(cfg)
 }
@@ -193,7 +219,8 @@ pub fn client_config(id: &Identity) -> Result<rustls::ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(HostKeyVerifier { provider }))
         .with_client_auth_cert(vec![cert], key)?;
-    cfg.alpn_protocols = vec![ALPN.to_vec()];
+    // The second entry is never selected; it asks for the host certificate.
+    cfg.alpn_protocols = vec![ALPN.to_vec(), ALPN_HOST_CERT.to_vec()];
     Ok(cfg)
 }
 

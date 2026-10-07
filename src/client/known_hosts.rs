@@ -43,7 +43,27 @@ impl KnownHosts {
         std::fs::read_to_string(&self.path)
             .unwrap_or_default()
             .lines()
-            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .filter_map(|l| l.split_whitespace().next().filter(|w| !w.starts_with(['@', '#'])).map(str::to_string))
+            .collect()
+    }
+
+    /// Keys on `@cert-authority` (or `@revoked`) lines whose host patterns
+    /// match one of `names` (OpenSSH syntax; hashed names are not matched).
+    pub fn marked(&self, marker: &str, names: &[String]) -> Vec<ssh_key::public::KeyData> {
+        let text = fs::read_to_string(&self.path).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                if words.next()? != marker {
+                    return None;
+                }
+                let patterns: Vec<&str> = words.next()?.split(',').collect();
+                let key = words.collect::<Vec<_>>().join(" ");
+                if !names.iter().any(|n| crate::pattern::host_matches(&patterns, n)) {
+                    return None;
+                }
+                ssh_key::PublicKey::from_openssh(&key).ok().map(|k| k.key_data().clone())
+            })
             .collect()
     }
 
@@ -74,5 +94,25 @@ mod tests {
         assert_eq!(kh.lookup("example.com").unwrap(), Some(a));
         assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(b));
         assert_eq!(kh.lookup("example.org").unwrap(), None);
+    }
+
+    #[test]
+    fn markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let ca = Identity::generate().public();
+        let bad = Identity::generate().public();
+        std::fs::write(
+            &path,
+            format!("@cert-authority *.example.com,!old.example.com {}\n@revoked * {}\n", ca.to_openssh("ca"), bad.to_openssh("")),
+        )
+        .unwrap();
+        let kh = KnownHosts::new(path);
+        let names = |n: &str| vec![n.to_string()];
+        assert_eq!(kh.marked("@cert-authority", &names("web.example.com")).len(), 1);
+        assert!(kh.marked("@cert-authority", &names("old.example.com")).is_empty());
+        assert!(kh.marked("@cert-authority", &names("example.org")).is_empty());
+        assert_eq!(kh.marked("@revoked", &names("anything")).len(), 1);
+        assert_eq!(kh.lookup("web.example.com").unwrap(), None, "marker lines are not host keys");
     }
 }

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"qsh/1";
+/// Offered (never selected) by clients that want the server's host certificate.
+pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
 pub const VERSION: u32 = 4;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
@@ -111,6 +113,12 @@ pub enum Request {
     UploadTree { path: String, name: String },
     /// Recursive download: a tar stream of the directory's contents follows `Reply::Ok`.
     DownloadTree { path: String },
+    // --- protocol version 4 ---
+    /// `-A`: make the client's ssh-agent available to this connection's
+    /// sessions (`SSH_AUTH_SOCK`). Each agent connection on the server arrives
+    /// as a server-opened stream starting with [`Opened::Agent`]. Closing this
+    /// stream ends the forwarding.
+    AgentForward,
 }
 
 /// First message on a stream the server opens to the client.
@@ -118,6 +126,8 @@ pub enum Request {
 pub enum Opened {
     /// A connection to a `-R` listener on `port`, from `origin`; raw bytes follow.
     Forwarded { port: u16, origin: String },
+    /// A program on the server talks to the forwarded agent; raw bytes follow.
+    Agent,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

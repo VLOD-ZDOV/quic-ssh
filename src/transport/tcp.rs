@@ -94,19 +94,21 @@ where
 }
 
 /// Peer key and exporter secret of a completed TLS handshake.
-fn tls_info<D>(c: &rustls::ConnectionCommon<D>) -> Result<(PublicKey, [u8; 32])> {
-    let peer_key = super::single_peer_cert(c.peer_certificates())?;
+type TlsInfo = (PublicKey, Option<Vec<u8>>, [u8; 32]);
+
+fn tls_info<D>(c: &rustls::ConnectionCommon<D>) -> Result<TlsInfo> {
+    let (peer_key, host_cert) = super::peer_identity(c.peer_certificates())?;
     let exporter = c
         .export_keying_material([0u8; 32], EXPORTER_LABEL, Some(b""))
         .context("TLS exporter failed")?;
-    Ok((peer_key, exporter))
+    Ok((peer_key, host_cert, exporter))
 }
 
-fn finish<T>(socket: T, mode: Mode, info: (PublicKey, [u8; 32]), remote: SocketAddr) -> Conn
+fn finish<T>(socket: T, mode: Mode, info: TlsInfo, remote: SocketAddr) -> Conn
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (peer_key, exporter) = info;
+    let (peer_key, host_cert, exporter) = info;
     let (cmds, incoming, alive) = start(socket, mode);
     Conn {
         inner: Inner::Tcp(TcpConn { cmds, incoming: Mutex::new(incoming), alive }),
@@ -115,6 +117,7 @@ where
         remote,
         hops: Vec::new(),
         server_version: 3,
+        host_cert,
     }
 }
 

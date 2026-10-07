@@ -197,25 +197,16 @@ fn load_private(path: &Path, batch: bool) -> Result<PrivateKey> {
     if batch {
         bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
     }
-    let pass = rpassword::prompt_password(format!("Enter passphrase for {}: ", path.display()))?;
+    let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
     key.decrypt(pass.as_bytes()).context("wrong passphrase")
 }
 
-/// Answers a server question (a one-time code) on the terminal.
+/// Answers a server question (a one-time code) on the terminal or through askpass.
 fn ask(text: &str, echo: bool, batch: bool) -> Result<String> {
     if batch {
         bail!("the server asks {text:?}, but prompting is disabled (BatchMode)");
     }
-    if echo {
-        use std::io::{BufRead, Write};
-        let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").context("no terminal to answer the server")?;
-        write!(&tty, "{text}")?;
-        let mut line = String::new();
-        std::io::BufReader::new(&tty).read_line(&mut line)?;
-        Ok(line.trim_end_matches(['\r', '\n']).to_string())
-    } else {
-        Ok(rpassword::prompt_password(text)?)
-    }
+    if echo { crate::prompt::line(text) } else { crate::prompt::secret(text) }
 }
 
 /// What the login ended with.

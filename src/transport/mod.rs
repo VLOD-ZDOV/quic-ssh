@@ -46,6 +46,8 @@ pub struct Conn {
     hops: Vec<Arc<Conn>>,
     /// The peer's protocol version once logged in (3 for servers that do not say).
     server_version: u32,
+    /// The server's OpenSSH host certificate (client side), if it sent one.
+    host_cert: Option<Vec<u8>>,
 }
 
 impl Conn {
@@ -76,6 +78,11 @@ impl Conn {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    /// The server's host certificate in SSH wire format, unverified.
+    pub fn host_cert(&self) -> Option<&[u8]> {
+        self.host_cert.as_deref()
     }
 
     pub fn set_server_version(&mut self, version: u32) {
@@ -119,9 +126,12 @@ impl Conn {
     }
 }
 
-fn single_peer_cert(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> Result<PublicKey> {
+/// The peer's key, and the server's SSH host certificate if it sent one
+/// (see [`crate::proto::ALPN_HOST_CERT`]).
+fn peer_identity(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> Result<(PublicKey, Option<Vec<u8>>)> {
     match certs {
-        Some([cert]) => crate::tls::cert_key(cert),
+        Some([cert]) => Ok((crate::tls::cert_key(cert)?, None)),
+        Some([cert, host_cert]) => Ok((crate::tls::cert_key(cert)?, Some(host_cert.to_vec()))),
         _ => bail!("peer did not present exactly one certificate"),
     }
 }

@@ -343,7 +343,18 @@ async fn session_main(a: SshArgs) -> Result<i32> {
             Err(e) => return Err(e),
         }
     }
-    let _remote = forward::start_remote(&conn, &remotes, quiet).await?;
+    // -A / ForwardAgent: the agent qsh itself would use.
+    let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
+        true => match &target.identity_agent {
+            Some(path) => path.clone(),
+            None => std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+        },
+        false => None,
+    };
+    if a.forward_agent == Some(true) && agent.is_none() && !quiet {
+        eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
+    }
+    let _remote = forward::start_remote(&conn, &remotes, agent, quiet).await?;
     if a.background {
         detach()?;
     }

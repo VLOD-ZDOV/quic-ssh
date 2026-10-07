@@ -212,6 +212,22 @@ check "forwarded connection is made as alice, not root" test "$FWD_UID" = "$ALIC
 exec 3>&-
 kill "$FWD_PID" "$LISTENER_PID" 2>/dev/null || true
 
+# --- agent forwarding ------------------------------------------------------------------
+if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
+    ssh-keygen -q -t ecdsa -N '' -C fwd-test -f "$T/agent_key"
+    ssh-agent -D -a "$T/agent.sock" >/dev/null 2>&1 &
+    AGENT_PID=$!
+    for _ in $(seq 50); do [[ -S "$T/agent.sock" ]] && break; sleep 0.1; done
+    SSH_AUTH_SOCK="$T/agent.sock" ssh-add -q "$T/agent_key" 2>/dev/null
+    OUT=$(SSH_AUTH_SOCK="$T/agent.sock" q -A qsh-alice@127.0.0.1 'stat -c "SOCK=%u:%a" "$SSH_AUTH_SOCK"; stat -c "DIR=%u:%a" "$(dirname "$SSH_AUTH_SOCK")"; ssh-add -l' 2>&1 || true)
+    check "forwarded agent socket belongs to alice, mode 600" grep -q "SOCK=$ALICE_UID:600" <<<"$OUT"
+    check "its directory belongs to alice, mode 700" grep -q "DIR=$ALICE_UID:700" <<<"$OUT"
+    check "the client's agent is reachable through it" grep -q "fwd-test" <<<"$OUT"
+    kill "$AGENT_PID" 2>/dev/null || true
+else
+    echo "  skip agent forwarding (no ssh-agent)"
+fi
+
 # --- remote forwarding limits --------------------------------------------------------
 OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -N -R 80:127.0.0.1:9 qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
 check "non-root user cannot listen on a privileged port (-R 80)" grep -q "only root may listen" <<<"$OUT"

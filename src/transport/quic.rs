@@ -41,12 +41,12 @@ fn finish(endpoint: Option<Endpoint>, conn: quinn::Connection) -> Result<Conn> {
     let certs = conn
         .peer_identity()
         .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok());
-    let peer_key = super::single_peer_cert(certs.as_deref().map(Vec::as_slice))?;
+    let (peer_key, host_cert) = super::peer_identity(certs.as_deref().map(Vec::as_slice))?;
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|_| anyhow::anyhow!("TLS exporter failed"))?;
     let remote = conn.remote_address();
-    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new(), server_version: 3 })
+    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new(), server_version: 3, host_cert })
 }
 
 pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result<Conn> {

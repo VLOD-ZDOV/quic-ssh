@@ -10,8 +10,8 @@ use tracing::{debug, warn};
 
 use super::users::User;
 use crate::authkeys::{self, AuthorizedKey, Grant, Login, Offered};
-use crate::config::ServerConfig;
-use crate::keys::{qsh_dir, read_strict, PublicKey};
+use crate::config::{ServerConfig, Totp};
+use crate::keys::{qsh_dir, read_strict, read_strict_private, PublicKey};
 use crate::proto::{auth_data, read_msg, write_msg, Auth, Reply};
 use crate::transport::{RecvHalf, SendHalf};
 
@@ -153,3 +153,65 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
     }
 }
 
+
+/// Wrong one-time codes allowed per connection.
+const TOTP_TRIES: u32 = 3;
+
+/// The last accepted time step per user, so a code works only once.
+pub type UsedCodes = std::sync::Mutex<std::collections::HashMap<u32, u64>>;
+
+/// Second factor after a key: asks for a one-time code if the user has set
+/// one up (or if the server requires it). `Err(message)` = deny with that answer.
+pub async fn second_factor(
+    send: &mut SendHalf,
+    recv: &mut RecvHalf,
+    user: &User,
+    mode: Totp,
+    version: u32,
+    used: &UsedCodes,
+) -> Result<Result<(), String>> {
+    if mode == Totp::Off {
+        return Ok(Ok(()));
+    }
+    let path = crate::totp::secret_path(&user.home);
+    let secret = match read_strict_private(&path, &user.home, user.uid) {
+        Ok(Some(text)) => match crate::totp::base32_decode(text.trim()) {
+            Ok(s) if s.len() >= 10 => s,
+            _ => {
+                warn!("{}: unusable secret, login refused", path.display());
+                return Ok(Err("access denied".into()));
+            }
+        },
+        Ok(None) if mode == Totp::Required => {
+            return Ok(Err("this server requires a one-time code, but none is set up for the account (`qshd totp`)".into()));
+        }
+        Ok(None) => return Ok(Ok(())),
+        // A secret that cannot be read safely must not turn 2FA off.
+        Err(e) => {
+            warn!("{e:#}; login refused");
+            return Ok(Err("access denied".into()));
+        }
+    };
+    if version < 4 {
+        return Ok(Err("this account needs a one-time code; update qsh to 0.5 or newer".into()));
+    }
+    for _ in 0..TOTP_TRIES {
+        write_msg(send, &Reply::Prompt { text: "One-time code: ".into(), echo: false }).await?;
+        let answer = match read_msg::<_, Auth>(recv).await? {
+            Auth::Response(a) => a,
+            Auth::Done => break,
+            _ => bail!("unexpected message while asking for a one-time code"),
+        };
+        {
+            let mut used = used.lock().unwrap();
+            let last = used.get(&user.uid).copied();
+            if let Some(step) = crate::totp::verify(&secret, &answer, now(), last) {
+                used.insert(user.uid, step);
+                return Ok(Ok(()));
+            }
+        }
+        warn!("{}: wrong one-time code", user.name);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Ok(Err("access denied".into()))
+}

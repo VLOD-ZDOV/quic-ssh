@@ -115,10 +115,7 @@ impl Identity {
             if !prompt {
                 bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
             }
-            let pass = rpassword::prompt_password(format!(
-                "Enter passphrase for {}: ",
-                path.display()
-            ))?;
+            let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
             key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
         }
         match key.key_data() {

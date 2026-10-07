@@ -52,7 +52,11 @@ impl Server {
     }
 
     fn start_listen(listen: &str, config: &str) -> Server {
-        let home = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), listen, config)
+    }
+
+    /// Starts in a prepared HOME (e.g. with a host key and certificate).
+    fn start_in(home: TempDir, listen: &str, config: &str) -> Server {
         let dir = home.path().join(".config/qsh");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("qshd.toml"), config).unwrap();
@@ -434,7 +438,6 @@ fn fake_openssh(dir: &std::path::Path) -> (String, PathBuf) {
     for tool in ["ssh", "scp"] {
         let script = dir.join(tool);
         std::fs::write(&script, format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\nexit 7\n", log.display())).unwrap();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&script).unwrap().permissions(), 0o755);
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
     let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
@@ -1335,4 +1338,143 @@ fn user_certificates() {
     assert_eq!(stdout(&out), "ca-line\n");
     let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), "-i", ed.to_str().unwrap(), &dest(), "true"]);
     assert!(!out.status.success(), "principal outside principals= accepted");
+}
+
+#[test]
+fn agent_forwarding() {
+    if !have("ssh-agent") || !have("ssh-add") {
+        return eprintln!("skipped: no ssh-agent");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let key = keygen(keys.path(), "fwd", "ecdsa");
+    let restricted = keygen(keys.path(), "restricted", "ed25519");
+    let (s, c) = server_with_keys("", &[public(&key), format!("no-agent-forwarding {}", public(&restricted))]);
+    let agent = start_agent();
+    let out = Command::new("ssh-add").arg(&key).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+    assert!(out.status.success(), "ssh-add: {}", stderr(&out));
+    let port = s.port.to_string();
+    let run = |args: &[&str]| {
+        let mut all = vec!["--accept-new-host", "-p", &port];
+        all.extend_from_slice(args);
+        c.cmd(&all).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap()
+    };
+    // With -A the remote side sees our agent's key; the socket is private to the user.
+    let out = run(&["-A", &dest(), "sh -c 'ssh-add -l; stat -c %a $SSH_AUTH_SOCK'"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("fwd (ECDSA)"), "{text}");
+    assert!(text.ends_with("600\n"), "{text}");
+    // Without -A there is no agent over there.
+    let show = "sh -c 'echo [$SSH_AUTH_SOCK]'";
+    let out = run(&[&dest(), show]);
+    assert_eq!(stdout(&out), "[]\n");
+    // no-agent-forwarding: refused with a warning, the session still runs.
+    let out = run(&["-A", "-i", restricted.to_str().unwrap(), "-o", "IdentitiesOnly=yes", &dest(), show]);
+    assert_eq!(stdout(&out), "[]\n", "{}", stderr(&out));
+    assert!(stderr(&out).contains("agent forwarding refused"), "{}", stderr(&out));
+}
+
+/// An askpass program that answers with the lines of `answers`, one per call.
+fn askpass_script(dir: &std::path::Path, answers: &[String]) -> PathBuf {
+    let list = dir.join("answers");
+    std::fs::write(&list, answers.join("\n") + "\n").unwrap();
+    let script = dir.join("askpass.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nhead -n1 '{0}'\nsed -i 1d '{0}'\necho \"$1\" >> '{1}'\n", list.display(), dir.join("asked").display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    script
+}
+
+#[test]
+fn one_time_codes() {
+    use qsh::totp;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let step = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let code = |s: u64| format!("{:06}", totp::code(secret, s));
+    let dir = tempfile::tempdir().unwrap();
+    let port = s.port.to_string();
+    let login = |answers: &[String]| {
+        let script = askpass_script(dir.path(), answers);
+        c.cmd(&["-p", &port, &dest(), "echo", "in"]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap()
+    };
+    // A wrong code, then the right one.
+    let now = step();
+    let out = login(&["000000".to_string(), code(now)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "in\n");
+    assert!(std::fs::read_to_string(dir.path().join("asked")).unwrap().contains("One-time code"));
+    // The same code cannot be used again.
+    let out = login(&[code(now), code(now), code(now)]);
+    assert!(!out.status.success(), "a code was accepted twice");
+    // The next one works.
+    let out = login(&[code(now + 1)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // BatchMode never prompts.
+    let out = c.run(&["-p", &port, "-o", "BatchMode=yes", &dest(), "true"]);
+    assert!(!out.status.success());
+    // A secret others can read is not used, and the login is refused (not let through).
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    let out = login(&[code(now + 1)]);
+    assert!(!out.status.success(), "a world-readable secret turned 2FA off");
+}
+
+#[test]
+fn one_time_codes_required() {
+    let s = Server::start_with("127.0.0.1", "totp = \"required\"\n");
+    let c = Client::paired(&s);
+    let out = c.run(&["-p", &s.port.to_string(), &dest(), "true"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("qshd totp"), "{}", stderr(&out));
+}
+
+#[test]
+fn host_certificates() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let ca = keygen(keys.path(), "host_ca", "ed25519");
+    let start = |principal: &str| {
+        let home = tempfile::tempdir().unwrap();
+        let out = Command::new(QSHD).arg("init").env("HOME", home.path()).output().unwrap();
+        assert!(out.status.success(), "qshd init: {}", stderr(&out));
+        let host_pub = home.path().join(".config/qsh/host_ed25519.pub");
+        let out = Command::new("ssh-keygen")
+            .args(["-q", "-s", ca.to_str().unwrap(), "-I", "test-host", "-h", "-n", principal, "-V", "-5m:+1h"])
+            .arg(&host_pub)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ssh-keygen -h: {}", stderr(&out));
+        Server::start_in(home, "127.0.0.1:0", "")
+    };
+    let c = Client::new();
+    assert!(c.run(&["keygen"]).status.success());
+    let client_pub = std::fs::read_to_string(c.home.path().join(".config/qsh/id_ed25519.pub")).unwrap();
+    let known = c.home.path().join(".config/qsh/known_hosts");
+    std::fs::write(&known, format!("@cert-authority 127.0.0.1,[127.0.0.1]:* {}\n", public(&ca))).unwrap();
+    let login = |s: &Server| {
+        std::fs::write(s.authorized_keys(), &client_pub).unwrap();
+        c.run(&["-o", "StrictHostKeyChecking=yes", "-p", &s.port.to_string(), &dest(), "echo", "trusted"])
+    };
+    // Signed for this host name: trusted without any prompt or known_hosts entry.
+    let good = start("127.0.0.1");
+    let out = login(&good);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "trusted\n");
+    // Signed for another name: not trusted (StrictHostKeyChecking=yes refuses).
+    let other = start("other.example.com");
+    assert!(!login(&other).status.success(), "certificate for another host accepted");
+    // A revoked CA is not trusted either.
+    let mut text = std::fs::read_to_string(&known).unwrap();
+    text.push_str(&format!("@revoked * {}\n", public(&ca)));
+    std::fs::write(&known, text).unwrap();
+    assert!(!login(&good).status.success(), "revoked CA accepted");
 }

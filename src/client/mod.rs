@@ -431,11 +431,67 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option
     Ok(conn)
 }
 
-/// Checks the server's key against known_hosts, following the host key policy.
+/// Files with `@cert-authority` and `@revoked` lines: qsh's known_hosts and OpenSSH's.
+fn marker_files(target: &Target) -> Vec<KnownHosts> {
+    let mut files = Vec::new();
+    if let Ok((kh, _)) = known_hosts_for(target) {
+        files.push(kh);
+    }
+    if let Ok(home) = home_dir() {
+        files.push(KnownHosts::new(home.join(".ssh").join("known_hosts")));
+    }
+    files.push(KnownHosts::new(PathBuf::from("/etc/ssh/ssh_known_hosts")));
+    files
+}
+
+/// Accepts the server through its host certificate, if one of the
+/// `@cert-authority` keys for this host signed it for this host name.
+fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, names: &[String], files: &[KnownHosts]) -> Result<String> {
+    use ssh_key::certificate::CertType;
+    let cert = ssh_key::Certificate::from_bytes(cert).context("cannot parse the host certificate")?;
+    let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
+    if cert.cert_type() != CertType::Host || cert.public_key() != &own {
+        bail!("not a host certificate for the presented key");
+    }
+    let cas: Vec<_> = files.iter().flat_map(|f| f.marked("@cert-authority", names)).collect();
+    if cas.is_empty() {
+        bail!("no @cert-authority for {}", target.host);
+    }
+    let revoked: Vec<_> = files.iter().flat_map(|f| f.marked("@revoked", names)).collect();
+    if revoked.contains(cert.signature_key()) {
+        bail!("the certificate authority is revoked");
+    }
+    let fingerprints: Vec<_> = cas.iter().map(|k| k.fingerprint(ssh_key::HashAlg::Sha256)).collect();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    cert.validate_at(now, &fingerprints).map_err(|_| anyhow::anyhow!("the certificate is not signed by a trusted CA, or has expired"))?;
+    if !cert.valid_principals().iter().any(|p| p.eq_ignore_ascii_case(&target.host)) {
+        bail!("the certificate is not valid for {} (principals {:?})", target.host, cert.valid_principals());
+    }
+    Ok(format!("certificate {:?} signed by {}", cert.key_id(), cert.signature_key().fingerprint(ssh_key::HashAlg::Sha256)))
+}
+
+/// Checks the server's key: a host certificate from a trusted CA, or
+/// known_hosts following the host key policy. Revoked keys never pass.
 async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) -> Result<()> {
     let (kh, kh_path) = known_hosts_for(target)?;
     let hid = host_id(&target.host, conn.remote_addr().port());
     let key = conn.peer_key();
+    let names = if hid == target.host { vec![hid.clone()] } else { vec![hid.clone(), target.host.clone()] };
+    let files = marker_files(target);
+    let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
+    if files.iter().any(|f| f.marked("@revoked", &names).contains(&own)) {
+        conn.close().await;
+        bail!("the host key of '{hid}' ({}) is marked as revoked in known_hosts", key.fingerprint());
+    }
+    if let Some(cert) = conn.host_cert() {
+        match check_host_cert(cert, key, target, &names, &files) {
+            Ok(how) => {
+                tracing::info!("host '{hid}' verified by {how}");
+                return Ok(());
+            }
+            Err(e) => tracing::debug!("host certificate not used: {e:#}"),
+        }
+    }
     match kh.lookup(&hid)? {
         Some(known) if known == key => Ok(()),
         Some(known) => {

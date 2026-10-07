@@ -7,9 +7,11 @@ pub mod config;
 pub mod keys;
 pub mod pair;
 pub mod pattern;
+pub mod prompt;
 pub mod proto;
 pub mod server;
 pub mod tls;
+pub mod totp;
 pub mod transport;
 pub mod tree;
 

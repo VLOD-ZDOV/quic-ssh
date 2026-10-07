@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -162,13 +163,40 @@ pub async fn start_dynamic(conn: Arc<Conn>, spec: &str, gateway: bool) -> Result
     Ok(())
 }
 
-/// Active `-R` forwards; dropping this cancels them.
+/// Active `-R` forwards and agent forwarding; dropping this cancels them.
 pub struct RemoteForwards {
     _requests: Vec<(SendHalf, RecvHalf)>,
 }
 
+/// `-A`: asks the server to offer the local agent at `agent` to its sessions.
+/// Problems are warnings, as in ssh: the session works without the agent.
+async fn request_agent(conn: &Conn, quiet: bool) -> Option<(SendHalf, RecvHalf)> {
+    if conn.server_version() < 4 {
+        if !quiet {
+            eprintln!("qsh: warning: the server's qshd is too old for agent forwarding (-A)");
+        }
+        return None;
+    }
+    let attempt = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, &Request::AgentForward).await?;
+        expect_ok(&mut recv).await?;
+        anyhow::Ok((send, recv))
+    };
+    match attempt.await {
+        Ok(streams) => Some(streams),
+        Err(e) => {
+            if !quiet {
+                eprintln!("qsh: warning: agent forwarding refused: {e:#}");
+            }
+            None
+        }
+    }
+}
+
 /// `-R`: asks the server to listen and serves the connections it hands back.
-pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], quiet: bool) -> Result<RemoteForwards> {
+/// With `agent` (`-A`), also forwards that ssh-agent socket.
+pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<PathBuf>, quiet: bool) -> Result<RemoteForwards> {
     let mut routes = HashMap::new();
     let mut requests = Vec::new();
     for f in forwards {
@@ -185,13 +213,41 @@ pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], quiet: bool) -
         }
         requests.push((send, recv));
     }
+    let agent = match agent {
+        Some(path) => match request_agent(conn, quiet).await {
+            Some(streams) => {
+                requests.push(streams);
+                Some(Arc::new(path))
+            }
+            None => None,
+        },
+        None => None,
+    };
+    if routes.is_empty() && agent.is_none() {
+        return Ok(RemoteForwards { _requests: requests });
+    }
     let routes = Arc::new(routes);
     let conn = conn.clone();
     tokio::spawn(async move {
         while let Some((send, mut recv)) = conn.accept_bi().await {
-            let routes = routes.clone();
+            let (routes, agent) = (routes.clone(), agent.clone());
             tokio::spawn(async move {
-                let Ok(Opened::Forwarded { port, origin }) = read_msg(&mut recv).await else { return };
+                let (port, origin) = match read_msg(&mut recv).await {
+                    Ok(Opened::Forwarded { port, origin }) => (port, origin),
+                    // Only if we asked for it: a server cannot reach our agent on its own.
+                    Ok(Opened::Agent) => {
+                        let Some(path) = agent else { return };
+                        match tokio::net::UnixStream::connect(path.as_path()).await {
+                            Ok(sock) => {
+                                let (r, w) = sock.into_split();
+                                let _ = crate::transport::bridge(r, w, send, recv).await;
+                            }
+                            Err(e) => warn!("forwarded agent: {e}"),
+                        }
+                        return;
+                    }
+                    Err(_) => return,
+                };
                 let Some((host, host_port)) = routes.get(&port) else { return };
                 match TcpStream::connect((host.as_str(), *host_port)).await {
                     Ok(tcp) => {

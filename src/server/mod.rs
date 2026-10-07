@@ -1,5 +1,6 @@
 //! The `qshd` daemon.
 
+mod agent;
 mod auth;
 mod exec;
 mod files;
@@ -34,6 +35,7 @@ const LINGER: Duration = Duration::from_secs(5);
 struct State {
     cfg: ServerConfig,
     host_key: PublicKey,
+    totp_used: auth::UsedCodes,
 }
 
 /// Counts connections that have not authenticated yet, in total and per IP,
@@ -82,10 +84,33 @@ impl Drop for Startup {
     }
 }
 
+/// The host certificate from `host_certificate`, if it is valid for the host key.
+fn host_certificate(cfg: &ServerConfig, host: &Identity) -> Option<Vec<u8>> {
+    use ssh_key::certificate::CertType;
+    let path = cfg.host_certificate.as_ref()?;
+    let loaded = std::fs::read_to_string(path)
+        .context("cannot read")
+        .and_then(|t| ssh_key::Certificate::from_openssh(t.trim()).context("cannot parse"));
+    let cert = match loaded {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("host certificate {}: {e:#}", path.display());
+            return None;
+        }
+    };
+    let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(host.public().0));
+    if cert.cert_type() != CertType::Host || cert.public_key() != &own {
+        warn!("host certificate {} is not a host certificate for this host key; not used", path.display());
+        return None;
+    }
+    info!("host certificate {:?} for {:?}", cert.key_id(), cert.valid_principals());
+    cert.to_bytes().ok()
+}
+
 /// Binds the configured address on UDP and TCP. If the default dual-stack
 /// address is unavailable (IPv6 disabled), falls back to IPv4.
 pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
-    let tls = crate::tls::server_config(host)?;
+    let tls = crate::tls::server_config(host, host_certificate(cfg, host))?;
     match Listener::bind(cfg.listen, tls.clone(), cfg.tcp).await {
         Err(e) if cfg.listen.ip() == Ipv6Addr::UNSPECIFIED => {
             debug!("dual-stack bind failed ({e:#}), using IPv4 only");
@@ -98,7 +123,7 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Result<()> {
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
-    let state = Arc::new(State { cfg, host_key: host.public() });
+    let state = Arc::new(State { cfg, host_key: host.public(), totp_used: Default::default() });
     loop {
         let incoming = listener.accept().await?;
         let addr = incoming.remote_addr();
@@ -192,6 +217,12 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
     };
+    let second = auth::second_factor(&mut send, &mut recv, &user, state.cfg.totp, version, &state.totp_used);
+    if let Err(msg) = tokio::time::timeout(auth::AUTH_TIMEOUT, second).await.context("login took too long")?? {
+        warn!("{addr}: {name}: second factor failed");
+        write_msg(&mut send, &Reply::Err(msg)).await?;
+        return Ok(());
+    }
     info!("{addr}: {name} logged in with {how} over {}", conn.transport_name());
     let welcome = if version >= 4 { Reply::Welcome { version: VERSION } } else { Reply::Ok };
     write_msg(&mut send, &welcome).await?;
@@ -199,13 +230,16 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
 
     let user = Arc::new(user);
     let grant = Arc::new(grant);
+    let agent = Arc::new(agent::AgentSocket::default());
     // Lets running sessions notice a dead connection even after the client
     // finished sending on their stream.
     let (closed_tx, closed_rx) = watch::channel(false);
     while let Some((send, recv)) = conn.accept_bi().await {
-        let (user, state, closed, conn, grant) = (user.clone(), state.clone(), closed_rx.clone(), conn.clone(), grant.clone());
+        let (user, state, closed, conn, grant, agent) =
+            (user.clone(), state.clone(), closed_rx.clone(), conn.clone(), grant.clone(), agent.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &conn, &user, &grant, &state, closed).await {
+            let ctx = StreamCtx { conn: &conn, user: &user, grant: &grant, state: &state, agent: &agent };
+            if let Err(e) = handle_stream(send, recv, ctx, closed).await {
                 debug!("{addr}: stream error: {e:#}");
             }
         });
@@ -215,15 +249,17 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     Ok(())
 }
 
-async fn handle_stream(
-    mut send: SendHalf,
-    mut recv: RecvHalf,
-    conn: &Arc<Conn>,
-    user: &User,
-    grant: &Grant,
-    state: &State,
-    closed: watch::Receiver<bool>,
-) -> Result<()> {
+/// What a stream of a logged-in connection works with.
+struct StreamCtx<'a> {
+    conn: &'a Arc<Conn>,
+    user: &'a User,
+    grant: &'a Grant,
+    state: &'a State,
+    agent: &'a agent::AgentSocket,
+}
+
+async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_>, closed: watch::Receiver<bool>) -> Result<()> {
+    let StreamCtx { conn, user, grant, state, agent } = ctx;
     let request = match read_msg(&mut recv).await {
         Ok(r) => r,
         // A request type from a newer client: say so instead of dropping the stream.
@@ -240,7 +276,10 @@ async fn handle_stream(
         extra_env: match (&limits.command, command) {
             (Some(_), Some(original)) => vec![("SSH_ORIGINAL_COMMAND".into(), original)],
             _ => Vec::new(),
-        },
+        }
+        .into_iter()
+        .chain(agent.path().map(|p| ("SSH_AUTH_SOCK".to_string(), p.to_string_lossy().into_owned())))
+        .collect(),
         client_env,
         pty: pty.filter(|_| !limits.no_pty),
     };
@@ -292,6 +331,12 @@ async fn handle_stream(
             files::upload(send, recv, user, &path, &name, size, mode).await
         }
         Request::Download { path } => files::download(send, user, &path).await,
+        Request::AgentForward => {
+            if !state.cfg.allow_agent_forwarding || limits.no_agent_forwarding {
+                return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
+            }
+            agent::forward(send, recv, conn.clone(), user, agent).await
+        }
         Request::Ping => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,

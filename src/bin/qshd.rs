@@ -1,3 +1,4 @@
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -31,6 +32,15 @@ enum Cmd {
     Init,
     /// Create a one-time pairing code for the current user
     Pair,
+    /// Set up one-time codes (TOTP) as a second factor for the current user
+    Totp {
+        /// Replace an existing secret
+        #[arg(long)]
+        force: bool,
+        /// Turn one-time codes off again
+        #[arg(long, conflicts_with = "force")]
+        disable: bool,
+    },
     #[command(hide = true)]
     InternalRecv { path: String, name: String, size: u64, mode: String },
     #[command(hide = true)]
@@ -60,6 +70,12 @@ fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
     let path = path.unwrap_or_else(|| dir.join(if is_root() { "config.toml" } else { "qshd.toml" }));
     let cfg = ServerConfig::load(&path)?;
     let key = cfg.host_key.clone().unwrap_or_else(|| dir.join("host_ed25519"));
+    let mut cfg = cfg;
+    if cfg.host_certificate.is_none() {
+        // OpenSSH's naming: the certificate for `key` is `key-cert.pub`.
+        let default = PathBuf::from(format!("{}-cert.pub", key.display()));
+        cfg.host_certificate = default.exists().then_some(default);
+    }
     Ok((cfg, key))
 }
 
@@ -94,6 +110,7 @@ fn main() {
         Some(Cmd::InternalTar { path }) => helpers::tar(&path),
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair) => pair(cli.config),
+        Some(Cmd::Totp { force, disable }) => totp(force, disable),
         Some(Cmd::Serve { listen }) => serve(cli.config, listen),
         None => serve(cli.config, None),
     };
@@ -125,6 +142,59 @@ fn pair(config: Option<PathBuf>) -> Result<()> {
     println!("On the client run:");
     println!("  qsh pair{port} {user}@{host} {code}");
     Ok(())
+}
+
+/// `qshd totp`: creates a secret, shows it as a QR code for an authenticator
+/// app, and stores it once a code from the app has been typed back.
+fn totp(force: bool, disable: bool) -> Result<()> {
+    use std::io::{BufRead, Write};
+    use qsh::totp;
+    let home = home_dir()?;
+    let path = totp::secret_path(&home);
+    if disable {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("One-time codes are turned off for this account."),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("One-time codes were not set up."),
+            Err(e) => return Err(e).with_context(|| format!("cannot remove {}", path.display())),
+        }
+        return Ok(());
+    }
+    if path.exists() && !force {
+        anyhow::bail!("one-time codes are already set up ({}); use --force to replace the secret or --disable to turn them off", path.display());
+    }
+    let mut secret = [0u8; 20];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+    let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name;
+    let host = nix::unistd::gethostname()?.to_string_lossy().into_owned();
+    let uri = totp::uri(&secret, &format!("{user}@{host}"));
+    println!("Scan this with an authenticator app (or enter the key by hand):\n");
+    print!("{}", totp::qr_text(&uri)?);
+    let key = totp::base32_encode(&secret);
+    let grouped: Vec<String> = key.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+    println!("\nKey: {}\n{uri}\n", grouped.join(" "));
+    let stdin = std::io::stdin();
+    for _ in 0..3 {
+        print!("Code from the app (to confirm): ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        if stdin.lock().read_line(&mut answer)? == 0 {
+            anyhow::bail!("not confirmed; nothing was changed");
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        if totp::verify(&secret, &answer, now, None).is_some() {
+            qsh::keys::create_private_dir(path.parent().context("bad path")?)?;
+            let tmp = path.with_extension("new");
+            let _ = std::fs::remove_file(&tmp);
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            writeln!(f, "{key}")?;
+            drop(f);
+            std::fs::rename(&tmp, &path)?;
+            println!("Done: logins to this account now ask for a one-time code after the key.");
+            return Ok(());
+        }
+        println!("That code does not match; check the clock on both devices and try again.");
+    }
+    anyhow::bail!("not confirmed; nothing was changed")
 }
 
 fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Result<()> {
