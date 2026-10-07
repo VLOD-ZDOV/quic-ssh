@@ -489,6 +489,7 @@ cargo test                        # unit tests and end-to-end tests (real qshd/q
 tests/system-mode.sh              # system mode (qshd as root): real root via sudo, or a user namespace without it
 cargo clippy --all-targets -- -D warnings
 QSH_FUZZ_ITERS=200000 cargo test --release --test fuzz   # longer run of the mutation tests
+cargo +nightly fuzz run tar_extract   # coverage-guided fuzzing (cargo-fuzz; targets in fuzz/)
 python3 bench/bench.py            # benchmark against OpenSSH
 ```
 

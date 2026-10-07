@@ -1,0 +1,62 @@
+[package]
+name = "qsh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+qsh = { path = ".." }
+postcard = { version = "1", features = ["use-std"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
+tempfile = "3"
+vt100 = "0.16"
+
+# Not part of the main crate's build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authorized_keys"
+path = "fuzz_targets/authorized_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_config"
+path = "fuzz_targets/client_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "revoked_keys"
+path = "fuzz_targets/revoked_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_extract"
+path = "fuzz_targets/tar_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "echo_prediction"
+path = "fuzz_targets/echo_prediction.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,30 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "fuzz/**", ".github/workflows/fuzz.yml"]
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [protocol, authorized_keys, client_config, revoked_keys, tar_extract, echo_prediction]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for 2 minutes
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts

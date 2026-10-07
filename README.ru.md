@@ -489,6 +489,7 @@ cargo test                        # юнит-тесты и сквозные те
 tests/system-mode.sh              # системный режим (qshd от root): через sudo или без него, в user namespace
 cargo clippy --all-targets -- -D warnings
 QSH_FUZZ_ITERS=200000 cargo test --release --test fuzz   # долгий прогон тестов с мутациями
+cargo +nightly fuzz run tar_extract   # фаззинг с обратной связью (cargo-fuzz; цели в fuzz/)
 python3 bench/bench.py            # бенчмарк против OpenSSH
 ```
 
