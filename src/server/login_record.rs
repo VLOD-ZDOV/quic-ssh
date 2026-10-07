@@ -110,7 +110,7 @@ mod imp {
         let mut data = Vec::new();
         f.read_to_end(&mut data)?;
         let line = &rec[LINE];
-        let slot = data.chunks_exact(SIZE).position(|e| {
+        let slot = data.as_chunks::<SIZE>().0.iter().position(|e| {
             let kind = i16::from_ne_bytes([e[0], e[1]]);
             (kind == USER_PROCESS || kind == DEAD_PROCESS) && &e[LINE] == line
         });
@@ -156,7 +156,8 @@ mod imp {
     use super::LoginRecord;
 
     fn put(field: &mut [libc::c_char], text: &str) {
-        for (d, s) in field.iter_mut().zip(text.bytes().take(field.len().saturating_sub(1))) {
+        let room = field.len().saturating_sub(1);
+        for (d, s) in field.iter_mut().zip(text.bytes().take(room)) {
             *d = s as libc::c_char;
         }
     }

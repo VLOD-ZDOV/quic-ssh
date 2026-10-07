@@ -248,7 +248,8 @@ mod tests {
         let me = nix::unistd::geteuid().as_raw();
         assert!(secure_path(&prog, me).is_err(), "world-writable program");
         std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // /tmp itself is world-writable (sticky), so a program below it is refused too.
+        // A directory above it that others can write to (like /tmp) is refused too.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(secure_path(&prog, me).is_err());
         assert!(secure_path(Path::new("/bin/sh"), me).is_ok());
     }

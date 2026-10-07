@@ -22,7 +22,8 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Fuzz ${{ matrix.target }} for 2 minutes
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120
+        # The prebuilt cargo-fuzz would otherwise build for its own (musl) target.
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=120
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
