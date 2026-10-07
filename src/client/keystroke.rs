@@ -17,7 +17,7 @@ use crate::proto::ClientMsg;
 
 pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(20);
 /// Every obfuscated message carries exactly this many bytes of data + padding.
-const PAD_TO: usize = 32;
+pub const PAD_TO: usize = 32;
 /// Pending input above this is treated as bulk and sent unobfuscated.
 const BULK: usize = 8 * PAD_TO;
 const CHAFF_MIN: Duration = Duration::from_millis(1000);

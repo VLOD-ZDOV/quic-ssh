@@ -60,6 +60,7 @@ impl PublicKey {
 }
 
 /// An Ed25519 private key used for host or client authentication.
+#[derive(Clone)]
 pub struct Identity {
     signing: SigningKey,
 }
@@ -102,8 +103,12 @@ impl Identity {
         Self::load_with(path, true)
     }
 
-    /// Like [`Identity::load`]; without `prompt`, an encrypted key is an error.
+    /// Like [`Identity::load`]; without `prompt`, an encrypted key is an error
+    /// unless this process already decrypted it (reconnects never prompt).
     pub fn load_with(path: &Path, prompt: bool) -> Result<Identity> {
+        if let Some(id) = decrypted_cache().lock().unwrap().get(path) {
+            return Ok(id.clone());
+        }
         let text = fs::read_to_string(path)
             .with_context(|| format!("cannot read key {}", path.display()))?;
         let mut key = PrivateKey::from_openssh(&text)
@@ -117,6 +122,10 @@ impl Identity {
             }
             let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
             key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
+            if let KeypairData::Ed25519(kp) = key.key_data() {
+                let id = Identity { signing: SigningKey::from_bytes(&kp.private.to_bytes()) };
+                decrypted_cache().lock().unwrap().insert(path.to_path_buf(), id);
+            }
         }
         match key.key_data() {
             KeypairData::Ed25519(kp) => Ok(Identity {
@@ -156,6 +165,12 @@ impl Identity {
         id.save(path, comment)?;
         Ok((id, true))
     }
+}
+
+/// Keys this process has decrypted, so a reconnect does not ask again.
+fn decrypted_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Identity>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Identity>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 /// Creates a directory (and parents) with mode 0700 for the leaf.

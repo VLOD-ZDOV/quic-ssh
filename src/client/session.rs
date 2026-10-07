@@ -1,14 +1,16 @@
 //! Interactive shells and remote commands.
 
 use std::io::IsTerminal;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::client::keystroke::Obfuscator;
-use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Request, ServerMsg};
-use crate::transport::Conn;
+use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, Request, ServerMsg};
+use crate::transport::{Conn, RecvHalf, SendHalf};
 
 /// Local variables forwarded to the server (the server filters them again).
 fn forwarded_env() -> Vec<(String, String)> {
@@ -37,20 +39,24 @@ impl Drop for RawMode {
 /// caller can close the connection cleanly (over QUIC the server would otherwise
 /// only notice after the idle timeout). In raw mode ^C is sent as a byte, so
 /// SIGINT is only watched in line mode.
-pub async fn termination_signal(watch_sigint: bool) -> i32 {
+pub fn termination_signal(watch_sigint: bool) -> impl std::future::Future<Output = i32> {
     use tokio::signal::unix::{signal, SignalKind};
+    // Registered right away, so a signal that arrives before the first poll
+    // is not handled by the default action (which would skip the clean close).
     let mut term = signal(SignalKind::terminate()).expect("signal handler");
     let mut hup = signal(SignalKind::hangup()).expect("signal handler");
     let mut int = signal(SignalKind::interrupt()).expect("signal handler");
-    tokio::select! {
-        _ = term.recv() => 128 + libc::SIGTERM,
-        _ = hup.recv() => 128 + libc::SIGHUP,
-        _ = int.recv(), if watch_sigint => 128 + libc::SIGINT,
+    async move {
+        tokio::select! {
+            _ = term.recv() => 128 + libc::SIGTERM,
+            _ = hup.recv() => 128 + libc::SIGHUP,
+            _ = int.recv(), if watch_sigint => 128 + libc::SIGINT,
+        }
     }
 }
 
 /// What to run and how.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct SessionOptions {
     /// Command line; `None` = login shell.
     pub command: Option<String>,
@@ -63,6 +69,10 @@ pub struct SessionOptions {
     pub escape_char: Option<u8>,
     /// `-n`: do not read stdin.
     pub stdin_null: bool,
+    /// Keep a terminal session across lost connections, reconnecting with this.
+    pub reconnect: Option<Reconnect>,
+    /// `ServerAliveInterval`/`ServerAliveCountMax` (persistent sessions default to 5 s × 3).
+    pub server_alive: Option<(Duration, u32)>,
 }
 
 /// Local handling of escape sequences (`~.`, `~?`, `~~`) typed at the start of a line.
@@ -123,8 +133,37 @@ impl Escapes {
     }
 }
 
+/// Logs in again after a lost connection, to resume the session with this
+/// token (without prompting: the terminal is in use by the session).
+pub type Reconnect = Arc<dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, Result<Arc<Conn>>> + Send + Sync>;
+
+/// Default liveness check of persistent sessions: ping after 5 s of silence,
+/// count the connection as lost after 3 unanswered pings.
+const DEFAULT_ALIVE: (Duration, u32) = (Duration::from_secs(5), 3);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+/// Why a resume attempt failed.
+enum ResumeError {
+    /// The server no longer has the session.
+    Gone(String),
+    Retry(anyhow::Error),
+}
+
+async fn resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Result<(Arc<Conn>, SendHalf, RecvHalf), ResumeError> {
+    let conn = reconnect(token.to_vec()).await.map_err(ResumeError::Retry)?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(ResumeError::Retry)?;
+    write_msg(&mut send, &Request::Resume { token: token.to_vec(), received }).await.map_err(ResumeError::Retry)?;
+    match read_msg_opt::<_, Reply>(&mut recv).await {
+        Ok(Some(Reply::Session { .. })) => Ok((conn, send, recv)),
+        Ok(Some(Reply::Err(e))) => Err(ResumeError::Gone(e)),
+        Ok(other) => Err(ResumeError::Retry(anyhow::anyhow!("unexpected answer {other:?}"))),
+        Err(e) => Err(ResumeError::Retry(e)),
+    }
+}
+
 /// Runs a command, subsystem or login shell and returns the remote exit code.
-pub async fn run(conn: &Conn, opts: SessionOptions) -> Result<i32> {
+/// With `reconnect`, an interactive session survives lost connections.
+pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let pty = if opts.pty && opts.subsystem.is_none() {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
@@ -132,49 +171,79 @@ pub async fn run(conn: &Conn, opts: SessionOptions) -> Result<i32> {
     } else {
         None
     };
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let request = match opts.subsystem.clone() {
-        Some(name) => Request::Subsystem { name, env: forwarded_env() },
-        None => Request::Exec { command: opts.command.clone(), env: forwarded_env(), pty: pty.clone() },
+    let persistent = opts.reconnect.is_some() && conn.server_version() >= 4;
+    let raw_wanted = pty.is_some() && std::io::stdin().is_terminal();
+    // Before the session exists, so a quitting user always ends it properly.
+    let stop = termination_signal(!raw_wanted);
+    tokio::pin!(stop);
+    let (send, mut recv) = conn.open_bi().await?;
+    let mut send = send;
+    let request = match (opts.subsystem.clone(), &pty) {
+        (Some(name), _) => Request::Subsystem { name, env: forwarded_env() },
+        (None, Some(spec)) if persistent => Request::Persistent { command: opts.command.clone(), env: forwarded_env(), pty: spec.clone() },
+        (None, _) => Request::Exec { command: opts.command.clone(), env: forwarded_env(), pty: pty.clone() },
     };
     write_msg(&mut send, &request).await?;
-    expect_ok(&mut recv).await?;
+    let token = match expect_ok(&mut recv).await? {
+        Reply::Session { token } => Some(token),
+        _ => None,
+    };
     let keystroke_interval = opts.keystroke_interval;
 
-    let raw = match pty.is_some() && std::io::stdin().is_terminal() {
+    let raw = match raw_wanted {
         true => Some(RawMode::enable()?),
         false => None,
     };
-    let stop = termination_signal(raw.is_none());
-    tokio::pin!(stop);
 
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(32);
+    // Where messages go; replaced after a reconnect. Messages sent while there
+    // is no working stream are dropped (typing during an outage is lost).
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SendHalf>(1);
+    sink_tx.send(send).await.ok();
+    let hung_up = Arc::new(tokio::sync::Notify::new());
     // Only a person typing into a terminal needs timing protection.
     let mut obfuscator = keystroke_interval.filter(|_| raw.is_some()).map(Obfuscator::new);
-    let writer = tokio::spawn(async move {
-        loop {
-            let deadline = obfuscator.as_ref().and_then(Obfuscator::deadline);
-            let tick = async {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
-            let out: Vec<ClientMsg> = tokio::select! {
-                msg = rx.recv() => match (msg, obfuscator.as_mut()) {
-                    (None, _) => break,
-                    (Some(ClientMsg::Stdin(data)), Some(o)) => o.input(std::time::Instant::now(), &data),
-                    (Some(msg), _) => vec![msg],
-                },
-                () = tick => obfuscator.as_mut().and_then(|o| o.tick(std::time::Instant::now())).into_iter().collect(),
-            };
-            for msg in out {
-                if write_msg(&mut send, &msg).await.is_err() {
-                    return;
+    let writer = {
+        let hung_up = hung_up.clone();
+        tokio::spawn(async move {
+            let mut sink: Option<SendHalf> = None;
+            loop {
+                let deadline = obfuscator.as_ref().and_then(Obfuscator::deadline);
+                let tick = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d.into()).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let out: Vec<ClientMsg> = tokio::select! {
+                    new = sink_rx.recv() => match new {
+                        Some(s) => {
+                            sink = Some(s);
+                            continue;
+                        }
+                        None => break,
+                    },
+                    msg = rx.recv() => match (msg, obfuscator.as_mut()) {
+                        (None, _) => break,
+                        (Some(ClientMsg::Stdin(data)), Some(o)) => o.input(std::time::Instant::now(), &data),
+                        (Some(msg), _) => vec![msg],
+                    },
+                    () = tick => obfuscator.as_mut().and_then(|o| o.tick(std::time::Instant::now())).into_iter().collect(),
+                };
+                for msg in out {
+                    let hangup = matches!(msg, ClientMsg::Hangup);
+                    if let Some(s) = sink.as_mut() {
+                        if write_msg(s, &msg).await.is_err() {
+                            sink = None;
+                        }
+                    }
+                    if hangup {
+                        hung_up.notify_one();
+                    }
                 }
             }
-        }
-    });
+        })
+    };
 
     // Escapes only apply when a person types into a terminal (as in ssh).
     let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(Escapes::new);
@@ -232,39 +301,125 @@ pub async fn run(conn: &Conn, opts: SessionOptions) -> Result<i32> {
             }
         });
     }
-    drop(tx);
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
+    // Ends a persistent session for good (not kept for a reconnect).
+    let hang_up = |tx: mpsc::Sender<ClientMsg>, hung_up: Arc<tokio::sync::Notify>| async move {
+        if tx.send(ClientMsg::Hangup).await.is_ok() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), hung_up.notified()).await;
+        }
+    };
+    let mut received: u64 = 0;
+    let mut last_heard = tokio::time::Instant::now();
+    let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
+    let (alive_interval, alive_max) = alive.unwrap_or(DEFAULT_ALIVE);
+    let mut heartbeat = tokio::time::interval(alive_interval);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let code = loop {
-        let msg = tokio::select! {
+        let lost = tokio::select! {
             msg = read_msg_opt::<_, ServerMsg>(&mut recv) => match msg {
                 // Unknown message type from a newer server: skip it.
                 Err(e) if e.is::<crate::proto::Malformed>() => continue,
-                other => other?,
+                Ok(Some(msg)) => {
+                    last_heard = tokio::time::Instant::now();
+                    match msg {
+                        ServerMsg::Stdout(d) => {
+                            received += d.len() as u64;
+                            stdout.write_all(&d).await?;
+                            stdout.flush().await?;
+                        }
+                        ServerMsg::Stderr(d) => {
+                            stderr.write_all(&d).await?;
+                            stderr.flush().await?;
+                        }
+                        ServerMsg::Exit { code, signal } => break code.or(signal.map(|s| 128 + s)).unwrap_or(255),
+                        ServerMsg::Pong(_) => {}
+                    }
+                    false
+                }
+                Ok(None) | Err(_) if token.is_some() => true,
+                Ok(None) => bail!("connection closed without exit status"),
+                Err(e) => return Err(e),
             },
-            code = &mut stop => break code,
+            code = &mut stop => {
+                if token.is_some() {
+                    hang_up(tx.clone(), hung_up.clone()).await;
+                }
+                break code;
+            }
             () = disconnect.notified() => {
+                if token.is_some() {
+                    hang_up(tx.clone(), hung_up.clone()).await;
+                }
                 let _ = stderr.write_all(b"\r\nConnection closed.\r\n").await;
                 break 255;
             }
+            _ = heartbeat.tick(), if alive.is_some() => {
+                let quiet = last_heard.elapsed();
+                if quiet >= alive_interval {
+                    // Chaff gets a Pong back; it looks like a keystroke on the wire.
+                    let _ = tx.send(ClientMsg::Typed { data: Vec::new(), pad: vec![0; super::keystroke::PAD_TO] }).await;
+                }
+                quiet >= alive_interval * alive_max
+            }
         };
-        match msg {
-            Some(ServerMsg::Stdout(d)) => {
-                stdout.write_all(&d).await?;
-                stdout.flush().await?;
+        if !lost {
+            continue;
+        }
+        if token.is_none() {
+            let _ = stderr.write_all(b"\r\nTimeout, server not responding.\r\n").await;
+            break 255;
+        }
+        // The connection is gone: reconnect and pick the session up where we were.
+        let (Some(token), Some(reconnect)) = (token.as_ref(), opts.reconnect.as_ref()) else { unreachable!() };
+        let _ = stderr.write_all(b"\r\n[qsh: connection lost, reconnecting... type ~. to give up]\r\n").await;
+        let old = conn.clone();
+        tokio::spawn(async move { old.close().await });
+        let mut delay = Duration::from_secs(1);
+        let resumed = loop {
+            tokio::select! {
+                () = disconnect.notified() => break None,
+                code = &mut stop => return Ok(code),
+                res = resume(reconnect, token, received) => match res {
+                    Ok(x) => break Some(x),
+                    Err(ResumeError::Gone(e)) => {
+                        let _ = stderr.write_all(format!("[qsh: {e}]\r\n").as_bytes()).await;
+                        drop(raw);
+                        return Ok(255);
+                    }
+                    Err(ResumeError::Retry(e)) => {
+                        tracing::debug!("reconnect: {e:#}");
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = disconnect.notified() => break None,
+                        }
+                        delay = (delay * 2).min(MAX_RETRY_DELAY);
+                    }
+                }
             }
-            Some(ServerMsg::Stderr(d)) => {
-                stderr.write_all(&d).await?;
-                stderr.flush().await?;
+        };
+        let Some((new_conn, new_send, new_recv)) = resumed else {
+            let _ = stderr.write_all(b"\r\nConnection closed (the session is kept on the server for a while).\r\n").await;
+            break 255;
+        };
+        conn = new_conn;
+        recv = new_recv;
+        let _ = sink_tx.send(new_send).await;
+        last_heard = tokio::time::Instant::now();
+        let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
+        // Two size changes make full-screen programs redraw what was lost.
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            if rows > 1 {
+                let _ = tx.send(ClientMsg::Resize { cols, rows: rows - 1 }).await;
             }
-            Some(ServerMsg::Exit { code, signal }) => break code.or(signal.map(|s| 128 + s)).unwrap_or(255),
-            Some(ServerMsg::Pong(_)) => {}
-            None => bail!("connection closed without exit status"),
+            let _ = tx.send(ClientMsg::Resize { cols, rows }).await;
         }
     };
+    drop(tx);
     writer.abort();
     drop(raw);
+    conn.close().await;
     Ok(code)
 }
 

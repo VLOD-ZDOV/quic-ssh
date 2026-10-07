@@ -188,7 +188,16 @@ fn cert_key_blob(blob: &[u8]) -> Option<Vec<u8>> {
     ssh_key::PublicKey::from(cert.public_key().clone()).to_bytes().ok()
 }
 
+/// Key files this process has decrypted, so a reconnect does not ask again.
+fn decrypted() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, PrivateKey>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 fn load_private(path: &Path, batch: bool) -> Result<PrivateKey> {
+    if let Some(key) = decrypted().lock().unwrap().get(path) {
+        return Ok(key.clone());
+    }
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let key = PrivateKey::from_openssh(&text).with_context(|| format!("cannot parse {}", path.display()))?;
     if !key.is_encrypted() {
@@ -198,7 +207,9 @@ fn load_private(path: &Path, batch: bool) -> Result<PrivateKey> {
         bail!("{} is encrypted and prompting is disabled (BatchMode)", path.display());
     }
     let pass = crate::prompt::secret(&format!("Enter passphrase for {}: ", path.display()))?;
-    key.decrypt(pass.as_bytes()).context("wrong passphrase")
+    let key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
+    decrypted().lock().unwrap().insert(path.to_path_buf(), key.clone());
+    Ok(key)
 }
 
 /// Answers a server question (a one-time code) on the terminal or through askpass.

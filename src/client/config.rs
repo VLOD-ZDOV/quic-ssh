@@ -58,6 +58,12 @@ pub struct HostConfig {
     pub identity_agent: Option<String>,
     /// `CertificateFile`s, in order.
     pub certificate_files: Vec<String>,
+    /// qsh's `PersistSession`: terminal sessions survive lost connections.
+    pub persist_session: Option<bool>,
+    /// `ServerAliveInterval` (seconds; 0 = off).
+    pub server_alive_interval: Option<u64>,
+    /// `ServerAliveCountMax`.
+    pub server_alive_count_max: Option<u32>,
 }
 
 fn yes(v: &str) -> bool {
@@ -173,6 +179,9 @@ impl Parser<'_> {
                 "identitiesonly" if o.identities_only.is_none() => o.identities_only = first.as_deref().map(yes),
                 "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
                 "certificatefile" => o.certificate_files.extend(first),
+                "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
+                "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
+                "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -351,6 +360,9 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         identities_only: ours.identities_only.or(ssh.identities_only),
         identity_agent: ours.identity_agent.or(ssh.identity_agent),
         certificate_files: ours.certificate_files.into_iter().chain(ssh.certificate_files).collect(),
+        persist_session: ours.persist_session.or(ssh.persist_session),
+        server_alive_interval: ours.server_alive_interval.or(ssh.server_alive_interval),
+        server_alive_count_max: ours.server_alive_count_max.or(ssh.server_alive_count_max),
     }
 }
 

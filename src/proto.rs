@@ -24,6 +24,11 @@ pub enum Hello {
     Login { version: u32, user: String },
     /// Pair a new client key with `user` using a one-time code (see `pair`).
     Pair { version: u32, user: String },
+    // --- protocol version 4 ---
+    /// Log in to resume the persistent session `token` (see `Request::Resume`).
+    /// The key is checked as for `Login`; the token, which only a client that
+    /// completed the whole login received, stands in for the second factor.
+    Resume { version: u32, user: String, token: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -43,6 +48,8 @@ pub enum Reply {
     AuthKey,
     /// Answer a question with [`Auth::Response`] (second factor).
     Prompt { text: String, echo: bool },
+    /// Answer to `Request::Persistent` / `Request::Resume`: the session's token.
+    Session { token: Vec<u8> },
 }
 
 /// Client messages on the hello stream while logging in (protocol version 4).
@@ -119,6 +126,13 @@ pub enum Request {
     /// as a server-opened stream starting with [`Opened::Agent`]. Closing this
     /// stream ends the forwarding.
     AgentForward,
+    /// Like `Exec` with a terminal, but the session survives the connection:
+    /// answered with `Reply::Session` (or `Reply::Ok` if the server keeps no
+    /// sessions), then `ClientMsg`/`ServerMsg` frames as for `Exec`.
+    Persistent { command: Option<String>, env: Vec<(String, String)>, pty: PtySpec },
+    /// Reattach to a persistent session after a lost connection. Output from
+    /// byte `received` on is sent again (as far as the server still has it).
+    Resume { token: Vec<u8>, received: u64 },
 }
 
 /// First message on a stream the server opens to the client.
@@ -139,6 +153,10 @@ pub enum ClientMsg {
     /// Keystrokes with timing obfuscation: `data` padded with `pad` to a fixed
     /// size. Empty `data` is chaff, which the server answers with `ServerMsg::Pong`.
     Typed { data: Vec<u8>, pad: Vec<u8> },
+    // --- protocol version 4 ---
+    /// End a persistent session now (the user quit), instead of keeping it
+    /// for a reconnect.
+    Hangup,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]

@@ -5,6 +5,7 @@ mod auth;
 mod exec;
 mod files;
 pub mod helpers;
+mod persist;
 mod users;
 
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ struct State {
     cfg: ServerConfig,
     host_key: PublicKey,
     totp_used: auth::UsedCodes,
+    sessions: Arc<persist::Sessions>,
 }
 
 /// Counts connections that have not authenticated yet, in total and per IP,
@@ -123,7 +125,8 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Result<()> {
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
-    let state = Arc::new(State { cfg, host_key: host.public(), totp_used: Default::default() });
+    let sessions = Arc::new(persist::Sessions::new(Duration::from_secs(cfg.session_timeout)));
+    let state = Arc::new(State { cfg, host_key: host.public(), totp_used: Default::default(), sessions });
     loop {
         let incoming = listener.accept().await?;
         let addr = incoming.remote_addr();
@@ -167,13 +170,14 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     .await
     .context("no hello in time")??;
 
-    let (name, pairing, version) = match hello {
-        Hello::Login { version, user } | Hello::Pair { version, user } if version < MIN_VERSION => {
+    let (name, pairing, version, resume) = match hello {
+        Hello::Login { version, user } | Hello::Pair { version, user } | Hello::Resume { version, user, .. } if version < MIN_VERSION => {
             write_msg(&mut send, &Reply::Err(format!("unsupported protocol version {version}"))).await?;
             bail!("client {user:?} uses protocol version {version}");
         }
-        Hello::Login { user, version } => (user, false, version),
-        Hello::Pair { user, version } => (user, true, version),
+        Hello::Login { user, version } => (user, false, version, None),
+        Hello::Pair { user, version } => (user, true, version, None),
+        Hello::Resume { user, version, token } => (user, false, version, Some(token)),
     };
     let looked_up = if valid_user_name(&name) {
         User::lookup(&name)
@@ -217,7 +221,15 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
     };
-    let second = auth::second_factor(&mut send, &mut recv, &user, state.cfg.totp, version, &state.totp_used);
+    // Resuming a session that this user started after a full login: the
+    // session token stands in for the second factor (so no prompt is needed).
+    let resuming = resume.is_some_and(|t| state.sessions.owns(&t, user.uid));
+    let second = async {
+        if resuming {
+            return Ok(Ok(()));
+        }
+        auth::second_factor(&mut send, &mut recv, &user, state.cfg.totp, version, &state.totp_used).await
+    };
     if let Err(msg) = tokio::time::timeout(auth::AUTH_TIMEOUT, second).await.context("login took too long")?? {
         warn!("{addr}: {name}: second factor failed");
         write_msg(&mut send, &Reply::Err(msg)).await?;
@@ -286,6 +298,15 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
     match request {
         Request::Exec { command, env, pty } => exec::run(send, recv, user, session(command, env, pty), closed).await,
+        Request::Persistent { command, env, pty } => {
+            let spec = session(command, env, Some(pty));
+            // Without a terminal (no-pty) or with sessions turned off: a plain session.
+            if spec.pty.is_none() || !state.sessions.enabled() {
+                return exec::run(send, recv, user, spec, closed).await;
+            }
+            state.sessions.start(send, recv, user, spec, closed).await
+        }
+        Request::Resume { token, received } => state.sessions.resume(send, recv, user, &token, received, closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
         Request::Subsystem { name, env } => match subsystem_command(&state.cfg, &name) {
             Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None), closed).await,

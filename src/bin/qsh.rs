@@ -123,6 +123,7 @@ impl ConnArgs {
             transport: self.transport,
             accept_new_host: self.accept_new_host,
             full: self.full,
+            resume: None,
         }
     }
 }
@@ -292,6 +293,7 @@ async fn session_main(a: SshArgs) -> Result<i32> {
         transport: a.transport,
         accept_new_host: a.accept_new_host,
         full: a.full,
+        resume: None,
     };
     if a.full && target.needs_proxy {
         return exec_openssh("ssh", ssh_args(&a, &target), "the ssh config uses ProxyJump/ProxyCommand");
@@ -315,6 +317,7 @@ async fn session_main(a: SshArgs) -> Result<i32> {
         dynamics.extend(target.dynamic_forwards.iter().map(|s| (s.clone(), false)));
     }
 
+    let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
     let conn = match client::connect(&target, &opts).await {
         Ok(c) => Arc::new(c),
         Err(e) if a.full && e.is::<Unreachable>() => {
@@ -354,6 +357,7 @@ async fn session_main(a: SshArgs) -> Result<i32> {
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
+    let uses_forwards = uses_forwards || agent.is_some();
     let _remote = forward::start_remote(&conn, &remotes, agent, quiet).await?;
     if a.background {
         detach()?;
@@ -394,8 +398,18 @@ async fn session_main(a: SshArgs) -> Result<i32> {
         Some(e) => client::parse_escape(Some(e)),
         None => target.escape_char,
     };
+    // A terminal session survives lost connections (unless forwards depend on
+    // this connection, or PersistSession is off): qsh logs in again by itself.
+    let reconnect: Option<session::Reconnect> = (pty && target.persist_session && !uses_forwards).then(|| {
+        let target = Target { batch_mode: true, quiet: true, ..target.clone() };
+        let opts = opts.clone();
+        Arc::new(move |token: Vec<u8>| {
+            let (target, opts) = (target.clone(), ConnectOptions { resume: Some(token), ..opts.clone() });
+            Box::pin(async move { client::connect(&target, &opts).await.map(Arc::new) }) as futures::future::BoxFuture<'static, _>
+        }) as session::Reconnect
+    });
     let code = session::run(
-        &conn,
+        conn.clone(),
         SessionOptions {
             command,
             subsystem,
@@ -403,6 +417,8 @@ async fn session_main(a: SshArgs) -> Result<i32> {
             keystroke_interval: target.keystroke_interval,
             escape_char,
             stdin_null: a.stdin_null || a.background,
+            reconnect,
+            server_alive: target.server_alive,
         },
     )
     .await?;

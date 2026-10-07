@@ -14,7 +14,7 @@ use crate::transport::{RecvHalf, SendHalf};
 
 /// How long to keep draining output after the process exited (background
 /// jobs may hold the pipes/pty open forever).
-const DRAIN_GRACE: Duration = Duration::from_secs(2);
+pub(super) const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Client variables passed through to the session (like sshd's AcceptEnv).
 fn accept_env(name: &str) -> bool {
@@ -33,17 +33,25 @@ pub struct Session {
     pub pty: Option<PtySpec>,
 }
 
-pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, session: Session, closed: watch::Receiver<bool>) -> Result<()> {
-    let Session { command, client_env, extra_env, pty } = session;
-    let mut env = user.env();
-    env.extend(client_env.into_iter().filter(|(k, _)| accept_env(k)));
-    env.extend(extra_env);
-    if let Some(p) = &pty {
-        env.push(("TERM".into(), p.term.clone()));
+impl Session {
+    /// The session's environment: the user's base variables, accepted client
+    /// variables, server-set ones, and `TERM` for a terminal.
+    pub(super) fn env(&mut self, user: &User) -> Vec<(String, String)> {
+        let mut env = user.env();
+        env.extend(std::mem::take(&mut self.client_env).into_iter().filter(|(k, _)| accept_env(k)));
+        env.extend(std::mem::take(&mut self.extra_env));
+        if let Some(p) = &self.pty {
+            env.push(("TERM".into(), p.term.clone()));
+        }
+        env
     }
-    let spawned = match pty {
-        Some(spec) => spawn_pty(user, command, env, &spec),
-        None => spawn_pipes(user, command, env),
+}
+
+pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: Session, closed: watch::Receiver<bool>) -> Result<()> {
+    let env = session.env(user);
+    let spawned = match session.pty {
+        Some(spec) => spawn_pty(user, session.command, env, &spec).map(|(c, p)| (c, Io::Pty(p))),
+        None => spawn_pipes(user, session.command, env),
     };
     let (child, io) = match spawned {
         Ok(x) => x,
@@ -84,12 +92,12 @@ fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>)
     Ok((child, io))
 }
 
-fn spawn_pty(
+pub(super) fn spawn_pty(
     user: &User,
     command: Option<String>,
     env: Vec<(String, String)>,
     spec: &PtySpec,
-) -> Result<(tokio::process::Child, Io)> {
+) -> Result<(tokio::process::Child, pty_process::Pty)> {
     let (pty, pts) = pty_process::open()?;
     pty.resize(pty_process::Size::new(spec.rows, spec.cols))?;
     let mut cmd = pty_process::Command::new(&user.shell)
@@ -104,7 +112,7 @@ fn spawn_pty(
     // SAFETY: the closure only performs async-signal-safe syscalls.
     cmd = unsafe { cmd.pre_exec(user.drop_privileges(true)) };
     let child = cmd.spawn(pts)?;
-    Ok((child, Io::Pty(pty)))
+    Ok((child, pty))
 }
 
 /// Forwards a child output stream as `ServerMsg`s until EOF.
@@ -129,10 +137,16 @@ async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap:
 async fn hang_up(child: &mut tokio::process::Child) {
     let Some(pid) = child.id() else { return };
     let group = nix::unistd::Pid::from_raw(-(pid as i32));
+    hang_up_group(group, child.wait()).await;
+}
+
+/// SIGHUP to a process group, then SIGKILL unless `exited` resolves within the grace period.
+pub(super) async fn hang_up_group<F: std::future::Future>(group: nix::unistd::Pid, exited: F) {
     let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGHUP);
-    if tokio::time::timeout(DRAIN_GRACE, child.wait()).await.is_err() {
+    tokio::pin!(exited);
+    if tokio::time::timeout(DRAIN_GRACE, &mut exited).await.is_err() {
         let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGKILL);
-        let _ = child.wait().await;
+        let _ = exited.await;
     } else {
         // The leader exited; make sure nothing of the group lingers.
         let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGKILL);
@@ -191,6 +205,8 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
             // EOF on a terminal is the user's ^D; resize without a PTY is meaningless.
             (ClientMsg::StdinEof, Input::Pty(_)) | (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
             (ClientMsg::Typed { .. }, _) => unreachable!("converted above"),
+            // Only persistent sessions outlive the stream; this one ends with it anyway.
+            (ClientMsg::Hangup, _) => {}
         }
     }
 }

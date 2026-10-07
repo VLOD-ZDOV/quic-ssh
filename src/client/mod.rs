@@ -83,6 +83,11 @@ pub struct Target {
     pub identity_agent: Option<Option<PathBuf>>,
     /// `CertificateFile`s from the config.
     pub certificate_files: Vec<PathBuf>,
+    /// Keep terminal sessions across lost connections (`PersistSession`, default yes).
+    pub persist_session: bool,
+    /// `ServerAliveInterval` and `ServerAliveCountMax`: ping the server when
+    /// it has been quiet this long, give up after this many unanswered pings.
+    pub server_alive: Option<(std::time::Duration, u32)>,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
 }
@@ -222,6 +227,11 @@ impl Target {
             identities_only: cfg.identities_only.unwrap_or(false),
             identity_agent,
             certificate_files,
+            persist_session: cfg.persist_session.unwrap_or(true),
+            server_alive: cfg
+                .server_alive_interval
+                .filter(|&s| s > 0)
+                .map(|s| (std::time::Duration::from_secs(s), cfg.server_alive_count_max.unwrap_or(3).max(1))),
             sources: sources.clone(),
             host,
             port,
@@ -243,6 +253,8 @@ pub struct ConnectOptions {
     pub accept_new_host: bool,
     /// `qsh --full`: QUIC only, give up quickly so the caller can hand over to ssh.
     pub full: bool,
+    /// Log in to resume the persistent session with this token.
+    pub resume: Option<Vec<u8>>,
 }
 
 /// Remembers for an hour that a host has no qshd, so `--full` goes straight to ssh.
@@ -542,7 +554,11 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
     let mut conn = open(target, opts, &id, via).await?;
     verify_host_key(&conn, target, opts).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &Hello::Login { version: VERSION, user: target.user.clone() }).await?;
+    let hello = match &opts.resume {
+        Some(token) => Hello::Resume { version: VERSION, user: target.user.clone(), token: token.clone() },
+        None => Hello::Login { version: VERSION, user: target.user.clone() },
+    };
+    write_msg(&mut send, &hello).await?;
     match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, &id).await {
         Ok(auth::Outcome::Welcome(version)) => {
             tracing::debug!("logged in, server protocol version {version}");
@@ -571,7 +587,7 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     if let Some(jumps) = &target.proxy_jump {
         // Jump hosts use the config files, but not this host's -o options.
         let sources = config::Sources { full: false, overrides: Vec::new(), ssh_config: target.sources.ssh_config.clone() };
-        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, ..opts.clone() };
+        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, ..opts.clone() };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
             let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))

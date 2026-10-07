@@ -1478,3 +1478,130 @@ fn host_certificates() {
     std::fs::write(&known, text).unwrap();
     assert!(!login(&good).status.success(), "revoked CA accepted");
 }
+
+/// A UDP relay to `port` that can drop everything, like a network outage.
+struct Relay {
+    port: u16,
+    blackhole: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn udp_relay(target: u16) -> Relay {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    let front = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let back = UdpSocket::bind("127.0.0.1:0").unwrap();
+    back.connect(("127.0.0.1", target)).unwrap();
+    let port = front.local_addr().unwrap().port();
+    let blackhole = Arc::new(AtomicBool::new(false));
+    let client = Arc::new(Mutex::new(None));
+    {
+        let (front, back, blackhole, client) = (front.try_clone().unwrap(), back.try_clone().unwrap(), blackhole.clone(), client.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok((n, from)) = front.recv_from(&mut buf) {
+                *client.lock().unwrap() = Some(from);
+                if !blackhole.load(Ordering::SeqCst) {
+                    let _ = back.send(&buf[..n]);
+                }
+            }
+        });
+    }
+    let hole = blackhole.clone();
+    std::thread::spawn(move || {
+        let blackhole = hole;
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = back.recv(&mut buf) {
+            let to = *client.lock().unwrap();
+            if let (Some(to), false) = (to, blackhole.load(Ordering::SeqCst)) {
+                let _ = front.send_to(&buf[..n], to);
+            }
+        }
+    });
+    Relay { port, blackhole }
+}
+
+/// Reads the child's output until `needle` shows up (or panics after `secs`).
+fn wait_for_output(rx: &std::sync::mpsc::Receiver<String>, seen: &mut String, needle: &str, secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !seen.contains(needle) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => seen.push_str(&chunk),
+            Err(_) => panic!("{needle:?} did not show up; output so far: {seen:?}"),
+        }
+    }
+}
+
+#[test]
+fn session_survives_network_outage() {
+    use std::sync::atomic::Ordering;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let relay = udp_relay(s.port);
+    let mut child = c
+        .cmd(&[
+            "-tt", "--transport", "quic", "--accept-new-host", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2",
+            "-p", &relay.port.to_string(), &dest(), "sh",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for pipe in [Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>, Box::new(child.stderr.take().unwrap())] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        });
+    }
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    // Output produced while the network is down must arrive after the reconnect.
+    stdin.write_all(b"sleep 3; echo dur$((2+2))ing\n").unwrap();
+    sleep(Duration::from_millis(300));
+    relay.blackhole.store(true, Ordering::SeqCst);
+    wait_for_output(&rx, &mut seen, "reconnecting", 15);
+    sleep(Duration::from_secs(4));
+    relay.blackhole.store(false, Ordering::SeqCst);
+    wait_for_output(&rx, &mut seen, "reconnected", 30);
+    wait_for_output(&rx, &mut seen, "dur4ing", 10);
+    // The same shell is still there.
+    stdin.write_all(b"echo af$((3+3))ter; exit 7\n").unwrap();
+    wait_for_output(&rx, &mut seen, "af6ter", 10);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(7), "{seen}");
+}
+
+#[test]
+fn hangup_ends_a_persistent_session() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    // The session's shell is gone once the client quits normally (SIGTERM here).
+    let mut child = c
+        .cmd(&["-tt", "-p", &s.port.to_string(), &dest(), "sh", "-c", "'echo $$ > persist.pid; sleep 60'"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid_file = s.home.path().join("persist.pid");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&pid_file).map(|t| t.trim().is_empty()).unwrap_or(true) {
+        assert!(Instant::now() < deadline, "session did not start");
+        sleep(Duration::from_millis(50));
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), nix::sys::signal::Signal::SIGTERM).unwrap();
+    child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+        assert!(Instant::now() < deadline, "the session outlived the client's SIGTERM");
+        sleep(Duration::from_millis(50));
+    }
+}
