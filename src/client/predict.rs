@@ -51,6 +51,57 @@ fn usable_size(rows: u16, cols: u16) -> bool {
     rows >= MIN_ROWS && cols >= MIN_COLS
 }
 
+/// Where the terminal's parser is after the server's output so far. Bytes
+/// of ours must not land inside an escape sequence or a UTF-8 character
+/// that a chunk of output left unfinished.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Parse {
+    #[default]
+    Ground,
+    /// After ESC.
+    Escape,
+    /// After ESC and intermediate bytes (0x20–0x2f).
+    EscapeIntermediate,
+    /// In a CSI sequence (ESC [).
+    Csi,
+    /// In a string (OSC, DCS, SOS, PM, APC) until BEL or ST.
+    Text,
+    /// ESC inside a string (the start of ST, ESC \).
+    TextEscape,
+    /// This many UTF-8 continuation bytes still to come.
+    Utf8(u8),
+}
+
+impl Parse {
+    fn feed(mut self, data: &[u8]) -> Parse {
+        for &b in data {
+            self = match (self, b) {
+                // CAN and SUB abort any sequence.
+                (_, 0x18 | 0x1a) => Parse::Ground,
+                (Parse::Text, 0x07) => Parse::Ground,
+                (Parse::Text, 0x1b) => Parse::TextEscape,
+                (Parse::Text, _) => Parse::Text,
+                (Parse::TextEscape, b'\\') => Parse::Ground,
+                (Parse::TextEscape, 0x1b) => Parse::TextEscape,
+                (Parse::TextEscape, _) => Parse::Text,
+                (_, 0x1b) => Parse::Escape,
+                (Parse::Escape, b'[') => Parse::Csi,
+                (Parse::Escape, b']' | b'P' | b'X' | b'^' | b'_') => Parse::Text,
+                (Parse::Escape | Parse::EscapeIntermediate, 0x20..=0x2f) => Parse::EscapeIntermediate,
+                (Parse::Escape | Parse::EscapeIntermediate, 0x30..=0x7e) => Parse::Ground,
+                (Parse::Csi, 0x40..=0x7e) => Parse::Ground,
+                (Parse::Escape | Parse::EscapeIntermediate | Parse::Csi, _) => self,
+                (Parse::Utf8(n), 0x80..=0xbf) => if n > 1 { Parse::Utf8(n - 1) } else { Parse::Ground },
+                (_, 0xc0..=0xdf) => Parse::Utf8(1),
+                (_, 0xe0..=0xef) => Parse::Utf8(2),
+                (_, 0xf0..=0xf7) => Parse::Utf8(3),
+                _ => Parse::Ground,
+            };
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Prediction {
     ch: u8,
@@ -78,6 +129,12 @@ pub struct Predictor {
     /// The terminal is big enough (see [`usable_size`]); otherwise output
     /// passes through untouched and nothing is predicted.
     active: bool,
+    parse: Parse,
+    /// Parameters of the CSI sequence being read, to follow insert mode.
+    csi: Vec<u8>,
+    /// Insert mode (CSI 4 h) is on: a drawn character would push text
+    /// aside, and the emulator does not model that, so nothing is drawn.
+    insert: bool,
 }
 
 impl Predictor {
@@ -93,6 +150,9 @@ impl Predictor {
             srtt: None,
             slow: false,
             active: usable_size(rows, cols),
+            parse: Parse::Ground,
+            csi: Vec::new(),
+            insert: false,
         }
     }
 
@@ -119,7 +179,7 @@ impl Predictor {
             Mode::Always => true,
             Mode::Auto => self.slow,
         };
-        fast_enough && p.epoch <= self.confirmed && !self.screen.screen().hide_cursor()
+        fast_enough && p.epoch <= self.confirmed && self.parse == Parse::Ground && !self.insert && !self.screen.screen().hide_cursor()
     }
 
     /// Draws pending predictions after the drawn ones, as far as allowed.
@@ -181,6 +241,7 @@ impl Predictor {
         self.erase(&mut out);
         out.extend_from_slice(data);
         self.screen.process(data);
+        self.follow_modes(data);
         self.unsettled = false;
         // Predictions that are now on the server's screen are confirmed.
         while let Some(p) = self.pending.front().copied() {
@@ -206,6 +267,26 @@ impl Predictor {
         }
         self.draw(&mut out);
         out
+    }
+
+    /// Follows the parser state and insert mode through server output.
+    fn follow_modes(&mut self, data: &[u8]) {
+        for &b in data {
+            let before = self.parse;
+            self.parse = self.parse.feed(&[b]);
+            match (before, self.parse) {
+                (Parse::Escape, Parse::Csi) => self.csi.clear(),
+                (Parse::Csi, Parse::Csi) if self.csi.len() < 64 => self.csi.push(b),
+                (Parse::Csi, Parse::Ground) if b == b'h' || b == b'l' => {
+                    if !self.csi.starts_with(b"?") && self.csi.split(|&c| c == b';').any(|p| p == b"4") {
+                        self.insert = b == b'h';
+                    }
+                }
+                // ESC c: a full reset.
+                (Parse::Escape, Parse::Ground) if b == b'c' => self.insert = false,
+                _ => {}
+            }
+        }
     }
 
     fn sample(&mut self, rtt: Duration) {
@@ -423,6 +504,77 @@ mod tests {
             h.same_as_server();
         }
         assert!(drawn > 300, "predictions were hardly ever drawn ({drawn})");
+    }
+
+    /// Server output made of random escape-sequence material (modes,
+    /// scrolling regions, insert mode, cursor moves).
+    #[test]
+    fn random_escape_sequences() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let alphabet = b"\x1b[;?0123456789hlHJKXDCABPLMm@rsu4 abc\r\n\x08";
+        for round in 0..2000 {
+            let mut h = Harness::new(Mode::Always);
+            for _ in 0..40 {
+                if rnd(2) == 0 {
+                    let c = [b'a' + rnd(26) as u8];
+                    h.key(std::str::from_utf8(&c).unwrap());
+                } else {
+                    let n = 1 + rnd(12) as usize;
+                    let bytes: Vec<u8> = (0..n).map(|_| alphabet[rnd(alphabet.len() as u64) as usize]).collect();
+                    h.server(&String::from_utf8(bytes).unwrap());
+                }
+            }
+            let out = h.p.clear();
+            h.term.process(&out);
+            assert_eq!(h.term.screen().contents(), h.server.screen().contents(), "round {round}");
+            assert_eq!(h.term.screen().cursor_position(), h.server.screen().cursor_position(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn unfinished_sequences() {
+        assert_eq!(Parse::Ground.feed(b"\x1b[3"), Parse::Csi);
+        assert_eq!(Parse::Csi.feed(b"1m"), Parse::Ground);
+        assert_eq!(Parse::Ground.feed(b"\x1b]0;title"), Parse::Text);
+        assert_eq!(Parse::Text.feed(b"\x1b\\"), Parse::Ground);
+        assert_eq!(Parse::Ground.feed("é".as_bytes()), Parse::Ground);
+        assert_eq!(Parse::Ground.feed(&"界".as_bytes()[..2]), Parse::Utf8(1));
+        assert_eq!(Parse::Ground.feed(b"\x1b(B"), Parse::Ground);
+        // A prediction waits until the sequence is over.
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ ");
+        h.key("a");
+        h.server("a\x1b[3");
+        h.key("b");
+        assert_eq!(h.line(), "$ a", "drawn inside an escape sequence");
+        h.server("1m");
+        h.key("c");
+        assert_eq!(h.line(), "$ abc", "drawn once the sequence is over");
+        let out = h.p.clear();
+        h.term.process(&out);
+        h.same_as_server();
+    }
+
+    #[test]
+    fn no_predictions_in_insert_mode() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ ");
+        h.key("a");
+        h.server("a\x1b[4h");
+        h.key("b");
+        assert_eq!(h.line(), "$ a");
+        h.server("b\x1b[4;12l");
+        h.key("c");
+        assert_eq!(h.line(), "$ abc");
+        h.server("\x1b[?4h");
+        h.key("d");
+        assert_eq!(h.line(), "$ abcd", "private mode 4 is something else");
     }
 
     #[test]
