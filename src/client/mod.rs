@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod auth;
 pub mod config;
+pub mod control;
 pub mod copy;
 pub mod forward;
 pub mod keystroke;
@@ -90,6 +91,8 @@ pub struct Target {
     /// `ServerAliveInterval` and `ServerAliveCountMax`: ping the server when
     /// it has been quiet this long, give up after this many unanswered pings.
     pub server_alive: Option<(std::time::Duration, u32)>,
+    /// Connection sharing (`ControlMaster` and friends).
+    pub sharing: control::Sharing,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
 }
@@ -212,6 +215,17 @@ impl Target {
             Some("accept-new" | "no" | "off") => HostKeyPolicy::AcceptNew,
             _ => HostKeyPolicy::Ask,
         };
+        let sharing = match home {
+            Some(h) => control::sharing(
+                [cfg.control_master.as_deref(), cfg.control_path.as_deref(), cfg.control_persist.as_deref()],
+                h,
+                &host,
+                port,
+                &user,
+                &local,
+            ),
+            None => control::Sharing::default(),
+        };
         let family = match cfg.address_family.as_deref() {
             Some("inet") => transport::Family::V4,
             Some("inet6") => transport::Family::V6,
@@ -246,6 +260,7 @@ impl Target {
                 .server_alive_interval
                 .filter(|&s| s > 0)
                 .map(|s| (std::time::Duration::from_secs(s), cfg.server_alive_count_max.unwrap_or(3).max(1))),
+            sharing,
             sources: sources.clone(),
             host,
             port,
@@ -268,6 +283,8 @@ pub struct ConnectOptions {
     pub full: bool,
     /// Log in to resume the persistent session with this token.
     pub resume: Option<Vec<u8>>,
+    /// May use the connection of a master qsh (`ControlMaster`/`ControlPath`).
+    pub share: bool,
 }
 
 /// Remembers for an hour that a host has no qshd, so `--full` goes straight to ssh.
@@ -599,11 +616,19 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
 /// Connects, verifies the host key against known_hosts and logs in, going
 /// through the target's jump hosts (`-J`/`ProxyJump`) if it has any.
 pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
+    // A resumed session logs in on its own: its master may be what went away.
+    #[cfg(unix)]
+    if let (true, None, Some(path)) = (opts.share, &opts.resume, &target.sharing.path) {
+        if let Some(conn) = transport::shared::attach(path).await {
+            tracing::info!("using the shared connection at {}", path.display());
+            return Ok(conn);
+        }
+    }
     let mut hops: Vec<Arc<Conn>> = Vec::new();
     if let Some(jumps) = &target.proxy_jump {
         // Jump hosts use the config files, but not this host's -o options.
         let sources = config::Sources { full: false, overrides: Vec::new(), ssh_config: target.sources.ssh_config.clone() };
-        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, ..opts.clone() };
+        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, share: false, ..opts.clone() };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
             let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))

@@ -189,6 +189,24 @@ qsh входит теми же ключами, что и ssh, в таком по
 - Выключить можно через `PersistSession no` в `~/.config/qsh/config` (или `-o PersistSession=no`). Сессии с пробросом портов или агента не сохраняются.
 - `ServerAliveInterval` и `ServerAliveCountMax` задают, как быстро замечается мёртвое соединение. Для остальных сессий они работают как в ssh.
 
+### Общее соединение (`ControlMaster`)
+
+Как и ssh, qsh может держать одно соединение и запускать через него следующие сессии, команды и копирования на тот же хост — без нового рукопожатия и входа:
+
+```
+# ~/.config/qsh/config
+Host *
+    ControlMaster auto
+    ControlPersist 10m
+```
+
+- `ControlMaster auto`: использовать работающий мастер или стать им. `yes` (или `-M`) — всегда становиться мастером. По умолчанию `no`: мастер используется, только если задан `ControlPath`.
+- `ControlPersist 10m` оставляет мастер в фоне на 10 минут после последней сессии (`yes` — до `-O exit`). Без него мастером становится первый qsh и после своей сессии ждёт остальные.
+- Сокет по умолчанию лежит в `~/.config/qsh/ctl/` (`ControlPath` или `-S путь`; подстановки `%h %p %r %C`). `ControlPath` из конфига ssh не используется: те сокеты говорят на протоколе ssh.
+- `qsh -O check host`, `-O exit`, `-O stop` — как в ssh.
+- Запуски с `-R` или `-A` открывают своё соединение. Терминальная сессия, начатая через мастер, переживает его: qsh сам входит заново и продолжает её.
+- Не работает под Windows.
+
 ### Алиасы хостов (`~/.ssh/config`)
 
 qsh читает твой `~/.ssh/config`, поэтому хосты, к которым ты уже ходишь по ssh, работают по имени:
@@ -214,7 +232,7 @@ Host myserver
     Port 8080
 ```
 
-Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (только qsh), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
+Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (только qsh), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` (в `~/.config/qsh/config`), `Include` и `Match all`. Остальные блоки `Match` пропускаются. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
 
 ### Режим совместимости с OpenSSH (`--full`)
 
@@ -407,7 +425,7 @@ python3 bench/bench.py
 ## Ограничения
 
 - Нет PAM (`pam_access`, `pam_limits`), utmp/wtmp и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP).
-- Нет X11, туннелей (`-w`) и общего соединения (`ControlMaster`).
+- Нет X11 и туннелей (`-w`).
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.
 - `-J` работает, только если на всех промежуточных хостах есть qshd; с `--full` хосты с `ProxyJump`/`ProxyCommand` отдаются ssh.

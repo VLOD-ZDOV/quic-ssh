@@ -124,6 +124,7 @@ impl ConnArgs {
             accept_new_host: self.accept_new_host,
             full: self.full,
             resume: None,
+            share: true,
         }
     }
 }
@@ -182,6 +183,12 @@ fn main() {
         std::process::exit(0);
     }
     a.full |= as_ssh;
+    #[cfg(unix)]
+    if std::env::var_os(MASTER_FD).is_some() {
+        init_logging(a.verbose > 0, a.quiet);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        finish(rt.block_on(master_main(a)));
+    }
     #[cfg(not(unix))]
     if a.background {
         finish(Err(anyhow!("-f (going to the background) is not supported on this system")));
@@ -195,52 +202,200 @@ fn main() {
         tracing::debug!("ignoring {ignored}");
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    finish(rt.block_on(session_main(a)));
+    finish(rt.block_on(session_main(a, &args)));
 }
 
 /// Environment variable carrying the readiness pipe to a backgrounded qsh.
 #[cfg(unix)]
 const DAEMON_FD: &str = "QSH_BACKGROUND_FD";
 
-/// `-f`: runs qsh again as a child that logs in (it may still ask questions on
-/// the terminal), then detaches; this process exits once the child is ready.
+/// Environment variable carrying the readiness pipe to a background
+/// connection master (`ControlPersist`).
 #[cfg(unix)]
-fn run_in_background(args: &[String]) -> Result<i32> {
+const MASTER_FD: &str = "QSH_MASTER_FD";
+
+/// Runs qsh again as a child with a readiness pipe in `env`; the child logs
+/// in (it may still ask questions on the terminal) and then reports a status
+/// word. Returns that word and the child.
+#[cfg(unix)]
+fn spawn_with_status(args: &[String], env: &str) -> Result<(String, std::process::Child)> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     // Only the write end is handed to the child (by number); the read end must not leak.
     let (read, write) = nix::unistd::pipe()?;
     nix::fcntl::fcntl(&read, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
+    let child = std::process::Command::new(std::env::current_exe()?)
         .args(&args[1..])
-        .env(DAEMON_FD, write.as_raw_fd().to_string())
+        .env_remove(DAEMON_FD)
+        .env_remove(MASTER_FD)
+        .env(env, write.as_raw_fd().to_string())
         .spawn()?;
     drop(write);
     let mut status = String::new();
     let _ = std::fs::File::from(read).read_to_string(&mut status);
-    if status.trim() == "ok" {
+    Ok((status.trim().to_string(), child))
+}
+
+/// `-f`: runs qsh again as a child that logs in, then detaches; this process
+/// exits once the child is ready.
+#[cfg(unix)]
+fn run_in_background(args: &[String]) -> Result<i32> {
+    let (status, mut child) = spawn_with_status(args, DAEMON_FD)?;
+    if status == "ok" {
         return Ok(0);
     }
     // The child failed before it was ready and has reported why.
     Ok(child.wait()?.code().unwrap_or(255))
 }
 
-/// In a backgrounded child: tell the parent we are ready, then detach from the
-/// terminal (new session, stdin from /dev/null; output stays, like ssh -f).
+/// In a child started by [`spawn_with_status`]: report `status` to the parent
+/// and detach from the terminal (new session, stdin from /dev/null). With
+/// `quiet`, output goes to /dev/null too; otherwise it stays, like ssh -f.
 #[cfg(unix)]
-fn detach() -> Result<()> {
+fn detach(env: &str, status: &str, quiet: bool) -> Result<()> {
     use std::io::Write;
     use std::os::fd::{FromRawFd, OwnedFd};
-    let Some(fd) = std::env::var(DAEMON_FD).ok().and_then(|v| v.parse::<i32>().ok()) else {
+    let Some(fd) = std::env::var(env).ok().and_then(|v| v.parse::<i32>().ok()) else {
         return Ok(());
     };
-    let null = std::fs::File::open("/dev/null")?;
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
     nix::unistd::dup2_stdin(&null)?;
+    if quiet {
+        nix::unistd::dup2_stdout(&null)?;
+        nix::unistd::dup2_stderr(&null)?;
+    }
     let _ = nix::unistd::setsid();
     // SAFETY: the fd was created for us by the parent and is used only here.
     let mut pipe = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    pipe.write_all(b"ok")?;
+    pipe.write_all(status.as_bytes())?;
     Ok(())
+}
+
+/// Starts a background master for `target` (`ControlPersist`) unless one is
+/// running. Returns an exit code if the master could not log in (it has
+/// said why), so the login is not tried, and failed, twice.
+#[cfg(unix)]
+async fn start_background_master(target: &Target, args: &[String]) -> Result<Option<i32>> {
+    use qsh::transport::shared;
+    let Some(path) = &target.sharing.path else { return Ok(None) };
+    if shared::control(path, shared::Command::Check).await.is_ok() {
+        return Ok(None);
+    }
+    let (status, mut child) = spawn_with_status(args, MASTER_FD)?;
+    match status.as_str() {
+        "ok" => Ok(None),
+        // No qshd there (`--full`): go on as usual, which hands over to ssh.
+        "none" => {
+            let _ = child.wait();
+            Ok(None)
+        }
+        _ => Ok(Some(child.wait()?.code().unwrap_or(255))),
+    }
+}
+
+/// The background master (`ControlPersist`): logs in, serves the connection
+/// on its socket, and ends when it has been unused for the persist time,
+/// on `-O exit`, or when the connection is lost.
+#[cfg(unix)]
+async fn master_main(a: SshArgs) -> Result<i32> {
+    use qsh::client::control::Persist;
+    use qsh::transport::shared::{InUse, Master};
+    let dest = a.destination.clone().context("missing destination")?;
+    let target = Target::resolve(&dest, a.port, &sources(&a))?;
+    let path = target.sharing.path.clone().context("no ControlPath")?;
+    prepare_control_dir(&path)?;
+    let opts = ConnectOptions {
+        identities: a.identities.clone(),
+        transport: a.transport,
+        accept_new_host: a.accept_new_host,
+        full: a.full,
+        resume: None,
+        share: false,
+    };
+    let conn = match client::connect(&target, &opts).await {
+        Ok(c) => Arc::new(c),
+        Err(e) if a.full && e.is::<Unreachable>() => {
+            detach(MASTER_FD, "none", true)?;
+            return Ok(255);
+        }
+        Err(e) => return Err(e),
+    };
+    let master = match Master::start(conn.clone(), &path) {
+        Ok(m) => m,
+        // Another qsh got there first: use that one.
+        Err(e) if e.is::<InUse>() => {
+            detach(MASTER_FD, "ok", true)?;
+            conn.close().await;
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
+    detach(MASTER_FD, "ok", true)?;
+    let linger = match target.sharing.persist {
+        Persist::Forever => None,
+        Persist::For(d) => Some(d),
+        Persist::No => Some(Duration::ZERO),
+    };
+    tokio::select! {
+        () = master.wait_idle(&conn, Some(linger)) => {}
+        _ = session::termination_signal(true) => {}
+    }
+    drop(master);
+    conn.close().await;
+    Ok(0)
+}
+
+/// Creates qsh's own socket directory (private); other ControlPath
+/// directories are the user's business, as in ssh.
+#[cfg(unix)]
+fn prepare_control_dir(path: &Path) -> Result<()> {
+    let default = qsh::client::control::default_dir(&home_dir()?);
+    if path.parent() == Some(default.as_path()) {
+        qsh::keys::create_private_dir(&default)?;
+    }
+    Ok(())
+}
+
+/// `-O check|exit|stop`.
+async fn control_command(target: &Target, command: &str) -> Result<i32> {
+    #[cfg(unix)]
+    {
+        use qsh::transport::shared::{control, Command};
+        let path = target
+            .sharing
+            .path
+            .as_ref()
+            .context("no control socket for this host (set ControlMaster or ControlPath, or use -S)")?;
+        let (cmd, done) = match command {
+            "check" => (Command::Check, None),
+            "exit" => (Command::Exit, Some("Exit request sent.")),
+            _ => (Command::Stop, Some("Stop listening request sent.")),
+        };
+        match control(path, cmd).await {
+            Ok(pid) => {
+                eprintln!("{}", done.map(str::to_string).unwrap_or_else(|| format!("Master running (pid={pid})")));
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!("qsh: {e:#}");
+                Ok(255)
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, command);
+        bail!("connection sharing (-O) is not supported on this system")
+    }
+}
+
+fn sources(a: &SshArgs) -> Sources {
+    let mut overrides = Vec::new();
+    if let Some(j) = &a.jump {
+        overrides.push(format!("ProxyJump {j}"));
+    }
+    overrides.extend(a.override_lines());
+    Sources { full: a.full, overrides, ssh_config: a.config_file.clone() }
 }
 
 async fn tool_main(cli: ToolCli) -> Result<i32> {
@@ -276,34 +431,27 @@ fn print_config(t: &Target) {
     if let Some(j) = &t.proxy_jump {
         println!("proxyjump {j}");
     }
+    if let Some(p) = &t.sharing.path {
+        println!("controlpath {}", p.display());
+    }
     println!("batchmode {}", if t.batch_mode { "yes" } else { "no" });
 }
 
-async fn session_main(a: SshArgs) -> Result<i32> {
+async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
     let Some(dest) = a.destination.clone() else {
         bail!("missing destination\n{USAGE}");
     };
-    let mut overrides = Vec::new();
-    if let Some(j) = &a.jump {
-        overrides.push(format!("ProxyJump {j}"));
-    }
-    overrides.extend(a.override_lines());
-    let sources = Sources { full: a.full, overrides, ssh_config: a.config_file.clone() };
-    let target = Target::resolve(&dest, a.port, &sources)?;
+    let target = Target::resolve(&dest, a.port, &sources(&a))?;
     if a.print_config {
         print_config(&target);
         return Ok(0);
     }
+    if let Some(cmd) = &a.control_command {
+        return control_command(&target, cmd).await;
+    }
     if a.background && !a.no_command && a.command.is_empty() && a.stdio_forward.is_none() {
         bail!("cannot go to the background (-f) without a command or -N");
     }
-    let opts = ConnectOptions {
-        identities: a.identities.clone(),
-        transport: a.transport,
-        accept_new_host: a.accept_new_host,
-        full: a.full,
-        resume: None,
-    };
     if a.full && target.needs_proxy {
         return exec_openssh("ssh", ssh_args(&a, &target), "the ssh config uses ProxyJump/ProxyCommand");
     }
@@ -327,6 +475,33 @@ async fn session_main(a: SshArgs) -> Result<i32> {
     }
 
     let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
+    // -A / ForwardAgent: the agent qsh itself would use.
+    let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
+        true => match &target.identity_agent {
+            Some(path) => path.clone(),
+            None => qsh::agent::default_path(),
+        },
+        false => None,
+    };
+    // Streams the server opens (-R, -A) would reach the master, not this qsh:
+    // such a run uses a connection of its own.
+    let share = remotes.is_empty() && agent.is_none();
+    let opts = ConnectOptions {
+        identities: a.identities.clone(),
+        transport: a.transport,
+        accept_new_host: a.accept_new_host,
+        full: a.full,
+        resume: None,
+        share,
+    };
+    #[cfg(unix)]
+    if share && target.sharing.background_master() {
+        if let Some(code) = start_background_master(&target, args).await? {
+            return Ok(code);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = args;
     let conn = match client::connect(&target, &opts).await {
         Ok(c) => Arc::new(c),
         Err(e) if a.full && e.is::<Unreachable>() => {
@@ -355,28 +530,32 @@ async fn session_main(a: SshArgs) -> Result<i32> {
             Err(e) => return Err(e),
         }
     }
-    // -A / ForwardAgent: the agent qsh itself would use.
-    let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
-        true => match &target.identity_agent {
-            Some(path) => path.clone(),
-            None => qsh::agent::default_path(),
-        },
-        false => None,
-    };
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
     let uses_forwards = uses_forwards || agent.is_some();
     let _remote = forward::start_remote(&conn, &remotes, agent, quiet).await?;
     #[cfg(unix)]
+    let master = start_master(&conn, &target, quiet);
+    #[cfg(unix)]
     if a.background {
-        detach()?;
+        detach(DAEMON_FD, "ok", false)?;
     }
 
     if a.no_command {
+        #[cfg(unix)]
+        let exit_requested = async {
+            match &master {
+                Some(m) => m.exit_requested().await,
+                None => std::future::pending().await,
+            }
+        };
+        #[cfg(not(unix))]
+        let exit_requested = std::future::pending::<()>();
         tokio::select! {
             _ = conn.closed() => bail!("connection closed"),
             _ = session::termination_signal(true) => {}
+            () = exit_requested => {}
         }
         conn.close().await;
         return Ok(0);
@@ -432,8 +611,52 @@ async fn session_main(a: SshArgs) -> Result<i32> {
         },
     )
     .await?;
+    #[cfg(unix)]
+    if let Some(m) = master {
+        wait_for_shared(m, &conn, quiet).await;
+    }
     conn.close().await;
     Ok(code)
+}
+
+/// `ControlMaster`: offers this connection to later qsh runs.
+#[cfg(unix)]
+fn start_master(conn: &Arc<qsh::transport::Conn>, target: &Target, quiet: bool) -> Option<qsh::transport::shared::Master> {
+    use qsh::client::control::ControlMaster;
+    let path = target.sharing.path.as_ref()?;
+    if conn.is_shared() || target.sharing.master == ControlMaster::No {
+        return None;
+    }
+    let started = prepare_control_dir(path).and_then(|()| qsh::transport::shared::Master::start(conn.clone(), path));
+    match started {
+        Ok(m) => {
+            tracing::debug!("sharing the connection at {}", path.display());
+            Some(m)
+        }
+        Err(e) => {
+            if target.sharing.master == ControlMaster::Yes && !quiet {
+                eprintln!("qsh: not sharing the connection: {e:#}");
+            }
+            None
+        }
+    }
+}
+
+/// After the master's own session: other qsh runs may still use the
+/// connection, so it stays until they are done (or the user gives up).
+#[cfg(unix)]
+async fn wait_for_shared(master: qsh::transport::shared::Master, conn: &qsh::transport::Conn, quiet: bool) {
+    master.stop_accepting();
+    if master.active() == 0 {
+        return;
+    }
+    if !quiet {
+        eprintln!("qsh: other qsh sessions still use this connection; waiting for them (Ctrl-C ends them)");
+    }
+    tokio::select! {
+        () = master.wait_idle(conn, None) => {}
+        _ = session::termination_signal(true) => {}
+    }
 }
 
 /// Arguments for OpenSSH's ssh: everything ssh understands, as given.

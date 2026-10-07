@@ -189,6 +189,24 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port or agent forwarding are not kept.
 - `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh.
 
+### Connection sharing (`ControlMaster`)
+
+Like ssh, qsh can keep one connection and run later sessions, commands and copies to the same host through it, without a new handshake and login:
+
+```
+# ~/.config/qsh/config
+Host *
+    ControlMaster auto
+    ControlPersist 10m
+```
+
+- `ControlMaster auto`: use a running master, or become one. `yes` (or `-M`) always becomes one. The default `no` uses a master only if `ControlPath` is set.
+- `ControlPersist 10m` keeps the master in the background for 10 minutes after the last session (`yes` until `-O exit`). Without it the first qsh is the master and, when its own session ends, waits for the others.
+- The socket is in `~/.config/qsh/ctl/` by default (`ControlPath`, or `-S path`; tokens `%h %p %r %C`). ssh's `ControlPath` is not used: those sockets speak ssh's protocol.
+- `qsh -O check host`, `-O exit`, `-O stop` as in ssh.
+- Runs with `-R` or `-A` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it.
+- Not on Windows.
+
 ### Host aliases (`~/.ssh/config`)
 
 qsh reads your existing `~/.ssh/config`, so hosts you already use with ssh work by name:
@@ -214,7 +232,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (qsh only), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` (qsh only), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -407,7 +425,7 @@ This is still a young project and has not had an external audit. For critical sy
 ## Limitations
 
 - No PAM (`pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP).
-- No X11, tunnels (`-w`) or connection sharing (`ControlMaster`).
+- No X11 or tunnels (`-w`).
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.

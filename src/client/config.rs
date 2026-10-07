@@ -7,7 +7,8 @@
 //! `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`,
 //! `ProxyJump`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`,
 //! `UserKnownHostsFile`, `ClearAllForwardings`, `EscapeChar`,
-//! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`.
+//! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`,
+//! `ControlMaster`, `ControlPath`, `ControlPersist`.
 //! Other `Match` blocks are skipped (their conditions are not evaluated).
 //!
 //! From `~/.ssh/config`, settings that describe the ssh session itself (`Port`,
@@ -64,6 +65,10 @@ pub struct HostConfig {
     pub server_alive_interval: Option<u64>,
     /// `ServerAliveCountMax`.
     pub server_alive_count_max: Option<u32>,
+    /// `ControlMaster`, `ControlPath` (qsh's config and `-o` only), `ControlPersist`.
+    pub control_master: Option<String>,
+    pub control_path: Option<String>,
+    pub control_persist: Option<String>,
 }
 
 fn yes(v: &str) -> bool {
@@ -182,6 +187,9 @@ impl Parser<'_> {
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
                 "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
+                "controlmaster" if o.control_master.is_none() => o.control_master = first,
+                "controlpath" if self.ours && o.control_path.is_none() => o.control_path = first,
+                "controlpersist" if o.control_persist.is_none() => o.control_persist = first,
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -376,6 +384,9 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         persist_session: ours.persist_session.or(ssh.persist_session),
         server_alive_interval: ours.server_alive_interval.or(ssh.server_alive_interval),
         server_alive_count_max: ours.server_alive_count_max.or(ssh.server_alive_count_max),
+        control_master: ours.control_master.or(ssh.control_master),
+        control_path: ours.control_path,
+        control_persist: ours.control_persist.or(ssh.control_persist),
     }
 }
 

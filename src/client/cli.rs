@@ -45,6 +45,8 @@ pub struct SshArgs {
     pub gateway_ports: bool,
     pub forward_agent: Option<bool>,
     pub print_config: bool,
+    /// `-O`: a command for the connection master (`check`, `exit`, `stop`).
+    pub control_command: Option<String>,
     /// `-f`: go to the background after logging in.
     pub background: bool,
     pub print_version: bool,
@@ -99,7 +101,13 @@ impl SshArgs {
                 }
             }
             // Protocol/compression/GSSAPI/syslog/multiplexing switches: nothing to do.
-            '1' | '2' | 'C' | 'K' | 'k' | 'M' | 'x' | 'y' => self.ignored.push(format!("-{c}")),
+            // Like `ControlMaster yes` (`-MM` asks in ssh; qsh does not ask).
+            'M' => {
+                self.options.push("ControlMaster yes".into());
+                // ssh would use its own sockets and protocol: not passed on.
+                return Ok(());
+            }
+            '1' | '2' | 'C' | 'K' | 'k' | 'x' | 'y' => self.ignored.push(format!("-{c}")),
             _ => return Err(format!("unknown option -{c}")),
         }
         self.passthrough.push(format!("-{c}"));
@@ -107,7 +115,9 @@ impl SshArgs {
     }
 
     fn apply_value(&mut self, c: char, v: String) -> Result<(), String> {
-        let pass = (c != 'p').then(|| v.clone());
+        // -p is re-added from the final port so `host:port` also reaches ssh;
+        // -S and -O name qsh's sharing sockets, which ssh cannot use.
+        let pass = (!matches!(c, 'p' | 'S' | 'O')).then(|| v.clone());
         match c {
             'p' => {
                 let p = v.parse().map_err(|_| format!("bad port {v:?}"))?;
@@ -123,12 +133,15 @@ impl SshArgs {
             'J' => self.jump = Some(v),
             'W' => self.stdio_forward = Some(v),
             'e' => self.escape_char = Some(v),
-            'O' => return Err("control commands (-O) are not supported: qsh has no connection multiplexing".into()),
+            'O' => match v.as_str() {
+                "check" | "exit" | "stop" => self.control_command = Some(v),
+                _ => return Err(format!("unsupported -O command {v:?} (check, exit, stop)")),
+            },
+            'S' => self.options.push(format!("ControlPath {v}")),
             'w' => return Err("tunnel devices (-w) are not supported".into()),
             // Bind address/interface, ciphers, MACs, logging, PKCS#11, tags, queries.
             _ => self.ignored.push(format!("-{c} {v}")),
         }
-        // -p is re-added from the final port so `host:port` also reaches ssh.
         if let Some(v) = pass {
             self.passthrough.push(format!("-{c}"));
             self.passthrough.push(v);
@@ -222,10 +235,11 @@ impl SshArgs {
 }
 
 pub const USAGE: &str = "\
-usage: qsh [-46AaCfGgNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfile]
+usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfile]
            [-i identity] [-J [user@]host[:port]] [-L [bind:]port:host:hostport]
-           [-l login] [-o option] [-p port] [-R [bind:]port:host:hostport]
-           [-W host:port] [--full] [--transport auto|quic|tcp] [--accept-new-host]
+           [-l login] [-O check|exit|stop] [-o option] [-p port]
+           [-R [bind:]port:host:hostport] [-S ctl_path] [-W host:port]
+           [--full] [--transport auto|quic|tcp] [--accept-new-host]
            [user@]host[:port] [command [argument ...]]
 
        qsh cp [-r] SRC DST        copy files, one side is [user@]host:path
@@ -300,8 +314,16 @@ mod tests {
     }
 
     #[test]
+    fn connection_sharing_options() {
+        let a = p("-M -S /tmp/s -O check host");
+        assert_eq!(a.options, vec!["ControlMaster yes", "ControlPath /tmp/s"]);
+        assert_eq!(a.control_command.as_deref(), Some("check"));
+        assert!(a.passthrough.is_empty(), "ssh must not get qsh's sockets: {:?}", a.passthrough);
+    }
+
+    #[test]
     fn rejects_bad_input() {
-        for bad in ["-p", "-p notaport h", "-Z h", "--nope h", "-O check h"] {
+        for bad in ["-p", "-p notaport h", "-Z h", "--nope h", "-O forward h"] {
             assert!(SshArgs::parse(bad.split_whitespace().map(String::from)).is_err(), "{bad}");
         }
         assert_eq!(option_line("Port=22").unwrap(), "Port 22");

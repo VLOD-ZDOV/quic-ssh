@@ -1,6 +1,8 @@
 //! Transport abstraction: QUIC (preferred) or TLS-over-TCP with yamux multiplexing.
 
 mod quic;
+#[cfg(unix)]
+pub mod shared;
 mod tcp;
 
 use std::net::SocketAddr;
@@ -34,6 +36,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 enum Inner {
     Quic(quic::QuicConn),
     Tcp(tcp::TcpConn),
+    /// Streams through another qsh's connection (see [`shared`]).
+    #[cfg(unix)]
+    Shared(shared::SharedConn),
 }
 
 /// An authenticated, encrypted, multiplexed connection.
@@ -55,6 +60,8 @@ impl Conn {
         match &self.inner {
             Inner::Quic(c) => c.open_bi().await,
             Inner::Tcp(c) => c.open_bi().await,
+            #[cfg(unix)]
+            Inner::Shared(c) => c.open_bi().await,
         }
     }
 
@@ -63,6 +70,9 @@ impl Conn {
         match &self.inner {
             Inner::Quic(c) => c.accept_bi().await,
             Inner::Tcp(c) => c.accept_bi().await,
+            // The server's streams go to the master.
+            #[cfg(unix)]
+            Inner::Shared(_) => None,
         }
     }
 
@@ -99,6 +109,15 @@ impl Conn {
         self.hops = hops;
     }
 
+    /// True for a connection through another qsh's master (see [`shared`]).
+    pub fn is_shared(&self) -> bool {
+        #[cfg(unix)]
+        if matches!(self.inner, Inner::Shared(_)) {
+            return true;
+        }
+        false
+    }
+
     pub fn transport_name(&self) -> &'static str {
         if !self.hops.is_empty() {
             return "tcp via jump host";
@@ -106,6 +125,8 @@ impl Conn {
         match &self.inner {
             Inner::Quic(_) => "quic",
             Inner::Tcp(_) => "tcp",
+            #[cfg(unix)]
+            Inner::Shared(c) => c.transport(),
         }
     }
 
@@ -114,6 +135,8 @@ impl Conn {
         match &self.inner {
             Inner::Quic(c) => c.closed().await,
             Inner::Tcp(c) => c.closed().await,
+            #[cfg(unix)]
+            Inner::Shared(c) => c.closed().await,
         }
     }
 
@@ -122,6 +145,9 @@ impl Conn {
         match &self.inner {
             Inner::Quic(c) => c.close().await,
             Inner::Tcp(c) => c.close().await,
+            // The master keeps the connection.
+            #[cfg(unix)]
+            Inner::Shared(_) => {}
         }
     }
 }

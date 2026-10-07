@@ -1732,3 +1732,113 @@ fn one_time_code_guessing_is_limited_across_connections() {
     assert!(!out.status.success(), "the right code was accepted during the lockout");
     assert!(stderr(&out).contains("too many wrong one-time codes"), "{}", stderr(&out));
 }
+
+/// `ControlMaster auto` + `ControlPersist` in qsh's config: the first run
+/// leaves a master in the background, later runs (sessions, copies) go
+/// through it without a login of their own, and `-O check|exit` talk to it.
+#[test]
+fn connection_sharing_with_a_background_master() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n").unwrap();
+    let port = s.port.to_string();
+    let out = c.run(&["-p", &port, &dest(), "echo", "one"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "one\n");
+    let out = c.run(&["-O", "check", "-p", &port, &dest()]);
+    assert!(stderr(&out).contains("Master running"), "{}", stderr(&out));
+    // Without the key on the server only the master's connection still works.
+    std::fs::remove_file(s.authorized_keys()).unwrap();
+    for i in 0..3 {
+        let out = c.run(&["-v", "-p", &port, &dest(), "echo", &format!("via-master-{i}")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("via-master-{i}\n"));
+        assert!(stderr(&out).contains("shared connection"), "{}", stderr(&out));
+    }
+    let local = c.home.path().join("shared.txt");
+    std::fs::write(&local, b"copied through the master").unwrap();
+    let out = c.run(&["cp", "-p", &port, local.to_str().unwrap(), &format!("{}:shared.txt", dest())]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(s.home.path().join("shared.txt")).unwrap(), b"copied through the master");
+    let mut child = c.cmd(&["-p", &port, &dest(), "wc", "-c"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&[b'x'; 100_000]).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(stdout(&out).trim(), "100000");
+    // -R needs a connection of its own (the server's streams would reach the master).
+    let out = c.run(&["-o", "BatchMode=yes", "-R", "0:127.0.0.1:9", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "-R went through the master");
+    let out = c.run(&["-O", "exit", "-p", &port, &dest()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-O", "check", "-p", &port, &dest()]);
+    assert!(!out.status.success(), "the master is still there");
+    let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "logged in without a key");
+}
+
+/// `-M -f -N -S path`: a master in the foreground process (here sent to the
+/// background with -f); `-S path` uses it.
+#[test]
+fn connection_sharing_with_an_explicit_socket() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let sock = c.home.path().join("master.sock");
+    let sock = sock.to_str().unwrap();
+    let status = c.cmd(&["-M", "-f", "-N", "-S", sock, "-p", &port, &dest()]).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+    assert!(status.success());
+    std::fs::remove_file(s.authorized_keys()).unwrap();
+    let out = c.run(&["-S", sock, "-p", &port, &dest(), "echo", "shared"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "shared\n");
+    // Without -S this run has no master to use.
+    let out = c.run(&["-p", &port, "-o", "BatchMode=yes", &dest(), "true"]);
+    assert!(!out.status.success());
+    let out = c.run(&["-S", sock, "-O", "exit", &dest()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::path::Path::new(sock).exists() {
+        assert!(Instant::now() < deadline, "the master did not exit");
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// A terminal session started through a master keeps running when the
+/// master goes away: qsh logs in by itself and resumes it.
+#[test]
+fn shared_session_survives_the_master() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPersist 60\n").unwrap();
+    let port = s.port.to_string();
+    assert!(c.run(&["-p", &port, &dest(), "true"]).status.success());
+    let mut child = c
+        .cmd(&["-tt", "-v", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-p", &port, &dest(), "sh"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for pipe in [Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>, Box::new(child.stderr.take().unwrap())] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        });
+    }
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    assert!(seen.contains("shared connection"), "{seen}");
+    assert!(c.run(&["-O", "exit", "-p", &port, &dest()]).status.success());
+    wait_for_output(&rx, &mut seen, "reconnected", 30);
+    stdin.write_all(b"echo af$((3+3))ter; exit 7\n").unwrap();
+    wait_for_output(&rx, &mut seen, "af6ter", 10);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(7), "{seen}");
+}
