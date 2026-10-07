@@ -21,7 +21,8 @@ Features:
 - local port forwarding (`-L`);
 - file copy (`qsh cp`);
 - Ed25519 key login only (your existing `~/.ssh/id_ed25519` works);
-- pairing with a one-time code, so you never copy keys by hand.
+- pairing with a one-time code, so you never copy keys by hand;
+- host aliases from your existing `~/.ssh/config` (`qsh myserver`).
 
 ## Installation
 
@@ -116,7 +117,34 @@ qsh -v user@host                       # show which transport is used
 qsh keygen                             # create ~/.config/qsh/id_ed25519
 ```
 
-The client key is chosen in this order: `-i FILE`, then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
+The client key is chosen in this order: `-i FILE`, then the first Ed25519 `IdentityFile` from the config (see below), then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
+
+### Host aliases (`~/.ssh/config`)
+
+qsh reads your existing `~/.ssh/config`, so hosts you already use with ssh work by name:
+
+```
+# ~/.ssh/config
+Host myserver
+    HostName 203.0.113.10
+    User root
+    IdentityFile ~/.ssh/work_key
+```
+
+```sh
+qsh myserver                        # = qsh -i ~/.ssh/work_key root@203.0.113.10
+qsh cp backup.tar myserver:/srv/
+```
+
+From `~/.ssh/config` qsh takes `HostName`, `User` and `IdentityFile` (only Ed25519 keys; others are skipped). `Port` is ignored there, because it is the SSH port. For qsh-specific settings, including the port, use `~/.config/qsh/config` with the same syntax; its values take precedence:
+
+```
+# ~/.config/qsh/config
+Host myserver
+    Port 8080
+```
+
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ## Server configuration
 
@@ -158,6 +186,14 @@ Compared with OpenSSH 10 (`ssh`/`scp` with default settings). The network is emu
 | loopback, no delay | 200 MiB | 5.8 Gbit/s | 5.2 Gbit/s | 16.8 Gbit/s |
 | RTT 50 ms, 100 Mbit/s | 50 MiB | 66.2 Mbit/s | **85.2 Mbit/s** | 79.2 Mbit/s |
 | RTT 100 ms, 1% loss, 20 Mbit/s | 10 MiB | 10.4 Mbit/s | **16.3 Mbit/s** | 14.1 Mbit/s |
+
+**Real server over the internet** (median of 15 runs; transfers: 20 MiB, median of 3):
+
+| | Connect + `true` | Upload | Download |
+|---|---:|---:|---:|
+| ssh / scp | 1000 ms | 53 Mbit/s | 53 Mbit/s |
+| qsh (QUIC) | **309 ms** | 70 Mbit/s | **107 Mbit/s** |
+| qsh (TCP fallback) | 337 ms | **107 Mbit/s** | 94 Mbit/s |
 
 Takeaways:
 

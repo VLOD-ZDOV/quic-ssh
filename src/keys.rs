@@ -76,12 +76,23 @@ impl Identity {
             .to_vec()
     }
 
+    /// Whether `path` holds an OpenSSH Ed25519 private key (checked without decrypting).
+    pub fn is_ed25519_file(path: &Path) -> bool {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|t| PrivateKey::from_openssh(&t).ok())
+            .is_some_and(|k| k.algorithm() == ssh_key::Algorithm::Ed25519)
+    }
+
     /// Loads an OpenSSH private key, asking for a passphrase if it is encrypted.
     pub fn load(path: &Path) -> Result<Identity> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("cannot read key {}", path.display()))?;
         let mut key = PrivateKey::from_openssh(&text)
             .with_context(|| format!("cannot parse key {}", path.display()))?;
+        if key.algorithm() != ssh_key::Algorithm::Ed25519 {
+            bail!("{} is not an ed25519 key (only ed25519 is supported)", path.display());
+        }
         if key.is_encrypted() {
             let pass = rpassword::prompt_password(format!(
                 "Enter passphrase for {}: ",

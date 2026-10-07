@@ -1,5 +1,6 @@
 //! The `qsh` client.
 
+pub mod config;
 pub mod copy;
 pub mod forward;
 mod known_hosts;
@@ -16,21 +17,33 @@ use crate::transport::{self, Conn, Mode};
 use known_hosts::{host_id, KnownHosts};
 
 /// `[user@]host[:port]`; IPv6 literals go in brackets: `user@[::1]:4422`.
+/// `host` may be an alias from `~/.config/qsh/config` or `~/.ssh/config`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Target {
     pub user: String,
+    /// Real host name (after `HostName` from the config).
     pub host: String,
     pub port: u16,
+    /// `IdentityFile`s from the config, in order.
+    pub identity_files: Vec<PathBuf>,
 }
 
 impl Target {
+    /// Parses a destination and applies the matching config entries.
+    /// Precedence: `-p`/`user@`/`:port` on the command line, then
+    /// `~/.config/qsh/config`, then `~/.ssh/config` (whose `Port` is ignored).
     pub fn parse(s: &str, port: Option<u16>) -> Result<Target> {
+        Self::parse_with(s, port, home_dir().ok().as_deref())
+    }
+
+    /// Like [`Target::parse`], reading the configs under `home` (none if `None`).
+    pub fn parse_with(s: &str, port: Option<u16>, home: Option<&Path>) -> Result<Target> {
         let (user, rest) = match s.rsplit_once('@') {
-            Some((u, r)) if !u.is_empty() => (u.to_string(), r),
+            Some((u, r)) if !u.is_empty() => (Some(u.to_string()), r),
             Some(_) => bail!("empty user name in {s:?}"),
-            None => (local_user()?, s),
+            None => (None, s),
         };
-        let (host, parsed_port) = if let Some(r) = rest.strip_prefix('[') {
+        let (alias, parsed_port) = if let Some(r) = rest.strip_prefix('[') {
             let (h, after) = r.split_once(']').context("unclosed '[' in host")?;
             match after.strip_prefix(':') {
                 Some(p) => (h, Some(p)),
@@ -43,14 +56,32 @@ impl Target {
                 None => (rest, None),
             }
         };
-        if host.is_empty() {
+        if alias.is_empty() {
             bail!("empty host in {s:?}");
         }
         let parsed_port = parsed_port.map(|p| p.parse::<u16>().context("invalid port")).transpose()?;
+        let cfg = home.map(|h| config::lookup(h, alias)).unwrap_or_default();
+
+        let host = cfg.hostname.map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
+        let user = match user.or(cfg.user) {
+            Some(u) => u,
+            None => local_user()?,
+        };
+        let identity_files = match home {
+            Some(home) => {
+                let local = local_user().unwrap_or_default();
+                cfg.identity_files
+                    .iter()
+                    .map(|f| config::expand_path(f, home, &host, &user, &local))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         Ok(Target {
             user,
-            host: host.to_string(),
-            port: port.or(parsed_port).unwrap_or(crate::DEFAULT_PORT),
+            host,
+            port: port.or(parsed_port).or(cfg.port).unwrap_or(crate::DEFAULT_PORT),
+            identity_files,
         })
     }
 }
@@ -73,11 +104,21 @@ fn default_identity_paths() -> Result<[PathBuf; 2]> {
     Ok([home.join(".ssh").join("id_ed25519"), qsh_dir(&home).join("id_ed25519")])
 }
 
-/// Loads the client key: `-i path`, else `~/.ssh/id_ed25519`, else `~/.config/qsh/id_ed25519`.
+/// Loads the client key: `-i path`, else the first Ed25519 `IdentityFile` from
+/// the config, else `~/.ssh/id_ed25519`, else `~/.config/qsh/id_ed25519`.
 /// With `create`, generates the latter when no key exists.
-pub fn load_identity(explicit: Option<&Path>, create: bool) -> Result<Identity> {
+pub fn load_identity(explicit: Option<&Path>, configured: &[PathBuf], create: bool) -> Result<Identity> {
     if let Some(p) = explicit {
         return Identity::load(p);
+    }
+    // Config entries may list RSA/ECDSA keys for ssh; skip those (without asking for a passphrase).
+    for p in configured {
+        if p.exists() {
+            if Identity::is_ed25519_file(p) {
+                return Identity::load(p);
+            }
+            tracing::debug!("skipping {}: not an ed25519 key", p.display());
+        }
     }
     let paths = default_identity_paths()?;
     if let Some(p) = paths.iter().find(|p| p.exists()) {
@@ -89,7 +130,7 @@ pub fn load_identity(explicit: Option<&Path>, create: bool) -> Result<Identity> 
         return Ok(id);
     }
     bail!(
-        "no key found ({} or {}); run `qsh keygen` or `qsh pair`",
+        "no ed25519 key found ({} or {}); run `qsh keygen` or `qsh pair`",
         paths[0].display(),
         paths[1].display()
     )
@@ -127,7 +168,7 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity) -> Result<C
 
 /// Connects, verifies the host key against known_hosts and logs in.
 pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
-    let id = load_identity(opts.identity.as_deref(), false)?;
+    let id = load_identity(opts.identity.as_deref(), &target.identity_files, false)?;
     let conn = open(target, opts, &id).await?;
 
     let kh = known_hosts()?;
@@ -175,7 +216,7 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
 
 /// Pairs this client with the server using a one-time code from `qshd pair`.
 pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<()> {
-    let id = load_identity(opts.identity.as_deref(), true)?;
+    let id = load_identity(opts.identity.as_deref(), &target.identity_files, true)?;
     let conn = open(target, opts, &id).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Pair { version: VERSION, user: target.user.clone() }).await?;
@@ -208,17 +249,38 @@ mod tests {
 
     #[test]
     fn parse_targets() {
-        let t = Target::parse("alice@example.com", None).unwrap();
+        let t = Target::parse_with("alice@example.com", None, None).unwrap();
         assert_eq!((t.user.as_str(), t.host.as_str(), t.port), ("alice", "example.com", crate::DEFAULT_PORT));
-        let t = Target::parse("bob@example.com:2200", None).unwrap();
+        let t = Target::parse_with("bob@example.com:2200", None, None).unwrap();
         assert_eq!(t.port, 2200);
-        let t = Target::parse("bob@example.com:2200", Some(99)).unwrap();
+        let t = Target::parse_with("bob@example.com:2200", Some(99), None).unwrap();
         assert_eq!(t.port, 99);
-        let t = Target::parse("c@[::1]:5", None).unwrap();
+        let t = Target::parse_with("c@[::1]:5", None, None).unwrap();
         assert_eq!((t.host.as_str(), t.port), ("::1", 5));
-        let t = Target::parse("c@[::1]", None).unwrap();
+        let t = Target::parse_with("c@[::1]", None, None).unwrap();
         assert_eq!(t.host, "::1");
-        assert!(Target::parse("@host", None).is_err());
-        assert!(Target::parse("a@host:notaport", None).is_err());
+        assert!(Target::parse_with("@host", None, None).is_err());
+        assert!(Target::parse_with("", None, None).is_err());
+        assert!(Target::parse_with("a@host:notaport", None, None).is_err());
+    }
+
+    #[test]
+    fn config_aliases() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::write(
+            home.path().join(".ssh/config"),
+            "Host myserver\n  Port 22\n  User root\n  HostName 192.0.2.10\n  IdentityFile ~/.ssh/work_key\n",
+        )
+        .unwrap();
+        let t = Target::parse_with("myserver", None, Some(home.path())).unwrap();
+        assert_eq!((t.user.as_str(), t.host.as_str(), t.port), ("root", "192.0.2.10", crate::DEFAULT_PORT));
+        assert_eq!(t.identity_files, vec![home.path().join(".ssh/work_key")]);
+        // Command line wins over the config.
+        let t = Target::parse_with("admin@myserver:9000", None, Some(home.path())).unwrap();
+        assert_eq!((t.user.as_str(), t.port), ("admin", 9000));
+        // Unknown names pass through unchanged.
+        let t = Target::parse_with("u@other", None, Some(home.path())).unwrap();
+        assert_eq!(t.host, "other");
     }
 }

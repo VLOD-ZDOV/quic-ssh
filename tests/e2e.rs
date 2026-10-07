@@ -387,3 +387,35 @@ fn killed_client_stops_remote_command() {
         }
     }
 }
+
+#[test]
+fn host_alias_from_config_files() {
+    let s = Server::start();
+    let c = Client::new();
+    // A custom-named key, as referenced by IdentityFile, authorized through the
+    // server's ~/.ssh/authorized_keys.
+    let key = c.home.path().join(".ssh/work_key");
+    assert!(c.run(&["keygen", "-f", key.to_str().unwrap()]).status.success());
+    let ssh_dir = s.home.path().join(".ssh");
+    std::fs::create_dir(&ssh_dir).unwrap();
+    std::fs::copy(key.with_extension("pub"), ssh_dir.join("authorized_keys")).unwrap();
+    // ~/.ssh/config supplies HostName/User/IdentityFile (its Port is the SSH
+    // port and must be ignored); ~/.config/qsh/config supplies the qsh port.
+    std::fs::write(
+        c.home.path().join(".ssh/config"),
+        format!("Host box\n  HostName 127.0.0.1\n  User {}\n  Port 22\n  IdentityFile ~/.ssh/work_key\n", user()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(c.home.path().join(".config/qsh")).unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host box\n  Port {}\n", s.port)).unwrap();
+
+    let out = c.run(&["--accept-new-host", "box", "echo", "alias-ok"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "alias-ok\n");
+
+    let local = c.home.path().join("note.txt");
+    std::fs::write(&local, "via alias").unwrap();
+    let out = c.run(&["cp", local.to_str().unwrap(), "box:note.txt"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(s.home.path().join("note.txt")).unwrap(), "via alias");
+}
