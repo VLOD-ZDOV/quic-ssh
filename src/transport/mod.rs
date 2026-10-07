@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
@@ -21,6 +21,8 @@ const EXPORTER_LABEL: &[u8] = b"EXPORTER-qsh-pair-v1";
 
 /// How long the client waits for QUIC before falling back to TCP.
 const QUIC_TIMEOUT: Duration = Duration::from_millis(2500);
+/// How long `--full` waits for qshd before handing over to ssh.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server-side limit for completing the TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -144,13 +146,87 @@ pub async fn connect(host: &str, port: u16, mode: Mode, tls: rustls::ClientConfi
             debug!("{}", errors.last().unwrap());
         }
     }
-    Err(anyhow!("cannot connect to {host}:{port}\n  {}", errors.join("\n  ")))
+    Err(Unreachable(format!("cannot connect to {host}:{port}\n  {}", errors.join("\n  "))).into())
 }
 
-/// Server listener bound to the same port on UDP (QUIC) and TCP.
+/// No qshd answered (as opposed to an authentication or host key failure).
+#[derive(Debug)]
+pub struct Unreachable(pub String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// QUIC-only connect for `qsh --full`, where the TCP port belongs to sshd.
+/// Tries every address and port in parallel and takes the first qshd that
+/// answers; gives up after [`PROBE_TIMEOUT`], or as soon as every UDP port
+/// turned out to be closed.
+pub async fn connect_probe(host: &str, ports: &[u16], tls: rustls::ClientConfig) -> Result<Conn> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut candidates = Vec::new();
+    for &port in ports {
+        let addrs = tokio::net::lookup_host((host, port)).await.with_context(|| format!("cannot resolve {host}"))?;
+        candidates.extend(addrs);
+    }
+    let tls = Arc::new(tls);
+    let mut attempts: FuturesUnordered<_> = candidates
+        .into_iter()
+        .map(|addr| {
+            let tls = tls.clone();
+            async move {
+                tokio::select! {
+                    r = tokio::time::timeout(PROBE_TIMEOUT, quic::connect(tls, addr)) => match r {
+                        Ok(Ok(conn)) => Ok(conn),
+                        Ok(Err(e)) => Err(format!("quic {addr}: {e:#}")),
+                        Err(_) => Err(format!("quic {addr}: no answer")),
+                    },
+                    () = udp_port_closed(addr) => Err(format!("quic {addr}: udp port closed")),
+                }
+            }
+        })
+        .collect();
+    let mut errors = Vec::new();
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(conn) => return Ok(conn),
+            Err(e) => errors.push(e),
+        }
+    }
+    let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+    Err(Unreachable(format!("no qshd at {host} (udp {})\n  {}", ports.join(", "), errors.join("\n  "))).into())
+}
+
+/// Resolves only if the host answers a datagram with ICMP port unreachable.
+async fn udp_port_closed(addr: SocketAddr) {
+    let bind: SocketAddr = if addr.is_ipv4() { ([0u8; 4], 0).into() } else { ([0u16; 8], 0).into() };
+    let probe = async {
+        let sock = tokio::net::UdpSocket::bind(bind).await?;
+        sock.connect(addr).await?;
+        // A single byte is ignored by a QUIC server (too short to be a packet).
+        sock.send(&[0]).await?;
+        let mut buf = [0u8; 1];
+        loop {
+            if let Err(e) = sock.recv(&mut buf).await {
+                if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    return std::io::Result::Ok(());
+                }
+                return Err(e);
+            }
+        }
+    };
+    if probe.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Server listener bound to the same port on UDP (QUIC) and, optionally, TCP.
 pub struct Listener {
     quic: quinn::Endpoint,
-    tcp: tokio::net::TcpListener,
+    tcp: Option<tokio::net::TcpListener>,
     tls: Arc<rustls::ServerConfig>,
 }
 
@@ -161,26 +237,43 @@ pub enum Incoming {
 }
 
 impl Listener {
-    pub async fn bind(addr: SocketAddr, tls: rustls::ServerConfig) -> Result<Listener> {
+    pub async fn bind(addr: SocketAddr, tls: rustls::ServerConfig, tcp: bool) -> Result<Listener> {
         let tls = Arc::new(tls);
         let quic = quic::server_endpoint(tls.clone(), addr)
             .with_context(|| format!("cannot listen on udp {addr}"))?;
-        // Port 0: put TCP on whatever port UDP got so both share one number.
-        let tcp_addr = SocketAddr::new(addr.ip(), quic.local_addr()?.port());
-        let tcp = tokio::net::TcpListener::bind(tcp_addr)
-            .await
-            .with_context(|| format!("cannot listen on tcp {tcp_addr}"))?;
+        let tcp = if tcp {
+            // Port 0: put TCP on whatever port UDP got so both share one number.
+            let tcp_addr = SocketAddr::new(addr.ip(), quic.local_addr()?.port());
+            Some(
+                tokio::net::TcpListener::bind(tcp_addr)
+                    .await
+                    .with_context(|| format!("cannot listen on tcp {tcp_addr}"))?,
+            )
+        } else {
+            None
+        };
         Ok(Listener { quic, tcp, tls })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.tcp.local_addr()?)
+        Ok(self.quic.local_addr()?)
+    }
+
+    /// Human-readable list of the active transports.
+    pub fn transports(&self) -> &'static str {
+        if self.tcp.is_some() { "quic + tcp" } else { "quic only" }
     }
 
     pub async fn accept(&self) -> Result<Incoming> {
+        let tcp_accept = async {
+            match &self.tcp {
+                Some(l) => l.accept().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             inc = self.quic.accept() => inc.map(|i| Incoming::Quic(Box::new(i))).context("quic endpoint closed"),
-            res = self.tcp.accept() => {
+            res = tcp_accept => {
                 let (sock, addr) = res?;
                 Ok(Incoming::Tcp(sock, addr, self.tls.clone()))
             }
@@ -189,6 +282,14 @@ impl Listener {
 }
 
 impl Incoming {
+    /// Drops the attempt without doing any handshake work.
+    pub fn reject(self) {
+        match self {
+            Incoming::Quic(i) => i.ignore(),
+            Incoming::Tcp(..) => {}
+        }
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         match self {
             Incoming::Quic(i) => i.remote_address(),
@@ -209,16 +310,25 @@ impl Incoming {
 }
 
 /// Copies bytes both ways between a TCP socket and a stream, propagating half-closes.
-pub async fn splice(tcp: tokio::net::TcpStream, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
+pub async fn splice(tcp: tokio::net::TcpStream, send: SendHalf, recv: RecvHalf) -> Result<()> {
+    let (tr, tw) = tcp.into_split();
+    bridge(tr, tw, send, recv).await
+}
+
+/// Copies `r` → `send` and `recv` → `w` concurrently, shutting each writer down at EOF.
+pub async fn bridge<R, W>(mut r: R, mut w: W, mut send: SendHalf, mut recv: RecvHalf) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
-    let (mut tr, mut tw) = tcp.into_split();
     let up = async {
-        tokio::io::copy(&mut tr, &mut send).await?;
+        tokio::io::copy(&mut r, &mut send).await?;
         send.shutdown().await
     };
     let down = async {
-        tokio::io::copy(&mut recv, &mut tw).await?;
-        tw.shutdown().await
+        tokio::io::copy(&mut recv, &mut w).await?;
+        w.shutdown().await
     };
     tokio::try_join!(up, down)?;
     Ok(())

@@ -24,20 +24,40 @@ pub struct Target {
     /// Real host name (after `HostName` from the config).
     pub host: String,
     pub port: u16,
+    /// `--full` only: more ports where qshd may answer, tried in parallel with `port`.
+    pub alt_ports: Vec<u16>,
     /// `IdentityFile`s from the config, in order.
     pub identity_files: Vec<PathBuf>,
+    /// The destination for handing over to `ssh`: `[user@]alias`, as typed.
+    pub ssh_dest: String,
+    /// Port given on the command line (`-p` or `:port`), if any.
+    pub cli_port: Option<u16>,
+    /// `LocalForward`s from the config, as `-L` specs.
+    pub local_forwards: Vec<String>,
+    /// `RequestTTY` from the config.
+    pub request_tty: Option<String>,
+    /// The config routes this host through ProxyJump/ProxyCommand.
+    pub needs_proxy: bool,
+}
+
+/// Host names and aliases: no option-looking names, whitespace or control
+/// characters (they could reach ssh's argument list or %-expansions).
+fn valid_host(host: &str) -> bool {
+    !host.is_empty() && !host.starts_with('-') && !host.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 impl Target {
     /// Parses a destination and applies the matching config entries.
     /// Precedence: `-p`/`user@`/`:port` on the command line, then
-    /// `~/.config/qsh/config`, then `~/.ssh/config` (whose `Port` is ignored).
-    pub fn parse(s: &str, port: Option<u16>) -> Result<Target> {
-        Self::parse_with(s, port, home_dir().ok().as_deref())
+    /// `~/.config/qsh/config`, then `~/.ssh/config`. The latter's `Port` is
+    /// the SSH port and only used with `full` (`qsh --full`), where the
+    /// default port is 22 instead of 4422.
+    pub fn parse(s: &str, port: Option<u16>, full: bool) -> Result<Target> {
+        Self::parse_with(s, port, home_dir().ok().as_deref(), full)
     }
 
     /// Like [`Target::parse`], reading the configs under `home` (none if `None`).
-    pub fn parse_with(s: &str, port: Option<u16>, home: Option<&Path>) -> Result<Target> {
+    pub fn parse_with(s: &str, port: Option<u16>, home: Option<&Path>, full: bool) -> Result<Target> {
         let (user, rest) = match s.rsplit_once('@') {
             Some((u, r)) if !u.is_empty() => (Some(u.to_string()), r),
             Some(_) => bail!("empty user name in {s:?}"),
@@ -56,17 +76,27 @@ impl Target {
                 None => (rest, None),
             }
         };
-        if alias.is_empty() {
-            bail!("empty host in {s:?}");
+        if !valid_host(alias) {
+            bail!("invalid host {alias:?}");
         }
         let parsed_port = parsed_port.map(|p| p.parse::<u16>().context("invalid port")).transpose()?;
-        let cfg = home.map(|h| config::lookup(h, alias)).unwrap_or_default();
+        let cfg = home.map(|h| config::lookup(h, alias, full)).unwrap_or_default();
 
         let host = cfg.hostname.map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
+        if !valid_host(&host) {
+            bail!("invalid HostName {host:?} for {alias}");
+        }
+        let ssh_dest = match &user {
+            Some(u) => format!("{u}@{alias}"),
+            None => alias.to_string(),
+        };
         let user = match user.or(cfg.user) {
             Some(u) => u,
             None => local_user()?,
         };
+        if !crate::proto::valid_user_name(&user) {
+            bail!("invalid user name {user:?}");
+        }
         let identity_files = match home {
             Some(home) => {
                 let local = local_user().unwrap_or_default();
@@ -77,11 +107,30 @@ impl Target {
             }
             None => Vec::new(),
         };
+        let cli_port = port.or(parsed_port);
+        // An explicit qsh port (command line or ~/.config/qsh/config) is used as is.
+        // Otherwise `--full` looks for qshd both on the ssh port (UDP-only qshd
+        // next to sshd) and on the standard qsh port.
+        let (port, alt_ports) = match cli_port.or(cfg.port) {
+            Some(p) => (p, Vec::new()),
+            None if full => {
+                let ssh_port = cfg.ssh_port.unwrap_or(22);
+                let alt = if ssh_port == crate::DEFAULT_PORT { vec![] } else { vec![crate::DEFAULT_PORT] };
+                (ssh_port, alt)
+            }
+            None => (crate::DEFAULT_PORT, Vec::new()),
+        };
         Ok(Target {
             user,
             host,
-            port: port.or(parsed_port).or(cfg.port).unwrap_or(crate::DEFAULT_PORT),
+            port,
+            alt_ports,
             identity_files,
+            ssh_dest,
+            cli_port,
+            local_forwards: cfg.local_forwards,
+            request_tty: cfg.request_tty,
+            needs_proxy: cfg.needs_proxy,
         })
     }
 }
@@ -97,6 +146,56 @@ pub struct ConnectOptions {
     pub transport: Mode,
     /// Trust unknown host keys without asking (still refuses changed keys).
     pub accept_new_host: bool,
+    /// `qsh --full`: QUIC only, give up quickly so the caller can hand over to ssh.
+    pub full: bool,
+}
+
+/// Remembers for an hour that a host has no qshd, so `--full` goes straight to ssh.
+struct NoQshdCache {
+    path: PathBuf,
+}
+
+const NO_QSHD_TTL: u64 = 3600;
+
+impl NoQshdCache {
+    fn new() -> Result<NoQshdCache> {
+        Ok(NoQshdCache { path: qsh_dir(&home_dir()?).join("no-qshd") })
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn entries(&self) -> Vec<(String, u64)> {
+        std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (id, t) = l.rsplit_once(' ')?;
+                Some((id.to_string(), t.parse().ok()?))
+            })
+            .filter(|(_, t)| Self::now().saturating_sub(*t) < NO_QSHD_TTL)
+            .collect()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.entries().iter().any(|(e, _)| e == id)
+    }
+
+    fn set(&self, id: &str, present: bool) {
+        let mut entries: Vec<_> = self.entries().into_iter().filter(|(e, _)| e != id).collect();
+        if present {
+            entries.push((id.to_string(), Self::now()));
+        }
+        let text: String = entries.iter().map(|(e, t)| format!("{e} {t}\n")).collect();
+        if let Some(dir) = self.path.parent() {
+            let _ = crate::keys::create_private_dir(dir);
+        }
+        let _ = std::fs::write(&self.path, text);
+    }
 }
 
 fn default_identity_paths() -> Result<[PathBuf; 2]> {
@@ -161,7 +260,20 @@ fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
 
 async fn open(target: &Target, opts: &ConnectOptions, id: &Identity) -> Result<Conn> {
     let tls = crate::tls::client_config(id)?;
-    let conn = transport::connect(&target.host, target.port, opts.transport, tls).await?;
+    let conn = if opts.full {
+        // `--transport quic` forces a fresh attempt even for hosts cached as qshd-less.
+        let cache = NoQshdCache::new()?;
+        let hid = host_id(&target.host, target.port);
+        if opts.transport != Mode::Quic && cache.contains(&hid) {
+            return Err(transport::Unreachable(format!("no qshd at {hid} (cached for up to an hour)")).into());
+        }
+        let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
+        let result = transport::connect_probe(&target.host, &ports, tls).await;
+        cache.set(&hid, result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
+        result?
+    } else {
+        transport::connect(&target.host, target.port, opts.transport, tls).await?
+    };
     tracing::info!("connected to {} over {}", conn.remote_addr(), conn.transport_name());
     Ok(conn)
 }
@@ -172,7 +284,7 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     let conn = open(target, opts, &id).await?;
 
     let kh = known_hosts()?;
-    let hid = host_id(&target.host, target.port);
+    let hid = host_id(&target.host, conn.remote_addr().port());
     let key = conn.peer_key();
     match kh.lookup(&hid)? {
         Some(known) if known == key => {}
@@ -249,19 +361,19 @@ mod tests {
 
     #[test]
     fn parse_targets() {
-        let t = Target::parse_with("alice@example.com", None, None).unwrap();
+        let t = Target::parse_with("alice@example.com", None, None, false).unwrap();
         assert_eq!((t.user.as_str(), t.host.as_str(), t.port), ("alice", "example.com", crate::DEFAULT_PORT));
-        let t = Target::parse_with("bob@example.com:2200", None, None).unwrap();
+        let t = Target::parse_with("bob@example.com:2200", None, None, false).unwrap();
         assert_eq!(t.port, 2200);
-        let t = Target::parse_with("bob@example.com:2200", Some(99), None).unwrap();
+        let t = Target::parse_with("bob@example.com:2200", Some(99), None, false).unwrap();
         assert_eq!(t.port, 99);
-        let t = Target::parse_with("c@[::1]:5", None, None).unwrap();
+        let t = Target::parse_with("c@[::1]:5", None, None, false).unwrap();
         assert_eq!((t.host.as_str(), t.port), ("::1", 5));
-        let t = Target::parse_with("c@[::1]", None, None).unwrap();
+        let t = Target::parse_with("c@[::1]", None, None, false).unwrap();
         assert_eq!(t.host, "::1");
-        assert!(Target::parse_with("@host", None, None).is_err());
-        assert!(Target::parse_with("", None, None).is_err());
-        assert!(Target::parse_with("a@host:notaport", None, None).is_err());
+        assert!(Target::parse_with("@host", None, None, false).is_err());
+        assert!(Target::parse_with("", None, None, false).is_err());
+        assert!(Target::parse_with("a@host:notaport", None, None, false).is_err());
     }
 
     #[test]
@@ -273,14 +385,24 @@ mod tests {
             "Host myserver\n  Port 22\n  User root\n  HostName 192.0.2.10\n  IdentityFile ~/.ssh/work_key\n",
         )
         .unwrap();
-        let t = Target::parse_with("myserver", None, Some(home.path())).unwrap();
+        let t = Target::parse_with("myserver", None, Some(home.path()), false).unwrap();
         assert_eq!((t.user.as_str(), t.host.as_str(), t.port), ("root", "192.0.2.10", crate::DEFAULT_PORT));
         assert_eq!(t.identity_files, vec![home.path().join(".ssh/work_key")]);
         // Command line wins over the config.
-        let t = Target::parse_with("admin@myserver:9000", None, Some(home.path())).unwrap();
+        let t = Target::parse_with("admin@myserver:9000", None, Some(home.path()), false).unwrap();
         assert_eq!((t.user.as_str(), t.port), ("admin", 9000));
+        // --full: ssh's Port (22 here), and 22 by default.
+        let t = Target::parse_with("myserver", None, Some(home.path()), true).unwrap();
+        assert_eq!((t.port, t.alt_ports.as_slice(), t.ssh_dest.as_str()), (22, &[crate::DEFAULT_PORT][..], "myserver"));
+        assert_eq!(Target::parse_with("u@other", None, Some(home.path()), true).unwrap().port, 22);
+        // An explicit port means exactly that port.
+        assert!(Target::parse_with("myserver:2222", None, Some(home.path()), true).unwrap().alt_ports.is_empty());
+        // Option-looking or odd names never get through.
+        assert!(Target::parse_with("-oProxyCommand=x", None, None, false).is_err());
+        assert!(Target::parse_with("a$b@host", None, None, false).is_err());
+        assert!(Target::parse_with("u@ho st", None, None, false).is_err());
         // Unknown names pass through unchanged.
-        let t = Target::parse_with("u@other", None, Some(home.path())).unwrap();
+        let t = Target::parse_with("u@other", None, Some(home.path()), false).unwrap();
         assert_eq!(t.host, "other");
     }
 }

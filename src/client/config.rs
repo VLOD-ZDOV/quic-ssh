@@ -1,10 +1,12 @@
 //! Host aliases from `~/.config/qsh/config` and `~/.ssh/config` (ssh_config syntax).
 //!
 //! Supported: `Host` patterns (`*`, `?`, `!negation`), `HostName`, `User`,
-//! `Port`, `IdentityFile`, `Include`, `Match all`; the first value found wins
-//! (IdentityFile accumulates). Other `Match` blocks are skipped because their
-//! conditions are not evaluated. From `~/.ssh/config` the `Port` is ignored:
-//! it is the SSH port, not the qsh one.
+//! `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`, `Include`,
+//! `Match all`; the first value found wins (IdentityFile and LocalForward
+//! accumulate). Other `Match` blocks are skipped because their conditions are
+//! not evaluated. From `~/.ssh/config`, `Port`, `LocalForward` and
+//! `RequestTTY` are only used in `--full` mode (they describe the ssh session),
+//! and `ProxyJump`/`ProxyCommand` are noted so `--full` can hand such hosts to ssh.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +18,15 @@ pub struct HostConfig {
     pub hostname: Option<String>,
     pub user: Option<String>,
     pub port: Option<u16>,
+    /// `Port` from `~/.ssh/config` (only read in `--full` mode).
+    pub ssh_port: Option<u16>,
     pub identity_files: Vec<String>,
+    /// `LocalForward` entries as `-L` specs (`[bind:]port:host:hostport`).
+    pub local_forwards: Vec<String>,
+    /// `RequestTTY` (`yes`, `no`, `force`, `auto`).
+    pub request_tty: Option<String>,
+    /// The host goes through `ProxyJump`/`ProxyCommand`, which qsh cannot do.
+    pub needs_proxy: bool,
 }
 
 /// `fnmatch`-style match supporting `*` and `?`.
@@ -106,7 +116,8 @@ struct Parser<'a> {
     host: &'a str,
     /// Directory relative `Include` paths are resolved against.
     base: &'a Path,
-    use_port: bool,
+    /// Read the ssh-session settings (`Port`, `LocalForward`, `RequestTTY`).
+    full: bool,
     out: HostConfig,
 }
 
@@ -131,10 +142,22 @@ impl Parser<'_> {
                 }
                 "hostname" if self.out.hostname.is_none() => self.out.hostname = args.into_iter().next(),
                 "user" if self.out.user.is_none() => self.out.user = args.into_iter().next(),
-                "port" if self.use_port && self.out.port.is_none() => {
+                "port" if self.full && self.out.port.is_none() => {
                     self.out.port = args.first().and_then(|p| p.parse().ok());
                 }
                 "identityfile" => self.out.identity_files.extend(args.into_iter().take(1)),
+                // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
+                "localforward" if self.full && args.len() == 2 => {
+                    self.out.local_forwards.push(format!("{}:{}", args[0], args[1]));
+                }
+                "requesttty" if self.full && self.out.request_tty.is_none() => {
+                    self.out.request_tty = args.into_iter().next().map(|v| v.to_ascii_lowercase());
+                }
+                "proxyjump" | "proxycommand" => {
+                    if args.first().is_some_and(|v| !v.eq_ignore_ascii_case("none")) {
+                        self.out.needs_proxy = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -163,10 +186,11 @@ impl Parser<'_> {
     }
 }
 
-/// Collects the settings for `host` from config `text`. `use_port` is false
-/// for `~/.ssh/config`, whose `Port` is the SSH port.
-pub fn parse(text: &str, host: &str, base: &Path, use_port: bool) -> HostConfig {
-    let mut p = Parser { host, base, use_port, out: HostConfig::default() };
+/// Collects the settings for `host` from config `text`. `full` is false for
+/// `~/.ssh/config` outside `--full`: its `Port`, `LocalForward` and
+/// `RequestTTY` belong to the ssh session.
+pub fn parse(text: &str, host: &str, base: &Path, full: bool) -> HostConfig {
+    let mut p = Parser { host, base, full, out: HostConfig::default() };
     p.feed(text, 0);
     p.out
 }
@@ -202,17 +226,22 @@ pub fn expand_path(s: &str, home: &Path, host: &str, remote_user: &str, local_us
 }
 
 /// Settings for `host` from `~/.config/qsh/config` (first) and `~/.ssh/config`.
-pub fn lookup(home: &Path, host: &str) -> HostConfig {
+/// `full`: also take the ssh-session settings from `~/.ssh/config` (`qsh --full`).
+pub fn lookup(home: &Path, host: &str, full: bool) -> HostConfig {
     let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_dir = home.join(".ssh");
     let ours = parse(&read(qsh_dir.join("config")), host, &qsh_dir, true);
-    let ssh = parse(&read(ssh_dir.join("config")), host, &ssh_dir, false);
+    let ssh = parse(&read(ssh_dir.join("config")), host, &ssh_dir, full);
     HostConfig {
         hostname: ours.hostname.or(ssh.hostname),
         user: ours.user.or(ssh.user),
         port: ours.port,
+        ssh_port: ssh.port,
         identity_files: ours.identity_files.into_iter().chain(ssh.identity_files).collect(),
+        local_forwards: ours.local_forwards.into_iter().chain(ssh.local_forwards).collect(),
+        request_tty: ours.request_tty.or(ssh.request_tty),
+        needs_proxy: ours.needs_proxy || ssh.needs_proxy,
     }
 }
 
@@ -272,6 +301,18 @@ Host *
     }
 
     #[test]
+    fn full_mode_session_settings() {
+        let text = "Host a\n LocalForward 8000 localhost:80\n LocalForward 127.0.0.1:9000 db:5432\n RequestTTY force\n\
+                    Host b\n ProxyJump bastion\nHost c\n ProxyCommand none\n";
+        let c = parse(text, "a", Path::new("/x"), true);
+        assert_eq!(c.local_forwards, vec!["8000:localhost:80", "127.0.0.1:9000:db:5432"]);
+        assert_eq!(c.request_tty.as_deref(), Some("force"));
+        assert!(parse(text, "a", Path::new("/x"), false).local_forwards.is_empty());
+        assert!(parse(text, "b", Path::new("/x"), false).needs_proxy);
+        assert!(!parse(text, "c", Path::new("/x"), true).needs_proxy);
+    }
+
+    #[test]
     fn includes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("conf.d")).unwrap();
@@ -299,9 +340,13 @@ Host *
         std::fs::create_dir_all(&ours).unwrap();
         std::fs::write(ssh.join("config"), "Host myserver\n HostName 192.0.2.1\n User root\n Port 22\n").unwrap();
         std::fs::write(ours.join("config"), "Host myserver\n Port 8080\n User admin\n").unwrap();
-        let c = lookup(home.path(), "myserver");
+        let c = lookup(home.path(), "myserver", false);
         assert_eq!(c.hostname.as_deref(), Some("192.0.2.1"));
         assert_eq!(c.user.as_deref(), Some("admin"));
         assert_eq!(c.port, Some(8080));
+        // --full: ssh's Port is used when qsh's config has none.
+        std::fs::write(ours.join("config"), "Host other\n Port 1\n").unwrap();
+        assert_eq!(lookup(home.path(), "myserver", true).ssh_port, Some(22));
+        assert_eq!(lookup(home.path(), "myserver", false).ssh_port, None);
     }
 }

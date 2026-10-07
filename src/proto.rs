@@ -61,6 +61,15 @@ pub enum ServerMsg {
     Exit { code: Option<i32>, signal: Option<i32> },
 }
 
+/// Accepted user names: 1–64 of `[A-Za-z0-9._-]`, not starting with `-`.
+/// Keeps shell metacharacters, control characters and option-like names out
+/// of everything downstream (compare OpenSSH 10.1/10.6 username fixes).
+pub fn valid_user_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 pub async fn write_msg<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(w: &mut W, msg: &T) -> Result<()> {
     let body = postcard::to_stdvec(msg)?;
     let mut buf = Vec::with_capacity(body.len() + 4);
@@ -119,6 +128,16 @@ mod tests {
         assert_eq!(m, ServerMsg::Exit { code: Some(3), signal: None });
         writer.await.unwrap();
         assert!(read_msg_opt::<_, ServerMsg>(&mut b).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn user_names() {
+        for ok in ["root", "alice", "first.last", "svc_backup", "user-1"] {
+            assert!(valid_user_name(ok), "{ok}");
+        }
+        for bad in ["", "-oProxyCommand=x", "a b", "a$b", "a\\b", "a`id`", "a;b", "a\nb", "a/b", "a:b", &"x".repeat(65)] {
+            assert!(!valid_user_name(bad), "{bad:?}");
+        }
     }
 
     #[tokio::test]

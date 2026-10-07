@@ -5,7 +5,8 @@ mod files;
 pub mod helpers;
 mod users;
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
 use crate::keys::{qsh_dir, read_key_list_strict, Identity, PublicKey};
-use crate::proto::{read_msg, write_msg, Hello, Reply, Request, VERSION};
+use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use users::User;
 
@@ -33,14 +34,60 @@ struct State {
     host_key: PublicKey,
 }
 
+/// Counts connections that have not authenticated yet, in total and per IP,
+/// so a flood of half-open connections cannot lock out real users (the
+/// MaxStartups idea; compare pre-auth DoS issues like CVE-2025-26466).
+struct Startups {
+    total: usize,
+    per_ip: usize,
+    counts: std::sync::Mutex<(usize, HashMap<IpAddr, usize>)>,
+}
+
+/// A slot in [`Startups`], released on drop.
+struct Startup {
+    owner: Arc<Startups>,
+    ip: IpAddr,
+}
+
+impl Startups {
+    fn new(total: usize, per_ip: usize) -> Arc<Startups> {
+        Arc::new(Startups { total, per_ip, counts: Default::default() })
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<Startup> {
+        let ip = ip.to_canonical();
+        let mut c = self.counts.lock().unwrap();
+        let n = c.1.get(&ip).copied().unwrap_or(0);
+        if c.0 >= self.total || n >= self.per_ip {
+            return None;
+        }
+        c.0 += 1;
+        c.1.insert(ip, n + 1);
+        Some(Startup { owner: self.clone(), ip })
+    }
+}
+
+impl Drop for Startup {
+    fn drop(&mut self) {
+        let mut c = self.owner.counts.lock().unwrap();
+        c.0 -= 1;
+        if let Some(n) = c.1.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                c.1.remove(&self.ip);
+            }
+        }
+    }
+}
+
 /// Binds the configured address on UDP and TCP. If the default dual-stack
 /// address is unavailable (IPv6 disabled), falls back to IPv4.
 pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
     let tls = crate::tls::server_config(host)?;
-    match Listener::bind(cfg.listen, tls.clone()).await {
+    match Listener::bind(cfg.listen, tls.clone(), cfg.tcp).await {
         Err(e) if cfg.listen.ip() == Ipv6Addr::UNSPECIFIED => {
             debug!("dual-stack bind failed ({e:#}), using IPv4 only");
-            Listener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), cfg.listen.port()), tls).await
+            Listener::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), cfg.listen.port()), tls, cfg.tcp).await
         }
         other => other,
     }
@@ -48,19 +95,26 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Result<()> {
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
+    let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
     let state = Arc::new(State { cfg, host_key: host.public() });
     loop {
         let incoming = listener.accept().await?;
+        let addr = incoming.remote_addr();
         let Ok(permit) = limit.clone().try_acquire_owned() else {
-            warn!("connection limit reached, dropping {}", incoming.remote_addr());
+            warn!("connection limit reached, dropping {addr}");
+            incoming.reject();
+            continue;
+        };
+        let Some(startup) = startups.try_acquire(addr.ip()) else {
+            debug!("too many unauthenticated connections, dropping {addr}");
+            incoming.reject();
             continue;
         };
         let state = state.clone();
         tokio::spawn(async move {
-            let addr = incoming.remote_addr();
             match incoming.handshake().await {
                 Ok(conn) => {
-                    if let Err(e) = handle_conn(&conn, state).await {
+                    if let Err(e) = handle_conn(&conn, state, startup).await {
                         debug!("{addr}: {e:#}");
                     }
                     // Dropping a QUIC connection discards unsent data, so let the
@@ -89,7 +143,7 @@ fn authorize(state: &State, user: &User, key: PublicKey) -> bool {
     })
 }
 
-async fn handle_conn(conn: &Conn, state: Arc<State>) -> Result<()> {
+async fn handle_conn(conn: &Conn, state: Arc<State>, startup: Startup) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let (mut send, recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -108,7 +162,12 @@ async fn handle_conn(conn: &Conn, state: Arc<State>) -> Result<()> {
         Hello::Login { user, .. } => (user, false),
         Hello::Pair { user, .. } => (user, true),
     };
-    let user = match User::lookup(&name) {
+    let looked_up = if valid_user_name(&name) {
+        User::lookup(&name)
+    } else {
+        Err(anyhow::anyhow!("invalid user name"))
+    };
+    let user = match looked_up {
         Ok(u) => u,
         Err(e) => {
             warn!("{addr}: rejected user {name:?}: {e:#}");
@@ -129,6 +188,7 @@ async fn handle_conn(conn: &Conn, state: Arc<State>) -> Result<()> {
     }
     info!("{addr}: {name} logged in with {} over {}", key.fingerprint(), conn.transport_name());
     write_msg(&mut send, &Reply::Ok).await?;
+    drop(startup);
 
     let user = Arc::new(user);
     // Lets running sessions notice a dead connection even after the client
@@ -160,6 +220,11 @@ async fn handle_stream(
             if !state.cfg.allow_tcp_forwarding {
                 return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
             }
+            if user.switches() {
+                // Connect as the user, not as root, so uid-based firewall rules
+                // (iptables --uid-owner) apply (compare CVE-2016-10010).
+                return forward_as_user(send, recv, user, &host, port).await;
+            }
             let connect = tokio::net::TcpStream::connect((host.as_str(), port));
             match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(tcp)) => {
@@ -176,6 +241,33 @@ async fn handle_stream(
         }
         Request::Download { path } => files::download(send, user, &path).await,
     }
+}
+
+/// Port forwarding through `qshd internal-connect`, which runs as the user.
+async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, host: &str, port: u16) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut child = user
+        .helper(&["internal-connect", host, &port.to_string()])?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // The helper prints "ok" once connected; the rest of stdout is the socket's data.
+    let mut out = BufReader::new(child.stdout.take().expect("piped"));
+    let mut status = String::new();
+    out.read_line(&mut status).await?;
+    if status.trim() != "ok" {
+        let mut err = String::new();
+        if let Some(e) = child.stderr.take() {
+            let _ = e.take(4096).read_to_string(&mut err).await;
+        }
+        return write_msg(&mut send, &Reply::Err(err.trim().to_string())).await;
+    }
+    write_msg(&mut send, &Reply::Ok).await?;
+    let stdin = child.stdin.take().expect("piped");
+    let result = crate::transport::bridge(out, stdin, send, recv).await;
+    let _ = child.kill().await;
+    result
 }
 
 /// Runs a helper as the user and returns its trimmed stdout, or its stderr as the error.
@@ -231,4 +323,25 @@ async fn pair(conn: &Conn, state: &State, user: &User, mut send: SendHalf, mut r
     send.shutdown().await?;
     info!("{addr}: paired key {} for {}", key.fingerprint(), user.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_limits() {
+        let s = Startups::new(3, 2);
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let a1 = s.try_acquire(a).unwrap();
+        let _a2 = s.try_acquire(a).unwrap();
+        assert!(s.try_acquire(a).is_none(), "per-IP limit");
+        // IPv4-mapped IPv6 counts as the same address.
+        assert!(s.try_acquire("::ffff:192.0.2.1".parse().unwrap()).is_none());
+        let _b1 = s.try_acquire(b).unwrap();
+        assert!(s.try_acquire(b).is_none(), "total limit");
+        drop(a1);
+        assert!(s.try_acquire(b).is_some(), "slot released on drop");
+    }
 }

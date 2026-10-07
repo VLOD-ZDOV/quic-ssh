@@ -26,7 +26,8 @@ fn upload_target(path: &str, name: &str) -> Result<PathBuf> {
 
 /// Receives exactly `size` bytes from stdin into the target file.
 pub fn recv(path: &str, name: &str, size: u64, mode: &str) -> Result<()> {
-    let mode = u32::from_str_radix(mode, 8).context("invalid mode")? & 0o7777;
+    // No setuid/setgid/sticky bits from the network (compare OpenSSH 10.3's scp fix).
+    let mode = u32::from_str_radix(mode, 8).context("invalid mode")? & 0o777;
     let target = upload_target(path, name)?;
     let mut f = OpenOptions::new()
         .write(true)
@@ -58,6 +59,42 @@ pub fn send(path: &str) -> Result<()> {
     out.write_all(&(meta.mode() & 0o7777).to_be_bytes())?;
     io::copy(&mut Read::take(&mut f, meta.len()), &mut out)?;
     out.flush()?;
+    Ok(())
+}
+
+/// Connects to `host:port` and relays stdin/stdout to the socket (port
+/// forwarding as the user). Prints "ok" first, or an error on stderr.
+pub fn connect(host: &str, port: u16) -> Result<()> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+    let mut last = None;
+    let mut sock = None;
+    for addr in (host, port).to_socket_addrs().with_context(|| format!("connect {host}:{port}"))? {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let sock = match (sock, last) {
+        (Some(s), _) => s,
+        (None, Some(e)) => bail!("connect {host}:{port}: {e}"),
+        (None, None) => bail!("connect {host}:{port}: no addresses"),
+    };
+    let _ = sock.set_nodelay(true);
+    let mut out = io::stdout();
+    writeln!(out, "ok")?;
+    out.flush()?;
+    let mut to_sock = sock.try_clone()?;
+    let upstream = std::thread::spawn(move || {
+        let _ = io::copy(&mut io::stdin().lock(), &mut to_sock);
+        let _ = to_sock.shutdown(std::net::Shutdown::Write);
+    });
+    let mut from_sock = sock;
+    let _ = io::copy(&mut from_sock, &mut io::stdout().lock());
+    let _ = upstream.join();
     Ok(())
 }
 

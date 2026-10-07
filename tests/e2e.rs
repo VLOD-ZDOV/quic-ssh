@@ -48,12 +48,16 @@ impl Server {
 
     /// `config` is written to qshd.toml; `listen_ip` lets a test leave UDP unanswered.
     fn start_with(listen_ip: &str, config: &str) -> Server {
+        Self::start_listen(&format!("{listen_ip}:0"), config)
+    }
+
+    fn start_listen(listen: &str, config: &str) -> Server {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join(".config/qsh");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("qshd.toml"), config).unwrap();
         let mut child = Command::new(QSHD)
-            .args(["serve", "--listen", &format!("{listen_ip}:0")])
+            .args(["serve", "--listen", listen])
             .env("HOME", home.path())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -395,7 +399,7 @@ fn host_alias_from_config_files() {
     // A custom-named key, as referenced by IdentityFile, authorized through the
     // server's ~/.ssh/authorized_keys.
     let key = c.home.path().join(".ssh/work_key");
-    assert!(c.run(&["keygen", "-f", key.to_str().unwrap()]).status.success());
+    assert!(c.run(&["keygen", key.to_str().unwrap()]).status.success());
     let ssh_dir = s.home.path().join(".ssh");
     std::fs::create_dir(&ssh_dir).unwrap();
     std::fs::copy(key.with_extension("pub"), ssh_dir.join("authorized_keys")).unwrap();
@@ -418,4 +422,290 @@ fn host_alias_from_config_files() {
     let out = c.run(&["cp", local.to_str().unwrap(), "box:note.txt"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(std::fs::read_to_string(s.home.path().join("note.txt")).unwrap(), "via alias");
+}
+
+// ---------------------------------------------------------------------------
+// `--full`: OpenSSH config compatibility and handover to ssh/scp.
+
+/// A fake `ssh`/`scp` that records its arguments, put first in PATH.
+fn fake_openssh(dir: &std::path::Path) -> (String, PathBuf) {
+    let log = dir.join("openssh-args");
+    for tool in ["ssh", "scp"] {
+        let script = dir.join(tool);
+        std::fs::write(&script, format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\nexit 7\n", log.display())).unwrap();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&script).unwrap().permissions(), 0o755);
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+    (path, log)
+}
+
+/// A UDP port with nothing listening (the kernel answers with ICMP unreachable).
+fn closed_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+#[test]
+fn full_mode_uses_qshd_on_ssh_port_and_config() {
+    // qshd on UDP only, as it would run on port 22 next to sshd.
+    let s = Server::start_with("127.0.0.1", "tcp = false\n");
+    let c = Client::paired(&s);
+    let fwd_target = echo_server();
+    let fwd_local = free_port();
+    std::fs::create_dir_all(c.home.path().join(".ssh")).unwrap();
+    std::fs::write(
+        c.home.path().join(".ssh/config"),
+        format!(
+            "Host box\n  HostName 127.0.0.1\n  Port {}\n  User {}\n  LocalForward {fwd_local} 127.0.0.1:{fwd_target}\n",
+            s.port,
+            user()
+        ),
+    )
+    .unwrap();
+    // Without --full the ssh Port is ignored and nothing listens on 4422.
+    let out = c.run(&["--accept-new-host", "--transport", "quic", "box", "true"]);
+    assert!(!out.status.success());
+    // With --full: Port and LocalForward come from ~/.ssh/config.
+    let mut child = c
+        .cmd(&["-f", "--accept-new-host", "box", "sleep", "5"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        if let Ok(sock) = std::net::TcpStream::connect(("127.0.0.1", fwd_local)) {
+            break sock;
+        }
+        assert!(Instant::now() < deadline, "LocalForward from ~/.ssh/config did not come up");
+        sleep(Duration::from_millis(50));
+    };
+    sock.write_all(b"cfg").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "echo:cfg");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let out = c.run(&["-f", "box", "echo", "via-qsh"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "via-qsh\n");
+}
+
+/// The common setup: qshd on its standard port 4422, sshd's port (22) in
+/// ~/.ssh/config. `--full` must find qshd on 4422 instead of falling back to ssh.
+#[test]
+fn full_mode_finds_qshd_on_standard_port() {
+    if UdpSocket::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() || TcpListener::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() {
+        eprintln!("skipped: port {} is in use on this machine", qsh::DEFAULT_PORT);
+        return;
+    }
+    let s = Server::start_listen(&format!("127.0.0.1:{}", qsh::DEFAULT_PORT), "");
+    let c = Client::paired(&s);
+    let bin = tempfile::tempdir().unwrap();
+    let (path, log) = fake_openssh(bin.path());
+    std::fs::create_dir_all(c.home.path().join(".ssh")).unwrap();
+    // Port 22 here is sshd's; nothing qsh-related listens on UDP 22.
+    std::fs::write(c.home.path().join(".ssh/config"), format!("Host std\n  HostName 127.0.0.1\n  Port 22\n  User {}\n", user())).unwrap();
+    let out = c.cmd(&["-f", "-v", "std", "echo", "quic-on-4422"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "quic-on-4422\n");
+    assert!(stderr(&out).contains("over quic"), "{}", stderr(&out));
+    assert!(!log.exists(), "ssh was used instead of qshd");
+}
+
+#[test]
+fn full_mode_hands_over_to_ssh_and_scp() {
+    let c = Client::new();
+    assert!(c.run(&["keygen"]).status.success());
+    let bin = tempfile::tempdir().unwrap();
+    let (path, log) = fake_openssh(bin.path());
+    let port = closed_udp_port();
+    std::fs::create_dir_all(c.home.path().join(".ssh")).unwrap();
+    std::fs::write(
+        c.home.path().join(".ssh/config"),
+        format!("Host plain\n  HostName 127.0.0.1\n  Port {port}\nHost jumped\n  HostName 127.0.0.1\n  ProxyJump bastion\n"),
+    )
+    .unwrap();
+    // Pin the qsh port too, so a qshd on 4422 from a parallel test is not found.
+    std::fs::create_dir_all(c.home.path().join(".config/qsh")).unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host plain\n  Port {port}\n")).unwrap();
+    let run = |args: &[&str]| c.cmd(args).env("PATH", &path).output().unwrap();
+
+    // No qshd on the UDP port: closed ports are detected at once, not after a timeout.
+    let start = Instant::now();
+    let out = run(&["-f", "-t", "-L", "9000:db:5432", "plain", "uname", "-a"]);
+    assert_eq!(out.status.code(), Some(7), "exit code of ssh is passed through");
+    assert!(start.elapsed() < Duration::from_millis(900), "took {:?}", start.elapsed());
+    // Hosts behind ProxyJump go straight to ssh.
+    run(&["-f", "jumped", "id"]);
+    // `cp` hands over to scp.
+    run(&["-f", "-p", "2200", "cp", "local.txt", "plain:remote.txt"]);
+    // The second attempt uses the "no qshd here" cache.
+    run(&["-f", "plain", "true"]);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(lines[0], "ssh -L 9000:db:5432 -t -- plain uname -a");
+    assert_eq!(lines[1], "ssh -- jumped id");
+    assert_eq!(lines[2], "scp -P 2200 -- local.txt plain:remote.txt");
+    assert_eq!(lines[3], "ssh -- plain true");
+    assert!(c.home.path().join(".config/qsh/no-qshd").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests derived from OpenSSH vulnerabilities (see docs/openssh-cve-review.md).
+
+/// CVE-2006-0225, CVE-2020-15778: scp passed paths through a shell.
+#[test]
+fn cve_cp_paths_are_not_shell_evaluated() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let local = c.home.path().join("f.txt");
+    std::fs::write(&local, "x").unwrap();
+    let evil = "a$(touch PWNED1)`touch PWNED2`;touch PWNED3";
+    let out = c.run(&["cp", "-p", &port, local.to_str().unwrap(), &format!("{}:{evil}", dest())]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(s.home.path().join(evil).exists(), "file is stored under the literal name");
+    let out = c.run(&["cp", "-p", &port, &format!("{}:$(touch PWNED4)", dest()), c.home.path().to_str().unwrap()]);
+    assert!(!out.status.success());
+    for n in 1..=4 {
+        let name = format!("PWNED{n}");
+        assert!(!s.home.path().join(&name).exists() && !c.home.path().join(&name).exists(), "{name} was created");
+    }
+}
+
+/// OpenSSH 10.3: scp kept setuid/setgid bits on downloaded files.
+#[test]
+fn cve_download_strips_setuid_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let remote = s.home.path().join("suid");
+    std::fs::write(&remote, "x").unwrap();
+    std::fs::set_permissions(&remote, std::fs::Permissions::from_mode(0o6755)).unwrap();
+    let local = c.home.path().join("suid");
+    let out = c.run(&["cp", "-p", &s.port.to_string(), &format!("{}:suid", dest()), local.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::metadata(&local).unwrap().permissions().mode() & 0o7000, 0);
+}
+
+/// OpenSSH 10.4/10.6: a download could land outside the intended directory.
+#[test]
+fn cve_download_target_stays_in_destination() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::create_dir(s.home.path().join("dir")).unwrap();
+    let into = c.home.path().join("into");
+    std::fs::create_dir(&into).unwrap();
+    for remote in ["dir/..", ".", "dir/."] {
+        let out = c.run(&["cp", "-p", &s.port.to_string(), &format!("{}:{remote}", dest()), into.to_str().unwrap()]);
+        assert!(!out.status.success(), "{remote} was accepted");
+    }
+    assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+}
+
+/// OpenSSH 10.0: DisableForwarding did not disable everything it should.
+#[test]
+fn cve_forwarding_can_be_disabled() {
+    let s = Server::start_with("127.0.0.1", "allow_tcp_forwarding = false\n");
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let local = free_port();
+    let spec = format!("{local}:127.0.0.1:{target}");
+    let mut child = c.cmd(&["-p", &s.port.to_string(), "-N", "-L", &spec, &dest()]).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        if let Ok(sock) = std::net::TcpStream::connect(("127.0.0.1", local)) {
+            break sock;
+        }
+        assert!(Instant::now() < deadline, "listener did not come up");
+        sleep(Duration::from_millis(50));
+    };
+    let _ = sock.write_all(b"ping");
+    let _ = sock.shutdown(std::net::Shutdown::Write);
+    let mut reply = Vec::new();
+    let _ = sock.read_to_end(&mut reply);
+    assert!(reply.is_empty(), "data was forwarded although forwarding is disabled");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// CVE-2025-26465 class: an error while checking the host key must not skip the check.
+#[test]
+fn cve_host_key_errors_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let kh = c.home.path().join(".config/qsh/known_hosts");
+    std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), &dest(), "echo", "ran"]);
+    std::fs::set_permissions(&kh, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!out.status.success());
+    assert!(!stdout(&out).contains("ran"));
+}
+
+/// CVE-2018-15473, CVE-2016-6210: user enumeration through different answers or timing.
+#[test]
+fn cve_no_user_enumeration() {
+    let s = Server::start();
+    let c = Client::new();
+    assert!(c.run(&["keygen"]).status.success());
+    let port = s.port.to_string();
+    let attempt = |who: &str| {
+        let start = Instant::now();
+        let out = c.run(&["--accept-new-host", "--transport", "tcp", "-p", &port, &format!("{who}@127.0.0.1"), "true"]);
+        (start.elapsed(), stderr(&out))
+    };
+    let (mut known, mut unknown) = (Vec::new(), Vec::new());
+    for _ in 0..15 {
+        let (t, e) = attempt(&user());
+        known.push((t, e));
+        let (t, e) = attempt("qsh-no-such-user");
+        unknown.push((t, e));
+    }
+    // The server's answer is the same; only the echoed user name in the local hint differs.
+    let msg = |e: &str| {
+        let line = e.lines().find(|l| l.starts_with("qsh:")).unwrap_or("").to_string();
+        line.split(" for ").next().unwrap_or("").to_string()
+    };
+    assert!(msg(&known[0].1).contains("access denied"), "{}", known[0].1);
+    assert_eq!(msg(&known[0].1), msg(&unknown[0].1));
+    let median = |v: &mut Vec<(Duration, String)>| {
+        v.sort_by_key(|x| x.0);
+        v[v.len() / 2].0
+    };
+    let (k, u) = (median(&mut known), median(&mut unknown));
+    eprintln!("median time: existing user {k:?}, unknown user {u:?}");
+    let diff = k.abs_diff(u);
+    assert!(diff < Duration::from_millis(15), "timing differs by {diff:?}");
+}
+
+/// CVE-2025-26466 class: unauthenticated connections from one address must not lock out others.
+#[test]
+fn cve_preauth_flood_is_contained() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // 60 TCP connections from 127.0.0.2 that never start TLS.
+    let flood: Vec<tokio::net::TcpStream> = rt.block_on(async {
+        let mut v = Vec::new();
+        for _ in 0..60 {
+            let sock = tokio::net::TcpSocket::new_v4().unwrap();
+            sock.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+            if let Ok(conn) = sock.connect(([127, 0, 0, 1], port).into()).await {
+                v.push(conn);
+            }
+        }
+        v
+    });
+    assert!(flood.len() >= 50, "flood connections were not established");
+    sleep(Duration::from_millis(300));
+    // A real user from another address still gets in, over both transports.
+    for t in ["quic", "tcp"] {
+        let out = exec(&c, &s, t, "echo still-ok");
+        assert!(out.status.success(), "{t}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "still-ok\n");
+    }
+    drop(flood);
 }

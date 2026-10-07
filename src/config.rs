@@ -11,6 +11,9 @@ use serde::Deserialize;
 pub struct ServerConfig {
     /// Address for both UDP (QUIC) and TCP.
     pub listen: SocketAddr,
+    /// Also accept the TLS-over-TCP fallback. With `false` qshd listens on UDP
+    /// only, so it can share a port number with sshd (e.g. 22) for `qsh --full`.
+    pub tcp: bool,
     /// Host key path; defaults to `host_ed25519` next to the config file.
     pub host_key: Option<PathBuf>,
     /// Also accept keys from `~/.ssh/authorized_keys`.
@@ -19,16 +22,23 @@ pub struct ServerConfig {
     pub allow_tcp_forwarding: bool,
     /// Maximum simultaneous connections.
     pub max_connections: usize,
+    /// Maximum connections that have not authenticated yet (like sshd's MaxStartups).
+    pub max_startups: usize,
+    /// Maximum unauthenticated connections from one IP address.
+    pub max_startups_per_ip: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             listen: SocketAddr::from(([0u16; 8], crate::DEFAULT_PORT)),
+            tcp: true,
             host_key: None,
             use_ssh_authorized_keys: true,
             allow_tcp_forwarding: true,
             max_connections: 256,
+            max_startups: 64,
+            max_startups_per_ip: 8,
         }
     }
 }

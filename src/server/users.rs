@@ -6,6 +6,30 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use nix::unistd::{geteuid, getgrouplist, Gid, Group, User as PwUser};
 
+/// Whether the account's expiry date (`chage -E`, `usermod -e`) has passed,
+/// checked the way pam_unix does: `sp_expire` is set and today is on or after
+/// it. Without a readable shadow entry the account counts as not expired.
+fn account_expired(name: &str) -> bool {
+    let Ok(cname) = CString::new(name) else { return true };
+    // SAFETY: getspnam_r fills `entry` using `buf`; both outlive the call and
+    // `found` is checked before `entry` is used.
+    let entry = unsafe {
+        let mut entry: libc::spwd = std::mem::zeroed();
+        let mut buf = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::spwd = std::ptr::null_mut();
+        let rc = libc::getspnam_r(cname.as_ptr(), &mut entry, buf.as_mut_ptr(), buf.len(), &mut found);
+        if rc != 0 || found.is_null() {
+            return false;
+        }
+        entry.sp_expire
+    };
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0) as libc::c_long;
+    entry != -1 && today >= entry
+}
+
 /// A user sessions run as.
 #[derive(Clone, Debug)]
 pub struct User {
@@ -33,6 +57,9 @@ impl User {
             // Same home the rest of this process (and `qshd pair`) uses.
             crate::keys::home_dir()?
         };
+        if switch && account_expired(name) {
+            bail!("account {name:?} has expired");
+        }
         let groups = if switch {
             let cname = CString::new(name)?;
             getgrouplist(&cname, pw.gid)?.into_iter().map(Gid::as_raw).collect()
@@ -49,6 +76,11 @@ impl User {
             groups,
             switch,
         })
+    }
+
+    /// True when the server runs as root and switches to this user.
+    pub fn switches(&self) -> bool {
+        self.switch
     }
 
     /// Base environment for the user's processes.

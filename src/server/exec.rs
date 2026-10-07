@@ -18,7 +18,9 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Client variables passed through to the session (like sshd's AcceptEnv).
 fn accept_env(name: &str) -> bool {
-    matches!(name, "LANG" | "COLORTERM") || name.starts_with("LC_")
+    // Only plain names: no `=`, NUL or other tricks (compare CVE-2014-2532).
+    let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    plain && (matches!(name, "LANG" | "COLORTERM") || name.starts_with("LC_"))
 }
 
 pub async fn run(
@@ -240,4 +242,17 @@ async fn supervise(
     drop(tx);
     let _ = writer.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_env;
+
+    #[test]
+    fn env_filter() {
+        assert!(accept_env("LANG") && accept_env("LC_ALL") && accept_env("COLORTERM"));
+        for bad in ["LD_PRELOAD", "PATH", "LC_X=LD_PRELOAD", "LC_\0", "LC_ ", "", "BASH_ENV"] {
+            assert!(!accept_env(bad), "{bad:?}");
+        }
+    }
 }

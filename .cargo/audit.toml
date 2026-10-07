@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # rsa "Marvin attack": rsa is an optional dependency of ssh-key that qsh
+    # never enables (qsh only supports Ed25519). It is listed in Cargo.lock
+    # but never compiled into qsh; `cargo tree -i rsa` prints nothing.
+    "RUSTSEC-2023-0071",
+]

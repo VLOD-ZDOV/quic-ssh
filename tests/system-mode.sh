@@ -131,6 +131,13 @@ check "group-writable authorized_keys is refused" bash -c "! HOME='$T/client' '$
 chmod 600 "$BOB_HOME/.config/qsh/authorized_keys"
 OUT=$(q qsh-bob@127.0.0.1 id -u 2>&1 || true)
 check "bob logs in once the file is safe" test "$OUT" = "$BOB_UID"
+if [[ -n ${QSH_TEST_NS:-} ]]; then
+    echo "  skip expired account is refused (needs real root and /etc/shadow)"
+else
+    usermod -e 1 qsh-bob
+    check "expired account is refused" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-bob@127.0.0.1 true </dev/null 2>/dev/null"
+    usermod -e '' qsh-bob
+fi
 
 # --- file copy ----------------------------------------------------------------------
 head -c 3000000 /dev/urandom > "$T/payload"
@@ -148,6 +155,33 @@ chmod 600 "$T/secret"
 check "download of a root-only file is denied" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-alice@127.0.0.1:$T/secret' '$T/stolen' 2>/dev/null"
 check "no file was created locally" test ! -e "$T/stolen"
 check "alice cannot read bob's home" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-alice@127.0.0.1:$BOB_HOME/.config/qsh/authorized_keys' '$T/x' 2>/dev/null"
+
+# --- port forwarding runs as the user (compare CVE-2016-10010) ------------------------
+# A listener that reports its port and holds one connection open.
+python3 - "$T/fwd_port" <<'PY' &
+import socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+c, _ = s.accept()
+time.sleep(5)
+PY
+LISTENER_PID=$!
+for _ in $(seq 50); do [[ -s "$T/fwd_port" ]] && break; sleep 0.1; done
+FWD_TARGET=$(cat "$T/fwd_port")
+FWD_LOCAL=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+HOME="$T/client" "$QSH" -p "$PORT" -N -L "$FWD_LOCAL:127.0.0.1:$FWD_TARGET" qsh-alice@127.0.0.1 < /dev/null 2>/dev/null &
+FWD_PID=$!
+for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$FWD_LOCAL) 2>/dev/null && break; sleep 0.1; done
+exec 3<>"/dev/tcp/127.0.0.1/$FWD_LOCAL"
+sleep 0.5
+# Owner uid (field 8 of /proc/net/tcp) of the socket that connected to the listener.
+TARGET_HEX=$(printf '%04X' "$FWD_TARGET")
+FWD_UID=$(awk -v p=":$TARGET_HEX" '$3 ~ p"$" && $4 == "01" {print $8; exit}' /proc/net/tcp)
+check "forwarded connection is made as alice, not root" test "$FWD_UID" = "$ALICE_UID"
+exec 3>&-
+kill "$FWD_PID" "$LISTENER_PID" 2>/dev/null || true
 
 # --- PTY ------------------------------------------------------------------------------
 # `script` gives qsh a terminal; markers keep the values apart from terminal noise.

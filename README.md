@@ -114,7 +114,8 @@ qsh cp user@host:logs/app.log .        # download
 qsh -p 2222 user@host                  # another port (or user@host:2222)
 qsh --transport tcp user@host          # force TCP (or quic)
 qsh -v user@host                       # show which transport is used
-qsh keygen                             # create ~/.config/qsh/id_ed25519
+qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
+qsh -f myserver                        # OpenSSH-compatible mode, see below
 ```
 
 The client key is chosen in this order: `-i FILE`, then the first Ed25519 `IdentityFile` from the config (see below), then `~/.ssh/id_ed25519`, then `~/.config/qsh/id_ed25519`. An encrypted key prompts for its passphrase.
@@ -144,7 +145,23 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RequestTTY`, `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+
+### OpenSSH-compatible mode (`-f`, `--full`)
+
+With `-f`, qsh behaves like a drop-in for `ssh`:
+
+- It also reads `Port`, `LocalForward` and `RequestTTY` from `~/.ssh/config`. Without `-f`, these describe the ssh session and are ignored.
+- It looks for qshd **both** on the ssh port (default 22) **and** on 4422, in parallel, and uses whichever answers. On 22, qshd can run UDP-only next to sshd (`tcp = false` in the server config). An explicit qsh port (`-p`, `:port` or `Port` in `~/.config/qsh/config`) means only that port is tried.
+- If no qshd answers within 1 s, or the host is configured with `ProxyJump`/`ProxyCommand` (which qsh cannot do), qsh runs the regular **`ssh`** (or **`scp`** for `qsh -f cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
+- Hosts without qshd are remembered for an hour, so later connections go straight to ssh. `--transport quic` forces a new check.
+- A wrong host key or a refused login never falls back to ssh.
+
+```sh
+qsh -f myserver                 # QUIC if qshd is there, otherwise plain ssh
+qsh -f -v myserver              # prints which one was used
+alias ssh='qsh -f'              # if you want it everywhere
+```
 
 ## Server configuration
 
@@ -161,6 +178,9 @@ listen = "[::]:4422"            # UDP and TCP; falls back to 0.0.0.0 if IPv6 is 
 use_ssh_authorized_keys = true  # also accept ~/.ssh/authorized_keys
 allow_tcp_forwarding = true
 max_connections = 256
+max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
+max_startups_per_ip = 8         # ... from one IP address
+tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh -f`
 ```
 
 User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. Only `ssh-ed25519` lines count. Lines with options (`from=`, `command=` and so on) are **ignored**, because qsh cannot enforce those restrictions.
@@ -215,14 +235,18 @@ python3 bench/bench.py
 - **The client** logs in with mutual TLS using its Ed25519 key. The signature is checked inside the TLS handshake, so the login is bound to the channel. There are no passwords at all.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code is single-use (burned after the first attempt, even a failed one) and expires after 10 minutes.
 - **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules.
-- **Resource limits:** handshake and hello timeouts, connection and stream limits, 60 s idle timeout.
+- **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout.
+- **Port forwarding** in system mode connects as the user, not as root, so firewall rules based on uid apply. Accounts whose expiry date has passed (`chage -E`, `usermod -e`) are refused.
 - **Disconnects:** if the client goes away, the session's whole process group gets SIGHUP, then SIGKILL after 2 s. Unlike ssh, a command without a PTY does not keep running unattended. On SIGINT/SIGTERM/SIGHUP the client closes the connection cleanly, so the server knows right away instead of waiting for the timeout.
 
-This is a young project and has not had an external audit. For critical systems, keep regular ssh as a fallback way in.
+All OpenSSH security advisories since 2006 have been checked against qsh. Each one is either not applicable, covered by a test that reproduces the attack, or fixed; see [docs/openssh-cve-review.md](docs/openssh-cve-review.md). Dependencies are checked with `cargo audit` in CI.
+
+This is still a young project and has not had an external audit. For critical systems, keep regular ssh as a fallback way in.
 
 ## Limitations
 
-- No PAM, utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login).
+- No PAM (2FA, `pam_access`, `pam_limits`), utmp/wtmp or `systemd-logind` sessions (`loginctl` will not show the login).
+- No keystroke timing obfuscation in interactive sessions (OpenSSH has had it since 9.5).
 - No agent forwarding, X11, `-R` or recursive `cp -r`.
 - Linux/Unix only.
 

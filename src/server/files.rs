@@ -29,7 +29,7 @@ pub async fn upload(
     mode: u32,
 ) -> Result<()> {
     let mut child = user
-        .helper(&["internal-recv", path, name, &size.to_string(), &format!("{:o}", mode & 0o7777)])?
+        .helper(&["internal-recv", path, name, &size.to_string(), &format!("{:o}", mode & 0o777)])?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

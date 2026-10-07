@@ -39,6 +39,8 @@ enum Cmd {
     InternalPairTake,
     #[command(hide = true)]
     InternalAddKey { line: String },
+    #[command(hide = true)]
+    InternalConnect { host: String, port: u16 },
 }
 
 fn is_root() -> bool {
@@ -72,6 +74,7 @@ fn main() {
         Some(Cmd::InternalSend { path }) => helpers::send(&path),
         Some(Cmd::InternalPairTake) => helpers::pair_take(),
         Some(Cmd::InternalAddKey { line }) => helpers::add_key(&line),
+        Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair) => pair(cli.config),
         Some(Cmd::Serve { listen }) => serve(cli.config, listen),
@@ -88,7 +91,7 @@ fn init(config: Option<PathBuf>) -> Result<()> {
     let id = host_key(&key_path)?;
     println!("Host key:    {}", key_path.display());
     println!("Fingerprint: {}", id.public().fingerprint());
-    println!("Listening:   {} (UDP + TCP)", cfg.listen);
+    println!("Listening:   {} ({})", cfg.listen, if cfg.tcp { "UDP + TCP" } else { "UDP only" });
     Ok(())
 }
 
@@ -124,8 +127,9 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
     rt.block_on(async {
         let listener = server::bind(&cfg, &host).await?;
         tracing::info!(
-            "listening on {} (quic + tcp), host key {}",
+            "listening on {} ({}), host key {}",
             listener.local_addr()?,
+            listener.transports(),
             host.public().fingerprint()
         );
         server::serve(listener, cfg, &host).await
