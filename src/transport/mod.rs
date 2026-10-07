@@ -307,20 +307,22 @@ pub enum Incoming {
 impl Listener {
     pub async fn bind(addr: SocketAddr, tls: rustls::ServerConfig, tcp: bool) -> Result<Listener> {
         let tls = Arc::new(tls);
-        let quic = quic::server_endpoint(tls.clone(), addr)
-            .with_context(|| format!("cannot listen on udp {addr}"))?;
-        let tcp = if tcp {
-            // Port 0: put TCP on whatever port UDP got so both share one number.
+        // Port 0: TCP goes on whatever port UDP got so both share one number;
+        // if that TCP port is taken, try another pair.
+        let attempts = if addr.port() == 0 && tcp { 20 } else { 1 };
+        for attempt in 1..=attempts {
+            let quic = quic::server_endpoint(tls.clone(), addr).with_context(|| format!("cannot listen on udp {addr}"))?;
+            if !tcp {
+                return Ok(Listener { quic, tcp: None, tls });
+            }
             let tcp_addr = SocketAddr::new(addr.ip(), quic.local_addr()?.port());
-            Some(
-                tokio::net::TcpListener::bind(tcp_addr)
-                    .await
-                    .with_context(|| format!("cannot listen on tcp {tcp_addr}"))?,
-            )
-        } else {
-            None
-        };
-        Ok(Listener { quic, tcp, tls })
+            match tokio::net::TcpListener::bind(tcp_addr).await {
+                Ok(l) => return Ok(Listener { quic, tcp: Some(l), tls }),
+                Err(e) if attempt == attempts => return Err(e).with_context(|| format!("cannot listen on tcp {tcp_addr}")),
+                Err(_) => {}
+            }
+        }
+        unreachable!("the last attempt returns")
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
