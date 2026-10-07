@@ -1,6 +1,7 @@
 //! The `qsh` client.
 
 pub mod cli;
+pub mod auth;
 pub mod config;
 pub mod copy;
 pub mod forward;
@@ -76,6 +77,12 @@ pub struct Target {
     /// `LogLevel QUIET` or `-q`: no informational messages.
     pub quiet: bool,
     pub forward_agent: bool,
+    /// `IdentitiesOnly`: offer only agent keys that match an identity file.
+    pub identities_only: bool,
+    /// `IdentityAgent`: `None` = `SSH_AUTH_SOCK`; `Some(None)` = no agent.
+    pub identity_agent: Option<Option<PathBuf>>,
+    /// `CertificateFile`s from the config.
+    pub certificate_files: Vec<PathBuf>,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
 }
@@ -161,6 +168,13 @@ impl Target {
         let expand = |f: &str| home.map(|h| config::expand_path(f, h, &host, &user, &local));
         let identity_files = cfg.identity_files.iter().filter_map(|f| expand(f)).collect();
         let known_hosts_file = cfg.user_known_hosts_file.as_deref().and_then(expand);
+        let certificate_files = cfg.certificate_files.iter().filter_map(|f| expand(f)).collect();
+        let identity_agent = match cfg.identity_agent.as_deref() {
+            None => None,
+            Some(v) if v.eq_ignore_ascii_case("none") => Some(None),
+            Some(v) if v == "SSH_AUTH_SOCK" || v == "$SSH_AUTH_SOCK" => None,
+            Some(v) => Some(expand(v)),
+        };
         let cli_port = port.or(parsed_port);
         // An explicit qsh port (command line, -o or ~/.config/qsh/config) is used
         // as is. Otherwise `--full` looks for qshd both on the ssh port (UDP-only
@@ -205,6 +219,9 @@ impl Target {
             family,
             quiet: cfg.log_level.as_deref() == Some("quiet"),
             forward_agent: cfg.forward_agent.unwrap_or(false),
+            identities_only: cfg.identities_only.unwrap_or(false),
+            identity_agent,
+            certificate_files,
             sources: sources.clone(),
             host,
             port,
@@ -283,8 +300,8 @@ fn default_identity_paths() -> Result<[PathBuf; 2]> {
     Ok([home.join(".ssh").join("id_ed25519"), qsh_dir(&home).join("id_ed25519")])
 }
 
-/// Loads the client key: the first Ed25519 key among `-i`, else among the
-/// config's `IdentityFile`s, else `~/.ssh/id_ed25519`, else
+/// Loads the key for the TLS handshake: the first Ed25519 key among `-i`,
+/// else among the config's `IdentityFile`s, else `~/.ssh/id_ed25519`, else
 /// `~/.config/qsh/id_ed25519`. With `create`, generates the latter when no key
 /// exists. With `batch`, an encrypted key is an error instead of a prompt.
 pub fn load_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool, batch: bool) -> Result<Identity> {
@@ -292,8 +309,15 @@ pub fn load_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool,
         if let Some(p) = explicit.iter().find(|p| Identity::is_ed25519_file(p)) {
             return Identity::load_with(p, !batch);
         }
-        // Report why the first one cannot be used (missing, not ed25519, unreadable).
-        return Identity::load_with(&explicit[0], !batch);
+        if create {
+            // Pairing registers the TLS key, so it has to be a real Ed25519 key.
+            return Identity::load_with(&explicit[0], !batch);
+        }
+        for p in explicit.iter().filter(|p| !p.exists()) {
+            eprintln!("Warning: identity file {} not accessible", p.display());
+        }
+        // Other key types are offered after the handshake.
+        return Ok(Identity::generate());
     }
     // Config entries may list RSA/ECDSA keys for ssh; skip those (without asking for a passphrase).
     for p in configured {
@@ -313,11 +337,9 @@ pub fn load_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool,
         eprintln!("Generated new key {}", paths[1].display());
         return Ok(id);
     }
-    bail!(
-        "no ed25519 key found ({} or {}); run `qsh keygen` or `qsh pair`",
-        paths[0].display(),
-        paths[1].display()
-    )
+    // No Ed25519 key: a throwaway one for TLS; agent keys and other key types
+    // are offered after the handshake.
+    Ok(Identity::generate())
 }
 
 /// The pinned key for `host:port`, if any.
@@ -461,20 +483,29 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
         );
     }
     let id = load_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
-    let conn = open(target, opts, &id, via).await?;
+    let mut conn = open(target, opts, &id, via).await?;
     verify_host_key(&conn, target, opts).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Login { version: VERSION, user: target.user.clone() }).await?;
-    if let Err(e) = expect_ok(&mut recv).await {
-        conn.close().await;
-        bail!(
-            "{e} for {}@{} (key {}).\nAdd the key on the server with `qsh pair` or to ~/.config/qsh/authorized_keys.",
-            target.user,
-            target.host,
-            id.public().fingerprint()
-        );
+    match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, &id).await {
+        Ok(auth::Outcome::Welcome(version)) => {
+            tracing::debug!("logged in, server protocol version {version}");
+            conn.set_server_version(version);
+            Ok(conn)
+        }
+        Ok(auth::Outcome::Denied(e)) => {
+            conn.close().await;
+            bail!(
+                "{e} for {}@{}.\nAdd your key on the server with `qsh pair`, or to ~/.ssh/authorized_keys there (ssh-copy-id).",
+                target.user,
+                target.host,
+            );
+        }
+        Err(e) => {
+            conn.close().await;
+            Err(e)
+        }
     }
-    Ok(conn)
 }
 
 /// Connects, verifies the host key against known_hosts and logs in, going

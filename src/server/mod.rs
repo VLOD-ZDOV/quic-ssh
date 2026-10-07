@@ -1,5 +1,6 @@
 //! The `qshd` daemon.
 
+mod auth;
 mod exec;
 mod files;
 pub mod helpers;
@@ -17,8 +18,9 @@ use tokio::sync::{watch, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::{GatewayPorts, ServerConfig};
-use crate::keys::{qsh_dir, read_key_list_strict, Identity, PublicKey};
-use crate::proto::{read_msg, valid_user_name, write_msg, Hello, Reply, Request, MIN_VERSION};
+use crate::keys::{Identity, PublicKey};
+use crate::authkeys::Grant;
+use crate::proto::{read_msg, valid_user_name, write_msg, Hello, PtySpec, Reply, Request, MIN_VERSION, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use users::User;
 
@@ -129,25 +131,10 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Re
     }
 }
 
-/// Checks the key against the user's authorized_keys files.
-fn authorize(state: &State, user: &User, key: PublicKey) -> bool {
-    let mut files = vec![qsh_dir(&user.home).join("authorized_keys")];
-    if state.cfg.use_ssh_authorized_keys {
-        files.push(user.home.join(".ssh").join("authorized_keys"));
-    }
-    files.iter().any(|path| match read_key_list_strict(path, &user.home, user.uid) {
-        Ok(keys) => keys.contains(&key),
-        Err(e) => {
-            warn!("ignoring {}: {e:#}", path.display());
-            false
-        }
-    })
-}
-
 async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
-    let (mut send, recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
+    let (mut send, mut recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.context("closed before hello")?;
         let hello: Hello = read_msg(&mut recv).await?;
         anyhow::Ok((send, recv, hello))
@@ -155,13 +142,13 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     .await
     .context("no hello in time")??;
 
-    let (name, pairing) = match hello {
+    let (name, pairing, version) = match hello {
         Hello::Login { version, user } | Hello::Pair { version, user } if version < MIN_VERSION => {
             write_msg(&mut send, &Reply::Err(format!("unsupported protocol version {version}"))).await?;
             bail!("client {user:?} uses protocol version {version}");
         }
-        Hello::Login { user, .. } => (user, false),
-        Hello::Pair { user, .. } => (user, true),
+        Hello::Login { user, version } => (user, false, version),
+        Hello::Pair { user, version } => (user, true, version),
     };
     let looked_up = if valid_user_name(&name) {
         User::lookup(&name)
@@ -169,36 +156,56 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         Err(anyhow::anyhow!("invalid user name"))
     };
     let user = match looked_up {
-        Ok(u) => u,
+        Ok(u) => Some(u),
         Err(e) => {
             warn!("{addr}: rejected user {name:?}: {e:#}");
-            // Same answers as for an existing user, so names cannot be probed.
-            let msg = if pairing { NO_PAIRING } else { "access denied" };
-            write_msg(&mut send, &Reply::Err(msg.into())).await?;
-            return Ok(());
+            None
         }
     };
-
     if pairing {
-        return pair(conn, &state, &user, send, recv).await;
+        match user {
+            Some(user) => return pair(conn, &state, &user, send, recv).await,
+            None => {
+                // Same answer as for an existing user without a code, so names cannot be probed.
+                write_msg(&mut send, &Reply::Err(NO_PAIRING.into())).await?;
+                return Ok(());
+            }
+        }
     }
-    if !authorize(&state, &user, key) {
-        warn!("{addr}: key {} not authorized for {name}", key.fingerprint());
+
+    // An unknown user goes through the same steps with no keys, so names cannot be probed.
+    let entries = user.as_ref().map(|u| auth::authorized_entries(&state.cfg, u)).unwrap_or_default();
+    let cas = auth::trusted_cas(&state.cfg);
+    let checker = auth::Checker {
+        entries: &entries,
+        cas: &cas,
+        login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now() },
+        exporter: conn.exporter(),
+    };
+    let mut granted = checker.check(&auth::tls_key(key)).ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
+    if granted.is_none() && version >= 4 {
+        let attempt = auth::key_auth(&mut send, &mut recv, &checker, state.cfg.max_auth_tries);
+        granted = tokio::time::timeout(auth::AUTH_TIMEOUT, attempt).await.context("login took too long")??;
+    }
+    let (Some(user), Some((grant, how))) = (user, granted) else {
+        warn!("{addr}: no authorized key for {name} (TLS key {})", key.fingerprint());
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
-    }
-    info!("{addr}: {name} logged in with {} over {}", key.fingerprint(), conn.transport_name());
-    write_msg(&mut send, &Reply::Ok).await?;
+    };
+    info!("{addr}: {name} logged in with {how} over {}", conn.transport_name());
+    let welcome = if version >= 4 { Reply::Welcome { version: VERSION } } else { Reply::Ok };
+    write_msg(&mut send, &welcome).await?;
     drop(startup);
 
     let user = Arc::new(user);
+    let grant = Arc::new(grant);
     // Lets running sessions notice a dead connection even after the client
     // finished sending on their stream.
     let (closed_tx, closed_rx) = watch::channel(false);
     while let Some((send, recv)) = conn.accept_bi().await {
-        let (user, state, closed, conn) = (user.clone(), state.clone(), closed_rx.clone(), conn.clone());
+        let (user, state, closed, conn, grant) = (user.clone(), state.clone(), closed_rx.clone(), conn.clone(), grant.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(send, recv, &conn, &user, &state, closed).await {
+            if let Err(e) = handle_stream(send, recv, &conn, &user, &grant, &state, closed).await {
                 debug!("{addr}: stream error: {e:#}");
             }
         });
@@ -213,6 +220,7 @@ async fn handle_stream(
     mut recv: RecvHalf,
     conn: &Arc<Conn>,
     user: &User,
+    grant: &Grant,
     state: &State,
     closed: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -224,21 +232,45 @@ async fn handle_stream(
         }
         Err(e) => return Err(e),
     };
+    let limits = &grant.restrictions;
+    // A forced command (`command=`, a certificate's force-command) replaces
+    // whatever the client asked to run, which is passed on like sshd does.
+    let session = |command: Option<String>, client_env, pty: Option<PtySpec>| exec::Session {
+        command: limits.command.clone().or(command.clone()),
+        extra_env: match (&limits.command, command) {
+            (Some(_), Some(original)) => vec![("SSH_ORIGINAL_COMMAND".into(), original)],
+            _ => Vec::new(),
+        },
+        client_env,
+        pty: pty.filter(|_| !limits.no_pty),
+    };
+    let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
     match request {
-        Request::Exec { command, env, pty } => {
-            exec::run(send, recv, user, command, env, pty, closed).await
-        }
+        Request::Exec { command, env, pty } => exec::run(send, recv, user, session(command, env, pty), closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
         Request::Subsystem { name, env } => match subsystem_command(&state.cfg, &name) {
-            Some(cmd) => exec::run(send, recv, user, Some(cmd), env, None, closed).await,
+            Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None), closed).await,
             None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
         },
-        Request::RemoteForward { bind, port } => remote_forward(send, recv, conn.clone(), user, state, &bind, port).await,
+        Request::RemoteForward { bind, port } => {
+            if !limits.may_listen(&bind, port) {
+                return write_msg(&mut send, &Reply::Err(format!("listening on port {port} is not permitted for this key"))).await;
+            }
+            remote_forward(send, recv, conn.clone(), user, state, &bind, port).await
+        }
+        Request::Upload { .. } | Request::Download { .. } | Request::UploadTree { .. } | Request::DownloadTree { .. }
+            if limits.command.is_some() =>
+        {
+            write_msg(&mut send, &files_denied()).await
+        }
         Request::UploadTree { path, name } => files::upload_tree(send, recv, user, &path, &name).await,
         Request::DownloadTree { path } => files::download_tree(send, user, &path).await,
         Request::DirectTcp { host, port } => {
             if !state.cfg.allow_tcp_forwarding {
                 return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
+            }
+            if !limits.may_open(&host, port) {
+                return write_msg(&mut send, &Reply::Err(format!("forwarding to {host}:{port} is not permitted for this key"))).await;
             }
             if user.switches() {
                 // Connect as the user, not as root, so uid-based firewall rules

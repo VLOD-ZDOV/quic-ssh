@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ALPN: &[u8] = b"qsh/1";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -33,6 +33,45 @@ pub enum Reply {
     // --- protocol version 3 ---
     /// Answer to [`Request::RemoteForward`]: the port actually bound.
     Bound { port: u16 },
+    // --- protocol version 4 (sent only to clients that announced it) ---
+    /// Login complete; carries the server's protocol version.
+    Welcome { version: u32 },
+    /// The key from the TLS handshake is not enough: prove another key with
+    /// [`Auth::Query`] / [`Auth::PublicKey`], or give up with [`Auth::Done`].
+    AuthKey,
+    /// Answer a question with [`Auth::Response`] (second factor).
+    Prompt { text: String, echo: bool },
+}
+
+/// Client messages on the hello stream while logging in (protocol version 4).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Auth {
+    /// Would this key (SSH wire format, or a certificate) be accepted? Answered
+    /// with `Reply::Ok` or `Reply::AuthKey`, without a signature, so security
+    /// keys are only touched for keys that will work.
+    Query { key: Vec<u8> },
+    /// Proof of a key: an SSH signature over [`auth_data`].
+    PublicKey { key: Vec<u8>, signature: Vec<u8> },
+    /// Answer to `Reply::Prompt`.
+    Response(String),
+    /// No more keys to offer.
+    Done,
+}
+
+/// SSHSIG namespace of login signatures; keeps them apart from signatures for
+/// SSH logins, git commits or files made with the same key.
+pub const AUTH_NAMESPACE: &str = "qsh-login@quic-ssh";
+
+/// The data a client signs to prove `key` for `user` on the connection with
+/// TLS `exporter`: an SSHSIG-wrapped hash of all three, so it can come from
+/// an ssh-agent and cannot be replayed on another connection.
+pub fn auth_data(exporter: &[u8; 32], user: &str, key: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(64 + user.len() + key.len());
+    for part in [b"qsh-userauth-v1".as_slice(), exporter, user.as_bytes(), key] {
+        msg.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        msg.extend_from_slice(part);
+    }
+    ssh_key::SshSig::signed_data(AUTH_NAMESPACE, ssh_key::HashAlg::Sha512, &msg).expect("encoding cannot fail")
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

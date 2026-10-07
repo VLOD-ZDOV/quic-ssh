@@ -99,7 +99,8 @@ impl Client {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(QSH);
-        c.args(args).env("HOME", self.home.path()).stdin(Stdio::null());
+        // No agent from the environment running the tests; tests that need one set it.
+        c.args(args).env("HOME", self.home.path()).env_remove("SSH_AUTH_SOCK").stdin(Stdio::null());
         c
     }
 
@@ -445,8 +446,12 @@ fn closed_udp_port() -> u16 {
     UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// Tests that probe or occupy qshd's standard port 4422 must not overlap.
+static STANDARD_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn full_mode_uses_qshd_on_ssh_port_and_config() {
+    let _port = STANDARD_PORT.lock().unwrap_or_else(|e| e.into_inner());
     // qshd on UDP only, as it would run on port 22 next to sshd.
     let s = Server::start_with("127.0.0.1", "tcp = false\n");
     let c = Client::paired(&s);
@@ -495,6 +500,7 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
 /// ~/.ssh/config. `--full` must find qshd on 4422 instead of falling back to ssh.
 #[test]
 fn full_mode_finds_qshd_on_standard_port() {
+    let _port = STANDARD_PORT.lock().unwrap_or_else(|e| e.into_inner());
     if UdpSocket::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() || TcpListener::bind(("127.0.0.1", qsh::DEFAULT_PORT)).is_err() {
         eprintln!("skipped: port {} is in use on this machine", qsh::DEFAULT_PORT);
         return;
@@ -1119,4 +1125,214 @@ fn installed_as_ssh() {
     // -G works (git uses it to detect an OpenSSH-compatible client).
     let out = run(&["-G", "-p", "2222", "somehost"]);
     assert!(stdout(&out).contains("port 2222"), "{}", stdout(&out));
+}
+
+// ---------------------------------------------------------------------------
+// v0.5: keys of any type, ssh-agent, authorized_keys options, certificates.
+
+fn have(tool: &str) -> bool {
+    Command::new("sh").args(["-c", &format!("command -v {tool}")]).output().is_ok_and(|o| o.status.success())
+}
+
+/// `ssh-keygen -t <kind>` without a passphrase; returns the private key path.
+fn keygen(dir: &std::path::Path, name: &str, kind: &str) -> PathBuf {
+    let path = dir.join(name);
+    let out = Command::new("ssh-keygen").args(["-q", "-t", kind, "-N", "", "-C", name, "-f"]).arg(&path).output().unwrap();
+    assert!(out.status.success(), "ssh-keygen: {}", stderr(&out));
+    path
+}
+
+fn public(path: &std::path::Path) -> String {
+    std::fs::read_to_string(format!("{}.pub", path.display())).unwrap().trim().to_string()
+}
+
+/// A server whose ~/.ssh/authorized_keys holds `lines`, and a client with known host key.
+fn server_with_keys(config: &str, lines: &[String]) -> (Server, Client) {
+    let s = Server::start_with("127.0.0.1", config);
+    let ssh = s.home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("authorized_keys"), lines.join("\n") + "\n").unwrap();
+    (s, Client::new())
+}
+
+struct AgentProc {
+    child: Child,
+    sock: PathBuf,
+    _dir: TempDir,
+}
+
+impl Drop for AgentProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_agent() -> AgentProc {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("agent.sock");
+    let child = Command::new("ssh-agent").args(["-D", "-a"]).arg(&sock).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "ssh-agent did not start");
+        sleep(Duration::from_millis(20));
+    }
+    AgentProc { child, sock, _dir: dir }
+}
+
+#[test]
+fn rsa_and_ecdsa_keys_from_files() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let rsa = keygen(keys.path(), "rsa", "rsa");
+    let ecdsa = keygen(keys.path(), "ecdsa", "ecdsa");
+    let small = {
+        let path = keys.path().join("small");
+        let out = Command::new("ssh-keygen").args(["-q", "-t", "rsa", "-b", "1024", "-N", "", "-f"]).arg(&path).output().unwrap();
+        out.status.success().then_some(path)
+    };
+    let mut lines = vec![public(&rsa), public(&ecdsa)];
+    lines.extend(small.iter().map(|p| public(p)));
+    let (s, c) = server_with_keys("", &lines);
+    let port = s.port.to_string();
+    for key in [&rsa, &ecdsa] {
+        let out = c.run(&["--accept-new-host", "-p", &port, "-i", key.to_str().unwrap(), &dest(), "echo", "in"]);
+        assert!(out.status.success(), "{}: {}", key.display(), stderr(&out));
+        assert_eq!(stdout(&out), "in\n");
+    }
+    if let Some(small) = small {
+        let out = c.run(&["--accept-new-host", "-p", &port, "-i", small.to_str().unwrap(), &dest(), "true"]);
+        assert!(!out.status.success(), "a 1024-bit RSA key was accepted");
+    }
+    // An unknown key is still refused.
+    let other = keygen(keys.path(), "other", "ecdsa");
+    let out = c.run(&["--accept-new-host", "-p", &port, "-i", other.to_str().unwrap(), &dest(), "true"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("access denied"), "{}", stderr(&out));
+}
+
+#[test]
+fn keys_from_ssh_agent() {
+    if !have("ssh-agent") || !have("ssh-add") {
+        return eprintln!("skipped: no ssh-agent");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let ecdsa = keygen(keys.path(), "agent_ecdsa", "ecdsa");
+    let rsa = keygen(keys.path(), "agent_rsa", "rsa");
+    let (s, c) = server_with_keys("", &[public(&rsa)]);
+    let agent = start_agent();
+    for key in [&ecdsa, &rsa] {
+        let out = Command::new("ssh-add").arg(key).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+        assert!(out.status.success(), "ssh-add: {}", stderr(&out));
+    }
+    // The key files are elsewhere: only the agent can sign.
+    std::fs::remove_file(&rsa).unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--accept-new-host", "-p"];
+        let port = s.port.to_string();
+        args.push(&port);
+        args.extend_from_slice(extra);
+        let d = dest();
+        args.extend_from_slice(&[&d, "echo", "agent"]);
+        c.cmd(&args).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap()
+    };
+    let out = run(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "agent\n");
+    // IdentityAgent none: no agent, no key.
+    let out = run(&["-o", "IdentityAgent=none"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn authorized_keys_options_are_enforced() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let forced = keygen(keys.path(), "forced", "ed25519");
+    let limited = keygen(keys.path(), "limited", "ecdsa");
+    let elsewhere = keygen(keys.path(), "elsewhere", "ecdsa");
+    let target = echo_server();
+    let lines = vec![
+        format!(r#"command="echo forced:$SSH_ORIGINAL_COMMAND" {}"#, public(&forced)),
+        format!(r#"no-pty,permitopen="127.0.0.1:{target}" {}"#, public(&limited)),
+        format!(r#"from="203.0.113.0/24" {}"#, public(&elsewhere)),
+        format!("unknown-option {}", public(&elsewhere)),
+    ];
+    let (s, c) = server_with_keys("", &lines);
+    let port = s.port.to_string();
+    let q = |key: &PathBuf, args: &[&str]| {
+        let mut all = vec!["--accept-new-host", "-p", &port, "-i", key.to_str().unwrap()];
+        all.extend_from_slice(args);
+        c.run(&all)
+    };
+    // command=: whatever is asked, the forced command runs and sees the original.
+    let out = q(&forced, &[&dest(), "id"]);
+    assert_eq!(stdout(&out), "forced:id\n", "{}", stderr(&out));
+    let f = keys.path().join("f.txt");
+    std::fs::write(&f, "x").unwrap();
+    let out = q(&forced, &["cp", f.to_str().unwrap(), &format!("{}:f.txt", dest())]);
+    assert!(!out.status.success() && !s.home.path().join("f.txt").exists(), "cp despite command=");
+    // no-pty: the session runs without a terminal.
+    let out = q(&limited, &["-tt", &dest(), "sh", "-c", "'[ -t 0 ] && echo tty || echo no-tty'"]);
+    assert_eq!(stdout(&out).trim(), "no-tty", "{}", stderr(&out));
+    // permitopen: only the listed destination.
+    let ok = q(&limited, &["-W", &format!("127.0.0.1:{target}"), &dest()]);
+    assert!(ok.status.success(), "{}", stderr(&ok));
+    let other = echo_server();
+    let denied = q(&limited, &["-W", &format!("127.0.0.1:{other}"), &dest()]);
+    assert!(!denied.status.success());
+    assert!(stderr(&denied).contains("not permitted"), "{}", stderr(&denied));
+    // from=: the key does not work from this address (and the bad line is ignored).
+    let out = q(&elsewhere, &[&dest(), "true"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn user_certificates() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let ca = keygen(keys.path(), "ca", "ed25519");
+    let sign = |key: &PathBuf, extra: &[&str]| {
+        let out = Command::new("ssh-keygen")
+            .args(["-q", "-s", ca.to_str().unwrap(), "-I", "test-cert", "-V", "-5m:+1h"])
+            .args(extra)
+            .arg(format!("{}.pub", key.display()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ssh-keygen -s: {}", stderr(&out));
+    };
+    // An Ed25519 key (used for TLS) and an ECDSA key, both with certificates.
+    let ed = keygen(keys.path(), "ed", "ed25519");
+    sign(&ed, &["-n", &user()]);
+    let ec = keygen(keys.path(), "ec", "ecdsa");
+    sign(&ec, &["-n", &user(), "-O", "force-command=echo from-cert"]);
+    let wrong = keygen(keys.path(), "wrong", "ecdsa");
+    sign(&wrong, &["-n", "somebody-else"]);
+
+    // Trusted by the server for everyone.
+    let ca_file = keys.path().join("user_ca.pub");
+    std::fs::copy(format!("{}.pub", ca.display()), &ca_file).unwrap();
+    let (s, c) = server_with_keys(&format!("trusted_user_ca_keys = \"{}\"\n", ca_file.display()), &[]);
+    let port = s.port.to_string();
+    let q = |key: &PathBuf, cmd: &str| c.run(&["--accept-new-host", "-p", &port, "-i", key.to_str().unwrap(), &dest(), cmd]);
+    let out = q(&ed, "echo cert");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "cert\n");
+    let out = q(&ec, "id");
+    assert_eq!(stdout(&out), "from-cert\n", "force-command: {}", stderr(&out));
+    assert!(!q(&wrong, "true").status.success(), "certificate for another principal accepted");
+
+    // Trusted by the user through a cert-authority line.
+    let (s, c) = server_with_keys("", &[format!("cert-authority,principals=\"somebody-else\" {}", public(&ca))]);
+    let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), "-i", wrong.to_str().unwrap(), &dest(), "echo", "ca-line"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "ca-line\n");
+    let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), "-i", ed.to_str().unwrap(), &dest(), "true"]);
+    assert!(!out.status.success(), "principal outside principals= accepted");
 }

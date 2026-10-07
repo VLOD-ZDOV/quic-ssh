@@ -1,7 +1,10 @@
 [advisories]
 ignore = [
-    # rsa "Marvin attack": rsa is an optional dependency of ssh-key that qsh
-    # never enables (qsh only supports Ed25519). It is listed in Cargo.lock
-    # but never compiled into qsh; `cargo tree -i rsa` prints nothing.
+    # rsa "Marvin attack" (non-constant-time private-key operations, no fixed
+    # release). qsh never decrypts with RSA. The server only verifies RSA
+    # signatures (public data). The client signs with an RSA key file once per
+    # login, with blinding, over data that includes a fresh per-connection
+    # secret, so a server cannot collect the many precisely timed operations
+    # on chosen input that the attack needs. Keys in ssh-agent never reach qsh.
     "RUSTSEC-2023-0071",
 ]

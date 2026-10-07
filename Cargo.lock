@@ -638,6 +638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1913,7 +1914,7 @@ dependencies = [
 
 [[package]]
 name = "qsh"
-version = "0.4.0"
+version = "0.5.0-dev"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1933,9 +1934,11 @@ dependencies = [
  "ratatui",
  "rcgen",
  "rpassword",
+ "rsa",
  "rustls",
  "serde",
  "sha2",
+ "signature",
  "spake2",
  "ssh-key",
  "tar",
@@ -2653,6 +2656,7 @@ checksum = "3b86f5297f0f04d08cabaa0f6bff7cb6aec4d9c3b49d87990d63da9d9156a8c3"
 dependencies = [
  "bcrypt-pbkdf",
  "ed25519-dalek",
+ "num-bigint-dig",
  "p256",
  "p384",
  "p521",

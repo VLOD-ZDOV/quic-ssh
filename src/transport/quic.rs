@@ -46,7 +46,7 @@ fn finish(endpoint: Option<Endpoint>, conn: quinn::Connection) -> Result<Conn> {
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|_| anyhow::anyhow!("TLS exporter failed"))?;
     let remote = conn.remote_address();
-    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new() })
+    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new(), server_version: 3 })
 }
 
 pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result<Conn> {

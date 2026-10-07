@@ -23,18 +23,21 @@ fn accept_env(name: &str) -> bool {
     plain && (matches!(name, "LANG" | "COLORTERM") || name.starts_with("LC_"))
 }
 
-pub async fn run(
-    mut send: SendHalf,
-    recv: RecvHalf,
-    user: &User,
-    // `$SHELL -c command`, or a login shell for `None`.
-    command: Option<String>,
-    client_env: Vec<(String, String)>,
-    pty: Option<PtySpec>,
-    closed: watch::Receiver<bool>,
-) -> Result<()> {
+/// What to start: `$SHELL -c command`, or a login shell for `None`.
+pub struct Session {
+    pub command: Option<String>,
+    /// Variables from the client (filtered by [`accept_env`]).
+    pub client_env: Vec<(String, String)>,
+    /// Variables set by the server (e.g. `SSH_ORIGINAL_COMMAND`).
+    pub extra_env: Vec<(String, String)>,
+    pub pty: Option<PtySpec>,
+}
+
+pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, session: Session, closed: watch::Receiver<bool>) -> Result<()> {
+    let Session { command, client_env, extra_env, pty } = session;
     let mut env = user.env();
     env.extend(client_env.into_iter().filter(|(k, _)| accept_env(k)));
+    env.extend(extra_env);
     if let Some(p) = &pty {
         env.push(("TERM".into(), p.term.clone()));
     }

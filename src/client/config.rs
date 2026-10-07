@@ -52,51 +52,19 @@ pub struct HostConfig {
     pub forward_agent: Option<bool>,
     /// `ObscureKeystrokeTiming` (`yes`, `no`, `interval:MS`).
     pub obscure_keystrokes: Option<String>,
+    /// Only offer agent keys that match an IdentityFile.
+    pub identities_only: Option<bool>,
+    /// `IdentityAgent`: socket path, `SSH_AUTH_SOCK` or `none`.
+    pub identity_agent: Option<String>,
+    /// `CertificateFile`s, in order.
+    pub certificate_files: Vec<String>,
 }
 
 fn yes(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "on")
 }
 
-/// `fnmatch`-style match supporting `*` and `?`.
-fn wildcard(pattern: &str, text: &str) -> bool {
-    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = ti;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
-            ti = mark;
-        } else {
-            return false;
-        }
-    }
-    p[pi..].iter().all(|&c| c == '*')
-}
-
-/// A `Host` line matches if any positive pattern matches and no negated one does.
-fn host_matches(patterns: &[String], host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    let mut matched = false;
-    for p in patterns {
-        let p = p.to_ascii_lowercase();
-        if let Some(neg) = p.strip_prefix('!') {
-            if wildcard(neg, &host) {
-                return false;
-            }
-        } else if wildcard(&p, &host) {
-            matched = true;
-        }
-    }
-    matched
-}
+use crate::pattern::{host_matches, wildcard};
 
 /// Splits `Keyword value`, `Keyword=value` and `Keyword "quoted value"` lines.
 fn split_line(line: &str) -> Option<(String, Vec<String>)> {
@@ -202,6 +170,9 @@ impl Parser<'_> {
                 "addressfamily" if o.address_family.is_none() => o.address_family = first.map(|v| v.to_ascii_lowercase()),
                 "loglevel" if o.log_level.is_none() => o.log_level = first.map(|v| v.to_ascii_lowercase()),
                 "forwardagent" if o.forward_agent.is_none() => o.forward_agent = first.as_deref().map(yes),
+                "identitiesonly" if o.identities_only.is_none() => o.identities_only = first.as_deref().map(yes),
+                "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
+                "certificatefile" => o.certificate_files.extend(first),
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -377,6 +348,9 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         forward_agent: ours.forward_agent.or(ssh.forward_agent),
         // A privacy preference, so ssh's setting applies to qsh sessions as well.
         obscure_keystrokes: ours.obscure_keystrokes.or(ssh.obscure_keystrokes),
+        identities_only: ours.identities_only.or(ssh.identities_only),
+        identity_agent: ours.identity_agent.or(ssh.identity_agent),
+        certificate_files: ours.certificate_files.into_iter().chain(ssh.certificate_files).collect(),
     }
 }
 
@@ -404,15 +378,6 @@ Host *
     User fallback
     IdentityFile ~/.ssh/id_%h
 "#;
-
-    #[test]
-    fn wildcards() {
-        assert!(wildcard("*", "anything"));
-        assert!(wildcard("web-?.example.com", "web-1.example.com"));
-        assert!(!wildcard("web-?.example.com", "web-10.example.com"));
-        assert!(wildcard("*.example.com", "a.b.example.com"));
-        assert!(!wildcard("*.example.com", "example.com"));
-    }
 
     #[test]
     fn alias_with_ssh_port_ignored() {

@@ -114,6 +114,7 @@ where
         exporter,
         remote,
         hops: Vec::new(),
+        server_version: 3,
     }
 }
 

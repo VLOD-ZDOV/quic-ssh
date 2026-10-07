@@ -44,6 +44,11 @@ impl PublicKey {
         key.to_openssh().expect("encoding an ed25519 public key cannot fail")
     }
 
+    /// SSH wire-format public key blob.
+    pub fn ssh_blob(&self) -> Vec<u8> {
+        self.ssh().to_bytes().expect("encoding an ed25519 public key cannot fail")
+    }
+
     /// Parses an `ssh-ed25519 AAAA... [comment]` line. Other key types yield `None`.
     pub fn parse_openssh(line: &str) -> Option<PublicKey> {
         let key = ssh_key::PublicKey::from_openssh(line.trim()).ok()?;
@@ -66,6 +71,14 @@ impl Identity {
 
     pub fn public(&self) -> PublicKey {
         PublicKey(self.signing.verifying_key().to_bytes())
+    }
+
+    /// SSH wire-format signature over `data`.
+    pub fn ssh_sign(&self, data: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        let sig = ssh_key::Signature::new(ssh_key::Algorithm::Ed25519, self.signing.sign(data).to_bytes().to_vec())
+            .expect("valid ed25519 signature size");
+        Vec::try_from(sig).expect("encoding a signature cannot fail")
     }
 
     pub fn pkcs8_der(&self) -> Vec<u8> {
@@ -197,27 +210,55 @@ fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reads a key-list file the way sshd's StrictModes does: no symlink at the
-/// end, and the file and its directories up to `home` owned by `uid` (or
-/// root) and not group/world writable. A missing file is an empty list.
-pub fn read_key_list_strict(path: &Path, home: &Path, uid: u32) -> Result<Vec<PublicKey>> {
-    use std::io::Read;
-    let mut f = match OpenOptions::new()
+/// Opens a file the way sshd's StrictModes reads authorized_keys: no symlink
+/// at the end, and the file and its directories up to `home` owned by `uid`
+/// (or root) and not group/world writable. `Ok(None)` if it does not exist.
+fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
+    let f = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
     };
     if !f.metadata()?.is_file() {
         bail!("{} is not a regular file", path.display());
     }
     check_owner_chain(path, home, uid)?;
+    Ok(Some(f))
+}
+
+fn read_limited(f: fs::File) -> Result<String> {
+    use std::io::Read;
     let mut text = String::new();
-    Read::take(&mut f, 1 << 20).read_to_string(&mut text)?;
-    Ok(parse_key_list(&text))
+    Read::take(f, 1 << 20).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Reads an authorized_keys-style file with StrictModes checks (see
+/// [`open_strict`]). A missing file reads as empty.
+pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
+    match open_strict(path, home, uid)? {
+        Some(f) => read_limited(f),
+        None => Ok(String::new()),
+    }
+}
+
+/// Like [`read_strict`] for secrets: the file must also be private (no
+/// permissions for group or others). `Ok(None)` if it does not exist.
+pub fn read_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<String>> {
+    let Some(f) = open_strict(path, home, uid)? else { return Ok(None) };
+    if f.metadata()?.mode() & 0o077 != 0 {
+        bail!("{} must be private (chmod 600)", path.display());
+    }
+    read_limited(f).map(Some)
+}
+
+/// The Ed25519 keys of an authorized_keys-style file read with [`read_strict`].
+pub fn read_key_list_strict(path: &Path, home: &Path, uid: u32) -> Result<Vec<PublicKey>> {
+    Ok(parse_key_list(&read_strict(path, home, uid)?))
 }
 
 #[cfg(test)]

@@ -34,6 +34,33 @@ pub struct ServerConfig {
     /// `$SHELL -c command`. `sftp` is found automatically if OpenSSH's
     /// sftp-server is installed.
     pub subsystems: BTreeMap<String, String>,
+    /// File with CA public keys trusted to sign user certificates for any
+    /// user (the certificate must name the user as a principal).
+    pub trusted_user_ca_keys: Option<PathBuf>,
+    /// Failed key proofs allowed per connection (like sshd's MaxAuthTries).
+    pub max_auth_tries: u32,
+    /// Allow `qsh -A` (ssh-agent forwarding).
+    pub allow_agent_forwarding: bool,
+    /// One-time codes (TOTP) as a second factor after the key.
+    pub totp: Totp,
+    /// OpenSSH host certificate for the host key; defaults to
+    /// `<host_key>-cert.pub` if that exists.
+    pub host_certificate: Option<PathBuf>,
+    /// How long an interactive session survives without its client (seconds),
+    /// so it can be resumed after a network outage. 0 turns this off.
+    pub session_timeout: u64,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Totp {
+    /// Never ask.
+    Off,
+    /// Ask users who set it up with `qshd totp`.
+    #[default]
+    Optional,
+    /// Ask everyone; users without a TOTP secret cannot log in.
+    Required,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default)]
@@ -58,6 +85,12 @@ impl Default for ServerConfig {
             max_startups_per_ip: 8,
             gateway_ports: GatewayPorts::No,
             subsystems: BTreeMap::new(),
+            trusted_user_ca_keys: None,
+            max_auth_tries: 6,
+            allow_agent_forwarding: true,
+            totp: Totp::Optional,
+            host_certificate: None,
+            session_timeout: 3600,
         }
     }
 }

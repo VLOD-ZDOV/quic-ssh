@@ -44,6 +44,8 @@ pub struct Conn {
     remote: SocketAddr,
     /// Jump-host connections this one is tunnelled through (kept alive with it).
     hops: Vec<Arc<Conn>>,
+    /// The peer's protocol version once logged in (3 for servers that do not say).
+    server_version: u32,
 }
 
 impl Conn {
@@ -74,6 +76,15 @@ impl Conn {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    pub fn set_server_version(&mut self, version: u32) {
+        self.server_version = version;
+    }
+
+    /// The server's protocol version (client side, after login).
+    pub fn server_version(&self) -> u32 {
+        self.server_version
     }
 
     /// Keeps the jump-host connections alive as long as this one.
