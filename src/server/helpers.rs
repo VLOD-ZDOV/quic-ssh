@@ -11,6 +11,27 @@ use anyhow::{bail, Context, Result};
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
 pub use super::users::{decode_args, BECOME, HELPER_ARGS, HELPER_FROM_ENV};
 
+/// Copies `r` to `w` with plain reads and writes. Not `io::copy`: between a
+/// socket or file and a pipe it uses `splice()`, which keeps the pipe locked
+/// while it waits for data, and qshd's own (non-blocking) access to the other
+/// end of that pipe then sleeps in the kernel until data comes, which stalls
+/// the whole server: a forwarded connection that stays quiet was enough.
+fn pump(mut r: impl Read, mut w: impl Write) -> io::Result<u64> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w.write_all(&buf[..n])?;
+        w.flush()?;
+        total += n as u64;
+    }
+}
+
 /// Where an upload goes: `path`, or `path/name` if `path` is a directory.
 fn upload_target(path: &str, name: &str) -> Result<PathBuf> {
     crate::tree::tree_target(Path::new(if path.is_empty() { "." } else { path }), name)
@@ -31,7 +52,7 @@ pub fn recv(path: &str, name: &str, size: u64, mode: &str) -> Result<()> {
     let mut out = io::stdout();
     writeln!(out, "ok")?;
     out.flush()?;
-    let n = io::copy(&mut io::stdin().lock().take(size), &mut f)
+    let n = pump(io::stdin().lock().take(size), &mut f)
         .with_context(|| format!("{}", target.display()))?;
     if n != size {
         bail!("{}: transfer interrupted ({n} of {size} bytes)", target.display());
@@ -50,7 +71,7 @@ pub fn send(path: &str) -> Result<()> {
     writeln!(out, "ok")?;
     out.write_all(&meta.len().to_be_bytes())?;
     out.write_all(&(meta.mode() & 0o7777).to_be_bytes())?;
-    io::copy(&mut Read::take(&mut f, meta.len()), &mut out)?;
+    pump(Read::take(&mut f, meta.len()), &mut out)?;
     out.flush()?;
     Ok(())
 }
@@ -82,11 +103,11 @@ pub fn connect(host: &str, port: u16) -> Result<()> {
     out.flush()?;
     let mut to_sock = sock.try_clone()?;
     let upstream = std::thread::spawn(move || {
-        let _ = io::copy(&mut io::stdin().lock(), &mut to_sock);
+        let _ = pump(io::stdin().lock(), &mut to_sock);
         let _ = to_sock.shutdown(std::net::Shutdown::Write);
     });
     let mut from_sock = sock;
-    let _ = io::copy(&mut from_sock, &mut io::stdout().lock());
+    let _ = pump(&mut from_sock, io::stdout().lock());
     let _ = upstream.join();
     Ok(())
 }

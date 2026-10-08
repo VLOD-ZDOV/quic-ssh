@@ -96,6 +96,30 @@ async fn bind_local(bind: Option<&str>, port: u16, gateway: bool) -> Result<Vec<
     }
 }
 
+/// How long repeated failures to reach the same target stay hidden.
+const QUIET_REPEATS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reports that a forwarded connection could not be opened: once per target
+/// and minute, so that a browser trying dozens of connections to a port that
+/// does not answer does not flood the terminal. The line ends with `\r\n`,
+/// as the terminal may be in raw mode for a session.
+fn report_failure(target: &str, e: &anyhow::Error) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static SHOWN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let now = Instant::now();
+    let show = {
+        let mut shown = SHOWN.get_or_init(Default::default).lock().unwrap();
+        shown.retain(|_, at| now.duration_since(*at) < QUIET_REPEATS);
+        shown.insert(target.to_string(), now).is_none()
+    };
+    if show {
+        eprint!("qsh: cannot forward to {target}: {e:#} (repeats are not shown for a minute)\r\n");
+    } else {
+        debug!("forward to {target}: {e:#}");
+    }
+}
+
 /// Opens a `DirectTcp` stream through the server.
 pub async fn open_direct(conn: &Conn, host: &str, port: u16) -> Result<(SendHalf, RecvHalf)> {
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -113,14 +137,14 @@ pub async fn start_local(conn: Arc<Conn>, fwd: Forward, gateway: bool) -> Result
                 let _ = tcp.set_nodelay(true);
                 let (conn, fwd) = (conn.clone(), fwd.clone());
                 tokio::spawn(async move {
-                    let result = async {
-                        let (send, recv) = open_direct(&conn, &fwd.host, fwd.host_port).await?;
-                        crate::transport::splice(tcp, send, recv).await
-                    }
-                    .await;
-                    match result {
+                    let (send, recv) = match open_direct(&conn, &fwd.host, fwd.host_port).await {
+                        Ok(s) => s,
+                        Err(e) => return report_failure(&format!("{}:{}", fwd.host, fwd.host_port), &e),
+                    };
+                    // Ends of open connections (resets included) are normal traffic.
+                    match crate::transport::splice(tcp, send, recv).await {
                         Ok(()) => debug!("forward from {peer} closed"),
-                        Err(e) => warn!("forward {}:{} failed: {e:#}", fwd.host, fwd.host_port),
+                        Err(e) => debug!("forward from {peer}: {e:#}"),
                     }
                 });
             }
@@ -256,7 +280,7 @@ pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<
                             debug!("remote forward from {origin}: {e:#}");
                         }
                     }
-                    Err(e) => warn!("remote forward to {host}:{host_port} failed: {e}"),
+                    Err(e) => report_failure(&format!("{host}:{host_port}"), &e.into()),
                 }
             });
         }

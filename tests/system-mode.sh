@@ -186,7 +186,7 @@ check "nologin user cannot download" bash -c "! HOME='$T/client' '$QSH' cp -p $P
 check "nologin user cannot download trees" bash -c "! HOME='$T/client' '$QSH' cp -r -p $PORT qsh-nol@127.0.0.1:.config '$T/nol-tree' 2>/dev/null"
 
 # --- port forwarding runs as the user (compare CVE-2016-10010) ------------------------
-# A listener that reports its port and holds one connection open.
+# A listener that reports its port and holds one connection open, silently.
 python3 - "$T/fwd_port" <<'PY' &
 import socket, sys, time
 s = socket.socket()
@@ -194,7 +194,7 @@ s.bind(("127.0.0.1", 0))
 s.listen(1)
 open(sys.argv[1], "w").write(str(s.getsockname()[1]))
 c, _ = s.accept()
-time.sleep(5)
+time.sleep(60)
 PY
 LISTENER_PID=$!
 for _ in $(seq 50); do [[ -s "$T/fwd_port" ]] && break; sleep 0.1; done
@@ -209,6 +209,10 @@ sleep 0.5
 TARGET_HEX=$(printf '%04X' "$FWD_TARGET")
 FWD_UID=$(awk -v p=":$TARGET_HEX" '$3 ~ p"$" && $4 == "01" {print $8; exit}' /proc/net/tcp)
 check "forwarded connection is made as alice, not root" test "$FWD_UID" = "$ALICE_UID"
+# A quiet forwarded connection must not stall the server (the helper once
+# copied with splice(), which kept the pipe that qshd reads locked).
+check "server answers while a forwarded connection is quiet" \
+    timeout 10 env HOME="$T/client" "$QSH" -p "$PORT" qsh-alice@127.0.0.1 true < /dev/null
 exec 3>&-
 kill "$FWD_PID" "$LISTENER_PID" 2>/dev/null || true
 
