@@ -34,10 +34,18 @@ pub fn encode(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
     if key.kind == KeyEventKind::Release {
         return Vec::new();
     }
-    let m = key.modifiers;
+    let mut m = key.modifiers;
+    // Windows reports AltGr as Ctrl+Alt, with the character it makes
+    // (`@`, `{`, `€`, `ą`): that character is what was typed. Ctrl+Alt with
+    // a Latin letter is a real Ctrl+Alt (ESC and the control code).
+    if let KeyCode::Char(c) = key.code {
+        if m.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) && !c.is_ascii_alphabetic() {
+            m.remove(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        }
+    }
     let alt = m.contains(KeyModifiers::ALT);
     let mut out = match key.code {
-        KeyCode::Char(c) if m.contains(KeyModifiers::CONTROL) => match c.to_ascii_lowercase() {
+        KeyCode::Char(c) if m.contains(KeyModifiers::CONTROL) => match latin_key(c).to_ascii_lowercase() {
             c @ 'a'..='z' => vec![c as u8 - b'a' + 1],
             ' ' | '@' | '2' => vec![0],
             '[' | '3' => vec![0x1b],
@@ -83,6 +91,18 @@ pub fn encode(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
         out.insert(0, 0x1b);
     }
     out
+}
+
+/// The Latin letter on the same key for a Russian (ЙЦУКЕН) letter, so that
+/// Ctrl+C works with that layout active (the console reports Ctrl+С).
+fn latin_key(c: char) -> char {
+    const RU: &str = "йцукенгшщзхъфывапролджэячсмитьбю";
+    const EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    match RU.chars().position(|r| r == lower) {
+        Some(i) => EN.chars().nth(i).unwrap_or(c),
+        None => c,
+    }
 }
 
 /// Follows `ESC [ ? 1 h` / `ESC [ ? 1 l` (application cursor keys) in output.
@@ -152,6 +172,12 @@ mod tests {
         assert_eq!(encode(k(KeyCode::F(1), none), false), b"\x1bOP");
         assert_eq!(encode(k(KeyCode::F(12), none), false), b"\x1b[24~");
         assert_eq!(encode(k(KeyCode::BackTab, KeyModifiers::SHIFT), false), b"\x1b[Z");
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(encode(k(KeyCode::Char('@'), altgr), false), b"@", "AltGr");
+        assert_eq!(encode(k(KeyCode::Char('ą'), altgr), false), "ą".as_bytes());
+        assert_eq!(encode(k(KeyCode::Char('a'), altgr), false), b"\x1b\x01", "a real Ctrl+Alt");
+        assert_eq!(encode(k(KeyCode::Char('с'), KeyModifiers::CONTROL), false), [3], "Ctrl+C on a Russian layout");
+        assert_eq!(encode(k(KeyCode::Char('Д'), KeyModifiers::CONTROL), false), [12]);
         let mut release = k(KeyCode::Char('a'), none);
         release.kind = KeyEventKind::Release;
         assert!(encode(release, false).is_empty());

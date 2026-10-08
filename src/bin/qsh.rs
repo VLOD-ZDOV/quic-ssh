@@ -239,6 +239,12 @@ fn main() {
         std::process::exit(0);
     }
     a.full |= as_ssh;
+    // A background master or `-f` child may live long: it must not keep its
+    // caller's pipes and files open (OpenSSH's closefrom(3)).
+    #[cfg(unix)]
+    if std::env::var_os(MASTER_FD).is_some() || std::env::var_os(DAEMON_FD).is_some() {
+        qsh::platform::close_inherited_fds();
+    }
     #[cfg(unix)]
     if std::env::var_os(MASTER_FD).is_some() {
         init_logging(a.verbose > 0, a.quiet);
@@ -694,6 +700,7 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
             Box::pin(async move { client::connect(&target, &opts).await.map(Arc::new) }) as futures::future::BoxFuture<'static, _>
         }) as session::Reconnect
     });
+    let quit = Arc::new(tokio::sync::Notify::new());
     let session = session::run(
         conn.clone(),
         SessionOptions {
@@ -706,18 +713,26 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
             reconnect,
             server_alive: target.server_alive,
             predict: target.predict,
+            quit: quit.clone(),
         },
     );
     // `-O exit` ends a master that runs a session too, like ssh's.
     #[cfg(unix)]
     let code = match &master {
-        Some(m) => tokio::select! {
-            code = session => code?,
-            () = m.exit_requested() => {
-                eprintln!("\r\nqsh: the shared connection was ended (-O exit)");
-                255
+        Some(m) => {
+            tokio::pin!(session);
+            tokio::select! {
+                code = &mut session => code?,
+                () = m.exit_requested() => {
+                    // Let the session end itself, so a persistent one is hung
+                    // up on the server instead of left behind.
+                    quit.notify_one();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut session).await;
+                    eprintln!("\r\nqsh: the shared connection was ended (-O exit)");
+                    255
+                }
             }
-        },
+        }
         None => session.await?,
     };
     #[cfg(not(unix))]

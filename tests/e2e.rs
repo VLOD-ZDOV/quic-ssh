@@ -141,6 +141,30 @@ fn exec(c: &Client, s: &Server, transport: &str, command: &str) -> Output {
     c.run(&["--transport", transport, "-p", &s.port.to_string(), &dest(), "/bin/sh", "-c", &format!("'{command}'")])
 }
 
+/// ServerAlive* must not call a working connection dead when the session's
+/// own stream is held up: output nobody reads for a while, or input the
+/// remote command does not read yet.
+#[test]
+fn server_alive_with_stalled_streams() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    for t in ["quic", "tcp"] {
+        let qsh = format!(
+            "HOME='{}' '{QSH}' --transport {t} -o ServerAliveInterval=1 -o ServerAliveCountMax=2 -p {port} {}",
+            c.home.path().display(),
+            dest()
+        );
+        let slow_reader = format!("{qsh} 'head -c 5000000 /dev/zero' | (sleep 4; wc -c)");
+        let out = Command::new("sh").args(["-c", &slow_reader]).output().unwrap();
+        assert_eq!(stdout(&out).trim(), "5000000", "{t}: {}", stderr(&out));
+        let not_reading = format!("head -c 1000000 /dev/zero | {qsh} 'sleep 4; wc -c'");
+        let out = Command::new("sh").args(["-c", &not_reading]).output().unwrap();
+        assert!(out.status.success(), "{t}: {}", stderr(&out));
+        assert_eq!(stdout(&out).trim(), "1000000", "{t}");
+    }
+}
+
 #[test]
 fn exec_over_both_transports() {
     let s = Server::start();

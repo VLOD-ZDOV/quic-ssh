@@ -119,6 +119,18 @@ struct Watch {
 const QUIET_MODES: [u16; 20] = [9, 12, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1034, 1035, 1036, 1039, 1042, 1043, 2026, 2027, 2031];
 
 impl vt100::Callbacks for Watch {
+    /// Characters vt100 does not draw (U+FFFD from invalid UTF-8, C1
+    /// controls) take a cell, or do something, on a real terminal.
+    fn unhandled_char(&mut self, _: &mut vt100::Screen, _: char) {
+        self.drifted = true;
+    }
+
+    fn unhandled_control(&mut self, _: &mut vt100::Screen, b: u8) {
+        // NUL, ENQ, XON/XOFF and DEL do nothing on the screen; SO/SI and
+        // the others switch character sets or worse.
+        self.drifted |= !matches!(b, 0x00 | 0x05 | 0x11 | 0x13 | 0x7f);
+    }
+
     fn unhandled_escape(&mut self, _: &mut vt100::Screen, i1: Option<u8>, _: Option<u8>, b: u8) {
         // ST, and switching (back) to the ASCII character set.
         let harmless = matches!((i1, b), (None, b'\\') | (Some(b'(' | b')' | b'*' | b'+'), b'B'));
@@ -133,6 +145,8 @@ impl vt100::Callbacks for Watch {
             (Some(b'>' | b'=' | b'<'), _) => true,
             // Cursor shape (CSI n SP q).
             (Some(b' '), 'q') => true,
+            // Erasing the scrollback (`clear` sends it): the screen stays.
+            (None, 'J') => params == [&[3][..]],
             (Some(b'?'), 'n' | 'u') => true,
             (Some(b'?'), 'h' | 'l') => params.iter().all(|p| p.iter().all(|m| QUIET_MODES.contains(m))),
             // Mode queries (DECRQM, CSI ? n $ p).
@@ -249,7 +263,15 @@ impl Predictor {
             && screen
                 .cell(row, col)
                 // A space (as `\b \b` leaves) looks the same as an empty cell.
-                .is_some_and(|c| matches!(c.contents(), "" | " ") && !c.is_wide_continuation() && c.bgcolor() == screen.bgcolor())
+                // Erasing a prediction leaves a plain blank: no underline or
+                // inverse to lose.
+                .is_some_and(|c| {
+                    matches!(c.contents(), "" | " ")
+                        && !c.is_wide_continuation()
+                        && c.bgcolor() == screen.bgcolor()
+                        && !c.underline()
+                        && !c.inverse()
+                })
     }
 
     /// Handles typed input (as sent to the server); returns bytes to write
@@ -275,10 +297,12 @@ impl Predictor {
             return out;
         }
         for &ch in data {
+            // Unsettled (after a control key or a character of another
+            // script): where the next character lands is not known.
             let at = match self.pending.back() {
+                _ if self.unsettled => None,
                 Some(last) if last.epoch == self.epoch => Some((last.row, last.col + 1)),
                 Some(_) => None,
-                None if self.unsettled => None,
                 None => Some(self.screen.screen().cursor_position()),
             };
             let Some((row, col)) = at.filter(|&(r, c)| self.free(r, c)) else { break };
@@ -327,6 +351,7 @@ impl Predictor {
         }
         // Predictions that are now on the server's screen are confirmed.
         let mut explained = false;
+        let mut last_confirmed = None;
         while let Some(p) = self.pending.front().copied() {
             let screen = self.screen.screen();
             let shown = screen.cell(p.row, p.col).is_some_and(|c| c.contents().as_bytes() == [p.ch]);
@@ -337,6 +362,7 @@ impl Predictor {
             }
             self.pending.pop_front();
             explained = true;
+            last_confirmed = Some((p.row, p.col));
             // A `*` may be a masked password prompt answering any key.
             if p.ch != b'*' && !self.burned {
                 self.confirmed = self.confirmed.max(p.epoch);
@@ -354,8 +380,13 @@ impl Predictor {
             }
         }
         // Output that typing did not cause (a prompt, say) makes what comes
-        // next uncertain: it needs a confirmation of its own.
-        if !explained && !data.is_empty() {
+        // next uncertain: it needs a confirmation of its own. Echoes are
+        // only the explanation if the cursor stopped right after the last
+        // one: an echo and a prompt arriving together ("y\r\nPassword: ")
+        // must not carry the confirmation over to the prompt.
+        let just_echoes = last_confirmed.is_some_and(|(row, col)| self.screen.screen().cursor_position() == (row, col + 1));
+        let caused_by_typing = explained && just_echoes;
+        if !caused_by_typing && !data.is_empty() {
             self.epoch += 1;
         }
         self.draw(&mut out);
@@ -561,6 +592,42 @@ mod tests {
             assert!(!screen.contains("*s") && !screen.contains("*e") && !screen.contains("*c"), "{screen}");
             h.server("*");
         }
+    }
+
+    /// A one-key answer echoed together with the next prompt: the echo
+    /// must not vouch for what is typed at that prompt (a password).
+    #[test]
+    fn echo_and_prompt_in_one_chunk() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ ");
+        h.key("a");
+        h.server("a");
+        h.key("y");
+        h.server("y\r\nPassword: ");
+        h.key("hunter2");
+        assert!(!h.term.screen().contents().contains("hunter"), "{}", h.term.screen().contents());
+    }
+
+    /// `clear` (with its scrollback erase) keeps predictions going.
+    #[test]
+    fn clear_keeps_predicting() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("\x1b[H\x1b[2J\x1b[3J$ ");
+        h.key("a");
+        h.server("a");
+        h.key("b");
+        assert_eq!(h.line(), "$ ab");
+    }
+
+    /// Not over underlined cells: erasing would lose the underline.
+    #[test]
+    fn underlined_fields() {
+        let mut h = Harness::new(Mode::Always);
+        h.server("$ \x1b[4m      \x1b[0m\x1b[3G");
+        h.key("a");
+        h.server("a");
+        h.key("b");
+        h.same_as_server();
     }
 
     /// Output the emulator does not model (REP, insert mode) stops

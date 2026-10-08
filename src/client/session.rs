@@ -174,6 +174,9 @@ pub struct SessionOptions {
     pub server_alive: Option<(Duration, u32)>,
     /// Local echo prediction for a person typing into a terminal.
     pub predict: super::predict::Mode,
+    /// Ends the session (a persistent one for good) when notified, as `~.`
+    /// does: `-O exit` to a master that runs this session.
+    pub quit: Arc<tokio::sync::Notify>,
 }
 
 /// Local handling of escape sequences (`~.`, `~?`, `~~`) typed at the start of a line.
@@ -355,7 +358,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // Escapes only apply when a person types into a terminal (as in ssh).
     let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(Escapes::new);
     // Echo prediction, likewise; it sees what is typed and what comes back.
-    let mut predictor = (raw.is_some() && opts.predict != Mode::Never).then(|| {
+    // Only when the output goes to the terminal too (not `| tee log`).
+    let mut predictor = (raw.is_some() && std::io::stdout().is_terminal() && opts.predict != Mode::Never).then(|| {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         Predictor::new(opts.predict, rows, cols)
     });
@@ -365,6 +369,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::CursorKeys::default()));
     let typed_tx = predictor.is_some().then_some(typed_tx);
     let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
+    // qsh's own messages (the `~?` help) are written by the main loop, after
+    // predictions are taken off the screen.
+    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<String>();
     let stdin_tx = tx.clone();
     if opts.stdin_null {
         let _ = stdin_tx.send(ClientMsg::StdinEof).await;
@@ -397,8 +404,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                                 break;
                             }
                             Some(EscapeAction::Help) => {
-                                let help = escapes.as_ref().map(Escapes::help).unwrap_or_default();
-                                let _ = tokio::io::stderr().write_all(help.as_bytes()).await;
+                                let _ = notice_tx.send(escapes.as_ref().map(Escapes::help).unwrap_or_default());
                             }
                             None => {}
                         }
@@ -418,7 +424,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // waits for the server's exit report so the hangup is not lost when the
     // connection closes right after it.
     async fn hang_up(tx: &mpsc::Sender<ClientMsg>, incoming: &mut Reader<ServerMsg>) {
-        if tx.send(ClientMsg::Hangup).await.is_err() {
+        // The queue may be full behind input the server does not take.
+        if !matches!(tokio::time::timeout(HANGUP_WAIT, tx.send(ClientMsg::Hangup)).await, Ok(Ok(()))) {
             return;
         }
         let _ = tokio::time::timeout(HANGUP_WAIT, async {
@@ -432,10 +439,44 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         })
         .await;
     }
+    type Heard = Arc<std::sync::Mutex<std::time::Instant>>;
+    // Asks whether the server is there when the session has been quiet:
+    // with a ping on a stream of its own, since the session's stream can be
+    // held up by flow control (a slow terminal, a command that does not read
+    // its input) while the connection is fine. In a task of its own, as the
+    // main loop may be stuck writing to a slow terminal meanwhile.
+    struct Pinger(tokio::task::JoinHandle<()>);
+    impl Drop for Pinger {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    fn pinger(conn: Arc<Conn>, heard: Heard, answered: Heard, every: Duration) -> Pinger {
+        Pinger(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let last = (*heard.lock().unwrap()).max(*answered.lock().unwrap());
+                if last.elapsed() < every {
+                    continue;
+                }
+                let asked = async {
+                    let (mut s, mut r) = conn.open_bi().await?;
+                    write_msg(&mut s, &Request::Ping).await?;
+                    expect_ok(&mut r).await?;
+                    anyhow::Ok(())
+                };
+                if let Ok(Ok(())) = tokio::time::timeout(every, asked).await {
+                    *answered.lock().unwrap() = std::time::Instant::now();
+                }
+            }
+        }))
+    }
+    let answered: Heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let mut received: u64 = 0;
     let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
     let (alive_interval, alive_max) = alive.unwrap_or(DEFAULT_ALIVE);
     let mut heartbeat = tokio::time::interval(alive_interval);
+    let mut pings = alive.map(|_| pinger(conn.clone(), incoming.heard(), answered.clone(), alive_interval));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Writes to the terminal, with predictions erased first and redrawn after.
     async fn show<W: AsyncWriteExt + Unpin>(w: &mut W, predictor: &mut Option<Predictor>, data: &[u8]) -> std::io::Result<()> {
@@ -475,6 +516,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                         stdout.flush().await?;
                     }
                 }
+                false
+            }
+            Some(text) = notice_rx.recv() => {
+                clear(&mut predictor).await;
+                stderr.write_all(text.as_bytes()).await?;
+                stderr.flush().await?;
                 false
             }
             () = async { tokio::time::sleep_until(deadline.expect("checked").into()).await }, if deadline.is_some() => {
@@ -520,15 +567,18 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 let _ = stderr.write_all(b"\r\nConnection closed.\r\n").await;
                 break 255;
             }
-            _ = heartbeat.tick(), if alive.is_some() => {
-                // When a message last arrived, not when the loop got to it
-                // (writing to a stalled terminal must not look like silence).
-                let quiet = incoming.last_received().elapsed();
-                if quiet >= alive_interval {
-                    // Chaff gets a Pong back; it looks like a keystroke on the wire.
-                    let _ = tx.send(ClientMsg::Typed { data: Vec::new(), pad: vec![0; super::keystroke::PAD_TO] }).await;
+            () = opts.quit.notified() => {
+                if token.is_some() {
+                    hang_up(&tx, &mut incoming).await;
                 }
-                quiet >= alive_interval * alive_max
+                clear(&mut predictor).await;
+                break 255;
+            }
+            _ = heartbeat.tick(), if alive.is_some() => {
+                // When a message last arrived (not when the loop got to it), or
+                // a ping was answered.
+                let heard = incoming.last_received().max(*answered.lock().unwrap());
+                heard.elapsed() >= alive_interval * alive_max
             }
         };
         if !lost {
@@ -573,6 +623,10 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         };
         conn = new_conn;
         incoming = Reader::spawn(new_recv);
+        if pings.take().is_some() {
+            *answered.lock().unwrap() = std::time::Instant::now();
+            pings = Some(pinger(conn.clone(), incoming.heard(), answered.clone(), alive_interval));
+        }
         let _ = sink_tx.send(new_send).await;
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
         // Two size changes make full-screen programs redraw what was lost.
@@ -584,6 +638,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         }
     };
     clear(&mut predictor).await;
+    drop(pings);
     drop(tx);
     writer.abort();
     drop(raw);

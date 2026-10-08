@@ -301,6 +301,11 @@ impl<T: DeserializeOwned + Send + 'static> Reader<T> {
         *self.last.lock().unwrap()
     }
 
+    /// A handle on [`Reader::last_received`] for other tasks.
+    pub fn heard(&self) -> std::sync::Arc<std::sync::Mutex<std::time::Instant>> {
+        self.last.clone()
+    }
+
     /// Like [`read_msg_opt`]; `Ok(None)` also after the end was reported once.
     pub async fn next(&mut self) -> Result<Option<T>> {
         self.rx.recv().await.unwrap_or(Ok(None))

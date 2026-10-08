@@ -234,6 +234,8 @@ pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
         let target = safe_join(dest, &rel)?;
         no_symlinks_below(dest, &target)?;
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+        #[cfg(not(unix))]
+        let _ = mode;
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 // The mode goes through the umask, as with files and `cp -r`.
