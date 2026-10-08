@@ -188,6 +188,56 @@ pub enum Mode {
 }
 
 /// Connects to `host:port` using the given transport mode.
+/// Where the client's end of a connection is (`-b`/`BindAddress`,
+/// `-B`/`BindInterface`), so that it leaves through the interface the user
+/// chose (a VPN, say).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Bind {
+    #[default]
+    Any,
+    Address(std::net::IpAddr),
+    Interface(String),
+}
+
+impl Bind {
+    /// Whether `remote` can be reached from this local address at all.
+    fn allows(&self, remote: &SocketAddr) -> bool {
+        match self {
+            Bind::Address(ip) => ip.is_ipv4() == remote.is_ipv4(),
+            _ => true,
+        }
+    }
+
+    /// The local address for a connection to `remote` (`None`: any).
+    fn local_for(&self, remote: &SocketAddr) -> Result<Option<SocketAddr>> {
+        Ok(match self {
+            Bind::Any => None,
+            Bind::Address(ip) => Some(SocketAddr::new(*ip, 0)),
+            Bind::Interface(name) => Some(SocketAddr::new(interface_address(name, remote.is_ipv4())?, 0)),
+        })
+    }
+}
+
+/// An address of the network interface `name` of the IP version wanted.
+#[cfg(unix)]
+fn interface_address(name: &str, v4: bool) -> Result<std::net::IpAddr> {
+    let found = nix::ifaddrs::getifaddrs()?.filter(|i| i.interface_name == name).find_map(|i| {
+        let a = i.address?;
+        match (v4, a.as_sockaddr_in(), a.as_sockaddr_in6()) {
+            (true, Some(s), _) => Some(std::net::IpAddr::V4(s.ip())),
+            // Not link-local: those need a scope to be usable.
+            (false, _, Some(s)) if (s.ip().segments()[0] & 0xffc0) != 0xfe80 => Some(std::net::IpAddr::V6(s.ip())),
+            _ => None,
+        }
+    });
+    found.with_context(|| format!("interface {name} has no IPv{} address", if v4 { 4 } else { 6 }))
+}
+
+#[cfg(not(unix))]
+fn interface_address(name: &str, _v4: bool) -> Result<std::net::IpAddr> {
+    bail!("binding to an interface ({name}) is not supported on this system; use BindAddress")
+}
+
 /// Which IP versions to use (`-4`, `-6`, `AddressFamily`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Family {
@@ -224,8 +274,8 @@ where
     tcp::connect_stream(Arc::new(tls), stream, remote).await
 }
 
-pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, tls: rustls::ClientConfig) -> Result<Conn> {
-    let addrs = resolve(host, port, family).await?;
+pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, bind: &Bind, tls: rustls::ClientConfig) -> Result<Conn> {
+    let addrs: Vec<SocketAddr> = resolve(host, port, family).await?.into_iter().filter(|a| bind.allows(a)).collect();
     if addrs.is_empty() {
         bail!("{host} has no addresses");
     }
@@ -235,7 +285,7 @@ pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, tls: rus
     if mode != Mode::Tcp {
         for &addr in &addrs {
             let timeout = if mode == Mode::Quic { TCP_TIMEOUT } else { QUIC_TIMEOUT };
-            match tokio::time::timeout(timeout, quic::connect(tls.clone(), addr)).await {
+            match tokio::time::timeout(timeout, quic::connect(tls.clone(), addr, bind.local_for(&addr)?)).await {
                 Ok(Ok(conn)) => return Ok(conn),
                 Ok(Err(e)) => errors.push(format!("quic {addr}: {e:#}")),
                 Err(_) => errors.push(format!("quic {addr}: timed out")),
@@ -245,7 +295,7 @@ pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, tls: rus
     }
     if mode != Mode::Quic {
         for &addr in &addrs {
-            match tokio::time::timeout(TCP_TIMEOUT, tcp::connect(tls.clone(), addr)).await {
+            match tokio::time::timeout(TCP_TIMEOUT, tcp::connect(tls.clone(), addr, bind.local_for(&addr)?)).await {
                 Ok(Ok(conn)) => return Ok(conn),
                 Ok(Err(e)) => errors.push(format!("tcp {addr}: {e:#}")),
                 Err(_) => errors.push(format!("tcp {addr}: timed out")),
@@ -272,29 +322,30 @@ impl std::error::Error for Unreachable {}
 /// Tries every address and port in parallel and takes the first qshd that
 /// answers; gives up after [`PROBE_TIMEOUT`], or as soon as every UDP port
 /// turned out to be closed. `tls` gives the config for each port.
-pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: impl Fn(u16) -> rustls::ClientConfig) -> Result<Conn> {
+pub async fn connect_probe(host: &str, ports: &[u16], family: Family, bind: &Bind, tls: impl Fn(u16) -> rustls::ClientConfig) -> Result<Conn> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut candidates = Vec::new();
     for &port in ports {
         // Not resolvable here does not mean ssh cannot reach it (its config may know better).
         match resolve(host, port, family).await {
-            Ok(addrs) => candidates.extend(addrs),
+            Ok(addrs) => candidates.extend(addrs.into_iter().filter(|a| bind.allows(a))),
             Err(e) => return Err(Unreachable(format!("{e:#}")).into()),
         }
     }
     let configs: std::collections::HashMap<u16, Arc<rustls::ClientConfig>> = ports.iter().map(|&p| (p, Arc::new(tls(p)))).collect();
+    let candidates: Vec<(SocketAddr, Option<SocketAddr>)> = candidates.into_iter().map(|a| Ok((a, bind.local_for(&a)?))).collect::<Result<_>>()?;
     let mut attempts: FuturesUnordered<_> = candidates
         .into_iter()
-        .map(|addr| {
+        .map(|(addr, local)| {
             let tls = configs[&addr.port()].clone();
             async move {
                 tokio::select! {
-                    r = tokio::time::timeout(PROBE_TIMEOUT, quic::connect(tls, addr)) => match r {
+                    r = tokio::time::timeout(PROBE_TIMEOUT, quic::connect(tls, addr, local)) => match r {
                         Ok(Ok(conn)) => Ok(conn),
                         Ok(Err(e)) => Err(format!("quic {addr}: {e:#}")),
                         Err(_) => Err(format!("quic {addr}: no answer")),
                     },
-                    () = udp_port_closed(addr) => Err(format!("quic {addr}: udp port closed")),
+                    () = udp_port_closed(addr, local) => Err(format!("quic {addr}: udp port closed")),
                 }
             }
         })
@@ -311,8 +362,9 @@ pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: impl 
 }
 
 /// Resolves only if the host answers a datagram with ICMP port unreachable.
-async fn udp_port_closed(addr: SocketAddr) {
-    let bind: SocketAddr = if addr.is_ipv4() { ([0u8; 4], 0).into() } else { ([0u16; 8], 0).into() };
+async fn udp_port_closed(addr: SocketAddr, local: Option<SocketAddr>) {
+    let any: SocketAddr = if addr.is_ipv4() { ([0u8; 4], 0).into() } else { ([0u16; 8], 0).into() };
+    let bind = local.unwrap_or(any);
     let probe = async {
         let sock = tokio::net::UdpSocket::bind(bind).await?;
         sock.connect(addr).await?;

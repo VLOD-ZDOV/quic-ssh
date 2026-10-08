@@ -57,7 +57,13 @@ async fn pump<R: AsyncRead + Unpin>(r: R, i: usize, err: bool, tx: mpsc::Unbound
         match r.read_until(b'\n', &mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(_) => {
-                let text = String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']).to_string();
+                // No control characters (tabs aside): a `\r` or an escape
+                // sequence could overwrite the prefix, posing as another host.
+                let text: String = String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\n', '\r'])
+                    .chars()
+                    .filter(|&c| c == '\t' || !c.is_control())
+                    .collect();
                 let _ = tx.send(if err { Line::Err(i, text) } else { Line::Out(i, text) });
             }
         }
@@ -68,16 +74,26 @@ async fn pump<R: AsyncRead + Unpin>(r: R, i: usize, err: bool, tx: mpsc::Unbound
 /// `flags` go to each `qsh`. Returns 0 if it succeeded everywhere, 255 if a
 /// host could not be reached, else 1.
 pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &[String]) -> Result<i32> {
+    let jobs: Vec<(String, Vec<String>)> = dests.iter().map(|d| (d.clone(), flags.to_vec())).collect();
+    run_each(&jobs, command, parallel).await
+}
+
+/// Like [`run`], with flags of its own for each host (`qsh ui` passes each
+/// host's preferences).
+pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parallel: usize) -> Result<i32> {
+    let dests: Vec<String> = jobs.iter().map(|(d, _)| d.clone()).collect();
+    let dests = dests.as_slice();
     if command.is_empty() {
         bail!("no command given (qsh multi HOSTS -- COMMAND)");
     }
     let exe = std::env::current_exe()?;
     let width = dests.iter().map(|d| d.chars().count()).max().unwrap_or(0);
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    let limit = Arc::new(Semaphore::new(parallel.max(1)));
+    // Bounded: tokio's semaphore panics above its maximum.
+    let limit = Arc::new(Semaphore::new(parallel.clamp(1, 256)));
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut tasks = Vec::new();
-    for (i, dest) in dests.iter().enumerate() {
+    for (i, (dest, flags)) in jobs.iter().enumerate() {
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.args(flags)
             .args(["-T", "-n", "-o", "BatchMode=yes", "--", dest])

@@ -12,6 +12,16 @@ use crate::transport::Conn;
 const MAX_BYTES: u64 = 4 << 30;
 const CHUNK: usize = 256 * 1024;
 const REPORT_EVERY: Duration = Duration::from_millis(100);
+/// A test that makes no progress for this long has failed (a server that
+/// stopped sending must not hang it).
+const STALL: Duration = Duration::from_secs(10);
+
+async fn or_stall<T>(f: impl std::future::Future<Output = std::io::Result<T>>) -> Result<T> {
+    match tokio::time::timeout(STALL, f).await {
+        Ok(r) => Ok(r?),
+        Err(_) => bail!("no progress for {} s", STALL.as_secs()),
+    }
+}
 
 /// One round trip on a fresh stream (what a new command or forward costs).
 pub async fn ping(conn: &Conn) -> Result<Duration> {
@@ -38,7 +48,7 @@ pub async fn download(conn: &Conn, duration: Duration, mut progress: impl FnMut(
     let mut total = 0u64;
     let mut buf = vec![0u8; CHUNK];
     while start.elapsed() < duration {
-        let n = recv.read(&mut buf).await?;
+        let n = or_stall(recv.read(&mut buf)).await?;
         if n == 0 {
             break;
         }
@@ -63,15 +73,15 @@ pub async fn upload(conn: &Conn, duration: Duration, mut progress: impl FnMut(u6
     let mut sent = 0u64;
     let buf = vec![0u8; CHUNK];
     while start.elapsed() < duration {
-        send.write_all(&buf).await?;
+        or_stall(send.write_all(&buf)).await?;
         sent += buf.len() as u64;
         if last.elapsed() >= REPORT_EVERY {
             last = Instant::now();
             progress(sent, start.elapsed());
         }
     }
-    send.shutdown().await?;
-    match expect_ok(&mut recv).await? {
+    or_stall(send.shutdown()).await?;
+    match tokio::time::timeout(STALL, expect_ok(&mut recv)).await.map_err(|_| anyhow::anyhow!("no answer for {} s", STALL.as_secs()))?? {
         Reply::File { size, .. } => Ok((size, start.elapsed())),
         other => bail!("unexpected reply {other:?}"),
     }

@@ -109,9 +109,7 @@ pub fn save(home: &Path, all: &[Saved]) -> Result<()> {
         text.push('\n');
         text += &s.block();
     }
-    let tmp = file.with_extension("new");
-    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &file).with_context(|| format!("cannot replace {}", file.display()))?;
+    crate::platform::replace_file(&file, text.as_bytes()).with_context(|| format!("cannot write {}", file.display()))?;
     Ok(())
 }
 

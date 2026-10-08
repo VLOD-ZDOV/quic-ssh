@@ -55,12 +55,14 @@ fn finish(endpoint: Option<Endpoint>, conn: quinn::Connection) -> Result<Conn> {
     Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new(), server_version: 3, host_cert })
 }
 
-pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result<Conn> {
-    let bind: SocketAddr = if addr.is_ipv4() {
+/// `local`: the address to send from (`-b`/`-B`); any if `None`.
+pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr, local: Option<SocketAddr>) -> Result<Conn> {
+    let any: SocketAddr = if addr.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
         (Ipv6Addr::UNSPECIFIED, 0).into()
     };
+    let bind = local.unwrap_or(any);
     let endpoint = Endpoint::client(bind)?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     cfg.transport_config(transport_config(false));

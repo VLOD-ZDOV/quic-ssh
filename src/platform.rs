@@ -65,6 +65,25 @@ pub fn terminal() -> io::Result<(File, File)> {
     }
 }
 
+/// Replaces `path` with `contents` in one step: written to a temporary file
+/// of a unique name next to it, then renamed over it, so a reader never sees
+/// half a file and two writers never write into the same temporary file.
+/// A symlink is followed (dotfile managers): the file it points to is
+/// replaced.
+pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let file = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let tmp = file.with_file_name(format!(".{name}.{}.{}.{nanos}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+    let written = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, &file));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Closes every descriptor above stderr, like OpenSSH's `closefrom(3)`:
 /// a program started for another user must not inherit anything of ours
 /// (a terminal master opened by another thread is close-on-exec only a

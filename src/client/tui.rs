@@ -46,6 +46,8 @@ enum Probe {
     /// No qshd: sessions go through ssh.
     NoQshd,
     Invalid(String),
+    /// Not checked, and why (a direct check could reveal this machine's address).
+    Unchecked(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,7 +203,19 @@ impl Form {
         }
         f.groups = groups::of(groups, &h.alias).join(" ");
         f.name = h.alias.clone();
-        if let Some(t) = &h.target {
+        // A saved connection: exactly what was saved, not what the configs
+        // make of it (a resolved port, user or `Host *` key would otherwise
+        // be written back into it).
+        let saved = (h.source == Source::Saved)
+            .then(|| home_dir().ok().map(|home| saved::load(&home)))
+            .flatten()
+            .and_then(|all| all.into_iter().find(|s| s.name == h.alias));
+        if let Some(s) = saved {
+            f.host = s.host;
+            f.user = s.user.unwrap_or_default();
+            f.port = s.port.map(|p| p.to_string()).unwrap_or_default();
+            f.key = s.identity.unwrap_or_default();
+        } else if let Some(t) = &h.target {
             f.host = t.host.clone();
             f.user = t.user.clone();
             if t.cli_port.is_some() || t.port != crate::DEFAULT_PORT {
@@ -789,6 +803,7 @@ impl App {
             Probe::Tcp { port, .. } => format!("{label}  (tcp {port}, UDP blocked?)"),
             Probe::NoQshd => "no qshd".to_string(),
             Probe::Invalid(e) => e.clone(),
+            Probe::Unchecked(why) => format!("not checked: {why}"),
             Probe::Pending => "checking…".to_string(),
         };
         let checked = h.checked_at.map(|t| format!("  · {}", ago(t, self.now))).unwrap_or_default();
@@ -948,6 +963,7 @@ fn probe_badge(p: &Probe) -> (&'static str, Color, String) {
         Probe::Tcp { handshake, .. } => ("●", Color::Yellow, format!("tcp {}", fmt_ms(*handshake))),
         Probe::NoQshd => ("○", Color::DarkGray, "ssh".to_string()),
         Probe::Invalid(_) => ("✗", Color::Red, "invalid".to_string()),
+        Probe::Unchecked(_) => ("·", Color::DarkGray, "not checked".to_string()),
     }
 }
 
@@ -1066,7 +1082,7 @@ fn to_cache(probe: &Probe, key: Option<KeyState>, endpoint: String) -> Option<Ca
         Probe::Quic { handshake, port } => ("quic", *port, *handshake),
         Probe::Tcp { handshake, port } => ("tcp", *port, *handshake),
         Probe::NoQshd => ("ssh", 0, Duration::ZERO),
-        Probe::Pending | Probe::Invalid(_) => return None,
+        Probe::Pending | Probe::Invalid(_) | Probe::Unchecked(_) => return None,
     };
     let key = key.map(|k| match k {
         KeyState::Known => "known",
@@ -1106,10 +1122,13 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
         // Reached through a proxy: connecting directly could reveal this machine's address.
         return (Probe::NoQshd, None);
     }
+    if target.proxy_jump.is_some() {
+        return (Probe::Unchecked("reached through a jump host"), None);
+    }
     let Ok(tls) = crate::tls::client_config(&id) else { return (Probe::NoQshd, None) };
     let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
     let start = Instant::now();
-    if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, |_| tls.clone()).await {
+    if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, &target.bind, |_| tls.clone()).await {
         let handshake = start.elapsed();
         let port = conn.remote_addr().port();
         let key = key_state(&target.host, port, conn.peer_key());
@@ -1119,7 +1138,7 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     // UDP may be blocked: try the TLS-over-TCP fallback on the qsh port.
     let port = target.alt_ports.first().copied().unwrap_or(target.port);
     let start = Instant::now();
-    match tokio::time::timeout(PROBE_TCP_TIMEOUT, transport::connect(&target.host, port, Transport::Tcp, target.family, tls)).await {
+    match tokio::time::timeout(PROBE_TCP_TIMEOUT, transport::connect(&target.host, port, Transport::Tcp, target.family, &target.bind, tls)).await {
         Ok(Ok(conn)) => {
             let handshake = start.elapsed();
             let key = key_state(&target.host, port, conn.peer_key());
@@ -1139,6 +1158,14 @@ fn start_probes(app: &mut App, only: Option<&str>, force: bool, tx: &mpsc::Unbou
             continue;
         }
         let (Some(target), Some(endpoint)) = (h.target.clone(), h.endpoint()) else { continue };
+        // Hosts only known from known_hosts may have been reached through a
+        // jump host or proxy that nothing here tells about: only on request.
+        if h.source == Source::KnownHost && !force {
+            if h.probe == Probe::Pending {
+                h.probe = Probe::Unchecked("from known_hosts only; r checks it directly");
+            }
+            continue;
+        }
         if !force {
             if let Some(c) = app.state.fresh_probe(&h.alias, &endpoint, t) {
                 (h.probe, h.key) = from_cache(c);
@@ -1231,6 +1258,8 @@ fn session_args(opts: &ConnectOptions, prefs: &Prefs, dest: &str) -> Vec<String>
         args.push("--transport".into());
         args.push(prefs.transport.clone());
     }
+    // A host named `keygen`, `cp` or `-x` is a host, not a tool or an option.
+    args.push("--".into());
     args.push(dest.to_string());
     args
 }
@@ -1392,23 +1421,23 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
             }
             Action::RunAll(cmd, dests) => {
                 leave();
-                let mut args = vec!["multi".to_string()];
-                // Like a session from the menu: plain ssh where there is no
-                // qshd, unless every host was set not to.
-                if dests.iter().any(|d| app.state.prefs(d).ssh_fallback) {
-                    args.push("--full".into());
-                }
-                args.extend(child_flags(&opts));
-                args.extend(dests.iter().cloned());
-                args.push("--".into());
-                args.push(cmd.clone());
-                let status = run_child(&args).await;
+                // Each host as a session from the menu would be: its own
+                // ssh fallback and transport preferences.
+                let jobs: Vec<(String, Vec<String>)> = dests
+                    .iter()
+                    .map(|d| {
+                        let mut flags = session_args(&opts, &app.state.prefs(d), d);
+                        flags.truncate(flags.len() - 2); // without `-- dest`
+                        (d.clone(), flags)
+                    })
+                    .collect();
+                let status = super::multi::run_each(&jobs, std::slice::from_ref(&cmd), 16).await;
                 wait_for_enter();
                 terminal = enter()?;
                 app.status = match status {
-                    Ok(s) if s.success() => format!("`{cmd}` ran on {} hosts", dests.len()),
+                    Ok(0) => format!("`{cmd}` ran on {} hosts", dests.len()),
                     Ok(_) => format!("`{cmd}` failed on some hosts"),
-                    Err(e) => format!("cannot run: {e}"),
+                    Err(e) => format!("cannot run: {e:#}"),
                 };
             }
             Action::Pair(i, code) => {
@@ -1416,6 +1445,7 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                 let alias = app.hosts[i].alias.clone();
                 let mut args = vec!["pair".to_string(), "--full".into()];
                 args.extend(child_flags(&opts));
+                args.push("--".into());
                 args.push(alias.clone());
                 args.push(code);
                 let status = run_child(&args).await;
@@ -1698,9 +1728,11 @@ mod tests {
     #[test]
     fn session_arguments_follow_preferences() {
         let opts = ConnectOptions::default();
-        assert_eq!(session_args(&opts, &Prefs::default(), "box"), ["--full", "box"]);
+        assert_eq!(session_args(&opts, &Prefs::default(), "box"), ["--full", "--", "box"]);
         let p = Prefs { transport: "tcp".into(), ssh_fallback: false };
-        assert_eq!(session_args(&opts, &p, "box"), ["--transport", "tcp", "box"]);
+        assert_eq!(session_args(&opts, &p, "box"), ["--transport", "tcp", "--", "box"]);
+        // A host named like a tool stays a host.
+        assert_eq!(session_args(&opts, &p, "keygen").last().map(String::as_str), Some("keygen"));
     }
 
     #[test]

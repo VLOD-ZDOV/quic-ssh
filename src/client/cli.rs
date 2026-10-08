@@ -77,6 +77,14 @@ fn option_line(o: &str) -> Result<String, String> {
     Ok(format!("{k} {v}"))
 }
 
+/// `-o` keywords only qsh knows (ssh stops at them).
+const QSH_ONLY_OPTIONS: [&str; 2] = ["PersistSession", "PredictiveEcho"];
+
+/// The keyword of a `-o` value (`Key=value` or `Key value`).
+fn option_keyword(v: &str) -> &str {
+    v.trim_start().split(|c: char| c == '=' || c.is_whitespace()).next().unwrap_or("")
+}
+
 impl SshArgs {
     fn apply_flag(&mut self, c: char) -> Result<(), String> {
         match c {
@@ -116,8 +124,10 @@ impl SshArgs {
 
     fn apply_value(&mut self, c: char, v: String) -> Result<(), String> {
         // -p is re-added from the final port so `host:port` also reaches ssh;
-        // -S and -O name qsh's sharing sockets, which ssh cannot use.
-        let pass = (!matches!(c, 'p' | 'S' | 'O')).then(|| v.clone());
+        // -S and -O name qsh's sharing sockets, which ssh cannot use; ssh
+        // refuses qsh's own -o keywords.
+        let qsh_only = c == 'o' && QSH_ONLY_OPTIONS.iter().any(|k| option_keyword(&v).eq_ignore_ascii_case(k));
+        let pass = (!matches!(c, 'p' | 'S' | 'O') && !qsh_only).then(|| v.clone());
         match c {
             'p' => {
                 let p = v.parse().map_err(|_| format!("bad port {v:?}"))?;
@@ -138,6 +148,8 @@ impl SshArgs {
                 _ => return Err(format!("unsupported -O command {v:?} (check, exit, stop)")),
             },
             'S' => self.options.push(format!("ControlPath {v}")),
+            'b' => self.options.push(format!("BindAddress {v}")),
+            'B' => self.options.push(format!("BindInterface {v}")),
             'w' => return Err("tunnel devices (-w) are not supported".into()),
             // Bind address/interface, ciphers, MACs, logging, PKCS#11, tags, queries.
             _ => self.ignored.push(format!("-{c} {v}")),

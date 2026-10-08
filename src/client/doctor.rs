@@ -180,7 +180,7 @@ async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
     let tcp_port = target.alt_ports.first().copied().unwrap_or(target.port);
     let mut found = Vec::new();
     let start = Instant::now();
-    let quic = tokio::time::timeout(STEP_TIMEOUT, transport::connect_probe(&target.host, &ports, target.family, |_| tls.clone())).await;
+    let quic = tokio::time::timeout(STEP_TIMEOUT, transport::connect_probe(&target.host, &ports, target.family, &target.bind, |_| tls.clone())).await;
     let quic = match quic {
         Ok(Ok(conn)) => {
             found.push(("quic", format!("qshd answers on udp {} ({})", conn.remote_addr().port(), ms(start.elapsed())), conn.peer_key()));
@@ -191,7 +191,7 @@ async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
         Err(_) => Some("no answer".to_string()),
     };
     let start = Instant::now();
-    let tcp = match tokio::time::timeout(STEP_TIMEOUT, transport::connect(&target.host, tcp_port, Mode::Tcp, target.family, tls)).await {
+    let tcp = match tokio::time::timeout(STEP_TIMEOUT, transport::connect(&target.host, tcp_port, Mode::Tcp, target.family, &target.bind, tls)).await {
         Ok(Ok(conn)) => {
             found.push(("tcp", format!("qshd answers on tcp {tcp_port} ({})", ms(start.elapsed())), conn.peer_key()));
             conn.close().await;

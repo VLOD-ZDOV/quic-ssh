@@ -75,9 +75,7 @@ impl UiState {
     pub fn save(&self, home: &Path) -> anyhow::Result<()> {
         let file = path(home);
         crate::keys::create_private_dir(file.parent().expect("has a parent"))?;
-        let tmp = file.with_extension("new");
-        std::fs::write(&tmp, toml::to_string(self)?)?;
-        std::fs::rename(&tmp, &file)?;
+        crate::platform::replace_file(&file, toml::to_string(self)?.as_bytes())?;
         Ok(())
     }
 

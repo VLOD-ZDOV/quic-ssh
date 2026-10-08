@@ -255,9 +255,12 @@ pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mu
 }
 
 /// Reads a `Reply` and turns `Reply::Err` into an error.
+/// Fails with the peer's error text, made safe to print: no control
+/// characters (escape sequences could redraw the terminal), at most 500
+/// characters.
 pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply> {
     match read_msg(r).await? {
-        Reply::Err(e) => bail!("{e}"),
+        Reply::Err(e) => bail!("{}", e.chars().filter(|c| !c.is_control()).take(500).collect::<String>()),
         other => Ok(other),
     }
 }

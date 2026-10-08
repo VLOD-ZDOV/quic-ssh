@@ -225,6 +225,10 @@ fn main() {
     }
     let mut a = match SshArgs::parse(args[1..].iter().cloned()) {
         Ok(a) => a,
+        // As ssh (or with --full), what qsh does not understand is ssh's.
+        Err(e) if as_ssh || args.iter().skip(1).any(|a| a == "--full") => {
+            finish(exec_openssh("ssh", without_qsh_options(&args[1..]), &e))
+        }
         Err(e) => {
             eprintln!("qsh: {e}\n{USAGE}");
             std::process::exit(255);
@@ -542,9 +546,18 @@ fn print_config(t: &Target) {
 
 async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
     let Some(dest) = a.destination.clone() else {
+        // `ssh -Q kex` and the like.
+        if a.full {
+            return exec_openssh("ssh", without_qsh_options(&args[1..]), "no destination for qsh");
+        }
         bail!("missing destination\n{USAGE}");
     };
-    let target = Target::resolve(&dest, a.port, &sources(&a))?;
+    let target = match Target::resolve(&dest, a.port, &sources(&a)) {
+        Ok(t) => t,
+        // A user or host qsh cannot take (an AD-style user, say): ssh's job.
+        Err(e) if a.full => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),
+        Err(e) => return Err(e),
+    };
     if a.print_config {
         print_config(&target);
         return Ok(0);
@@ -796,11 +809,36 @@ fn with_doctor_hint(e: anyhow::Error, target: &Target) -> anyhow::Error {
 }
 
 /// Arguments for OpenSSH's ssh: everything ssh understands, as given.
+/// The command line for ssh, without qsh's own long options.
+fn without_qsh_options(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            out.push(arg.clone());
+            out.extend(it.cloned());
+            break;
+        }
+        match arg.as_str() {
+            "--full" | "--accept-new-host" | "--verbose" => {}
+            "--transport" => {
+                it.next();
+            }
+            _ if arg.starts_with("--transport=") => {}
+            _ => out.push(arg.clone()),
+        }
+    }
+    out
+}
+
 fn ssh_args(a: &SshArgs, target: &Target) -> Vec<String> {
     let mut args = a.passthrough.clone();
     if let Some(p) = target.cli_port {
         args.push("-p".into());
         args.push(p.to_string());
+    }
+    for o in &target.ssh_options {
+        args.extend(["-o".to_string(), o.clone()]);
     }
     // `--` so the destination can never be read as an option.
     args.push("--".into());
@@ -918,6 +956,9 @@ async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &Co
         }
         if args.verbose {
             v.push("-v".into());
+        }
+        for o in &target.ssh_options {
+            v.extend(["-o".to_string(), o.clone()]);
         }
         v.extend(["--".to_string(), src.to_string(), dst.to_string()]);
         v

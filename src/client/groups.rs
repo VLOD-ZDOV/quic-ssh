@@ -38,9 +38,7 @@ pub fn save(home: &Path, groups: &Groups) -> Result<()> {
     crate::keys::create_private_dir(file.parent().context("bad path")?)?;
     let groups: Groups = groups.iter().filter(|(_, hosts)| !hosts.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
     let text = format!("# Host groups for `qsh multi -g NAME` and `qsh ui` (e: a host's groups).\n{}", toml::to_string(&groups)?);
-    let tmp = file.with_extension("new");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &file)?;
+    crate::platform::replace_file(&file, text.as_bytes())?;
     Ok(())
 }
 

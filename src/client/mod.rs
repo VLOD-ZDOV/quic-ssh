@@ -60,6 +60,8 @@ pub struct Target {
     pub identity_files: Vec<PathBuf>,
     /// The destination for handing over to `ssh`: `[user@]alias`, as typed.
     pub ssh_dest: String,
+    /// `-o` options that make ssh reach the same host (see `HostConfig::for_ssh`).
+    pub ssh_options: Vec<String>,
     /// Port given on the command line (`-p` or `:port`), if any.
     pub cli_port: Option<u16>,
     /// Forwards from the config, as `-L`/`-R`/`-D` specs.
@@ -83,6 +85,8 @@ pub struct Target {
     /// Session escape character; `None` disables escapes (`EscapeChar none`).
     pub escape_char: Option<u8>,
     pub family: transport::Family,
+    /// Where connections leave from (`-b`/`BindAddress`, `-B`/`BindInterface`).
+    pub bind: transport::Bind,
     /// `LogLevel QUIET` or `-q`: no informational messages.
     pub quiet: bool,
     pub forward_agent: bool,
@@ -169,6 +173,10 @@ impl Target {
                 None if after.is_empty() => (h, None),
                 None => bail!("unexpected text after ']' in {s:?}"),
             }
+        } else if rest.matches(':').count() >= 2 {
+            // An IPv6 address without brackets (as scp, sftp, rsync and git
+            // pass it): no port in it.
+            (rest, None)
         } else {
             match rest.split_once(':') {
                 Some((h, p)) => (h, Some(p)),
@@ -241,11 +249,17 @@ impl Target {
             Some("inet6") => transport::Family::V6,
             _ => transport::Family::Any,
         };
+        let bind = match (&cfg.bind_address, &cfg.bind_interface) {
+            (Some(a), _) => transport::Bind::Address(a.parse().with_context(|| format!("invalid BindAddress {a:?}"))?),
+            (None, Some(i)) => transport::Bind::Interface(i.clone()),
+            (None, None) => transport::Bind::Any,
+        };
         Ok(Target {
             user,
             alt_ports,
             identity_files,
             ssh_dest,
+            ssh_options: cfg.for_ssh.clone(),
             cli_port,
             local_forwards: cfg.local_forwards,
             remote_forwards: cfg.remote_forwards,
@@ -260,6 +274,7 @@ impl Target {
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
             escape_char: parse_escape(cfg.escape_char.as_deref()),
             family,
+            bind,
             quiet: cfg.log_level.as_deref() == Some("quiet"),
             forward_agent: cfg.forward_agent.unwrap_or(false),
             identities_only: cfg.identities_only.unwrap_or(false),
@@ -345,7 +360,8 @@ impl NoQshdCache {
         if let Some(dir) = self.path.parent() {
             let _ = crate::keys::create_private_dir(dir);
         }
-        let _ = std::fs::write(&self.path, text);
+        // Several qsh at once (qsh multi): never a half-written file.
+        let _ = crate::platform::replace_file(&self.path, text.as_bytes());
     }
 }
 
@@ -492,12 +508,12 @@ async fn open_any(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rus
         if opts.transport != Mode::Quic && cache.contains(&hid) {
             return Err(transport::Unreachable(format!("no qshd at {hid} (cached for up to an hour)")).into());
         }
-        let result = transport::connect_probe(&target.host, &target_ports(target), target.family, |p| tls[&p].clone()).await;
+        let result = transport::connect_probe(&target.host, &target_ports(target), target.family, &target.bind, |p| tls[&p].clone()).await;
         let refused = rejected.lock().unwrap().is_some();
         cache.set(&hid, !refused && result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
         result?
     } else {
-        transport::connect(&target.host, target.port, opts.transport, target.family, tls[&target.port].clone()).await?
+        transport::connect(&target.host, target.port, opts.transport, target.family, &target.bind, tls[&target.port].clone()).await?
     };
     tracing::info!("connected to {} over {}", conn.remote_addr(), conn.transport_name());
     Ok(conn)
@@ -710,15 +726,20 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
 }
 
 /// Opens, verifies and logs in to one host (directly or through `via`).
-async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
+/// Connecting directly could bypass a proxy the user relies on (e.g. Tor).
+fn refuse_proxy(target: &Target) -> Result<()> {
     if target.needs_proxy {
-        // Connecting directly could bypass a proxy the user relies on (e.g. Tor).
         bail!(
-            "the config for {} uses ProxyCommand or (in ~/.ssh/config) ProxyJump, which qsh cannot follow; \
+            "the config for {} uses ProxyCommand or (in ssh's config) ProxyJump, which qsh cannot follow; \
              use --full to connect with ssh instead, or set ProxyJump in ~/.config/qsh/config",
             target.host
         );
     }
+    Ok(())
+}
+
+async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
+    refuse_proxy(target)?;
     let own = find_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
     match login_once(target, opts, via, own.as_ref(), false).await {
         // qshd before 0.5 knows only the TLS key: log in again with the own key
@@ -800,33 +821,44 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
             return Ok(conn);
         }
     }
+    // Before any jump host is contacted.
+    refuse_proxy(target)?;
+    let hops = jump_hosts(target, opts).await?;
+    let mut conn = establish(target, opts, hops.last().map(|c| c.as_ref())).await?;
+    conn.set_hops(hops);
+    Ok(conn)
+}
+
+/// Connections to the target's jump hosts (`-J`/`ProxyJump`), in order.
+async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Conn>>> {
     let mut hops: Vec<Arc<Conn>> = Vec::new();
     if let Some(jumps) = &target.proxy_jump {
         // Jump hosts use the config files, but not this host's -o options.
         let sources = config::Sources { full: false, overrides: Vec::new(), ssh_config: target.sources.ssh_config.clone() };
         let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, share: false, ..opts.clone() };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
+            let mut hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
+            // Nothing may stop to ask on the way when this host may not (qsh multi).
+            hop.batch_mode |= target.batch_mode;
             let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))
                 .await
                 .with_context(|| format!("jump host {spec}"))?;
             hops.push(Arc::new(conn));
         }
     }
-    let mut conn = establish(target, opts, hops.last().map(|c| c.as_ref())).await?;
-    conn.set_hops(hops);
-    Ok(conn)
+    Ok(hops)
 }
 
 /// Pairs this client with the server using a one-time code from `qshd pair`.
 pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<()> {
-    if target.needs_proxy {
-        bail!("the config for {} uses ProxyCommand or ProxyJump; pairing needs a direct connection", target.host);
-    }
+    refuse_proxy(target)?;
     let id = load_identity(&opts.identities, &target.identity_files, true, target.batch_mode)?;
+    // Through qsh's jump hosts, like a login.
+    let hops = jump_hosts(target, opts).await?;
     // The server is checked by the pairing code, not by known_hosts.
     let tls = target_ports(target).into_iter().map(|p| crate::tls::client_config(&id).map(|c| (p, c))).collect::<Result<_>>()?;
-    let conn = open(target, opts, &tls, &Rejection::default(), None).await?;
+    let mut conn = open(target, opts, &tls, &Rejection::default(), hops.last().map(|c| c.as_ref())).await?;
+    conn.set_hops(hops);
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Pair { version: VERSION, user: target.user.clone() }).await?;
     let result = async {
@@ -864,6 +896,9 @@ mod tests {
         assert_eq!(t.port, 2200);
         let t = Target::parse_with("bob@example.com:2200", Some(99), None, false).unwrap();
         assert_eq!(t.port, 99);
+        let t = Target::parse_with("u@2001:db8::5", None, None, false).unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("2001:db8::5", crate::DEFAULT_PORT), "unbracketed IPv6");
+        assert_eq!(Target::parse_with("::1", None, None, false).unwrap().host, "::1");
         let t = Target::parse_with("c@[::1]:5", None, None, false).unwrap();
         assert_eq!((t.host.as_str(), t.port), ("::1", 5));
         let t = Target::parse_with("c@[::1]", None, None, false).unwrap();

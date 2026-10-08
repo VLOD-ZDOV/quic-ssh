@@ -3,14 +3,18 @@
 //! Precedence: `-o` options, then `~/.config/qsh/config`, then `~/.ssh/config`
 //! (or the `-F` file); within each the first value found wins (IdentityFile
 //! and the forwards accumulate). Supported keywords: `Host` patterns (`*`,
-//! `?`, `!`), `Match all`, `Include`, `HostName`, `User`, `Port`,
+//! `?`, `!`), `Match`, `Include`, `HostName`, `User`, `Port`,
 //! `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`,
 //! `ProxyJump`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`,
 //! `UserKnownHostsFile`, `ClearAllForwardings`, `EscapeChar`,
 //! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`,
 //! `ControlMaster`, `ControlPath`, `ControlPersist`, and qsh's own
 //! `PersistSession` and `PredictiveEcho`.
-//! Other `Match` blocks are skipped (their conditions are not evaluated).
+//! `Match` blocks are evaluated for `all`, `host`, `originalhost`, `user` and
+//! `localuser`; a block whose conditions qsh cannot check (`exec`,
+//! `localnetwork`, `canonical`...) is not used, except that a proxy in it
+//! counts. Like ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config`
+//! (not with `-F`), and `#` starts a comment anywhere on a line.
 //!
 //! From `~/.ssh/config`, settings that describe the ssh session itself (`Port`,
 //! the forwards, `RequestTTY`) are only used in `--full` mode. Its
@@ -20,6 +24,8 @@
 use std::path::{Path, PathBuf};
 
 const MAX_INCLUDE_DEPTH: usize = 16;
+/// OpenSSH's system-wide client config (not read with `-F`, as by ssh).
+const SYSTEM_SSH_CONFIG: &str = "/etc/ssh/ssh_config";
 
 /// Settings collected for one host alias.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -74,6 +80,13 @@ pub struct HostConfig {
     pub predictive_echo: Option<String>,
     /// `Compression` (used by `qsh cp`).
     pub compression: Option<bool>,
+    /// `BindAddress` and `BindInterface` (`-b`, `-B`).
+    pub bind_address: Option<String>,
+    pub bind_interface: Option<String>,
+    /// `-o` options for ssh/scp when `--full` hands the host over: what only
+    /// qsh's config says (a name only `qsh ui` saved, say), so that ssh
+    /// reaches the same host.
+    pub for_ssh: Vec<String>,
 }
 
 fn yes(v: &str) -> bool {
@@ -100,6 +113,10 @@ fn split_line(line: &str) -> Option<(String, Vec<String>)> {
         while chars.peek().is_some_and(|c| c.is_whitespace()) {
             chars.next();
         }
+        // An unquoted word starting with `#` begins a comment (OpenSSH's argv_split).
+        if chars.peek() == Some(&'#') {
+            break;
+        }
         let mut arg = String::new();
         if chars.peek() == Some(&'"') {
             chars.next();
@@ -125,29 +142,119 @@ fn split_line(line: &str) -> Option<(String, Vec<String>)> {
     Some((keyword, args))
 }
 
+/// Whether a `Host`/`Match` block applies.
+#[derive(Clone, Copy, PartialEq)]
+enum Applies {
+    Yes,
+    No,
+    /// Depends on what qsh cannot check (`Match exec`, `localnetwork`...):
+    /// its settings are not used, but a proxy in it counts (see `needs_proxy`).
+    Maybe,
+}
+
 struct Parser<'a> {
     host: &'a str,
     /// Directory relative `Include` paths are resolved against.
-    base: &'a Path,
+    base: PathBuf,
     /// Read the ssh-session settings (`Port`, forwards, `RequestTTY`, `ProxyJump`).
     full: bool,
     /// qsh's own config or `-o` (as opposed to ssh's config).
     ours: bool,
     out: HostConfig,
+    /// `CanonicalizeHostname` is on: blocks may match the canonical name,
+    /// which qsh does not compute.
+    canonicalize: bool,
+    /// Some ProxyCommand/ProxyJump appears anywhere in the file.
+    any_proxy: bool,
+}
+
+/// A proxy setting that is not `none`.
+fn is_proxy(keyword: &str, first: Option<&str>) -> bool {
+    matches!(keyword, "proxyjump" | "proxycommand") && first.is_some_and(|v| !v.eq_ignore_ascii_case("none"))
 }
 
 impl Parser<'_> {
+    /// Evaluates `Match` criteria like OpenSSH, as far as qsh can.
+    fn match_applies(&self, args: &[String]) -> Applies {
+        let mut result = Applies::Yes;
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            let (negated, criterion) = match word.strip_prefix('!') {
+                Some(c) => (true, c.to_ascii_lowercase()),
+                None => (false, word.to_ascii_lowercase()),
+            };
+            let patterns = |arg: Option<&String>| -> Vec<String> { arg.map(|a| a.split(',').map(str::to_string).collect()).unwrap_or_default() };
+            let this = match criterion.as_str() {
+                "all" => Applies::Yes,
+                "host" => {
+                    let name = self.out.hostname.as_deref().unwrap_or(self.host);
+                    if host_matches(&patterns(words.next()), name) { Applies::Yes } else { Applies::No }
+                }
+                "originalhost" => {
+                    if host_matches(&patterns(words.next()), self.host) { Applies::Yes } else { Applies::No }
+                }
+                "localuser" => {
+                    let me = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+                    if host_matches(&patterns(words.next()), &me) { Applies::Yes } else { Applies::No }
+                }
+                "user" => {
+                    let pats = patterns(words.next());
+                    match self.out.user.as_deref() {
+                        Some(u) if host_matches(&pats, u) => Applies::Yes,
+                        Some(_) => Applies::No,
+                        None => Applies::Maybe,
+                    }
+                }
+                // Evaluated on a second pass after canonicalization, which qsh does not do.
+                "canonical" | "final" => Applies::Maybe,
+                // `exec`, `localnetwork`, `tagged`, `version` and anything newer.
+                _ => {
+                    words.next();
+                    Applies::Maybe
+                }
+            };
+            let this = match (negated, this) {
+                (true, Applies::Yes) => Applies::No,
+                (true, Applies::No) => Applies::Yes,
+                (_, x) => x,
+            };
+            result = match (result, this) {
+                (Applies::No, _) | (_, Applies::No) => Applies::No,
+                (Applies::Maybe, _) | (_, Applies::Maybe) => Applies::Maybe,
+                _ => Applies::Yes,
+            };
+        }
+        result
+    }
+
     fn feed(&mut self, text: &str, depth: usize) {
         // Lines before the first Host/Match apply to every host.
-        let mut active = true;
+        let mut active = Applies::Yes;
         for line in text.lines() {
             let Some((keyword, args)) = split_line(line) else { continue };
             let first = args.first().cloned();
+            if is_proxy(&keyword, first.as_deref()) {
+                self.any_proxy = true;
+                // A proxy that may apply: do not connect around it.
+                if active == Applies::Maybe {
+                    self.out.needs_proxy = true;
+                }
+            }
+            match keyword.as_str() {
+                "host" => {
+                    active = if host_matches(&args, self.host) { Applies::Yes } else { Applies::No };
+                    continue;
+                }
+                "match" => {
+                    active = self.match_applies(&args);
+                    continue;
+                }
+                _ => {}
+            }
             let o = &mut self.out;
             match keyword.as_str() {
-                "host" => active = host_matches(&args, self.host),
-                "match" => active = args.len() == 1 && args[0].eq_ignore_ascii_case("all"),
-                _ if !active => {}
+                _ if active != Applies::Yes => {}
+                "canonicalizehostname" => self.canonicalize |= first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("no")),
                 "include" if depth < MAX_INCLUDE_DEPTH => {
                     for pattern in &args {
                         for file in self.expand_include(pattern) {
@@ -197,6 +304,8 @@ impl Parser<'_> {
                 "controlpersist" if o.control_persist.is_none() => o.control_persist = first,
                 "predictiveecho" if o.predictive_echo.is_none() => o.predictive_echo = first,
                 "compression" if o.compression.is_none() => o.compression = first.as_deref().map(yes),
+                "bindaddress" if o.bind_address.is_none() => o.bind_address = first,
+                "bindinterface" if o.bind_interface.is_none() => o.bind_interface = first,
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -206,12 +315,31 @@ impl Parser<'_> {
     }
 
     fn expand_include(&self, pattern: &str) -> Vec<PathBuf> {
-        expand_include(self.base, pattern)
+        expand_include(&self.base, pattern)
+    }
+
+    fn new<'h>(host: &'h str, base: &Path, full: bool, ours: bool) -> Parser<'h> {
+        Parser { host, base: base.to_path_buf(), full, ours, out: HostConfig::default(), canonicalize: false, any_proxy: false }
+    }
+
+    /// Feeds another file, with its own directory for `Include`.
+    fn feed_file(&mut self, text: &str, base: &Path) {
+        self.base = base.to_path_buf();
+        // Blocks do not continue into the next file.
+        self.feed(&format!("{text}\nMatch all\n"), 0);
+    }
+
+    fn finish(mut self) -> HostConfig {
+        // Blocks may match a canonical name qsh does not know: any proxy then counts.
+        if self.canonicalize && self.any_proxy {
+            self.out.needs_proxy = true;
+        }
+        self.out
     }
 
     fn run(mut self, text: &str) -> HostConfig {
         self.feed(text, 0);
-        self.out
+        self.finish()
     }
 }
 
@@ -230,7 +358,11 @@ fn expand_include(base: &Path, pattern: &str) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| wildcard(&name, &e.file_name().to_string_lossy()))
+        // Like glob(3): a leading dot must be matched explicitly.
+        .filter(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            (!file.starts_with('.') || name.starts_with('.')) && wildcard(&name, &file)
+        })
         .map(|e| e.path())
         .collect();
     files.sort();
@@ -284,9 +416,7 @@ pub const UI_HOSTS: &str = "ui-hosts";
 /// `~/.ssh/config` outside `--full`: its `Port`, `LocalForward` and
 /// `RequestTTY` belong to the ssh session.
 pub fn parse(text: &str, host: &str, base: &Path, full: bool) -> HostConfig {
-    let mut p = Parser { host, base, full, ours: full, out: HostConfig::default() };
-    p.feed(text, 0);
-    p.out
+    Parser::new(host, base, full, full).run(text)
 }
 
 /// Parses `ObscureKeystrokeTiming`: `yes` (default 20 ms), `no`, `interval:MS`.
@@ -351,7 +481,8 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
-    let ssh_dir = ssh_file.parent().map(Path::to_path_buf).unwrap_or_else(|| home.join(".ssh"));
+    // Relative Includes in the user's file are in ~/.ssh, even with -F (as in ssh).
+    let ssh_dir = home.join(".ssh");
     // -o lines come first: before any `Host` they apply to every host and win.
     // `Match all` ends the last `Host` block of each part, so settings in the
     // next one are not taken as part of it.
@@ -361,8 +492,27 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         read(&qsh_dir.join("config")),
         read(&qsh_dir.join(UI_HOSTS))
     );
-    let ours = Parser { host, base: &qsh_dir, full: true, ours: true, out: HostConfig::default() }.run(&ours_text);
-    let ssh = Parser { host, base: &ssh_dir, full: sources.full, ours: false, out: HostConfig::default() }.run(&read(&ssh_file));
+    let ours = Parser::new(host, &qsh_dir, true, true).run(&ours_text);
+    // ssh's own files: the user's, then (without -F) the system-wide one,
+    // as ssh reads them; first value wins across both.
+    let mut ssh = Parser::new(host, &ssh_dir, sources.full, false);
+    ssh.feed_file(&read(&ssh_file), &ssh_dir);
+    if sources.ssh_config.is_none() {
+        let system = Path::new(SYSTEM_SSH_CONFIG);
+        ssh.feed_file(&read(system), system.parent().unwrap_or(Path::new("/")));
+    }
+    let ssh = ssh.finish();
+    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && ours.proxy_jump.is_none());
+    let mut for_ssh = Vec::new();
+    if let (Some(h), None) = (&ours.hostname, &ssh.hostname) {
+        for_ssh.push(format!("HostName={h}"));
+    }
+    if let (Some(u), None) = (&ours.user, &ssh.user) {
+        for_ssh.push(format!("User={u}"));
+    }
+    for f in &ours.identity_files {
+        for_ssh.push(format!("IdentityFile={f}"));
+    }
     HostConfig {
         hostname: ours.hostname.or(ssh.hostname),
         user: ours.user.or(ssh.user),
@@ -374,7 +524,9 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         dynamic_forwards: ours.dynamic_forwards.into_iter().chain(ssh.dynamic_forwards).collect(),
         proxy_jump: ours.proxy_jump,
         request_tty: ours.request_tty.or(ssh.request_tty),
-        needs_proxy: ssh.needs_proxy || ours.needs_proxy,
+        // A ProxyJump in qsh's own config (or -J) is how to reach a host that
+        // ssh reaches through a proxy, so it takes care of ssh's.
+        needs_proxy,
         batch_mode: ours.batch_mode.or(ssh.batch_mode),
         strict_host_key_checking: ours.strict_host_key_checking.or(ssh.strict_host_key_checking),
         user_known_hosts_file: ours.user_known_hosts_file,
@@ -396,6 +548,9 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         control_persist: ours.control_persist.or(ssh.control_persist),
         predictive_echo: ours.predictive_echo.or(ssh.predictive_echo),
         compression: ours.compression.or(ssh.compression),
+        bind_address: ours.bind_address.or(ssh.bind_address),
+        bind_interface: ours.bind_interface.or(ssh.bind_interface),
+        for_ssh,
     }
 }
 
@@ -523,5 +678,49 @@ Host *
         assert_eq!(c.user.as_deref(), Some("override"));
         assert_eq!(c.user_known_hosts_file.as_deref(), Some("~/kh"));
         assert_eq!(lookup(home.path(), "myserver", &Sources::default()).user_known_hosts_file, None);
+    }
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    fn cfg(text: &str, host: &str) -> HostConfig {
+        parse(text, host, Path::new("/nonexistent"), true)
+    }
+
+    #[test]
+    fn comments_end_lines() {
+        let c = cfg("Host alpha   # was: beta\n    HostName 192.0.2.10   # the office box\n", "beta");
+        assert_eq!(c.hostname, None, "a comment is not a host pattern");
+        let c = cfg("Host alpha   # was: beta\n    HostName 192.0.2.10   # the office box\n", "alpha");
+        assert_eq!(c.hostname.as_deref(), Some("192.0.2.10"));
+        let c = cfg("Match all   # everything\n    ProxyCommand nc -x 127.0.0.1:9050 %h %p\n", "any");
+        assert!(c.needs_proxy, "Match all with a comment still applies");
+    }
+
+    #[test]
+    fn match_blocks_are_evaluated() {
+        let text = "Host m2\n    HostName 192.0.2.5\nMatch originalhost m2\n    ProxyCommand nc %h %p\n    User via\n";
+        let c = cfg(text, "m2");
+        assert!(c.needs_proxy);
+        assert_eq!(c.user.as_deref(), Some("via"));
+        assert!(!cfg(text, "other").needs_proxy);
+        let c = cfg("Match host 192.0.2.*\n    User ops\n", "192.0.2.7");
+        assert_eq!(c.user.as_deref(), Some("ops"));
+        let c = cfg("Match !host 192.0.2.*\n    User ops\n", "192.0.2.7");
+        assert_eq!(c.user, None);
+    }
+
+    /// What qsh cannot check: settings are not used, but a proxy counts.
+    #[test]
+    fn unknown_conditions_with_a_proxy() {
+        let c = cfg("Match exec \"test -e /tmp/vpn\"\n    ProxyJump bastion\n    User other\n", "h");
+        assert!(c.needs_proxy);
+        assert_eq!(c.user, None);
+        let c = cfg("Match exec \"true\"\n    User other\n", "h");
+        assert!(!c.needs_proxy);
+        let c = cfg("CanonicalizeHostname yes\nHost *.corp.example\n    ProxyJump bastion\n", "box");
+        assert!(c.needs_proxy, "the canonical name could match");
     }
 }

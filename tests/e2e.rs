@@ -165,6 +165,27 @@ fn server_alive_with_stalled_streams() {
     }
 }
 
+/// `-b` / `-B`: connections leave from the address or interface asked for,
+/// or not at all (never around it).
+#[test]
+fn bind_address_and_interface() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    for t in ["quic", "tcp"] {
+        let out = c.run(&["--transport", t, "-b", "127.0.0.1", "-p", &port, &dest(), "echo", "bound"]);
+        assert_eq!(stdout(&out), "bound\n", "{t}: {}", stderr(&out));
+        let out = c.run(&["--transport", t, "-b", "192.0.2.1", "-p", &port, &dest(), "true"]);
+        assert!(!out.status.success(), "{t}: connected from an address this machine does not have");
+    }
+    if cfg!(target_os = "linux") {
+        let out = c.run(&["-B", "lo", "-p", &port, &dest(), "echo", "lo"]);
+        assert_eq!(stdout(&out), "lo\n", "{}", stderr(&out));
+        let out = c.run(&["-B", "no-such-if0", "-p", &port, &dest(), "true"]);
+        assert!(stderr(&out).contains("no-such-if0"), "{}", stderr(&out));
+    }
+}
+
 #[test]
 fn exec_over_both_transports() {
     let s = Server::start();
@@ -552,6 +573,29 @@ fn full_mode_finds_qshd_on_standard_port() {
     assert_eq!(stdout(&out), "quic-on-4422\n");
     assert!(stderr(&out).contains("over quic"), "{}", stderr(&out));
     assert!(!log.exists(), "ssh was used instead of qshd");
+}
+
+/// With --full, what qsh cannot parse is ssh's: queries, AD-style users,
+/// options qsh does not have; qsh's own -o keywords are not passed on.
+#[test]
+fn full_mode_hands_unparsable_input_to_ssh() {
+    let c = Client::new();
+    let bin = tempfile::tempdir().unwrap();
+    let (path, log) = fake_openssh(bin.path());
+    let run = |args: &[&str]| c.cmd(args).env("PATH", &path).output().unwrap();
+    for (args, expect) in [
+        (&["--full", "-Q", "kex"][..], "ssh -Q kex"),
+        (&["--full", "-O", "forward", "-L", "1:h:2", "box"][..], "ssh -O forward -L 1:h:2 box"),
+        (&["--full", "--transport", "tcp", "user@corp.example@192.0.2.9", "true"][..], "ssh user@corp.example@192.0.2.9 true"),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(7), "{args:?}: {}", stderr(&out));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), expect, "{args:?}");
+    }
+    // qsh-only -o keywords never reach ssh.
+    let cli = qsh::client::cli::SshArgs::parse(["-o", "PredictiveEcho=yes", "-o", "Compression=yes", "h"].map(String::from)).unwrap();
+    assert_eq!(cli.passthrough, ["-o", "Compression=yes"]);
 }
 
 #[test]

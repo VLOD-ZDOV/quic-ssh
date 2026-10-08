@@ -147,8 +147,16 @@ fn keep_alive(sock: &TcpStream) {
     }
 }
 
-pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result<Conn> {
-    let sock = TcpStream::connect(addr).await?;
+/// `local`: the address to connect from (`-b`/`-B`); any if `None`.
+pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr, local: Option<SocketAddr>) -> Result<Conn> {
+    let sock = match local {
+        None => TcpStream::connect(addr).await?,
+        Some(local) => {
+            let s = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+            s.bind(local).with_context(|| format!("cannot bind to {}", local.ip()))?;
+            s.connect(addr).await?
+        }
+    };
     sock.set_nodelay(true)?;
     keep_alive(&sock);
     let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
