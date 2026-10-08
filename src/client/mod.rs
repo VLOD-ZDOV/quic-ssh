@@ -20,6 +20,7 @@ pub mod saved;
 pub mod tui;
 pub mod ui_state;
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -358,41 +359,46 @@ fn default_identity_paths() -> Result<[PathBuf; 2]> {
 /// `~/.config/qsh/id_ed25519`. With `create`, generates the latter when no key
 /// exists. With `batch`, an encrypted key is an error instead of a prompt.
 pub fn load_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool, batch: bool) -> Result<Identity> {
+    // No Ed25519 key: a throwaway one for TLS; agent keys and other key types
+    // are offered after the handshake.
+    Ok(find_identity(explicit, configured, create, batch)?.unwrap_or_else(Identity::generate))
+}
+
+/// Like [`load_identity`], but `None` instead of a throwaway key.
+fn find_identity(explicit: &[PathBuf], configured: &[PathBuf], create: bool, batch: bool) -> Result<Option<Identity>> {
     if !explicit.is_empty() {
         if let Some(p) = explicit.iter().find(|p| Identity::is_ed25519_file(p)) {
-            return Identity::load_with(p, !batch);
+            return Identity::load_with(p, !batch).map(Some);
         }
         if create {
             // Pairing registers the TLS key, so it has to be a real Ed25519 key.
-            return Identity::load_with(&explicit[0], !batch);
+            return Identity::load_with(&explicit[0], !batch).map(Some);
         }
         for p in explicit.iter().filter(|p| !p.exists()) {
             eprintln!("Warning: identity file {} not accessible", p.display());
         }
         // Other key types are offered after the handshake.
-        return Ok(Identity::generate());
+        return Ok(None);
     }
     // Config entries may list RSA/ECDSA keys for ssh; skip those (without asking for a passphrase).
     for p in configured {
         if p.exists() {
             if Identity::is_ed25519_file(p) {
-                return Identity::load_with(p, !batch);
+                return Identity::load_with(p, !batch).map(Some);
             }
             tracing::debug!("skipping {}: not an ed25519 key", p.display());
         }
     }
     let paths = default_identity_paths()?;
     if let Some(p) = paths.iter().find(|p| p.exists()) {
-        return Identity::load_with(p, !batch);
+        return Identity::load_with(p, !batch).map(Some);
     }
     if create {
         let (id, _) = Identity::load_or_generate(&paths[1], "qsh")?;
         eprintln!("Generated new key {}", paths[1].display());
-        return Ok(id);
+        return Ok(Some(id));
     }
-    // No Ed25519 key: a throwaway one for TLS; agent keys and other key types
-    // are offered after the handshake.
-    Ok(Identity::generate())
+    Ok(None)
 }
 
 /// The pinned key for `host:port`, if any.
@@ -437,8 +443,21 @@ fn confirm_new_host(id: &str, key: PublicKey) -> Result<bool> {
     Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
-async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option<&Conn>) -> Result<Conn> {
-    let tls = crate::tls::client_config(id)?;
+/// Why the TLS host check refused a server (see [`host_check`]).
+type Rejection = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Connects to the target, with the TLS config `tls` has for each port. A
+/// server refused by a host check is reported as such, never as unreachable
+/// (so `--full` does not hand it to ssh, nor remember it as qshd-less).
+async fn open(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rustls::ClientConfig>, rejected: &Rejection, via: Option<&Conn>) -> Result<Conn> {
+    let result = open_any(target, opts, tls, rejected, via).await;
+    if let Some(reason) = rejected.lock().unwrap().take() {
+        bail!("{reason}");
+    }
+    result
+}
+
+async fn open_any(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rustls::ClientConfig>, rejected: &Rejection, via: Option<&Conn>) -> Result<Conn> {
     if let Some(via) = via {
         // Through a jump host: TLS + yamux over a stream forwarded to the qshd TCP port.
         // In --full mode the target port may be sshd's, so the other candidates are tried too.
@@ -449,7 +468,7 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option
                     .await
                     .with_context(|| format!("jump host cannot reach {}:{port}", target.host))?;
                 let label = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
-                tokio::time::timeout(JUMP_HANDSHAKE_TIMEOUT, transport::connect_stream(tokio::io::join(recv, send), tls.clone(), label))
+                tokio::time::timeout(JUMP_HANDSHAKE_TIMEOUT, transport::connect_stream(tokio::io::join(recv, send), tls[&port].clone(), label))
                     .await
                     .map_err(|_| anyhow::anyhow!("no TLS answer from {}:{port}", target.host))?
                     .with_context(|| format!("no qshd at {}:{port}", target.host))
@@ -473,12 +492,12 @@ async fn open(target: &Target, opts: &ConnectOptions, id: &Identity, via: Option
         if opts.transport != Mode::Quic && cache.contains(&hid) {
             return Err(transport::Unreachable(format!("no qshd at {hid} (cached for up to an hour)")).into());
         }
-        let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
-        let result = transport::connect_probe(&target.host, &ports, target.family, tls).await;
-        cache.set(&hid, result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
+        let result = transport::connect_probe(&target.host, &target_ports(target), target.family, |p| tls[&p].clone()).await;
+        let refused = rejected.lock().unwrap().is_some();
+        cache.set(&hid, !refused && result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
         result?
     } else {
-        transport::connect(&target.host, target.port, opts.transport, target.family, tls).await?
+        transport::connect(&target.host, target.port, opts.transport, target.family, tls[&target.port].clone()).await?
     };
     tracing::info!("connected to {} over {}", conn.remote_addr(), conn.transport_name());
     Ok(conn)
@@ -497,70 +516,150 @@ fn marker_files(target: &Target) -> Vec<KnownHosts> {
     files
 }
 
-/// Accepts the server through its host certificate, if one of the
-/// `@cert-authority` keys for this host signed it for this host name.
-fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, names: &[String], files: &[KnownHosts]) -> Result<String> {
-    use ssh_key::certificate::CertType;
-    let cert = ssh_key::Certificate::from_bytes(cert).context("cannot parse the host certificate")?;
-    let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
-    if cert.cert_type() != CertType::Host || cert.public_key() != &own {
-        bail!("not a host certificate for the presented key");
-    }
-    let cas: Vec<_> = files.iter().flat_map(|f| f.marked("@cert-authority", names)).collect();
-    if cas.is_empty() {
-        bail!("no @cert-authority for {}", target.host);
-    }
-    let revoked: Vec<_> = files.iter().flat_map(|f| f.marked("@revoked", names)).collect();
-    if revoked.contains(cert.signature_key()) {
-        bail!("the certificate authority is revoked");
-    }
-    let fingerprints: Vec<_> = cas.iter().map(|k| k.fingerprint(ssh_key::HashAlg::Sha256)).collect();
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-    cert.validate_at(now, &fingerprints).map_err(|_| anyhow::anyhow!("the certificate is not signed by a trusted CA, or has expired"))?;
-    if !cert.valid_principals().iter().any(|p| p.eq_ignore_ascii_case(&target.host)) {
-        bail!("the certificate is not valid for {} (principals {:?})", target.host, cert.valid_principals());
-    }
-    Ok(format!("certificate {:?} signed by {}", cert.key_id(), cert.signature_key().fingerprint(ssh_key::HashAlg::Sha256)))
+/// What a host certificate says about the server.
+enum CertVerdict {
+    /// Signed by a trusted CA for this host (how, for the log).
+    Valid(String),
+    /// Not signed by a CA trusted for this host: the key is checked as if
+    /// there were no certificate.
+    Unusable(String),
+    /// Signed by a revoked CA, or by a trusted CA but expired, for another
+    /// host or another key: the server is refused, as by OpenSSH.
+    Invalid(String),
 }
 
-/// Checks the server's key: a host certificate from a trusted CA, or
-/// known_hosts following the host key policy. Revoked keys never pass.
-async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) -> Result<()> {
+/// Checks the server's host certificate against the `@cert-authority` and
+/// `@revoked` keys for this host.
+fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, names: &[String], files: &[KnownHosts]) -> CertVerdict {
+    use ssh_key::certificate::CertType;
+    let cert = match ssh_key::Certificate::from_bytes(cert) {
+        Ok(c) => c,
+        Err(e) => return CertVerdict::Unusable(format!("cannot parse the host certificate: {e}")),
+    };
+    let revoked: Vec<_> = files.iter().flat_map(|f| f.marked("@revoked", names)).collect();
+    if revoked.contains(cert.signature_key()) {
+        return CertVerdict::Invalid("its certificate authority is revoked".into());
+    }
+    let cas: Vec<_> = files.iter().flat_map(|f| f.marked("@cert-authority", names)).collect();
+    if !cas.contains(cert.signature_key()) {
+        return CertVerdict::Unusable(format!("no @cert-authority for {} with the certificate's CA key", target.host));
+    }
+    let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
+    if cert.cert_type() != CertType::Host || cert.public_key() != &own {
+        return CertVerdict::Invalid("its certificate is not a host certificate for the key it presented".into());
+    }
+    let fingerprints: Vec<_> = cas.iter().map(|k| k.fingerprint(ssh_key::HashAlg::Sha256)).collect();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if cert.validate_at(now, &fingerprints).is_err() {
+        return CertVerdict::Invalid("its certificate has expired or its signature does not verify".into());
+    }
+    if !cert.valid_principals().iter().any(|p| p.eq_ignore_ascii_case(&target.host)) {
+        return CertVerdict::Invalid(format!("its certificate is not valid for {} (principals {:?})", target.host, cert.valid_principals()));
+    }
+    CertVerdict::Valid(format!("certificate {:?} signed by {}", cert.key_id(), cert.signature_key().fingerprint(ssh_key::HashAlg::Sha256)))
+}
+
+/// What the client makes of a server's key.
+enum HostTrust {
+    /// In known_hosts, or vouched for by a trusted CA (how, for the log).
+    Trusted(String),
+    /// Not known yet: the host key policy decides.
+    Unknown,
+    /// Never accepted; the message says why.
+    Refused(String),
+}
+
+/// Judges the key (and host certificate) that the server at `port` presents.
+/// Revoked keys never pass.
+fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -> Result<HostTrust> {
     let (kh, kh_path) = known_hosts_for(target)?;
-    let hid = host_id(&target.host, conn.remote_addr().port());
-    let key = conn.peer_key();
+    let hid = host_id(&target.host, port);
     let names = if hid == target.host { vec![hid.clone()] } else { vec![hid.clone(), target.host.clone()] };
     let files = marker_files(target);
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
     if files.iter().any(|f| f.marked("@revoked", &names).contains(&own)) {
-        conn.close().await;
-        bail!("the host key of '{hid}' ({}) is marked as revoked in known_hosts", key.fingerprint());
+        return Ok(HostTrust::Refused(format!("the host key of '{hid}' ({}) is marked as revoked in known_hosts", key.fingerprint())));
     }
-    if let Some(cert) = conn.host_cert() {
+    if let Some(cert) = cert {
         match check_host_cert(cert, key, target, &names, &files) {
-            Ok(how) => {
-                tracing::info!("host '{hid}' verified by {how}");
-                return Ok(());
-            }
-            Err(e) => tracing::debug!("host certificate not used: {e:#}"),
+            CertVerdict::Valid(how) => return Ok(HostTrust::Trusted(how)),
+            CertVerdict::Unusable(why) => tracing::debug!("host certificate not used: {why}"),
+            CertVerdict::Invalid(why) => return Ok(HostTrust::Refused(format!("host '{hid}' is refused: {why}"))),
         }
     }
-    match kh.lookup(&hid)? {
-        Some(known) if known == key => Ok(()),
-        Some(known) => {
-            conn.close().await;
-            bail!(
-                "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n\
-                 Someone could be eavesdropping on you right now (man-in-the-middle attack),\n\
-                 or the host key has just been changed.\n\
-                 Host '{hid}' now presents {}, expected {}.\n\
-                 If the change is legitimate, remove the line for '{hid}' from {}.",
-                key.fingerprint(),
-                known.fingerprint(),
-                kh_path.display()
-            );
+    Ok(match kh.lookup(&hid)? {
+        Some(known) if known == key => HostTrust::Trusted("known_hosts".into()),
+        Some(known) => HostTrust::Refused(format!(
+            "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n\
+             Someone could be eavesdropping on you right now (man-in-the-middle attack),\n\
+             or the host key has just been changed.\n\
+             Host '{hid}' now presents {}, expected {}.\n\
+             If the change is legitimate, remove the line for '{hid}' from {}.",
+            key.fingerprint(),
+            known.fingerprint(),
+            kh_path.display()
+        )),
+        None => HostTrust::Unknown,
+    })
+}
+
+/// The check run inside the TLS handshake, before the client sends its own
+/// certificate: a server that would be refused afterwards (changed or
+/// revoked key, bad host certificate) never learns which key the client has.
+/// Unknown servers pass here and go through the host key policy afterwards.
+fn host_check(target: &Target, port: u16, rejected: &Rejection) -> crate::tls::HostCheck {
+    let (target, rejected) = (target.clone(), rejected.clone());
+    Arc::new(move |key, cert| match judge_host(&target, port, key, cert) {
+        Ok(HostTrust::Refused(reason)) => {
+            *rejected.lock().unwrap() = Some(reason.clone());
+            Err(reason)
         }
-        None => {
+        // Errors (an unreadable known_hosts) come up again after the handshake.
+        _ => Ok(()),
+    })
+}
+
+/// The ports a connection to the target may end up on.
+fn target_ports(target: &Target) -> Vec<u16> {
+    std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect()
+}
+
+/// TLS configs for the target's ports. The handshake carries the client's
+/// own key only where known_hosts already has the server's key (and the
+/// host check refuses any other); elsewhere it uses a throwaway key, and the
+/// own key is offered after the host is accepted, so that a server the user
+/// has not accepted (or an impostor) does not learn who is connecting.
+/// Also returns the ports that use the throwaway key.
+fn tls_configs(target: &Target, own: &Identity, throwaway: &Identity, rejected: &Rejection) -> Result<(HashMap<u16, rustls::ClientConfig>, Vec<u16>)> {
+    let (kh, _) = known_hosts_for(target)?;
+    let (mut configs, mut hidden) = (HashMap::new(), Vec::new());
+    for port in target_ports(target) {
+        let pinned = matches!(kh.lookup(&host_id(&target.host, port)), Ok(Some(_)));
+        if !pinned {
+            hidden.push(port);
+        }
+        let id = if pinned { own } else { throwaway };
+        configs.insert(port, crate::tls::checked_client_config(id, Some(host_check(target, port, rejected)))?);
+    }
+    Ok((configs, hidden))
+}
+
+/// Checks the server's key after the handshake: a host certificate from a
+/// trusted CA, or known_hosts following the host key policy.
+async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) -> Result<()> {
+    let port = conn.remote_addr().port();
+    let hid = host_id(&target.host, port);
+    let key = conn.peer_key();
+    match judge_host(target, port, key, conn.host_cert())? {
+        HostTrust::Trusted(how) => {
+            tracing::info!("host '{hid}' verified by {how}");
+            Ok(())
+        }
+        HostTrust::Refused(reason) => {
+            conn.close().await;
+            bail!("{reason}");
+        }
+        HostTrust::Unknown => {
             let policy = if opts.accept_new_host { HostKeyPolicy::AcceptNew } else { target.host_key_policy };
             let trusted = match policy {
                 HostKeyPolicy::AcceptNew => true,
@@ -572,7 +671,7 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
                 conn.close().await;
                 bail!("host key verification failed for '{hid}' ({}); use `qsh pair` or --accept-new-host", key.fingerprint());
             }
-            kh.add(&hid, key)?;
+            known_hosts_for(target)?.0.add(&hid, key)?;
             if !target.quiet {
                 eprintln!("Permanently added '{hid}' (ED25519) to the list of known hosts.");
             }
@@ -591,23 +690,60 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
             target.host
         );
     }
-    let id = load_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
-    let mut conn = open(target, opts, &id, via).await?;
+    let own = find_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
+    match login_once(target, opts, via, own.as_ref(), false).await {
+        // qshd before 0.5 knows only the TLS key: log in again with the own key
+        // in the handshake (the host has been accepted by now, so this is no leak).
+        Err(e) if e.is::<TlsKeyOnly>() => login_once(target, opts, via, own.as_ref(), true).await,
+        result => result,
+    }
+}
+
+/// The server refused a throwaway TLS key without asking for other keys.
+#[derive(Debug)]
+struct TlsKeyOnly;
+
+impl std::fmt::Display for TlsKeyOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server only accepts the key from the TLS handshake")
+    }
+}
+
+impl std::error::Error for TlsKeyOnly {}
+
+/// One connection and login. `own`: the client's Ed25519 key, if it has
+/// one; `real_tls`: use it in the handshake on every port.
+async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, own: Option<&Identity>, real_tls: bool) -> Result<Conn> {
+    let throwaway = Identity::generate();
+    let own = own.unwrap_or(&throwaway);
+    let rejected = Rejection::default();
+    let (tls, hidden) = if real_tls {
+        let check = |p| crate::tls::checked_client_config(own, Some(host_check(target, p, &rejected))).map(|c| (p, c));
+        (target_ports(target).into_iter().map(check).collect::<Result<_>>()?, Vec::new())
+    } else {
+        tls_configs(target, own, &throwaway, &rejected)?
+    };
+    let mut conn = open(target, opts, &tls, &rejected, via).await?;
     verify_host_key(&conn, target, opts).await?;
+    let hidden = hidden.contains(&conn.remote_addr().port()) && !std::ptr::eq(own, &throwaway);
+    let tls_id = if hidden { &throwaway } else { own };
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = match &opts.resume {
         Some(token) => Hello::Resume { version: VERSION, user: target.user.clone(), token: token.clone() },
         None => Hello::Login { version: VERSION, user: target.user.clone() },
     };
     write_msg(&mut send, &hello).await?;
-    match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, &id).await {
+    match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, tls_id, own).await {
         Ok(auth::Outcome::Welcome(version)) => {
             tracing::debug!("logged in, server protocol version {version}");
             conn.set_server_version(version);
             Ok(conn)
         }
-        Ok(auth::Outcome::Denied(e)) => {
+        Ok(auth::Outcome::Denied { reason: e, asked_for_keys }) => {
             conn.close().await;
+            if hidden && !asked_for_keys {
+                return Err(TlsKeyOnly.into());
+            }
             if opts.resume.is_some() {
                 return Err(LoginRefused(e).into());
             }
@@ -659,7 +795,9 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
         bail!("the config for {} uses ProxyCommand or ProxyJump; pairing needs a direct connection", target.host);
     }
     let id = load_identity(&opts.identities, &target.identity_files, true, target.batch_mode)?;
-    let conn = open(target, opts, &id, None).await?;
+    // The server is checked by the pairing code, not by known_hosts.
+    let tls = target_ports(target).into_iter().map(|p| crate::tls::client_config(&id).map(|c| (p, c))).collect::<Result<_>>()?;
+    let conn = open(target, opts, &tls, &Rejection::default(), None).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_msg(&mut send, &Hello::Pair { version: VERSION, user: target.user.clone() }).await?;
     let result = async {

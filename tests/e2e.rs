@@ -64,6 +64,8 @@ impl Server {
         let mut child = Command::new(QSHD)
             .args(["serve", "--listen", listen])
             .env("HOME", home.path())
+            // One-time codes work right after the start (debug builds only).
+            .env("QSHD_TEST_NO_TOTP_FLOOR", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1499,8 +1501,17 @@ fn host_certificates() {
     // A revoked CA is not trusted either.
     let mut text = std::fs::read_to_string(&known).unwrap();
     text.push_str(&format!("@revoked * {}\n", public(&ca)));
-    std::fs::write(&known, text).unwrap();
+    std::fs::write(&known, &text).unwrap();
     assert!(!login(&good).status.success(), "revoked CA accepted");
+    // Not even with the host key pinned: a certificate from a revoked CA
+    // means the host is refused (as OpenSSH does), not checked as a plain key.
+    let host_key = std::fs::read_to_string(good.home.path().join(".config/qsh/host_ed25519.pub")).unwrap();
+    let key = host_key.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+    text.push_str(&format!("[127.0.0.1]:{} {key}\n", good.port));
+    std::fs::write(&known, text).unwrap();
+    let out = login(&good);
+    assert!(!out.status.success(), "revoked CA accepted with a pinned key");
+    assert!(stderr(&out).contains("certificate authority is revoked"), "{}", stderr(&out));
 }
 
 /// A UDP relay to `port` that can drop everything, like a network outage.

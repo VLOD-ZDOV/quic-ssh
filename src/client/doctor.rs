@@ -180,7 +180,7 @@ async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
     let tcp_port = target.alt_ports.first().copied().unwrap_or(target.port);
     let mut found = Vec::new();
     let start = Instant::now();
-    let quic = tokio::time::timeout(STEP_TIMEOUT, transport::connect_probe(&target.host, &ports, target.family, tls.clone())).await;
+    let quic = tokio::time::timeout(STEP_TIMEOUT, transport::connect_probe(&target.host, &ports, target.family, |_| tls.clone())).await;
     let quic = match quic {
         Ok(Ok(conn)) => {
             found.push(("quic", format!("qshd answers on udp {} ({})", conn.remote_addr().port(), ms(start.elapsed())), conn.peer_key()));

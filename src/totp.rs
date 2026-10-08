@@ -13,7 +13,7 @@ pub fn secret_path(home: &std::path::Path) -> std::path::PathBuf {
 pub const STEP: u64 = 30;
 const DIGITS: u32 = 6;
 /// Codes from one step before or after are accepted too (clock drift).
-const WINDOW: u64 = 1;
+pub const WINDOW: u64 = 1;
 const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 /// RFC 4648 base32 without padding.

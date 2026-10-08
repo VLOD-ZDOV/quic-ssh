@@ -1109,7 +1109,7 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     let Ok(tls) = crate::tls::client_config(&id) else { return (Probe::NoQshd, None) };
     let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
     let start = Instant::now();
-    if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, tls.clone()).await {
+    if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, |_| tls.clone()).await {
         let handshake = start.elapsed();
         let port = conn.remote_addr().port();
         let key = key_state(&target.host, port, conn.peer_key());

@@ -78,12 +78,23 @@ fn bad_cert(e: anyhow::Error) -> TlsError {
     TlsError::General(format!("{e:#}"))
 }
 
+/// Judges the server's key (and SSH host certificate, if it sent one)
+/// during the handshake; `Err` ends the handshake with that reason.
+pub type HostCheck = Arc<dyn Fn(PublicKey, Option<&[u8]>) -> Result<(), String> + Send + Sync>;
+
 /// Client-side check of the server certificate: a well-formed Ed25519
-/// certificate whose handshake signature verifies. The key itself is checked
-/// against known_hosts by the caller.
-#[derive(Debug)]
+/// certificate whose handshake signature verifies, and, with a `check`, a key
+/// the client already trusts or does not know yet. A rejected server never
+/// sees the client's certificate: the client sends it only after this check.
 struct HostKeyVerifier {
     provider: Arc<CryptoProvider>,
+    check: Option<HostCheck>,
+}
+
+impl std::fmt::Debug for HostKeyVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostKeyVerifier").field("check", &self.check.is_some()).finish()
+    }
 }
 
 impl ServerCertVerifier for HostKeyVerifier {
@@ -99,7 +110,10 @@ impl ServerCertVerifier for HostKeyVerifier {
         if intermediates.len() > 1 {
             return Err(TlsError::General("unexpected certificate chain".into()));
         }
-        cert_key(end_entity).map_err(bad_cert)?;
+        let key = cert_key(end_entity).map_err(bad_cert)?;
+        if let Some(check) = &self.check {
+            check(key, intermediates.first().map(|c| c.as_ref())).map_err(TlsError::General)?;
+        }
         Ok(ServerCertVerified::assertion())
     }
 
@@ -211,13 +225,19 @@ pub fn server_config(host: &Identity, host_cert: Option<Vec<u8>>) -> Result<rust
     Ok(cfg)
 }
 
+/// A client config without a host check (probes that do not log in).
 pub fn client_config(id: &Identity) -> Result<rustls::ClientConfig> {
+    checked_client_config(id, None)
+}
+
+/// A client config whose handshake fails unless `check` accepts the server.
+pub fn checked_client_config(id: &Identity, check: Option<HostCheck>) -> Result<rustls::ClientConfig> {
     let provider = provider();
     let (cert, key) = self_signed(id)?;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(HostKeyVerifier { provider }))
+        .with_custom_certificate_verifier(Arc::new(HostKeyVerifier { provider, check }))
         .with_client_auth_cert(vec![cert], key)?;
     // The second entry is never selected; it asks for the host certificate.
     cfg.alpn_protocols = vec![ALPN.to_vec(), ALPN_HOST_CERT.to_vec()];
@@ -239,7 +259,7 @@ mod tests {
     fn verifier_requires_ed25519() {
         let name = ServerName::try_from(SERVER_NAME).unwrap();
         let verify = |cert: &CertificateDer<'_>| {
-            HostKeyVerifier { provider: provider() }
+            HostKeyVerifier { provider: provider(), check: None }
                 .verify_server_cert(cert, &[], &name, &[], UnixTime::now())
                 .is_ok()
         };
@@ -247,5 +267,45 @@ mod tests {
         assert!(verify(&cert));
         let ecdsa = rcgen::generate_simple_self_signed(vec!["x".into()]).unwrap();
         assert!(!verify(ecdsa.cert.der()));
+    }
+
+    #[test]
+    fn verifier_runs_the_host_check() {
+        let name = ServerName::try_from(SERVER_NAME).unwrap();
+        let (trusted, other) = (Identity::generate(), Identity::generate());
+        let pin = trusted.public();
+        let check: HostCheck = Arc::new(move |key, _| if key == pin { Ok(()) } else { Err("changed".into()) });
+        let verifier = HostKeyVerifier { provider: provider(), check: Some(check) };
+        let verify = |id: &Identity| verifier.verify_server_cert(&self_signed(id).unwrap().0, &[], &name, &[], UnixTime::now()).is_ok();
+        assert!(verify(&trusted));
+        assert!(!verify(&other));
+    }
+
+    /// The client's certificate goes out only after the host check: a
+    /// refused server never learns the client's key.
+    #[test]
+    fn refused_server_never_sees_the_client_key() {
+        let server_cfg = Arc::new(server_config(&Identity::generate(), None).unwrap());
+        let refuse: HostCheck = Arc::new(|_, _| Err("refused".into()));
+        for (check, accepted) in [(None, true), (Some(refuse), false)] {
+            let client_cfg = Arc::new(checked_client_config(&Identity::generate(), check).unwrap());
+            let mut client = rustls::ClientConnection::new(client_cfg, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
+            let mut server = rustls::ServerConnection::new(server_cfg.clone()).unwrap();
+            for _ in 0..10 {
+                let mut buf = Vec::new();
+                client.write_tls(&mut buf).unwrap();
+                server.read_tls(&mut buf.as_slice()).unwrap();
+                let server_ok = server.process_new_packets().is_ok();
+                let mut buf = Vec::new();
+                server.write_tls(&mut buf).unwrap();
+                client.read_tls(&mut buf.as_slice()).unwrap();
+                let client_ok = client.process_new_packets().is_ok();
+                if !server_ok || !client_ok || (!client.is_handshaking() && !server.is_handshaking()) {
+                    break;
+                }
+            }
+            assert_eq!(server.peer_certificates().is_some(), accepted);
+            assert_eq!(client.is_handshaking(), !accepted);
+        }
     }
 }

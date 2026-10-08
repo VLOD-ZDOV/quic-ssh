@@ -18,8 +18,9 @@ use crate::transport::{Conn, RecvHalf, SendHalf};
 const DEFAULT_KEYS: [&str; 5] = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk"];
 
 enum Signer {
-    /// The key from the TLS handshake (offered here with its certificate).
-    Tls,
+    /// The client's own Ed25519 key: offered here with its certificates, and
+    /// on its own if the handshake used a throwaway key.
+    Own,
     Agent,
     File(PathBuf),
 }
@@ -54,8 +55,9 @@ fn read_cert(path: &Path) -> Option<Certificate> {
     }
 }
 
-/// Everything this client can offer, in order: certificates of the TLS key,
-/// agent keys, then key files with their certificates.
+/// Everything this client can offer, in order: certificates of the own key,
+/// the own key itself (unless it was the TLS key), agent keys, then key
+/// files with their certificates.
 pub struct Keyring {
     agent: Option<Agent>,
     candidates: Vec<Candidate>,
@@ -63,7 +65,7 @@ pub struct Keyring {
 }
 
 impl Keyring {
-    pub async fn new(target: &Target, explicit: &[PathBuf], tls: &Identity) -> Keyring {
+    pub async fn new(target: &Target, explicit: &[PathBuf], tls: &Identity, own: &Identity) -> Keyring {
         let mut files: Vec<PathBuf> = explicit.iter().chain(&target.identity_files).cloned().collect();
         if files.is_empty() {
             if let Ok(home) = home_dir() {
@@ -105,14 +107,17 @@ impl Keyring {
         for (path, cert) in &certs {
             let Ok(blob) = cert.to_bytes() else { continue };
             let label = format!("certificate {}", path.display());
-            if cert.public_key() == &ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(tls.public().0)) {
-                add(&mut out, blob, label, Signer::Tls);
+            if cert.public_key() == &ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(own.public().0)) {
+                add(&mut out, blob, label, Signer::Own);
             } else if let Some((key, _)) = file_keys.iter().find(|(_, k)| k == cert.public_key()) {
                 if !is_security_key(&cert.public_key().algorithm()) {
                     add(&mut out, blob, label, Signer::File(key.clone()));
                 }
             }
         }
+
+        // Already proven in the handshake if it was the TLS key (then `seen` has it).
+        add(&mut out, own.public().ssh_blob(), format!("ED25519 {}", own.public().fingerprint()), Signer::Own);
 
         let agent = match &target.identity_agent {
             Some(None) => None,
@@ -148,10 +153,10 @@ impl Keyring {
         Keyring { agent, candidates: out, next: 0 }
     }
 
-    async fn sign(&mut self, index: usize, data: &[u8], tls: &Identity, batch: bool) -> Result<Vec<u8>> {
+    async fn sign(&mut self, index: usize, data: &[u8], own: &Identity, batch: bool) -> Result<Vec<u8>> {
         let c = &self.candidates[index];
         match &c.signer {
-            Signer::Tls => Ok(tls.ssh_sign(data)),
+            Signer::Own => Ok(own.ssh_sign(data)),
             Signer::Agent => self.agent.as_mut().context("agent went away")?.sign(&c.blob, data).await,
             Signer::File(path) => {
                 let key = crate::keys::load_private_key(path, !batch)?;
@@ -209,18 +214,25 @@ fn ask(text: &str, echo: bool, batch: bool) -> Result<String> {
 pub enum Outcome {
     /// Logged in; the server's protocol version.
     Welcome(u32),
-    Denied(String),
+    /// Refused; `asked_for_keys`: the server took part in key login (qshd 0.5
+    /// and newer), so the refusal does not depend on which key TLS used.
+    Denied { reason: String, asked_for_keys: bool },
 }
 
-/// Runs the login conversation after `Hello::Login` until the server lets us in or refuses.
-pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, explicit: &[PathBuf], tls: &Identity) -> Result<Outcome> {
+/// Runs the login conversation after `Hello::Login` until the server lets us
+/// in or refuses. `tls`: the key the handshake used; `own`: the client's own
+/// Ed25519 key (the same, unless the handshake used a throwaway key).
+pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, explicit: &[PathBuf], tls: &Identity, own: &Identity) -> Result<Outcome> {
     let mut keyring: Option<Keyring> = None;
     let mut reply: Reply = read_msg(recv).await?;
     loop {
         reply = match reply {
             Reply::Ok => return Ok(Outcome::Welcome(3)),
             Reply::Welcome { version } => return Ok(Outcome::Welcome(version)),
-            Reply::Err(e) => return Ok(Outcome::Denied(server_text(&e).trim_start_matches("(server) ").to_string())),
+            Reply::Err(e) => {
+                let reason = server_text(&e).trim_start_matches("(server) ").to_string();
+                return Ok(Outcome::Denied { reason, asked_for_keys: keyring.is_some() });
+            }
             Reply::Prompt { text, echo } => {
                 let answer = ask(&text, echo, target.batch_mode)?;
                 write_msg(send, &Auth::Response(answer)).await?;
@@ -228,10 +240,10 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             }
             Reply::AuthKey => {
                 if keyring.is_none() {
-                    keyring = Some(Keyring::new(target, explicit, tls).await);
+                    keyring = Some(Keyring::new(target, explicit, tls, own).await);
                 }
                 let ring = keyring.as_mut().unwrap();
-                offer_next(ring, conn, send, recv, target, tls).await?
+                offer_next(ring, conn, send, recv, target, own).await?
             }
             other => bail!("unexpected reply {other:?} while logging in"),
         };
@@ -240,7 +252,7 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
 
 /// Offers keys until the server accepts one, then proves it. Returns the
 /// server's answer to the proof, or to `Auth::Done` if nothing was accepted.
-async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, tls: &Identity) -> Result<Reply> {
+async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, own: &Identity) -> Result<Reply> {
     while ring.next < ring.candidates.len() {
         let index = ring.next;
         ring.next += 1;
@@ -253,7 +265,7 @@ async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: 
         }
         debug!("server accepts {}", ring.candidates[index].label);
         let data = auth_data(&conn.exporter(), &target.user, &blob);
-        let signature = match ring.sign(index, &data, tls, target.batch_mode).await {
+        let signature = match ring.sign(index, &data, own, target.batch_mode).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("qsh: {}: {e:#}", ring.candidates[index].label);

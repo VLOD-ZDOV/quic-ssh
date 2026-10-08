@@ -184,13 +184,30 @@ const TOTP_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// One-time code bookkeeping per uid: the last accepted time step (so a code
 /// works once) and recent failures (so codes cannot be guessed by reconnecting).
-#[derive(Default)]
 pub struct TotpState {
     used: std::collections::HashMap<u32, u64>,
     failures: std::collections::HashMap<u32, std::collections::VecDeque<std::time::Instant>>,
+    /// The last time step an earlier qshd process could have accepted: the
+    /// codes it used are not known, so none up to here are taken (a code
+    /// seen before a restart cannot be replayed after it).
+    floor: u64,
+}
+
+impl Default for TotpState {
+    fn default() -> TotpState {
+        // Tests log in right after starting a server (never in release builds).
+        let testing = cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_NO_TOTP_FLOOR").is_some();
+        let floor = if testing { 0 } else { now() / crate::totp::STEP + crate::totp::WINDOW };
+        TotpState { used: Default::default(), failures: Default::default(), floor }
+    }
 }
 
 impl TotpState {
+    /// Steps up to this one are not accepted for `uid`.
+    fn last_used(&self, uid: u32) -> u64 {
+        self.used.get(&uid).copied().unwrap_or(0).max(self.floor)
+    }
+
     /// Recent failures of `uid`, forgetting those older than the window.
     fn recent_failures(&mut self, uid: u32) -> usize {
         let Some(list) = self.failures.get_mut(&uid) else { return 0 };
@@ -247,7 +264,10 @@ pub async fn second_factor(
             warn!("{}: too many wrong one-time codes recently; refusing for now", user.name);
             return Ok(Err("too many wrong one-time codes; try again later".into()));
         }
-        write_msg(send, &Reply::Prompt { text: "One-time code: ".into(), echo: false }).await?;
+        // Right after a start, the current code may be one that is not taken.
+        let starting = now() / crate::totp::STEP <= used.lock().unwrap().floor;
+        let text = if starting { "One-time code (qshd has just started: wait for the next code): " } else { "One-time code: " };
+        write_msg(send, &Reply::Prompt { text: text.into(), echo: false }).await?;
         let answer = match read_msg::<_, Auth>(recv).await? {
             Auth::Response(a) => a,
             Auth::Done => break,
@@ -255,8 +275,8 @@ pub async fn second_factor(
         };
         {
             let mut state = used.lock().unwrap();
-            let last = state.used.get(&user.uid).copied();
-            if let Some(step) = crate::totp::verify(&secret, &answer, now(), last) {
+            let last = state.last_used(user.uid);
+            if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
                 state.used.insert(user.uid, step);
                 state.failures.remove(&user.uid);
                 return Ok(Ok(()));
@@ -300,5 +320,19 @@ mod tests {
         state.failures.entry(7).or_default().extend([old, old, std::time::Instant::now()]);
         assert_eq!(state.recent_failures(7), 1, "old failures are forgotten");
         assert_eq!(state.recent_failures(8), 0);
+    }
+
+    #[test]
+    fn totp_codes_from_before_a_start_are_not_taken() {
+        let secret = [7u8; 20];
+        let mut state = TotpState::default();
+        let step = now() / crate::totp::STEP;
+        // The current code (and the next one, within the window) may have been used before.
+        let current = format!("{:06}", crate::totp::code(&secret, step));
+        assert_eq!(crate::totp::verify(&secret, &current, now(), Some(state.last_used(1))), None);
+        state.floor = step - 2;
+        assert_eq!(crate::totp::verify(&secret, &current, now(), Some(state.last_used(1))), Some(step));
+        state.used.insert(1, step);
+        assert_eq!(state.last_used(1), step);
     }
 }

@@ -67,14 +67,33 @@ impl KnownHosts {
             .collect()
     }
 
+    /// Appends an entry in one write, so that entries added at the same time
+    /// (`qsh multi` to new hosts) never mix; starts a new line if the file
+    /// does not end with one.
     pub fn add(&self, id: &str, key: PublicKey) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             create_private_dir(dir)?;
         }
-        let mut f = OpenOptions::new().append(true).create(true).open(&self.path)?;
-        writeln!(f, "{id} {}", key.to_openssh(""))?;
+        let mut f = OpenOptions::new().read(true).append(true).create(true).open(&self.path)?;
+        let mut line = format!("{id} {}\n", key.to_openssh(""));
+        if !ends_with_newline(&mut f)? {
+            line.insert(0, '\n');
+        }
+        f.write_all(line.as_bytes())?;
         Ok(())
     }
+}
+
+/// Whether the file is empty or ends with a newline.
+fn ends_with_newline(f: &mut fs::File) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if f.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 #[cfg(test)]
@@ -94,6 +113,14 @@ mod tests {
         assert_eq!(kh.lookup("example.com").unwrap(), Some(a));
         assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(b));
         assert_eq!(kh.lookup("example.org").unwrap(), None);
+        // A hand-edited file without a final newline: the next entry still gets its own line.
+        let path = dir.path().join("q").join("known_hosts");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.trim_end()).unwrap();
+        let c = Identity::generate().public();
+        kh.add("example.net", c).unwrap();
+        assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(b));
+        assert_eq!(kh.lookup("example.net").unwrap(), Some(c));
     }
 
     #[test]

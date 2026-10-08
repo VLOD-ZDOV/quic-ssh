@@ -255,8 +255,8 @@ impl std::error::Error for Unreachable {}
 /// QUIC-only connect for `qsh --full`, where the TCP port belongs to sshd.
 /// Tries every address and port in parallel and takes the first qshd that
 /// answers; gives up after [`PROBE_TIMEOUT`], or as soon as every UDP port
-/// turned out to be closed.
-pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: rustls::ClientConfig) -> Result<Conn> {
+/// turned out to be closed. `tls` gives the config for each port.
+pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: impl Fn(u16) -> rustls::ClientConfig) -> Result<Conn> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut candidates = Vec::new();
     for &port in ports {
@@ -266,11 +266,11 @@ pub async fn connect_probe(host: &str, ports: &[u16], family: Family, tls: rustl
             Err(e) => return Err(Unreachable(format!("{e:#}")).into()),
         }
     }
-    let tls = Arc::new(tls);
+    let configs: std::collections::HashMap<u16, Arc<rustls::ClientConfig>> = ports.iter().map(|&p| (p, Arc::new(tls(p)))).collect();
     let mut attempts: FuturesUnordered<_> = candidates
         .into_iter()
         .map(|addr| {
-            let tls = tls.clone();
+            let tls = configs[&addr.port()].clone();
             async move {
                 tokio::select! {
                     r = tokio::time::timeout(PROBE_TIMEOUT, quic::connect(tls, addr)) => match r {

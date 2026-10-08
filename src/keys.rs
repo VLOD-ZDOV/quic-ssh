@@ -161,6 +161,8 @@ pub fn load_private_key(path: &Path, prompt: bool) -> Result<PrivateKey> {
     if let Some(key) = decrypted_cache().lock().unwrap().get(path) {
         return Ok(key.clone());
     }
+    #[cfg(unix)]
+    check_private_mode(path)?;
     let text = fs::read_to_string(path).with_context(|| format!("cannot read key {}", path.display()))?;
     let key = PrivateKey::from_openssh(&text).with_context(|| format!("cannot parse key {}", path.display()))?;
     if !key.is_encrypted() {
@@ -173,6 +175,22 @@ pub fn load_private_key(path: &Path, prompt: bool) -> Result<PrivateKey> {
     let key = key.decrypt(pass.as_bytes()).context("wrong passphrase")?;
     decrypted_cache().lock().unwrap().insert(path.to_path_buf(), key.clone());
     Ok(key)
+}
+
+/// Refuses a private key of ours that other users can read, as OpenSSH
+/// does: it may already be stolen, and the owner should know.
+#[cfg(unix)]
+fn check_private_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).with_context(|| format!("cannot read key {}", path.display()))?;
+    if meta.uid() == nix::unistd::getuid().as_raw() && meta.mode() & 0o077 != 0 {
+        let (mode, path) = (meta.mode() & 0o777, path.display());
+        bail!(
+            "permissions {mode:04o} for {path} are too open: a private key must not be accessible by others \
+             (chmod 600 {path}; if others could read it, consider it compromised)"
+        );
+    }
+    Ok(())
 }
 
 /// Creates a directory (and parents) with mode 0700 for the leaf.
@@ -197,20 +215,16 @@ pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
 }
 
 #[cfg(unix)]
-/// Checks that `path` and every directory from it up to `top` is owned by
-/// `uid` or root and not group/world writable (otherwise someone else could
-/// swap the file).
+/// Checks that `path` and every directory above its real location, up to
+/// `top`, is owned by `uid` or root and not group/world writable (otherwise
+/// someone else could swap the file). Like sshd, the real path counts: a
+/// symlinked directory (`~/.ssh -> /elsewhere`) is checked where it really
+/// is, all the way up to `/` if that is outside `top`.
 fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
-    let mut cur = Some(path);
-    while let Some(p) = cur {
-        let meta = match fs::metadata(p) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                cur = p.parent().filter(|_| p != top);
-                continue;
-            }
-            Err(e) => return Err(e).with_context(|| format!("cannot stat {}", p.display())),
-        };
+    let real = fs::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
+    let top = fs::canonicalize(top).unwrap_or_else(|_| top.to_path_buf());
+    for p in real.ancestors() {
+        let meta = fs::metadata(p).with_context(|| format!("cannot stat {}", p.display()))?;
         if meta.uid() != uid && meta.uid() != 0 {
             bail!("{} has wrong owner", p.display());
         }
@@ -220,7 +234,6 @@ fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
         if p == top {
             break;
         }
-        cur = p.parent();
     }
     Ok(())
 }
@@ -326,6 +339,45 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(read_key_list_strict(&file, home.path(), uid).is_err());
         assert!(read_key_list_strict(&dir.join("missing"), home.path(), uid).unwrap().is_empty());
+    }
+
+    /// A symlinked directory is checked where it really is.
+    #[cfg(unix)]
+    #[test]
+    fn strict_read_follows_symlinked_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let uid = nix::unistd::getuid().as_raw();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = elsewhere.path().join("shared");
+        let real = shared.join("ssh");
+        fs::create_dir_all(&real).unwrap();
+        let key = Identity::generate().public();
+        fs::write(real.join("authorized_keys"), key.to_openssh("k")).unwrap();
+        std::os::unix::fs::symlink(&real, home.path().join(".ssh")).unwrap();
+        let file = home.path().join(".ssh/authorized_keys");
+        fs::set_permissions(elsewhere.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        // Outside home, the check goes up to `/`: a temporary directory may
+        // sit in a world-writable one, so only the difference is asserted.
+        let before = read_key_list_strict(&file, home.path(), uid).is_ok();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(read_key_list_strict(&file, home.path(), uid).is_err(), "world-writable directory behind a symlink");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(read_key_list_strict(&file, home.path(), uid).is_ok(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_private_keys_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        Identity::generate().save(&path, "c").unwrap();
+        assert!(Identity::load(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = Identity::load(&path).err().expect("a world-readable key is refused");
+        assert!(format!("{err:#}").contains(&format!("0644 for {} are too open", path.display())), "{err:#}");
     }
 
     #[test]
