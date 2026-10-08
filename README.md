@@ -164,7 +164,7 @@ qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
 ```
 
-Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`. Other ssh flags are accepted and ignored (`-v` lists them). `-C` on a session is ignored too; for compressed copies use `qsh cp -C`.
+Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`, `-b` and `-B` (the local address or interface connections leave from). Other ssh flags are accepted and ignored (`-v` lists them). `-C` on a session is ignored too; for compressed copies use `qsh cp -C`.
 
 In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
 
@@ -193,7 +193,7 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - Keys typed during an outage are dropped, and `~.` gives up waiting.
 - Quitting normally (exit, `~.`, closing the terminal) ends the session on the server as usual.
 - Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port or agent forwarding are not kept.
-- `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh.
+- `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
 
 ### Connection sharing (`ControlMaster`)
 
@@ -238,7 +238,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `Include`, `Match all`. Other `Match` blocks are skipped. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` (in `~/.config/qsh/config`), `BindAddress`, `BindInterface`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`). A `Match` block whose conditions qsh cannot check (`exec`, `localnetwork`, `canonical`...) is not used, but a `ProxyCommand` or `ProxyJump` in it still counts, so qsh never connects around a proxy that may apply. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), and `#` starts a comment anywhere on a line. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -248,7 +248,8 @@ With `--full` (automatic when qsh is installed as `ssh`), qsh behaves like a dro
 - It looks for qshd **both** on the ssh port (default 22) **and** on 4422, in parallel, and uses whichever answers. On 22, qshd can run UDP-only next to sshd (`tcp = false` in the server config). An explicit qsh port (`-p`, `:port` or `Port` in `~/.config/qsh/config`) means only that port is tried.
 - If no qshd answers within 1 s, or `~/.ssh/config` gives the host a `ProxyJump`/`ProxyCommand` (the hops may not run qshd), qsh runs the regular **`ssh`** (or **`scp`** for `qsh --full cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
 - Hosts without qshd are remembered for an hour, so later connections go straight to ssh. `--transport quic` forces a new check.
-- A wrong host key or a refused login never falls back to ssh.
+- What qsh cannot parse (`ssh -Q kex`, `-O forward`, a user name like `user@corp.example`) also goes to ssh. A name that only qsh's own config knows (a connection saved in `qsh ui`, say) gets its `HostName`, `User` and `IdentityFile` passed to ssh, so ssh reaches the same host.
+- A wrong host key or a refused login never falls back to ssh. Neither does a host known on one candidate port that presents a different key on the other: it is refused.
 
 ```sh
 qsh --full myserver               # QUIC if qshd is there, otherwise plain ssh
@@ -461,8 +462,9 @@ python3 bench/bench.py
 - **The client** logs in with mutual TLS using its Ed25519 key, or after the handshake with a signature by any SSH key or certificate over data bound to the TLS session. Either way, the login cannot be relayed to another connection. To a host it does not know yet, the client shows its key only after the host is accepted (the handshake uses a throwaway key). Private key files that other users can read are refused, as by OpenSSH. There are no passwords at all. A second factor (TOTP) can be added.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code is single-use (burned after the first attempt, even a failed one) and expires after 10 minutes.
 - **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. Like sshd, file transfers and subsystems (sftp) start through the user's login shell, so `nologin` or `git-shell` also block them. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules, along the real path (a symlinked `~/.ssh` is checked where it really is).
-- **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout.
-- **Directory copy** (`cp -r`) unpacks only regular files and directories. Absolute paths, `..`, links and device files are refused, and setuid/setgid bits are dropped, so a malicious server cannot write outside the target directory.
+- **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout (TCP keepalive on the TCP fallback). Before login a connection may open few streams and the server buffers at most about 1 MiB for it. User lookups and key files are read off the threads that drive the network, and helpers never hold a pipe that qshd reads locked.
+- **No inherited descriptors:** like sshd's `closefrom`, a user's program gets nothing from qshd but stdin, stdout and stderr (no other session's terminal, even for a moment).
+- **Directory copy** (`cp -r`) unpacks only regular files and directories. Absolute paths, `..`, links and device files are refused, and setuid/setgid bits are dropped, so a malicious server cannot write outside the target directory. Long-name and PAX headers over 64 KiB are refused before they are read, so it cannot fill the client's memory either.
 - **Port forwarding** in system mode connects as the user, not as root, so firewall rules based on uid apply. Accounts whose expiry date has passed (`chage -E`, `usermod -e`) are refused.
 - **Disconnects:** a command without a terminal is stopped when its client goes away: its whole process group gets SIGHUP, then SIGKILL after 2 s. Unlike ssh, it does not keep running unattended. A terminal session is kept for `session_timeout` so the client can resume it; only a client of the same user that holds the session's 128-bit token can do that. On SIGINT/SIGTERM/SIGHUP the client ends the session and closes the connection cleanly.
 - **Memory safety:** qsh and qshd contain no `unsafe` code (`#![forbid(unsafe_code)]`). As root, qshd switches users in a small helper process (`qshd internal-become`) that sets the groups, group and user and then runs the user's program.
