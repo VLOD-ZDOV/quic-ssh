@@ -148,7 +148,8 @@ impl<R> MetaLimit<R> {
         }
         self.pax = (kind == b'x').then(Vec::new);
         self.data = size;
-        self.pad = size.div_ceil(512) * 512 - size;
+        // Padding up to the next 512 bytes (no overflow for absurd sizes).
+        self.pad = (512 - size % 512) % 512;
         if size == 0 {
             self.data_done();
         }
@@ -490,5 +491,14 @@ mod meta_tests {
         let mut data = header(b'0', "file", 0).as_bytes().to_vec();
         data.extend_from_slice(header(b'L', "real", 8 << 30).as_bytes());
         assert!(io::copy(&mut MetaLimit::new(data.as_slice()), &mut io::sink()).is_err());
+    }
+
+    /// A size near u64::MAX (base-256) is not a reason to panic.
+    #[test]
+    fn absurd_sizes() {
+        let mut h = header(b'0', "file", 0);
+        h.as_mut_bytes()[124..136].copy_from_slice(&[0xff; 12]);
+        let mut guard = MetaLimit::new(&h.as_bytes()[..]);
+        let _ = io::copy(&mut guard, &mut io::sink());
     }
 }
