@@ -129,6 +129,10 @@ OUT=$(q qsh-alice@127.0.0.1 "grep -E '^(CapEff|CapPrm|CapBnd)' /proc/self/status
 check "no effective/permitted capabilities" bash -c "[[ \$(grep -c '0000000000000000' <<<'$OUT') -eq 2 ]]"
 OUT=$(q qsh-alice@127.0.0.1 'echo "$HOME|$USER|$(pwd)"' 2>&1 || true)
 check "HOME, USER and cwd are alice's" test "$OUT" = "$ALICE_HOME|qsh-alice|$ALICE_HOME"
+# Only stdin, stdout and stderr (and ls's own listing): nothing of qshd's,
+# such as another session's terminal, reaches a user's program.
+OUT=$(q qsh-alice@127.0.0.1 'ls /proc/self/fd' 2>&1 | tr '\n' ' ' || true)
+check "no descriptors inherited from qshd" test "$OUT" = "0 1 2 3 "
 
 # --- authorization ----------------------------------------------------------------
 check "alice's key cannot log in as bob" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-bob@127.0.0.1 true </dev/null 2>/dev/null"

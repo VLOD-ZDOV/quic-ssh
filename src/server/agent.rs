@@ -28,38 +28,66 @@ impl AgentSocket {
     }
 }
 
+/// The socket's directory, kept open: cleaning up goes through this
+/// descriptor, never through the path inside a directory the user owns
+/// (they could swap it for a symlink to make root delete elsewhere).
+struct AgentDir {
+    fd: std::os::fd::OwnedFd,
+    dir: PathBuf,
+}
+
+impl AgentDir {
+    fn socket(&self) -> PathBuf {
+        self.dir.join(SOCKET)
+    }
+}
+
+const SOCKET: &str = "agent.sock";
+
 /// A fresh private directory with a listening socket in it, both owned by the
 /// user. Root creates them in a directory nobody else can enter yet, and only
 /// then hands it over, so no path the user controls is ever followed.
-fn listen(user: &User) -> Result<(UnixListener, PathBuf)> {
+fn listen(user: &User) -> Result<(UnixListener, AgentDir)> {
+    use nix::fcntl::OFlag;
     // /tmp like sshd: root's own TMPDIR (e.g. on macOS) may be out of the user's reach.
     let template = Path::new("/tmp").join("qsh-XXXXXXXX");
     let dir = nix::unistd::mkdtemp(&template).context("cannot create agent directory")?;
-    let path = dir.join("agent.sock");
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let fd = match nix::fcntl::open(&dir, flags, nix::sys::stat::Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(e).context("cannot open agent directory");
+        }
+    };
+    let agent_dir = AgentDir { fd, dir };
+    let path = agent_dir.socket();
+    let dir = &agent_dir.dir;
     let setup = || -> Result<UnixListener> {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         if user.switches() {
             std::os::unix::fs::chown(&path, Some(user.uid), Some(user.gid))?;
-            std::os::unix::fs::chown(&dir, Some(user.uid), Some(user.gid))?;
+            std::os::unix::fs::chown(dir, Some(user.uid), Some(user.gid))?;
         }
         Ok(listener)
     };
     match setup() {
-        Ok(l) => Ok((l, path)),
+        Ok(l) => Ok((l, agent_dir)),
         Err(e) => {
-            cleanup(&path);
+            cleanup(&agent_dir);
             Err(e)
         }
     }
 }
 
-fn cleanup(path: &Path) {
-    // unlink and rmdir never follow links, even if the user swapped the socket.
-    let _ = std::fs::remove_file(path);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
+fn cleanup(d: &AgentDir) {
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    // Relative to the directory itself, wherever its path now leads. Then the
+    // directory, if its name in /tmp is still a directory (rmdir does not
+    // follow a symlink put there instead) and empty.
+    let _ = unlinkat(&d.fd, SOCKET, UnlinkatFlags::NoRemoveDir);
+    let _ = unlinkat(nix::fcntl::AT_FDCWD, &d.dir, UnlinkatFlags::RemoveDir);
 }
 
 /// Serves `Request::AgentForward` until the client closes the request stream.
@@ -68,17 +96,18 @@ pub async fn forward(mut send: SendHalf, recv: RecvHalf, conn: Arc<Conn>, user: 
     if socket.active.swap(true, Ordering::SeqCst) {
         return write_msg(&mut send, &Reply::Err("agent forwarding is already active".into())).await;
     }
-    let (listener, path) = match listen(user) {
+    let (listener, dir) = match listen(user) {
         Ok(x) => x,
         Err(e) => {
             socket.active.store(false, Ordering::SeqCst);
             return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await;
         }
     };
+    let path = dir.socket();
     *socket.path.lock().unwrap() = Some(path.clone());
     let result = serve(send, recv, conn, user, listener, &path).await;
     *socket.path.lock().unwrap() = None;
-    cleanup(&path);
+    cleanup(&dir);
     socket.active.store(false, Ordering::SeqCst);
     result
 }

@@ -232,6 +232,20 @@ fn totp(force: bool, disable: bool) -> Result<()> {
     anyhow::bail!("not confirmed; nothing was changed")
 }
 
+/// Lifts the soft limit on open files (often 1024) towards the hard one:
+/// every connection, forwarded connection and helper holds descriptors.
+/// Capped so that the users' programs, which inherit it, see a usual value.
+fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    const WANT: u64 = 8192;
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+        let new = hard.min(WANT);
+        if soft < new {
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, new, hard);
+        }
+    }
+}
+
 fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -240,6 +254,7 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
         )
         .with_writer(std::io::stderr)
         .init();
+    raise_fd_limit();
     let (mut cfg, key_path) = load_config(config)?;
     if let Some(l) = listen {
         cfg.listen = l;

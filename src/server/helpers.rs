@@ -70,7 +70,7 @@ pub fn send(path: &str) -> Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "ok")?;
     out.write_all(&meta.len().to_be_bytes())?;
-    out.write_all(&(meta.mode() & 0o7777).to_be_bytes())?;
+    out.write_all(&(meta.mode() & 0o777).to_be_bytes())?;
     pump(Read::take(&mut f, meta.len()), &mut out)?;
     out.flush()?;
     Ok(())
@@ -156,6 +156,7 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     if dashes != "--" {
         bail!("bad arguments");
     }
+    crate::platform::close_inherited_fds();
     let (uid, gid) = (Uid::from_raw(uid.parse()?), Gid::from_raw(gid.parse()?));
     if tty == "tty" {
         let (group, mode) = match Group::from_name("tty") {

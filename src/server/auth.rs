@@ -248,7 +248,11 @@ pub async fn second_factor(
         return Ok(Ok(()));
     }
     let path = crate::totp::secret_path(&user.home);
-    let secret = match read_strict_private(&path, &user.home, user.uid) {
+    let read = {
+        let (path, home, uid) = (path.clone(), user.home.clone(), user.uid);
+        tokio::task::spawn_blocking(move || read_strict_private(&path, &home, uid)).await?
+    };
+    let secret = match read {
         Ok(Some(text)) => match crate::totp::base32_decode(text.trim()) {
             Ok(s) if s.len() >= 10 => s,
             _ => {

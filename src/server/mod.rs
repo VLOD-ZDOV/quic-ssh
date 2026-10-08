@@ -134,12 +134,24 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 }
 
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity) -> Result<()> {
+    // Remember where qshd is while the path is still valid (see users::exe_path).
+    let _ = users::exe_path();
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
     let sessions = Arc::new(persist::Sessions::new(Duration::from_secs(cfg.session_timeout)));
     let state = Arc::new(State { cfg, host_key: host.public(), totp_used: Default::default(), sessions });
     loop {
-        let incoming = listener.accept().await?;
+        let incoming = match listener.accept().await {
+            Ok(i) => i,
+            // Out of descriptors (EMFILE) and the like: wait a little and go
+            // on, as sshd does; the server must not end over one connection.
+            Err(e) if e.is::<std::io::Error>() => {
+                warn!("cannot accept a connection: {e:#}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let addr = incoming.remote_addr();
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             warn!("connection limit reached, dropping {addr}");
@@ -190,8 +202,11 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         Hello::Pair { user, version } => (user, true, version, None),
         Hello::Resume { user, version, token } => (user, false, version, Some(token)),
     };
+    // User lookups (NSS: maybe LDAP or SSSD) and reading the key files can
+    // block: never on a worker thread, which may be the one driving the network.
     let looked_up = if valid_user_name(&name) {
-        User::lookup(&name)
+        let n = name.clone();
+        tokio::task::spawn_blocking(move || User::lookup(&n)).await?
     } else {
         Err(anyhow::anyhow!("invalid user name"))
     };
@@ -212,9 +227,14 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     }
 
     // An unknown user goes through the same steps with no keys, so names cannot be probed.
-    let entries = user.as_ref().map(|u| auth::authorized_entries(&state.cfg, u)).unwrap_or_default();
-    let cas = auth::trusted_cas(&state.cfg);
-    let revoked = revoked::Revocation::load(state.cfg.revoked_keys.as_deref());
+    let (entries, cas, revoked) = {
+        let (state, user) = (state.clone(), user.clone());
+        tokio::task::spawn_blocking(move || {
+            let entries = user.as_ref().map(|u| auth::authorized_entries(&state.cfg, u)).unwrap_or_default();
+            (entries, auth::trusted_cas(&state.cfg), revoked::Revocation::load(state.cfg.revoked_keys.as_deref()))
+        })
+        .await?
+    };
     let command = user.as_ref().and_then(|u| keys_command::KeysCommand::new(&state.cfg, u));
     let checker = auth::Checker {
         entries: &entries,
@@ -255,6 +275,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         return Ok(());
     }
     info!("{addr}: {name} logged in with {how} over {}", conn.transport_name());
+    conn.logged_in();
     let welcome = if version >= 4 { Reply::Welcome { version: VERSION } } else { Reply::Ok };
     write_msg(&mut send, &welcome).await?;
     drop(startup);
@@ -345,6 +366,14 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
         },
         Request::RemoteForward { bind, port } => {
+            // No address (older clients): loopback, as ssh asks for by
+            // default, unless gateway_ports = "clientspecified" takes it as
+            // all addresses, which a host-less permitlisten does not allow.
+            let bind = match (bind.as_str(), state.cfg.gateway_ports) {
+                ("", GatewayPorts::ClientSpecified) => "*".to_string(),
+                ("", _) => "localhost".to_string(),
+                _ => bind,
+            };
             if !limits.may_listen(&bind, port) {
                 return write_msg(&mut send, &Reply::Err(format!("listening on port {port} is not permitted for this key"))).await;
             }

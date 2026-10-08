@@ -46,10 +46,11 @@ x509-parser = "0.18"
 libc = "0.2"
 vt100 = "0.16.2"
 async-compression = { version = "0.4.50", features = ["tokio", "zstd"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 jiff = "0.2.38"
-nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname"] }
+nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource"] }
 pty-process = { version = "0.5", features = ["async"] }
 
 

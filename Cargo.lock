@@ -2096,6 +2096,7 @@ dependencies = [
  "sha1",
  "sha2",
  "signature",
+ "socket2",
  "spake2",
  "ssh-key",
  "tar",

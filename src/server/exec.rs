@@ -176,16 +176,18 @@ enum Input {
     Pty(pty_process::OwnedWritePty),
 }
 
-/// Applies client input to the child. Sends on `gone` if the client vanished
-/// (stream error), as opposed to a clean end of its input.
+/// Applies client input to the child. Sends on `gone` when the stream ends:
+/// clients never end their side of a command's stream themselves (the end
+/// of input is `StdinEof`), so an end, clean or not, means the client is
+/// gone. A clean one is how a client that was killed looks through a shared
+/// connection (its master just passes the closed socket on).
 async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>) {
     loop {
         let msg = match read_msg_opt::<_, ClientMsg>(&mut recv).await {
             Ok(Some(msg)) => msg,
-            Ok(None) => return,
             // Unknown message type from a newer client: skip it.
             Err(e) if e.is::<crate::proto::Malformed>() => continue,
-            Err(_) => {
+            Ok(None) | Err(_) => {
                 let _ = gone.send(());
                 return;
             }
@@ -267,8 +269,7 @@ async fn supervise(
 
     let status: Option<ExitStatus> = tokio::select! {
         s = child.wait() => s.ok(),
-        // A clean end of client input drops the sender without sending; only
-        // an explicit signal (stream error) or a closed connection means the client is gone.
+        // The client's side of the stream ended, or the connection closed.
         Ok(()) = &mut gone_rx => {
             hang_up(&mut child).await;
             None

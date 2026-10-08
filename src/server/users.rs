@@ -130,7 +130,7 @@ impl User {
         if !self.switch {
             return (program.to_owned(), Vec::new());
         }
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+        let exe = self_program();
         let groups: Vec<String> = self.groups.iter().map(|g| g.to_string()).collect();
         let mut args: Vec<std::ffi::OsString> = vec![
             BECOME.into(),
@@ -156,7 +156,9 @@ impl User {
         let (exe, args) = self.launch(program.as_ref(), arg0, false);
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args).env_clear().envs(self.env()).kill_on_drop(true);
-        if !self.switch {
+        if self.switch {
+            name_self(&mut cmd);
+        } else {
             cmd.current_dir(&self.home);
             if let Some(a) = arg0 {
                 cmd.arg0(a);
@@ -169,7 +171,11 @@ impl User {
     pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>) -> pty_process::Command {
         let (exe, args) = self.launch(program.as_ref(), arg0, true);
         let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(env).kill_on_drop(true);
-        if !self.switch {
+        if self.switch {
+            if let Ok(p) = exe_path() {
+                cmd = cmd.arg0(p);
+            }
+        } else {
             cmd = cmd.current_dir(&self.home);
             if let Some(a) = arg0 {
                 cmd = cmd.arg0(a);
@@ -182,8 +188,10 @@ impl User {
     /// file access in the user's home happens with the user's own permissions.
     /// `args` is the subcommand followed by its positional arguments.
     pub fn helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
-        let exe = std::env::current_exe().context("cannot locate qshd binary")?;
-        let mut cmd = self.command(exe);
+        let mut cmd = self.command(self_program());
+        if !self.switch {
+            name_self(&mut cmd);
+        }
         cmd.args(helper_argv(args));
         Ok(cmd)
     }
@@ -193,12 +201,46 @@ impl User {
     /// (nologin, git-shell) then also restricts file transfers. The arguments
     /// travel in the environment, so the shell never parses client input.
     pub fn shell_helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
-        let exe = std::env::current_exe().context("cannot locate qshd binary")?;
+        // Through a shell `/proc/self/exe` would be the shell: the path it is.
+        let exe = exe_path()?;
         let exe = exe.to_str().context("qshd path is not UTF-8")?;
         let mut cmd = self.command(&self.shell);
         cmd.arg("-c").arg(format!("{} {HELPER_FROM_ENV}", shell_quote(exe)?));
         cmd.env(HELPER_ARGS, encode_args(&helper_argv(args)));
         Ok(cmd)
+    }
+}
+
+/// qshd's own path, as found when first asked (call early: after an
+/// upgrade replaced the file, the running binary's path reads
+/// "... (deleted)").
+pub fn exe_path() -> Result<PathBuf> {
+    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let p = std::env::current_exe().ok()?;
+        let text = p.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from);
+        Some(text.unwrap_or(p))
+    })
+    .clone()
+    .context("cannot locate the qshd binary")
+}
+
+/// What to run to start qshd itself (helpers, `internal-become`): on Linux
+/// the running binary through `/proc/self/exe`, which works even after an
+/// upgrade replaced the file (and keeps helpers at the server's version);
+/// elsewhere (or without /proc) its path.
+fn self_program() -> PathBuf {
+    if cfg!(target_os = "linux") && std::path::Path::new("/proc/self/exe").exists() {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        exe_path().unwrap_or_else(|_| PathBuf::from("qshd"))
+    }
+}
+
+/// Shows qshd's real path as argv[0] of a helper started as `/proc/self/exe`.
+fn name_self(cmd: &mut tokio::process::Command) {
+    if let Ok(p) = exe_path() {
+        cmd.arg0(p);
     }
 }
 

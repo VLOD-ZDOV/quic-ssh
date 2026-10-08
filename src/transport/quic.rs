@@ -14,15 +14,21 @@ pub struct QuicConn {
     conn: quinn::Connection,
 }
 
-fn transport_config() -> Arc<TransportConfig> {
+/// Connection-wide receive window once logged in.
+const RECEIVE_WINDOW: u32 = 32 << 20;
+
+/// `server`: start with the limits for a client that has not logged in
+/// yet (see [`QuicConn::logged_in`]).
+fn transport_config(server: bool) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
-    t.max_concurrent_bidi_streams(VarInt::from_u32(super::MAX_STREAMS));
+    let (streams, window) = if server { (super::PREAUTH_STREAMS, super::PREAUTH_WINDOW) } else { (super::MAX_STREAMS, RECEIVE_WINDOW) };
+    t.max_concurrent_bidi_streams(VarInt::from_u32(streams));
     t.max_concurrent_uni_streams(VarInt::from_u32(0));
     t.keep_alive_interval(Some(super::KEEPALIVE));
     t.max_idle_timeout(Some(super::IDLE_TIMEOUT.try_into().expect("valid idle timeout")));
     // Larger windows than the defaults so bulk copies are not window-limited on long links.
     t.stream_receive_window(VarInt::from_u32(8 << 20));
-    t.receive_window(VarInt::from_u32(32 << 20));
+    t.receive_window(VarInt::from_u32(window));
     t.send_window(32 << 20);
     // BBR instead of the default Cubic: it does not treat random loss (Wi-Fi,
     // mobile) as congestion; with 1% loss it keeps ~2x the throughput of Cubic.
@@ -33,7 +39,7 @@ fn transport_config() -> Arc<TransportConfig> {
 pub fn server_endpoint(tls: Arc<rustls::ServerConfig>, addr: SocketAddr) -> Result<Endpoint> {
     let crypto = QuicServerConfig::try_from(tls)?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    cfg.transport_config(transport_config());
+    cfg.transport_config(transport_config(true));
     Ok(Endpoint::server(cfg, addr)?)
 }
 
@@ -57,7 +63,7 @@ pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result
     };
     let endpoint = Endpoint::client(bind)?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    cfg.transport_config(transport_config());
+    cfg.transport_config(transport_config(false));
     let conn = endpoint.connect_with(cfg, addr, crate::tls::SERVER_NAME)?.await?;
     finish(Some(endpoint), conn)
 }
@@ -85,6 +91,11 @@ impl QuicConn {
 
     pub async fn closed(&self) {
         self.conn.closed().await;
+    }
+
+    pub fn logged_in(&self) {
+        self.conn.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
+        self.conn.set_max_concurrent_bi_streams(VarInt::from_u32(super::MAX_STREAMS));
     }
 
     pub async fn close(&self) {

@@ -30,6 +30,11 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum concurrent streams (sessions, forwards, copies) per connection.
 const MAX_STREAMS: u32 = 128;
+/// Before the client has logged in, the server only reads the login stream:
+/// it accepts few streams and buffers little, so that connections that
+/// never log in cannot take much memory.
+const PREAUTH_STREAMS: u32 = 4;
+const PREAUTH_WINDOW: u32 = 1 << 20;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -127,6 +132,17 @@ impl Conn {
             Inner::Tcp(_) => "tcp",
             #[cfg(unix)]
             Inner::Shared(c) => c.transport(),
+        }
+    }
+
+    /// Server side: the client has logged in, lift the limits for clients
+    /// that have not (see [`PREAUTH_STREAMS`]).
+    pub fn logged_in(&self) {
+        match &self.inner {
+            Inner::Quic(c) => c.logged_in(),
+            Inner::Tcp(c) => c.logged_in(),
+            #[cfg(unix)]
+            Inner::Shared(_) => {}
         }
     }
 
@@ -370,7 +386,8 @@ impl Listener {
         tokio::select! {
             inc = self.quic.accept() => inc.map(|i| Incoming::Quic(Box::new(i))).context("quic endpoint closed"),
             res = tcp_accept => {
-                let (sock, addr) = res?;
+                // A plain io::Error: the caller tells it from a closed endpoint.
+                let (sock, addr) = res.map_err(anyhow::Error::new)?;
                 Ok(Incoming::Tcp(sock, addr, self.tls.clone()))
             }
         }

@@ -73,6 +73,11 @@ fn safe_join(dest: &Path, entry: &Path) -> Result<PathBuf> {
     let mut depth = 0;
     for c in entry.components() {
         match c {
+            // On Windows a later `C:x` would replace the whole path, and
+            // `name:stream` writes to an alternate data stream.
+            Component::Normal(name) if cfg!(windows) && name.to_string_lossy().contains(':') => {
+                bail!("refusing unsafe path {:?} in the archive", entry)
+            }
             Component::Normal(name) => {
                 out.push(name);
                 depth += 1;
@@ -103,10 +108,126 @@ fn no_symlinks_below(dest: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Largest long name (GNU `L`/`K`) or PAX header accepted. The tar crate
+/// reads these whole into memory, at whatever size the sender declares.
+const MAX_META: u64 = 64 * 1024;
+
+/// Watches the tar stream on its way to the tar crate and refuses oversized
+/// metadata entries before they are read. It follows the archive layout
+/// itself: 512-byte headers, then data padded to 512 bytes, its size from
+/// the header or from a preceding PAX `size=` record. Sparse and
+/// multi-volume entries, whose extra blocks it does not follow, are refused
+/// (qsh never sends them).
+struct MetaLimit<R> {
+    inner: R,
+    header: Vec<u8>,
+    /// Data bytes still to pass before the padding.
+    data: u64,
+    /// Padding bytes after the data.
+    pad: u64,
+    /// The data of a PAX header being passed, kept to find `size=`.
+    pax: Option<Vec<u8>>,
+    /// Size from a PAX header, for the entry after it.
+    next_size: Option<u64>,
+}
+
+impl<R> MetaLimit<R> {
+    fn new(inner: R) -> MetaLimit<R> {
+        MetaLimit { inner, header: Vec::with_capacity(512), data: 0, pad: 0, pax: None, next_size: None }
+    }
+
+    fn header_done(&mut self) -> io::Result<()> {
+        let h = std::mem::take(&mut self.header);
+        let kind = h[156];
+        let size = self.next_size.take().unwrap_or_else(|| header_size(&h[124..136]));
+        let refuse = |what: String| Err(io::Error::new(io::ErrorKind::InvalidData, what));
+        match kind {
+            b'S' | b'M' => return refuse("refusing a sparse or multi-volume entry in the archive".into()),
+            b'L' | b'K' | b'x' | b'g' if size > MAX_META => return refuse(format!("refusing an archive header entry of {size} bytes")),
+            _ => {}
+        }
+        self.pax = (kind == b'x').then(Vec::new);
+        self.data = size;
+        self.pad = size.div_ceil(512) * 512 - size;
+        if size == 0 {
+            self.data_done();
+        }
+        Ok(())
+    }
+
+    fn data_done(&mut self) {
+        if let Some(pax) = self.pax.take() {
+            self.next_size = pax_value(&pax, b"size").and_then(|v| std::str::from_utf8(v).ok()?.parse().ok());
+        }
+    }
+}
+
+impl<R: Read> Read for MetaLimit<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let mut rest = &buf[..n];
+        while !rest.is_empty() {
+            let take = |want: u64, rest: &mut &[u8]| {
+                let (now, later) = rest.split_at(want.min(rest.len() as u64) as usize);
+                *rest = later;
+                now.len()
+            };
+            if self.data > 0 {
+                let before = rest;
+                let k = take(self.data, &mut rest);
+                if let Some(pax) = &mut self.pax {
+                    pax.extend_from_slice(&before[..k]);
+                }
+                self.data -= k as u64;
+                if self.data == 0 {
+                    self.data_done();
+                }
+            } else if self.pad > 0 {
+                self.pad -= take(self.pad, &mut rest) as u64;
+            } else {
+                let before = rest;
+                let k = take(512 - self.header.len() as u64, &mut rest);
+                self.header.extend_from_slice(&before[..k]);
+                if self.header.len() == 512 {
+                    self.header_done()?;
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// A header's size field: octal digits, or base-256 when the top bit is set.
+fn header_size(field: &[u8]) -> u64 {
+    if field[0] & 0x80 != 0 {
+        return field[1..].iter().fold(0u64, |n, &b| n.saturating_mul(256).saturating_add(b as u64));
+    }
+    let text: String = field.iter().map(|&b| b as char).filter(|c| c.is_ascii_digit()).collect();
+    u64::from_str_radix(&text, 8).unwrap_or(0)
+}
+
+/// The value of `key` in PAX records (`LEN key=value\n`).
+fn pax_value<'a>(mut data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    while !data.is_empty() {
+        let space = data.iter().position(|&b| b == b' ')?;
+        let len: usize = std::str::from_utf8(&data[..space]).ok()?.parse().ok()?;
+        if len <= space || len > data.len() {
+            return None;
+        }
+        let record = &data[space + 1..len];
+        let record = record.strip_suffix(b"\n").unwrap_or(record);
+        if let Some(value) = record.strip_prefix(key).and_then(|r| r.strip_prefix(b"=")) {
+            return Some(value);
+        }
+        data = &data[len..];
+    }
+    None
+}
+
 /// Extracts a tar stream into the existing directory `dest`.
 pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
-    let mut archive = tar::Archive::new(input);
+    let mut archive = tar::Archive::new(MetaLimit::new(input));
     for entry in archive.entries()? {
         let mut entry = entry?;
         let rel = entry.path()?.into_owned();
@@ -115,8 +236,16 @@ pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
-                match fs::create_dir(&target) {
-                    Ok(()) => crate::platform::set_mode(&target, mode | 0o700)?,
+                // The mode goes through the umask, as with files and `cp -r`.
+                #[cfg(unix)]
+                let created = {
+                    use std::os::unix::fs::DirBuilderExt;
+                    fs::DirBuilder::new().mode(mode | 0o700).create(&target)
+                };
+                #[cfg(not(unix))]
+                let created = fs::create_dir(&target);
+                match created {
+                    Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists && target.is_dir() => {}
                     Err(e) => return Err(e).with_context(|| format!("{}", target.display())),
                 }
@@ -289,5 +418,75 @@ mod tests {
         assert_eq!(tree_target(d.path(), "proj").unwrap(), d.path().join("proj"));
         assert_eq!(tree_target(&d.path().join("new"), "proj").unwrap(), d.path().join("new"));
         assert!(tree_target(d.path(), "..").is_err());
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+
+    fn header(kind: u8, name: &str, size: u64) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_size(size);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::new(kind));
+        h.set_cksum();
+        h
+    }
+
+    #[test]
+    fn long_names_still_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("{}/{}", "d".repeat(80), "f".repeat(90));
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(3);
+        h.set_mode(0o644);
+        b.append_data(&mut h, &long, &b"abc"[..]).unwrap();
+        let data = b.into_inner().unwrap();
+        fs::create_dir(dir.path().join("d".repeat(80))).unwrap();
+        let stats = extract_tree(data.as_slice(), dir.path()).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(fs::read(dir.path().join(&long)).unwrap(), b"abc");
+    }
+
+    /// A long-name entry declaring gigabytes is refused at its header,
+    /// before the tar crate would read it into memory.
+    #[test]
+    fn huge_metadata_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = header(b'L', "././@LongLink", 8 << 30).as_bytes().to_vec();
+        data.extend(std::iter::repeat_n(b'a', 4096));
+        let err = extract_tree(data.as_slice(), dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing an archive header entry"), "{err:#}");
+    }
+
+    /// The layout is followed through a PAX size, so a long name hidden
+    /// behind it is still seen.
+    #[test]
+    fn pax_size_is_followed() {
+        let record = |k: &str, v: &str| {
+            let body = format!(" {k}={v}\n");
+            let mut len = body.len() + 1;
+            while len.to_string().len() + body.len() != len {
+                len += 1;
+            }
+            format!("{len}{body}")
+        };
+        let pax = record("size", "1024");
+        let mut data = header(b'x', "pax", pax.len() as u64).as_bytes().to_vec();
+        data.extend_from_slice(pax.as_bytes());
+        data.resize(data.len().div_ceil(512) * 512, 0);
+        // The entry's own header says 0 bytes; its real data (1024) holds
+        // what would look like headers to a reader that ignored the PAX size.
+        data.extend_from_slice(header(b'0', "file", 0).as_bytes());
+        data.extend_from_slice(header(b'L', "fake", 8 << 30).as_bytes());
+        data.extend(std::iter::repeat_n(0u8, 512));
+        let mut guard = MetaLimit::new(data.as_slice());
+        assert!(io::copy(&mut guard, &mut io::sink()).is_ok(), "the fake header inside data was taken for a header");
+        let mut data = header(b'0', "file", 0).as_bytes().to_vec();
+        data.extend_from_slice(header(b'L', "real", 8 << 30).as_bytes());
+        assert!(io::copy(&mut MetaLimit::new(data.as_slice()), &mut io::sink()).is_err());
     }
 }

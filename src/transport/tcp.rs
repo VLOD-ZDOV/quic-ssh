@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -25,6 +26,9 @@ pub struct TcpConn {
     cmds: mpsc::Sender<Cmd>,
     incoming: Mutex<mpsc::Receiver<yamux::Stream>>,
     alive: watch::Receiver<bool>,
+    /// How many streams opened by the peer may wait to be accepted; more are
+    /// reset (few before login, see [`super::PREAUTH_STREAMS`]).
+    queue: Arc<AtomicUsize>,
 }
 
 fn yamux_config() -> Config {
@@ -43,7 +47,7 @@ fn split(s: yamux::Stream) -> (SendHalf, RecvHalf) {
 /// Runs the yamux connection in a background task. All stream I/O (including
 /// window updates) is driven here, so streams may write without reading.
 /// The connection closes on `Cmd::Close` or when the `TcpConn` is dropped.
-fn start<T>(socket: T, mode: Mode) -> (mpsc::Sender<Cmd>, mpsc::Receiver<yamux::Stream>, watch::Receiver<bool>)
+fn start<T>(socket: T, mode: Mode, queue: Arc<AtomicUsize>) -> (mpsc::Sender<Cmd>, mpsc::Receiver<yamux::Stream>, watch::Receiver<bool>)
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -77,7 +81,12 @@ where
                 match conn.poll_next_inbound(cx) {
                     // A full queue means the peer opens streams faster than we
                     // serve them; dropping the stream resets it.
-                    Poll::Ready(Some(Ok(stream))) => drop(in_tx.try_send(stream)),
+                    Poll::Ready(Some(Ok(stream))) => {
+                        let waiting = in_tx.max_capacity() - in_tx.capacity();
+                        if waiting < queue.load(Ordering::Relaxed) {
+                            drop(in_tx.try_send(stream));
+                        }
+                    }
                     Poll::Ready(Some(Err(e))) => {
                         tracing::debug!("yamux connection error: {e}");
                         return Poll::Ready(());
@@ -109,9 +118,11 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (peer_key, host_cert, exporter) = info;
-    let (cmds, incoming, alive) = start(socket, mode);
+    let limit = if matches!(mode, Mode::Server) { super::PREAUTH_STREAMS } else { super::MAX_STREAMS };
+    let queue = Arc::new(AtomicUsize::new(limit as usize));
+    let (cmds, incoming, alive) = start(socket, mode, queue.clone());
     Conn {
-        inner: Inner::Tcp(TcpConn { cmds, incoming: Mutex::new(incoming), alive }),
+        inner: Inner::Tcp(TcpConn { cmds, incoming: Mutex::new(incoming), alive, queue }),
         peer_key,
         exporter,
         remote,
@@ -121,9 +132,25 @@ where
     }
 }
 
+/// TCP keepalive (QUIC has its own): a peer that vanished without a word
+/// (sleep, a changed network, a NAT that forgot the connection) is noticed
+/// after about a minute instead of never, on both sides.
+fn keep_alive(sock: &TcpStream) {
+    use std::time::Duration;
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+    let ka = ka.with_interval(Duration::from_secs(10));
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    let ka = ka.with_retries(3);
+    if let Err(e) = socket2::SockRef::from(sock).set_tcp_keepalive(&ka) {
+        tracing::debug!("TCP keepalive: {e}");
+    }
+}
+
 pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr) -> Result<Conn> {
     let sock = TcpStream::connect(addr).await?;
     sock.set_nodelay(true)?;
+    keep_alive(&sock);
     let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
     let stream = tokio_rustls::TlsConnector::from(tls).connect(name, sock).await?;
     let info = tls_info(stream.get_ref().1)?;
@@ -144,6 +171,7 @@ where
 
 pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: SocketAddr) -> Result<Conn> {
     sock.set_nodelay(true)?;
+    keep_alive(&sock);
     let stream = tokio_rustls::TlsAcceptor::from(tls).accept(sock).await?;
     let info = tls_info(stream.get_ref().1)?;
     Ok(finish(stream, Mode::Server, info, addr))
@@ -159,6 +187,10 @@ impl TcpConn {
 
     pub async fn accept_bi(&self) -> Option<(SendHalf, RecvHalf)> {
         self.incoming.lock().await.recv().await.map(split)
+    }
+
+    pub fn logged_in(&self) {
+        self.queue.store(super::MAX_STREAMS as usize, Ordering::Relaxed);
     }
 
     pub async fn closed(&self) {

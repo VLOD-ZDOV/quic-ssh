@@ -65,6 +65,27 @@ pub fn terminal() -> io::Result<(File, File)> {
     }
 }
 
+/// Closes every descriptor above stderr, like OpenSSH's `closefrom(3)`:
+/// a program started for another user must not inherit anything of ours
+/// (a terminal master opened by another thread is close-on-exec only a
+/// moment after it is opened), and a background qsh must not keep its
+/// caller's pipes open.
+pub fn close_inherited_fds() {
+    #[cfg(unix)]
+    {
+        let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let fds: Vec<std::os::fd::RawFd> = entries
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd > 2)
+            .collect();
+        // The listing's own descriptor is closed by now; closing it again fails harmlessly.
+        for fd in fds {
+            let _ = nix::unistd::close(fd);
+        }
+    }
+}
+
 /// Makes stdin, stdout and stderr blocking. qsh reads and writes them from
 /// blocking threads, but a parent may hand over non-blocking descriptors
 /// (openrsync does, with its socket pair), and a read would then fail at once

@@ -96,6 +96,9 @@ async fn bind_local(bind: Option<&str>, port: u16, gateway: bool) -> Result<Vec<
     }
 }
 
+/// How long a SOCKS client may take to say where it wants to go.
+const SOCKS_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long repeated failures to reach the same target stay hidden.
 const QUIET_REPEATS: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -164,7 +167,11 @@ pub async fn start_dynamic(conn: Arc<Conn>, spec: &str, gateway: bool) -> Result
                 let conn = conn.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let req = super::socks::accept(&mut tcp).await?;
+                        // A program that connects and never finishes the handshake
+                        // must not hold the connection forever.
+                        let req = tokio::time::timeout(SOCKS_HANDSHAKE, super::socks::accept(&mut tcp))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("no SOCKS request in time"))??;
                         match open_direct(&conn, &req.host, req.port).await {
                             Ok((send, recv)) => {
                                 req.reply(&mut tcp, true).await?;
@@ -225,7 +232,9 @@ pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<
     let mut requests = Vec::new();
     for f in forwards {
         let (mut send, mut recv) = conn.open_bi().await?;
-        write_msg(&mut send, &Request::RemoteForward { bind: f.bind.clone().unwrap_or_default(), port: f.port }).await?;
+        // Like ssh: without an address, ask for loopback.
+        let bind = f.bind.clone().unwrap_or_else(|| "localhost".into());
+        write_msg(&mut send, &Request::RemoteForward { bind, port: f.port }).await?;
         match expect_ok(&mut recv).await.with_context(|| format!("remote forward {}", f.describe()))? {
             Reply::Bound { port } => {
                 if f.port == 0 && !quiet {

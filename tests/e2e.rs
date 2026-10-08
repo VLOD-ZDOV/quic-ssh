@@ -1808,6 +1808,19 @@ fn connection_sharing_with_a_background_master() {
     child.stdin.take().unwrap().write_all(&[b'x'; 100_000]).unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(stdout(&out).trim(), "100000");
+    // A client killed while its command runs: the command ends on the server
+    // too, as without a master (the master just sees the socket close).
+    let pidfile = s.home.path().join("cmd.pid");
+    let mut child = c.cmd(&["-p", &port, &dest(), "sh", "-c", &format!("'echo $$ > {}; exec sleep 300'", pidfile.display())]).spawn().unwrap();
+    let pid = wait_for_file(&pidfile);
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists() || !cfg!(target_os = "linux"));
+    child.kill().unwrap();
+    let _ = child.wait();
+    let gone = (0..50).any(|_| {
+        sleep(Duration::from_millis(100));
+        !process_alive(&pid)
+    });
+    assert!(gone, "the command outlived its client");
     // -R needs a connection of its own (the server's streams would reach the master).
     let out = c.run(&["-o", "BatchMode=yes", "-R", "0:127.0.0.1:9", "-p", &port, &dest(), "true"]);
     assert!(!out.status.success(), "-R went through the master");
@@ -1818,6 +1831,23 @@ fn connection_sharing_with_a_background_master() {
     assert!(!out.status.success(), "the master is still there");
     let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
     assert!(!out.status.success(), "logged in without a key");
+}
+
+/// Waits for a file to have content (a pid written by a remote command) and returns it.
+fn wait_for_file(path: &std::path::Path) -> String {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.ends_with('\n') {
+                return text.trim().to_string();
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+    panic!("{} never appeared", path.display());
+}
+
+fn process_alive(pid: &str) -> bool {
+    Command::new("kill").args(["-0", pid]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 /// `-M -f -N -S path`: a master in the foreground process (here sent to the
