@@ -33,6 +33,14 @@ use users::User;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const NO_PAIRING: &str = "no active pairing code for this user (run `qshd pair` on the server; codes expire)";
+/// "No pairing code" always takes this long, so that the time a check for an
+/// existing user takes does not tell which users exist.
+const NO_PAIRING_DELAY: Duration = Duration::from_millis(500);
+
+async fn refuse_pairing(send: &mut SendHalf, since: tokio::time::Instant) -> Result<()> {
+    tokio::time::sleep_until(since + NO_PAIRING_DELAY).await;
+    write_msg(send, &Reply::Err(NO_PAIRING.into())).await
+}
 /// How long a finished connection waits for the client to close it.
 const LINGER: Duration = Duration::from_secs(5);
 
@@ -197,11 +205,9 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     if pairing {
         match user {
             Some(user) => return pair(conn, &state, &user, send, recv).await,
-            None => {
-                // Same answer as for an existing user without a code, so names cannot be probed.
-                write_msg(&mut send, &Reply::Err(NO_PAIRING.into())).await?;
-                return Ok(());
-            }
+            // Same answer, after the same time, as for an existing user
+            // without a code, so names cannot be probed.
+            None => return refuse_pairing(&mut send, tokio::time::Instant::now()).await,
         }
     }
 
@@ -581,12 +587,12 @@ async fn run_helper(user: &User, args: &[&str]) -> Result<String> {
 async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
+    let started = tokio::time::Instant::now();
     let code = match run_helper(user, &["internal-pair-take"]).await {
         Ok(code) => code,
         Err(e) => {
             warn!("{addr}: pairing for {} refused: {e:#}", user.name);
-            write_msg(&mut send, &Reply::Err(NO_PAIRING.into())).await?;
-            return Ok(());
+            return refuse_pairing(&mut send, started).await;
         }
     };
     write_msg(&mut send, &Reply::Ok).await?;

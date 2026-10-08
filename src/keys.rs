@@ -219,10 +219,17 @@ pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
 /// `top`, is owned by `uid` or root and not group/world writable (otherwise
 /// someone else could swap the file). Like sshd, the real path counts: a
 /// symlinked directory (`~/.ssh -> /elsewhere`) is checked where it really
-/// is, all the way up to `/` if that is outside `top`.
+/// is, all the way up to `/` if that is outside `top`, where the file itself
+/// must belong to the user.
 fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
     let real = fs::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
     let top = fs::canonicalize(top).unwrap_or_else(|_| top.to_path_buf());
+    // Outside the home directory only the user's own files count: root reads
+    // these, and a symlink must not make it read someone else's (such as
+    // root's authorized_keys) as the user's.
+    if uid != 0 && !real.starts_with(&top) && fs::metadata(&real)?.uid() != uid {
+        bail!("{} leads outside the home directory to a file the user does not own", path.display());
+    }
     for p in real.ancestors() {
         let meta = fs::metadata(p).with_context(|| format!("cannot stat {}", p.display()))?;
         if meta.uid() != uid && meta.uid() != 0 {
@@ -365,6 +372,18 @@ mod tests {
         assert!(read_key_list_strict(&file, home.path(), uid).is_err(), "world-writable directory behind a symlink");
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(read_key_list_strict(&file, home.path(), uid).is_ok(), before);
+    }
+
+    /// A symlink out of the home directory to a file the user does not own
+    /// (say, root's authorized_keys) is not read as the user's.
+    #[cfg(unix)]
+    #[test]
+    fn strict_read_refuses_foreign_files_outside_home() {
+        let home = tempfile::tempdir().unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        std::os::unix::fs::symlink("/etc", home.path().join(".ssh")).unwrap();
+        let err = read_strict(&home.path().join(".ssh/passwd"), home.path(), me.max(1)).unwrap_err();
+        assert!(format!("{err:#}").contains("does not own"), "{err:#}");
     }
 
     #[cfg(unix)]

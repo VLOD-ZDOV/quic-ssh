@@ -108,6 +108,10 @@ pub struct Checker<'a> {
 impl Checker<'_> {
     pub async fn check(&self, offered: &Offered) -> Result<Grant, String> {
         key_allowed(offered.signing_key()).map_err(|e| format!("{e:#}"))?;
+        // The CA's key must meet the same minimum (no small RSA CAs).
+        if let Offered::Cert(cert) = offered {
+            key_allowed(cert.signature_key()).map_err(|e| format!("certificate authority: {e:#}"))?;
+        }
         self.revoked.check(offered)?;
         let from_files = authkeys::check(offered, self.entries, self.cas, &self.login);
         match (from_files, self.command) {
@@ -121,6 +125,9 @@ impl Checker<'_> {
         let offered = Offered::from_bytes(key).map_err(|e| format!("{e:#}"))?;
         let grant = self.check(&offered).await?;
         let sig = ssh_key::Signature::try_from(signature).map_err(|e| format!("bad signature encoding: {e}"))?;
+        if !authkeys::signature_fits(offered.signing_key(), &sig) {
+            return Err(format!("{} signature for a {} key", sig.algorithm(), offered.signing_key().algorithm()));
+        }
         let data = auth_data(&self.exporter, self.login.user, key);
         offered.signing_key().verify(&data, &sig).map_err(|_| "signature does not verify".to_string())?;
         if let Some(flags) = authkeys::security_key_flags(&sig) {
@@ -187,6 +194,9 @@ const TOTP_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub struct TotpState {
     used: std::collections::HashMap<u32, u64>,
     failures: std::collections::HashMap<u32, std::collections::VecDeque<std::time::Instant>>,
+    /// Codes asked for and not answered yet, per uid: they count as possible
+    /// failures, so parallel logins cannot get more guesses than the limit.
+    pending: std::collections::HashMap<u32, usize>,
     /// The last time step an earlier qshd process could have accepted: the
     /// codes it used are not known, so none up to here are taken (a code
     /// seen before a restart cannot be replayed after it).
@@ -198,7 +208,7 @@ impl Default for TotpState {
         // Tests log in right after starting a server (never in release builds).
         let testing = cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_NO_TOTP_FLOOR").is_some();
         let floor = if testing { 0 } else { now() / crate::totp::STEP + crate::totp::WINDOW };
-        TotpState { used: Default::default(), failures: Default::default(), floor }
+        TotpState { used: Default::default(), failures: Default::default(), pending: Default::default(), floor }
     }
 }
 
@@ -259,11 +269,30 @@ pub async fn second_factor(
     if version < 4 {
         return Ok(Err("this account needs a one-time code; update qsh to 0.5 or newer".into()));
     }
-    for _ in 0..TOTP_TRIES {
-        if used.lock().unwrap().recent_failures(user.uid) >= TOTP_MAX_FAILURES {
-            warn!("{}: too many wrong one-time codes recently; refusing for now", user.name);
-            return Ok(Err("too many wrong one-time codes; try again later".into()));
+    /// Takes back a reserved guess when its answer is in (or the login ends).
+    struct Reserved<'a>(&'a UsedCodes, u32);
+    impl Drop for Reserved<'_> {
+        fn drop(&mut self) {
+            let mut state = self.0.lock().unwrap();
+            if let Some(n) = state.pending.get_mut(&self.1) {
+                *n -= 1;
+                if *n == 0 {
+                    state.pending.remove(&self.1);
+                }
+            }
         }
+    }
+    for _ in 0..TOTP_TRIES {
+        let _reserved = {
+            let mut state = used.lock().unwrap();
+            let pending = state.pending.get(&user.uid).copied().unwrap_or(0);
+            if state.recent_failures(user.uid) + pending >= TOTP_MAX_FAILURES {
+                warn!("{}: too many wrong one-time codes recently; refusing for now", user.name);
+                return Ok(Err("too many wrong one-time codes; try again later".into()));
+            }
+            *state.pending.entry(user.uid).or_default() += 1;
+            Reserved(used, user.uid)
+        };
         // Right after a start, the current code may be one that is not taken.
         let starting = now() / crate::totp::STEP <= used.lock().unwrap().floor;
         let text = if starting { "One-time code (qshd has just started: wait for the next code): " } else { "One-time code: " };

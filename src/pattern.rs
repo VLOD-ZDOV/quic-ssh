@@ -76,6 +76,7 @@ pub fn cidr_contains(cidr: &str, ip: IpAddr) -> Option<bool> {
 /// `from=` in authorized_keys: comma-separated address patterns (wildcards or
 /// CIDR, `!` to exclude). Like sshd, a negated match denies, then any positive
 /// match allows. Host name patterns cannot match, since qshd does no reverse DNS.
+/// A malformed CIDR denies, as in sshd (a typo must not open an exclusion).
 pub fn address_allowed(list: &str, ip: IpAddr) -> bool {
     let text = ip.to_canonical().to_string();
     let mut allowed = false;
@@ -84,7 +85,14 @@ pub fn address_allowed(list: &str, ip: IpAddr) -> bool {
             Some(rest) => (true, rest),
             None => (false, p),
         };
-        let hit = if p.contains('/') { cidr_contains(p, ip).unwrap_or(false) } else { wildcard(p, &text) };
+        let hit = if p.contains('/') {
+            match cidr_contains(p, ip) {
+                Some(hit) => hit,
+                None => return false,
+            }
+        } else {
+            wildcard(p, &text)
+        };
         if hit && neg {
             return false;
         }
@@ -128,6 +136,7 @@ mod tests {
         assert!(address_allowed("2001:db8::/32", ip("2001:db8::1")));
         assert!(address_allowed("127.0.0.1", ip("::ffff:127.0.0.1")), "mapped addresses count as IPv4");
         assert!(!address_allowed("example.com", ip("192.0.2.7")));
+        assert!(!address_allowed("!10.0.0.0/33,*", ip("10.0.0.1")), "a malformed exclusion denies");
         assert!(source_address_allowed("192.0.2.0/24", ip("192.0.2.9")));
         assert!(!source_address_allowed("192.0.2.0/24,bogus", ip("192.0.2.9")));
         assert!(!source_address_allowed("192.0.2.0/33", ip("192.0.2.9")));

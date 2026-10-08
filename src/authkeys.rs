@@ -186,13 +186,29 @@ pub fn parse_line(line: &str) -> Result<Option<AuthorizedKey>> {
     let r = &mut entry.restrictions;
     for (name, value) in parse_options(options)? {
         let need = |v: Option<String>| v.with_context(|| format!("option {name} needs a value"));
+        // Like OpenSSH: a second command, from or principals makes the line
+        // unusable (a later one must not widen an earlier restriction), and
+        // the earliest expiry-time counts.
+        let once = |set: bool| if set { Err(anyhow::anyhow!("option {name} given more than once")) } else { Ok(()) };
         match name.as_str() {
-            "command" => r.command = Some(need(value)?),
-            "from" => entry.from = Some(need(value)?),
+            "command" => {
+                once(r.command.is_some())?;
+                r.command = Some(need(value)?);
+            }
+            "from" => {
+                once(entry.from.is_some())?;
+                entry.from = Some(need(value)?);
+            }
             "permitopen" => r.permit_open.push(need(value)?),
             "permitlisten" => r.permit_listen.push(need(value)?),
-            "expiry-time" => entry.expiry = Some(parse_expiry(&need(value)?)?),
-            "principals" => entry.principals = Some(need(value)?.split(',').map(|s| s.trim().to_string()).collect()),
+            "expiry-time" => {
+                let t = parse_expiry(&need(value)?)?;
+                entry.expiry = Some(entry.expiry.map_or(t, |e| e.min(t)));
+            }
+            "principals" => {
+                once(entry.principals.is_some())?;
+                entry.principals = Some(need(value)?.split(',').map(|s| s.trim().to_string()).collect());
+            }
             "cert-authority" => entry.cert_authority = true,
             "restrict" => {
                 r.no_pty = true;
@@ -333,6 +349,9 @@ fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyD
     // Either the server trusts the CA for everyone (principal = user name), or
     // the user trusts it in authorized_keys (principals= or the user name).
     let mut grant = None;
+    // A cert-authority line must allow no-touch-required too (as in OpenSSH);
+    // a CA trusted for the whole server leaves it to the certificate.
+    let mut line_allows_no_touch = true;
     if trusted_cas.contains(ca) {
         if !principals.iter().any(|p| p == login.user) {
             return Err(format!("certificate is not valid for {}", login.user));
@@ -354,6 +373,7 @@ fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyD
                 continue;
             }
             grant = Some(Grant { restrictions: e.restrictions.clone(), require_presence: false, require_verified: e.verify_required });
+            line_allows_no_touch = e.no_touch_required;
             break;
         }
         if grant.is_none() {
@@ -384,8 +404,20 @@ fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyD
     r.no_pty |= !ext.contains_key("permit-pty");
     r.no_port_forwarding |= !ext.contains_key("permit-port-forwarding");
     r.no_agent_forwarding |= !ext.contains_key("permit-agent-forwarding");
-    grant.require_presence = is_security_key(cert.public_key()) && !ext.contains_key("no-touch-required");
+    grant.require_presence = is_security_key(cert.public_key()) && !(ext.contains_key("no-touch-required") && line_allows_no_touch);
     Ok(grant)
+}
+
+/// Whether `signature` is of the kind `key` makes. The signature's own
+/// algorithm name must not decide how it is checked: ssh-key verifies a
+/// security-key signature by the key's type whatever the signature claims
+/// to be, so a relabelled one would skip the touch and PIN checks (OpenSSH
+/// refuses such a signature, too).
+pub fn signature_fits(key: &KeyData, signature: &ssh_key::Signature) -> bool {
+    match (key.algorithm(), signature.algorithm()) {
+        (Algorithm::Rsa { .. }, Algorithm::Rsa { hash }) => hash.is_some(),
+        (k, s) => k == s,
+    }
 }
 
 /// Security-key signatures end with a flags byte and a 4-byte counter.
@@ -398,6 +430,20 @@ pub fn security_key_flags(signature: &ssh_key::Signature) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::signature_fits;
+
+    #[test]
+    fn signatures_must_match_the_key_type() {
+        let sig = |alg: Algorithm, len: usize| ssh_key::Signature::new(alg, vec![1; len]).unwrap();
+        let sk = KeyData::SkEd25519(ssh_key::public::SkEd25519::new(ssh_key::public::Ed25519PublicKey([7; 32]), "ssh:"));
+        assert!(signature_fits(&sk, &sig(Algorithm::SkEd25519, 69)));
+        assert!(!signature_fits(&sk, &sig(Algorithm::Rsa { hash: Some(ssh_key::HashAlg::Sha256) }, 69)), "relabelled as RSA");
+        assert!(!signature_fits(&sk, &sig(Algorithm::Ed25519, 64)));
+        let ed = KeyData::Ed25519(ssh_key::public::Ed25519PublicKey([7; 32]));
+        assert!(signature_fits(&ed, &sig(Algorithm::Ed25519, 64)));
+        assert!(!signature_fits(&ed, &sig(Algorithm::SkEd25519, 69)));
+    }
+
     use super::*;
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test";
@@ -442,6 +488,16 @@ mod tests {
         // Local time: within a day of UTC midnight.
         let local = parse_expiry("20300101").unwrap() as i64;
         assert!((local - 1_893_456_000).abs() <= 14 * 3600, "{local}");
+    }
+
+    /// A second from/command/principals cannot widen the first; the earliest expiry counts.
+    #[test]
+    fn repeated_options() {
+        for twice in ["from=\"192.0.2.1\",from=\"*\"", "command=\"a\",command=\"b\"", "principals=\"a\",principals=\"b\""] {
+            assert!(parse_line(&format!("{twice} {KEY}")).is_err(), "{twice}");
+        }
+        let e = parse_line(&format!("expiry-time=\"20300101Z\",expiry-time=\"20400101Z\" {KEY}")).unwrap().unwrap();
+        assert_eq!(e.expiry, Some(1_893_456_000));
     }
 
     #[test]

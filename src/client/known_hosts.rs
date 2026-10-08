@@ -26,32 +26,46 @@ impl KnownHosts {
         KnownHosts { path }
     }
 
+    /// The file's text (empty if it does not exist). Bytes that are not
+    /// UTF-8 spoil only their own line, as with OpenSSH.
+    fn text(&self) -> Result<String> {
+        match fs::read(&self.path) {
+            Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("cannot read {}", self.path.display()))),
+        }
+    }
+
+    /// The key for `id`, from a line naming it (alone or in a comma-separated
+    /// list, as OpenSSH writes `host,address`).
     pub fn lookup(&self, id: &str) -> Result<Option<PublicKey>> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(text.lines().find_map(|line| {
-            let (name, key) = line.trim().split_once(char::is_whitespace)?;
-            if name == id { PublicKey::parse_openssh(key) } else { None }
+        Ok(self.text()?.lines().find_map(|line| {
+            let (names, key) = line.trim().split_once(char::is_whitespace)?;
+            if names.starts_with(['@', '#']) || !names.split(',').any(|n| n == id) {
+                return None;
+            }
+            PublicKey::parse_openssh(key.trim())
         }))
     }
 
     /// All host ids in the file, in order.
     pub fn ids(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.path)
+        self.text()
             .unwrap_or_default()
             .lines()
-            .filter_map(|l| l.split_whitespace().next().filter(|w| !w.starts_with(['@', '#'])).map(str::to_string))
+            .filter_map(|l| l.split_whitespace().next().filter(|w| !w.starts_with(['@', '#'])))
+            .flat_map(|names| names.split(',').map(str::to_string).collect::<Vec<_>>())
             .collect()
     }
 
     /// Keys on `@cert-authority` (or `@revoked`) lines whose host patterns
     /// match one of `names` (OpenSSH syntax; hashed names are not matched).
-    pub fn marked(&self, marker: &str, names: &[String]) -> Vec<ssh_key::public::KeyData> {
-        let text = fs::read_to_string(&self.path).unwrap_or_default();
-        text.lines()
+    /// A file that exists but cannot be read is an error: its `@revoked`
+    /// lines must not be skipped silently.
+    pub fn marked(&self, marker: &str, names: &[String]) -> Result<Vec<ssh_key::public::KeyData>> {
+        Ok(self
+            .text()?
+            .lines()
             .filter_map(|line| {
                 let mut words = line.split_whitespace();
                 if words.next()? != marker {
@@ -64,7 +78,7 @@ impl KnownHosts {
                 }
                 ssh_key::PublicKey::from_openssh(&key).ok().map(|k| k.key_data().clone())
             })
-            .collect()
+            .collect())
     }
 
     /// Appends an entry in one write, so that entries added at the same time
@@ -121,6 +135,15 @@ mod tests {
         kh.add("example.net", c).unwrap();
         assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(b));
         assert_eq!(kh.lookup("example.net").unwrap(), Some(c));
+        // OpenSSH-style lists of names, and a line that is not UTF-8 elsewhere.
+        let d = Identity::generate().public();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"# caf\xe9\n");
+        bytes.extend_from_slice(format!("alias.example,192.0.2.9 {}\n", d.to_openssh("")).as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(kh.lookup("192.0.2.9").unwrap(), Some(d));
+        assert_eq!(kh.lookup("alias.example").unwrap(), Some(d));
+        assert_eq!(kh.lookup("example.com").unwrap(), Some(a));
     }
 
     #[test]
@@ -136,10 +159,10 @@ mod tests {
         .unwrap();
         let kh = KnownHosts::new(path);
         let names = |n: &str| vec![n.to_string()];
-        assert_eq!(kh.marked("@cert-authority", &names("web.example.com")).len(), 1);
-        assert!(kh.marked("@cert-authority", &names("old.example.com")).is_empty());
-        assert!(kh.marked("@cert-authority", &names("example.org")).is_empty());
-        assert_eq!(kh.marked("@revoked", &names("anything")).len(), 1);
+        assert_eq!(kh.marked("@cert-authority", &names("web.example.com")).unwrap().len(), 1);
+        assert!(kh.marked("@cert-authority", &names("old.example.com")).unwrap().is_empty());
+        assert!(kh.marked("@cert-authority", &names("example.org")).unwrap().is_empty());
+        assert_eq!(kh.marked("@revoked", &names("anything")).unwrap().len(), 1);
         assert_eq!(kh.lookup("web.example.com").unwrap(), None, "marker lines are not host keys");
     }
 }

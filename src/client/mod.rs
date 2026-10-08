@@ -530,17 +530,15 @@ enum CertVerdict {
 
 /// Checks the server's host certificate against the `@cert-authority` and
 /// `@revoked` keys for this host.
-fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, names: &[String], files: &[KnownHosts]) -> CertVerdict {
+fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, revoked: &[ssh_key::public::KeyData], cas: &[ssh_key::public::KeyData]) -> CertVerdict {
     use ssh_key::certificate::CertType;
     let cert = match ssh_key::Certificate::from_bytes(cert) {
         Ok(c) => c,
         Err(e) => return CertVerdict::Unusable(format!("cannot parse the host certificate: {e}")),
     };
-    let revoked: Vec<_> = files.iter().flat_map(|f| f.marked("@revoked", names)).collect();
     if revoked.contains(cert.signature_key()) {
         return CertVerdict::Invalid("its certificate authority is revoked".into());
     }
-    let cas: Vec<_> = files.iter().flat_map(|f| f.marked("@cert-authority", names)).collect();
     if !cas.contains(cert.signature_key()) {
         return CertVerdict::Unusable(format!("no @cert-authority for {} with the certificate's CA key", target.host));
     }
@@ -577,11 +575,19 @@ fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -
     let names = if hid == target.host { vec![hid.clone()] } else { vec![hid.clone(), target.host.clone()] };
     let files = marker_files(target);
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
-    if files.iter().any(|f| f.marked("@revoked", &names).contains(&own)) {
+    let marked = |marker: &str| -> Result<Vec<_>> {
+        let mut keys = Vec::new();
+        for f in &files {
+            keys.extend(f.marked(marker, &names)?);
+        }
+        Ok(keys)
+    };
+    let revoked = marked("@revoked")?;
+    if revoked.contains(&own) {
         return Ok(HostTrust::Refused(format!("the host key of '{hid}' ({}) is marked as revoked in known_hosts", key.fingerprint())));
     }
     if let Some(cert) = cert {
-        match check_host_cert(cert, key, target, &names, &files) {
+        match check_host_cert(cert, key, target, &revoked, &marked("@cert-authority")?) {
             CertVerdict::Valid(how) => return Ok(HostTrust::Trusted(how)),
             CertVerdict::Unusable(why) => tracing::debug!("host certificate not used: {why}"),
             CertVerdict::Invalid(why) => return Ok(HostTrust::Refused(format!("host '{hid}' is refused: {why}"))),
@@ -599,8 +605,31 @@ fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -
             known.fingerprint(),
             kh_path.display()
         )),
-        None => HostTrust::Unknown,
+        None => other_ports(target, port, key, &kh)?,
     })
+}
+
+/// A key not known for this port: in `--full`, the same host may be known
+/// on another of its candidate ports. The same key there vouches for it; a
+/// different one means someone else answers on this port (a probe takes
+/// whichever port answers first), which must not pass as a new host.
+fn other_ports(target: &Target, port: u16, key: PublicKey, kh: &KnownHosts) -> Result<HostTrust> {
+    for other in target_ports(target).into_iter().filter(|&p| p != port) {
+        match kh.lookup(&host_id(&target.host, other))? {
+            Some(known) if known == key => return Ok(HostTrust::Trusted(format!("the key known for port {other}"))),
+            Some(known) => {
+                return Ok(HostTrust::Refused(format!(
+                    "'{}' presents {} on port {port}, but this host is known with {} on port {other}; \
+                     a different key on another port is refused (if it is right, add it with `qsh -p {port} --accept-new-host`)",
+                    target.host,
+                    key.fingerprint(),
+                    known.fingerprint()
+                )))
+            }
+            None => {}
+        }
+    }
+    Ok(HostTrust::Unknown)
 }
 
 /// The check run inside the TLS handshake, before the client sends its own
