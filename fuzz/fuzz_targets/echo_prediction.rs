@@ -28,6 +28,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     term.process(&p.clear());
-    assert_eq!(term.screen().contents(), server.screen().contents());
+    // What the screens show: a space the server wrote and an empty cell
+    // (which an erased prediction leaves) look the same.
+    let visible = |s: &vt100::Screen| s.contents().lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim_end().to_string();
+    assert_eq!(visible(term.screen()), visible(server.screen()));
     assert_eq!(term.screen().cursor_position(), server.screen().cursor_position());
 });

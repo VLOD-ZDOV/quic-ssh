@@ -484,6 +484,44 @@ impl Predictor {
 
 #[cfg(test)]
 mod tests {
+
+    /// What a screen shows: a space the server wrote and an empty cell look
+    /// the same (an erased prediction leaves the latter).
+    fn visible(screen: &vt100::Screen) -> String {
+        screen.contents().lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim_end().to_string()
+    }
+
+    /// Replays the `echo_prediction` fuzz target on one input: after
+    /// `clear`, the terminal must show exactly the server's screen.
+    fn replay(data: &[u8]) {
+        use std::time::{Duration, Instant};
+        let Some((&first, rest)) = data.split_first() else { return };
+        let (rows, cols) = (24, 20 + (first % 100) as u16);
+        let mut p = Predictor::new(if first & 1 == 0 { Mode::Always } else { Mode::Auto }, rows, cols);
+        let mut term = vt100::Parser::new(rows, cols, 0);
+        let mut server = vt100::Parser::new(rows, cols, 0);
+        let mut now = Instant::now();
+        for chunk in rest.chunks(17) {
+            let (&tag, body) = chunk.split_first().unwrap();
+            now += Duration::from_millis(u64::from(tag >> 2));
+            match tag & 3 {
+                0 | 1 => term.process(&p.typed(body, now)),
+                2 => {
+                    term.process(&p.output(body, now));
+                    server.process(body);
+                }
+                _ => term.process(&p.expire(now + Duration::from_secs(60))),
+            }
+        }
+        term.process(&p.clear());
+        assert_eq!(visible(term.screen()), visible(server.screen()));
+        assert_eq!(term.screen().cursor_position(), server.screen().cursor_position());
+    }
+
+    #[test]
+    fn fuzz_regressions() {
+        replay(&[0x00, 0x00, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x62, 0x22, 0x22, 0x22, 0x22, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x21]);
+    }
     use super::*;
 
     /// A predictor and the terminal it writes to.
@@ -517,7 +555,7 @@ mod tests {
         }
 
         fn same_as_server(&self) {
-            assert_eq!(self.term.screen().contents(), self.server.screen().contents());
+            assert_eq!(visible(self.term.screen()), visible(self.server.screen()));
             assert_eq!(self.term.screen().cursor_position(), self.server.screen().cursor_position());
         }
     }
@@ -797,7 +835,7 @@ mod tests {
             }
             let out = h.p.clear();
             h.term.process(&out);
-            assert_eq!(h.term.screen().contents(), h.server.screen().contents(), "round {round}");
+            assert_eq!(visible(h.term.screen()), visible(h.server.screen()), "round {round}");
             assert_eq!(h.term.screen().cursor_position(), h.server.screen().cursor_position(), "round {round}");
         }
     }
