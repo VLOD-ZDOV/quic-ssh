@@ -104,7 +104,8 @@ impl Agent {
     }
 
     async fn request(&mut self, body: &[u8]) -> Result<Vec<u8>> {
-        let mut frame = Vec::with_capacity(body.len() + 4);
+        // Zeroed after sending: it may carry a private key (`add`).
+        let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(body.len() + 4));
         put_string(&mut frame, body);
         self.sock.write_all(&frame).await?;
         let len = self.sock.read_u32().await? as usize;

@@ -44,6 +44,10 @@ pub struct SshArgs {
     /// `-g`: let other hosts connect to local forwards.
     pub gateway_ports: bool,
     pub forward_agent: Option<bool>,
+    /// X11 forwarding by `-X`/`-Y` (on) and `-x` (off): the last one wins;
+    /// `-Y` also makes it trusted, as in ssh.
+    pub x11: Option<bool>,
+    pub x11_trusted: bool,
     pub print_config: bool,
     /// `-O`: a command for the connection master (`check`, `exit`, `stop`).
     pub control_command: Option<String>,
@@ -104,12 +108,9 @@ impl SshArgs {
             'V' => self.print_version = true,
             'v' => self.verbose += 1,
             // X11 forwarding: untrusted (-X), trusted (-Y), off (-x).
-            'X' => self.options.push("ForwardX11 yes".into()),
-            'Y' => {
-                self.options.push("ForwardX11 yes".into());
-                self.options.push("ForwardX11Trusted yes".into());
-            }
-            'x' => self.options.push("ForwardX11 no".into()),
+            'X' => self.x11 = Some(true),
+            'Y' => (self.x11, self.x11_trusted) = (Some(true), true),
+            'x' => self.x11 = Some(false),
             // Protocol/compression/GSSAPI/syslog/multiplexing switches: nothing to do.
             // Like `ControlMaster yes` (`-MM` asks in ssh; qsh does not ask).
             'M' => {
@@ -246,7 +247,16 @@ impl SshArgs {
     /// The `-o` options and other switches as config lines (highest
     /// precedence). `-l` goes to the configs as the command line's user.
     pub fn override_lines(&self) -> Vec<String> {
-        let mut lines = self.options.clone();
+        // Switches before -o, which does not change what they set (as in ssh).
+        let mut lines: Vec<String> = match self.x11 {
+            Some(true) => vec!["ForwardX11 yes".into()],
+            Some(false) => vec!["ForwardX11 no".into()],
+            None => Vec::new(),
+        };
+        if self.x11_trusted {
+            lines.push("ForwardX11Trusted yes".into());
+        }
+        lines.extend(self.options.iter().cloned());
         if self.quiet {
             lines.push("LogLevel quiet".into());
         }
@@ -297,6 +307,8 @@ mod tests {
         assert_eq!(a.login.as_deref(), Some("bob"));
         assert_eq!(a.destination.as_deref(), Some("host"));
         assert_eq!(a.command, vec!["uname", "-a"]);
+        assert_eq!(p("-Y -x host").override_lines(), ["ForwardX11 no", "ForwardX11Trusted yes"], "the last X11 switch wins");
+        assert_eq!(p("-x -X host").override_lines()[0], "ForwardX11 yes");
         // Values that would become extra config lines, or odd user names.
         for bad in [["-l", "bob\nProxyCommand evil"], ["-o", "User=x\nMatch exec evil"], ["-J", "gw\rProxyCommand x"], ["-l", "$(id)"]] {
             assert!(SshArgs::parse(bad.iter().map(|s| s.to_string()).chain(["host".into()])).is_err(), "{bad:?}");

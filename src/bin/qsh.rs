@@ -664,15 +664,20 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
     // -A / ForwardAgent: the agent qsh itself would use.
     let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
-        true => match &target.identity_agent {
-            Some(path) => path.clone(),
-            None => qsh::agent::default_path(),
+        true => match (&target.forward_agent_socket, &target.identity_agent) {
+            (Some(socket), _) => Some(socket.clone()),
+            (None, Some(path)) => path.clone(),
+            (None, None) => qsh::agent::default_path(),
         },
         false => None,
     };
     // Streams the server opens (-R, -A, -X) would reach the master, not this
     // qsh: such a run uses a connection of its own.
     let share = remotes.is_empty() && agent.is_none() && target.forward_x11.is_none();
+    // The agent and the display are offered to every session of the
+    // connection: one with them is not one to share with later runs.
+    #[cfg(unix)]
+    let private = agent.is_some() || target.forward_x11.is_some();
     let opts = ConnectOptions {
         identities: a.identities.clone(),
         transport: a.transport,
@@ -756,7 +761,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         run_local_command(&target.expand_tokens(command)?);
     }
     #[cfg(unix)]
-    let master = start_master(&conn, &target, quiet, &forwarder);
+    let master = if private { None } else { start_master(&conn, &target, quiet, &forwarder) };
     #[cfg(unix)]
     if a.background {
         detach(DAEMON_FD, "ok", false)?;

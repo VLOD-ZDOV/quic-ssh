@@ -28,6 +28,8 @@ use crate::proto::{read_msg, write_msg};
 const MUX_VERSION: u32 = 1;
 /// How long a client waits for a master's answer before connecting on its own.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long `-O forward` waits for the master and the server.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MuxRequest {
@@ -165,6 +167,8 @@ pub type ForwardHook = Arc<dyn Fn(char, String, bool) -> futures::future::BoxFut
 /// Sends a control command to the master at `path`; returns its process id
 /// and, for forwards, the master's message.
 pub async fn control(path: &Path, command: Command) -> Result<(u32, String)> {
+    // A forward waits for the server too (a -R listener), not just the master.
+    let limit = if matches!(command, Command::Forward { .. }) { FORWARD_TIMEOUT } else { ANSWER_TIMEOUT };
     let connect = async {
         let mut sock = connect(path).await?;
         write_msg(&mut sock, &MuxRequest::Check { version: MUX_VERSION }).await?;
@@ -186,7 +190,7 @@ pub async fn control(path: &Path, command: Command) -> Result<(u32, String)> {
             Err(_) => bail!("the master does not understand this request (update qsh and start a new master)"),
         }
     };
-    tokio::time::timeout(ANSWER_TIMEOUT, connect)
+    tokio::time::timeout(limit, connect)
         .await
         .context("the master does not answer")?
         .with_context(|| format!("control socket {}", path.display()))
@@ -247,7 +251,8 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     let tmp = path.with_extension(format!("{:08x}", rand::random::<u32>()));
     // Two qsh replacing the same stale socket at once must take turns.
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&lock_path)?;
+    // Not through a symlink someone put there (in a shared ControlPath directory).
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&lock_path)?;
     lock.lock()?;
     let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
     let result = (|| {
@@ -385,20 +390,35 @@ impl Drop for Master {
 /// write towards the server does not cut the other direction short: the
 /// server may stop reading when its command is done, and the client must
 /// still get everything the server sent (the exit status above all).
+/// A client that is gone (its socket fails) ends both directions, though:
+/// the server must see the end of the input, and the stream must not wait
+/// for output nobody reads.
 async fn relay(sock: UnixStream, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let (mut r, mut w) = sock.into_split();
     let up = async {
-        if tokio::io::copy(&mut r, &mut send).await.is_ok() {
-            let _ = send.shutdown().await;
-        }
+        let copied = tokio::io::copy(&mut r, &mut send).await;
+        let _ = send.shutdown().await;
+        copied.is_ok()
     };
     let down = async {
         tokio::io::copy(&mut recv, &mut w).await?;
         w.shutdown().await
     };
-    let ((), result) = tokio::join!(up, down);
-    Ok(result?)
+    tokio::pin!(up, down);
+    let (mut up_done, mut result) = (false, None);
+    while !up_done || result.is_none() {
+        tokio::select! {
+            ok = &mut up, if !up_done => {
+                if !ok {
+                    return Ok(());
+                }
+                up_done = true;
+            }
+            r = &mut down, if result.is_none() => result = Some(r),
+        }
+    }
+    Ok(result.expect("set above")?)
 }
 
 /// What every client connection of a master shares.

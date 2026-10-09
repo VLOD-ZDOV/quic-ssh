@@ -117,6 +117,8 @@ pub struct Target {
     /// `LogLevel QUIET` or `-q`: no informational messages.
     pub quiet: bool,
     pub forward_agent: bool,
+    /// `ForwardAgent /path` or `ForwardAgent $VAR`: this agent socket.
+    pub forward_agent_socket: Option<PathBuf>,
     /// `IdentitiesOnly`: offer only agent keys that match an identity file.
     pub identities_only: bool,
     /// `IdentityAgent`: `None` = `SSH_AUTH_SOCK`; `Some(None)` = no agent.
@@ -220,7 +222,14 @@ impl Target {
                 Some('d') => out.push_str(&home_dir().map(|h| h.display().to_string()).unwrap_or_default()),
                 Some('h') => out.push_str(&self.host),
                 Some('i') => out.push_str(&crate::platform::uid().to_string()),
-                Some('j') => out.push_str(self.proxy_jump.as_deref().unwrap_or("")),
+                // Jump hosts are not resolved yet: their names must pass the same check.
+                Some('j') => {
+                    let jumps = self.proxy_jump.as_deref().unwrap_or("");
+                    if !jumps.split(',').filter(|j| !j.is_empty()).all(valid_host) {
+                        bail!("invalid jump host in {jumps:?}");
+                    }
+                    out.push_str(jumps)
+                }
                 Some('L') => out.push_str(crate::platform::hostname().split('.').next().unwrap_or("")),
                 Some('l') => out.push_str(&crate::platform::hostname()),
                 Some('n') => out.push_str(&self.alias),
@@ -325,7 +334,7 @@ impl Target {
         let local = local_user().unwrap_or_default();
         let expand = |f: &str| home.map(|h| config::expand_path(f, h, &host, &user, &local));
         let identity_files = cfg.identity_files.iter().filter_map(|f| expand(f)).collect();
-        if let Some(why) = &cfg.canonicalize_failed {
+        if let Some(why) = cfg.bad_file.as_ref().or(cfg.canonicalize_failed.as_ref()) {
             bail!("{why}");
         }
         let known_hosts_file = cfg.user_known_hosts_file.as_deref().and_then(expand);
@@ -333,10 +342,15 @@ impl Target {
         let known_hosts_read_also = cfg
             .more_known_hosts_files
             .iter()
+            .filter(|f| !f.eq_ignore_ascii_case("none"))
             .chain(global.iter().filter(|g| !g.eq_ignore_ascii_case("none")))
             .filter_map(|f| expand(f))
             .collect();
         let certificate_files = cfg.certificate_files.iter().filter_map(|f| expand(f)).collect();
+        let forward_agent_socket = cfg.forward_agent_socket.as_deref().and_then(|v| match v.strip_prefix('$') {
+            Some(var) => std::env::var_os(var).map(PathBuf::from),
+            None => expand(v),
+        });
         let identity_agent = match cfg.identity_agent.as_deref() {
             None => None,
             Some(v) if v.eq_ignore_ascii_case("none") => Some(None),
@@ -423,6 +437,7 @@ impl Target {
             bind,
             quiet: cfg.log_level.as_deref() == Some("quiet"),
             forward_agent: cfg.forward_agent.unwrap_or(false),
+            forward_agent_socket,
             identities_only: cfg.identities_only.unwrap_or(false),
             identity_agent,
             certificate_files,
@@ -601,7 +616,9 @@ fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
         Some(p) => p.clone(),
         None => qsh_dir(&home_dir()?).join("known_hosts"),
     };
-    let kh = KnownHosts::with(path.clone(), target.known_hosts_read_also.clone(), target.known_hosts_extra.clone(), target.hash_known_hosts);
+    // `UserKnownHostsFile none`: no file of the user's (none to add keys to either).
+    let own = (!path.as_os_str().eq_ignore_ascii_case("none")).then(|| path.clone());
+    let kh = KnownHosts::with(own, target.known_hosts_read_also.clone(), target.known_hosts_extra.clone(), target.hash_known_hosts);
     Ok((kh, path))
 }
 
@@ -1077,7 +1094,9 @@ async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Co
         let sources = config::Sources { ssh_config: target.sources.ssh_config.clone(), ..Default::default() };
         let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, share: false, ..opts.clone() };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let mut hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
+            let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
+            // Each hop's host key is checked like the target's, KnownHostsCommand included.
+            let mut hop = with_known_hosts_command(&hop)?;
             // Nothing may stop to ask on the way when this host may not (qsh multi).
             hop.batch_mode |= target.batch_mode;
             let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))

@@ -13,8 +13,8 @@ use base64::Engine;
 use crate::keys::{create_private_dir, PublicKey};
 
 pub struct KnownHosts {
-    /// The file new keys are added to.
-    path: PathBuf,
+    /// The file new keys are added to (none: `UserKnownHostsFile none`).
+    path: Option<PathBuf>,
     /// More files that are only read (more `UserKnownHostsFile`s,
     /// `GlobalKnownHostsFile`).
     read_also: Vec<PathBuf>,
@@ -58,10 +58,12 @@ fn names_match(field: &str, id: &str) -> bool {
     crate::pattern::host_matches(&plain, id)
 }
 
-/// `host`, or `[host]:port` for a non-default port (same convention as OpenSSH).
+/// `host`, or `[host]:port` for a non-default port (same convention as
+/// OpenSSH), in lower case like ssh's names (hashed names must match exactly).
 pub fn host_id(host: &str, port: u16) -> String {
+    let host = host.to_ascii_lowercase();
     if port == crate::DEFAULT_PORT {
-        host.to_string()
+        host
     } else {
         format!("[{host}]:{port}")
     }
@@ -69,11 +71,12 @@ pub fn host_id(host: &str, port: u16) -> String {
 
 impl KnownHosts {
     pub fn new(path: PathBuf) -> KnownHosts {
-        KnownHosts { path, read_also: Vec::new(), extra: None, hash: false }
+        KnownHosts { path: Some(path), read_also: Vec::new(), extra: None, hash: false }
     }
 
     /// Also reads `files` and `extra` (never written), and hashes names it adds.
-    pub fn with(path: PathBuf, files: Vec<PathBuf>, extra: Option<Arc<String>>, hash: bool) -> KnownHosts {
+    /// `path`: the user's file (`None`: `UserKnownHostsFile none`).
+    pub fn with(path: Option<PathBuf>, files: Vec<PathBuf>, extra: Option<Arc<String>>, hash: bool) -> KnownHosts {
         KnownHosts { path, read_also: files, extra, hash }
     }
 
@@ -81,13 +84,14 @@ impl KnownHosts {
     /// UTF-8 spoil only their own line, as with OpenSSH.
     fn text(&self) -> Result<String> {
         let mut text = String::new();
-        for (i, path) in std::iter::once(&self.path).chain(&self.read_also).enumerate() {
+        let own = self.path.iter().map(|p| (p, true));
+        for (path, is_own) in own.chain(self.read_also.iter().map(|p| (p, false))) {
             match fs::read(path) {
                 Ok(b) => text.push_str(&String::from_utf8_lossy(&b)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // Only the user's own file must be readable; others (the
                 // system's, which may be closed to users) are skipped as by ssh.
-                Err(e) if i > 0 => tracing::debug!("skipping {}: {e}", path.display()),
+                Err(e) if !is_own => tracing::debug!("skipping {}: {e}", path.display()),
                 Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
             }
             text.push('\n');
@@ -158,10 +162,11 @@ impl KnownHosts {
     /// (`qsh multi` to new hosts) never mix; starts a new line if the file
     /// does not end with one.
     pub fn add(&self, id: &str, key: PublicKey) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
+        let Some(path) = &self.path else { anyhow::bail!("UserKnownHostsFile is none: the key is not saved") };
+        if let Some(dir) = path.parent() {
             create_private_dir(dir)?;
         }
-        let mut f = OpenOptions::new().read(true).append(true).create(true).open(&self.path)?;
+        let mut f = OpenOptions::new().read(true).append(true).create(true).open(path)?;
         let name = if self.hash { hash_name(id) } else { id.to_string() };
         let mut line = format!("{name} {}\n", key.to_openssh(""));
         if !ends_with_newline(&mut f)? {
@@ -246,7 +251,7 @@ mod tests {
         let (a, b, c) = (Identity::generate().public(), Identity::generate().public(), Identity::generate().public());
         let global = dir.path().join("global");
         std::fs::write(&global, format!("*.example.com,!bad.example.com {}\n", b.to_openssh(""))).unwrap();
-        let kh = KnownHosts::with(dir.path().join("own"), vec![global], Some(Arc::new(format!("from-command {}\n", c.to_openssh("")))), true);
+        let kh = KnownHosts::with(Some(dir.path().join("own")), vec![global], Some(Arc::new(format!("from-command {}\n", c.to_openssh("")))), true);
         kh.add("[host.example]:2222", a).unwrap();
         let text = std::fs::read_to_string(dir.path().join("own")).unwrap();
         assert!(text.starts_with("|1|") && !text.contains("host.example"), "{text}");

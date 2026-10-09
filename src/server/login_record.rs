@@ -147,7 +147,8 @@ mod imp {
         b[4..8].copy_from_slice(&pid.to_ne_bytes());
         put(&mut b, LINE, line);
         // Like sshd: the last four bytes of the line name the entry.
-        put(&mut b, ID, &line[line.len().saturating_sub(4)..]);
+        // (Characters, not bytes, so an odd name cannot split one.)
+        put(&mut b, ID, line.char_indices().rev().nth(3).map_or(line, |(i, _)| &line[i..]));
         if let Some((user, host)) = who {
             put(&mut b, USER, user);
             put(&mut b, HOST, &host.to_string());

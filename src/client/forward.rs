@@ -120,6 +120,7 @@ impl Forward {
             Listen::Unix(p) => p.clone(),
         };
         match &self.dest {
+            Dest::Tcp { host, port } if host.contains(':') => format!("{listen}:[{host}]:{port}"),
             Dest::Tcp { host, port } => format!("{listen}:{host}:{port}"),
             Dest::Unix(p) => format!("{listen}:{p}"),
             Dest::Socks => listen,
@@ -249,10 +250,21 @@ async fn bridge_stream<S: AsyncRead + AsyncWrite + Unpin>(sock: S, send: SendHal
     crate::transport::bridge(r, w, send, recv).await
 }
 
+/// How long connecting to a `-R` destination may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Connects to `host:port` here, giving up after [`CONNECT_TIMEOUT`].
+async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out")),
+    }
+}
+
 /// Connects to a `-R` forward's destination here and relays the stream.
 async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String) {
     let result = match &dest {
-        Dest::Tcp { host, port } => match TcpStream::connect((host.as_str(), *port)).await {
+        Dest::Tcp { host, port } => match connect_tcp(host, *port).await {
             Ok(tcp) => {
                 let _ = tcp.set_nodelay(true);
                 crate::transport::splice(tcp, send, recv).await
@@ -273,7 +285,7 @@ async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String
                 let req = tokio::time::timeout(SOCKS_HANDSHAKE, super::socks::accept(&mut stream))
                     .await
                     .map_err(|_| anyhow::anyhow!("no SOCKS request in time"))??;
-                match TcpStream::connect((req.host.as_str(), req.port)).await {
+                match connect_tcp(&req.host, req.port).await {
                     Ok(tcp) => {
                         req.reply(&mut stream, true).await?;
                         let _ = tcp.set_nodelay(true);
@@ -313,6 +325,8 @@ struct Active {
     _request: Option<(SendHalf, RecvHalf)>,
     /// `-R`: the port the server bound.
     bound: Option<u16>,
+    /// `-L` from a Unix socket: its file, removed with the forward.
+    _socket: Option<SocketFile>,
 }
 
 impl Drop for Active {
@@ -323,9 +337,30 @@ impl Drop for Active {
     }
 }
 
+/// A socket file this process made: removed on drop, if it is still the
+/// one (by inode).
+#[cfg_attr(not(unix), allow(dead_code))]
+struct SocketFile {
+    path: PathBuf,
+    ino: u64,
+}
+
+impl Drop for SocketFile {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.ino) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 /// The forwards of one connection.
 pub struct Forwarder {
-    conn: Arc<Conn>,
+    /// The connection; a persistent session replaces it when it reconnects.
+    conn: Mutex<Arc<Conn>>,
     /// `-g`: local forwards listen on all addresses by default.
     gateway: bool,
     active: Mutex<Vec<Active>>,
@@ -347,7 +382,7 @@ impl Drop for Forwarder {
 impl Forwarder {
     pub fn new(conn: Arc<Conn>, gateway: bool) -> Arc<Forwarder> {
         Arc::new(Forwarder {
-            conn,
+            conn: Mutex::new(conn),
             gateway,
             active: Mutex::default(),
             routes: Arc::default(),
@@ -357,13 +392,38 @@ impl Forwarder {
         })
     }
 
+    fn conn(&self) -> Arc<Conn> {
+        self.conn.lock().unwrap().clone()
+    }
+
+    /// A persistent session got a new connection: the forwards of the old
+    /// one are gone with it (added later with `~C` or `-O forward`; a
+    /// session with forwards from the start does not reconnect). Returns
+    /// them, as `~#` shows them, so they can be added again.
+    pub fn reconnected(&self, conn: Arc<Conn>) -> Vec<String> {
+        let gone = self.list();
+        *self.conn.lock().unwrap() = conn;
+        self.active.lock().unwrap().clear();
+        {
+            let mut routes = self.routes.lock().unwrap();
+            routes.ports.clear();
+            routes.paths.clear();
+        }
+        if let Some(d) = self.dispatcher.lock().unwrap().take() {
+            d.abort();
+        }
+        gone
+    }
+
     /// `-L` (`kind` 'L') or `-D` ('D'): listens here.
     pub async fn local(&self, kind: char, fwd: Forward) -> Result<()> {
         let mut tasks = Vec::new();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut socket = None;
         match &fwd.listen {
             Listen::Tcp { bind, port } => {
                 for listener in bind_local(bind.as_deref(), *port, self.gateway).await? {
-                    let (conn, dest) = (self.conn.clone(), fwd.dest.clone());
+                    let (conn, dest) = (self.conn(), fwd.dest.clone());
                     tasks.push(
                         tokio::spawn(async move {
                             while let Ok((tcp, peer)) = listener.accept().await {
@@ -377,8 +437,9 @@ impl Forwarder {
             }
             #[cfg(unix)]
             Listen::Unix(path) => {
-                let listener = bind_local_unix(path)?;
-                let (conn, dest, path) = (self.conn.clone(), fwd.dest.clone(), path.clone());
+                let (listener, file) = bind_local_unix(path)?;
+                socket = Some(file);
+                let (conn, dest, path) = (self.conn(), fwd.dest.clone(), path.clone());
                 tasks.push(
                     tokio::spawn(async move {
                         while let Ok((sock, _)) = listener.accept().await {
@@ -391,33 +452,51 @@ impl Forwarder {
             #[cfg(not(unix))]
             Listen::Unix(_) => bail!("Unix sockets are not supported here"),
         }
-        self.active.lock().unwrap().push(Active { kind, fwd, tasks, _request: None, bound: None });
+        self.active.lock().unwrap().push(Active { kind, fwd, tasks, _request: None, bound: None, _socket: socket });
         Ok(())
     }
 
     /// `-R`: asks the server to listen. Returns the port it bound (TCP).
     pub async fn remote(&self, fwd: Forward) -> Result<Option<u16>> {
-        if self.conn.is_shared() {
+        if self.conn().is_shared() {
             bail!("remote forwards need a connection of their own (this one is shared)");
+        }
+        // The server tells connections apart by port only.
+        if let Listen::Tcp { port, .. } = &fwd.listen {
+            if *port != 0 && self.routes.lock().unwrap().ports.contains_key(port) {
+                bail!("there is a remote forward on port {port} already");
+            }
         }
         // Routes first: a connection may arrive right after the server listens.
         self.dispatch();
-        let (mut send, mut recv) = self.conn.open_bi().await?;
+        let (mut send, mut recv) = self.conn().open_bi().await?;
         let bound = match &fwd.listen {
             Listen::Tcp { bind, port } => {
                 // Like ssh: without an address, ask for loopback.
                 let bind = bind.clone().unwrap_or_else(|| "localhost".into());
-                write_msg(&mut send, &Request::RemoteForward { bind, port: *port }).await?;
-                match expect_ok(&mut recv).await? {
-                    Reply::Bound { port } => {
+                if *port != 0 {
+                    self.routes.lock().unwrap().ports.insert(*port, fwd.dest.clone());
+                }
+                let reply = async {
+                    write_msg(&mut send, &Request::RemoteForward { bind, port: *port }).await?;
+                    expect_ok(&mut recv).await
+                };
+                match reply.await {
+                    Ok(Reply::Bound { port }) => {
                         self.routes.lock().unwrap().ports.insert(port, fwd.dest.clone());
                         Some(port)
                     }
-                    other => bail!("unexpected reply {other:?}"),
+                    result => {
+                        self.routes.lock().unwrap().ports.remove(port);
+                        match result {
+                            Err(e) => return Err(e),
+                            Ok(other) => bail!("unexpected reply {other:?}"),
+                        }
+                    }
                 }
             }
             Listen::Unix(path) => {
-                if self.conn.server_version() < 6 {
+                if self.conn().server_version() < 6 {
                     bail!("the server's qshd is too old for Unix socket forwarding");
                 }
                 write_msg(&mut send, &Request::RemoteForwardStreamLocal { path: path.clone() }).await?;
@@ -426,14 +505,14 @@ impl Forwarder {
                 None
             }
         };
-        self.active.lock().unwrap().push(Active { kind: 'R', fwd, tasks: Vec::new(), _request: Some((send, recv)), bound });
+        self.active.lock().unwrap().push(Active { kind: 'R', fwd, tasks: Vec::new(), _request: Some((send, recv)), bound, _socket: None });
         Ok(bound)
     }
 
     /// `-A`: asks the server to offer the local agent at `path` to its
     /// sessions. Problems are warnings, as in ssh: the session works without.
     pub async fn agent(&self, path: PathBuf, quiet: bool) {
-        if self.conn.server_version() < 4 {
+        if self.conn().server_version() < 4 {
             if !quiet {
                 say("qsh: warning: the server's qshd is too old for agent forwarding (-A)\n");
             }
@@ -442,7 +521,7 @@ impl Forwarder {
         self.routes.lock().unwrap().agent = Some(Arc::new(path));
         self.dispatch();
         let attempt = async {
-            let (mut send, mut recv) = self.conn.open_bi().await?;
+            let (mut send, mut recv) = self.conn().open_bi().await?;
             write_msg(&mut send, &Request::AgentForward).await?;
             expect_ok(&mut recv).await?;
             anyhow::Ok((send, recv))
@@ -461,7 +540,7 @@ impl Forwarder {
     /// `-X`/`-Y`: asks the server for a display whose connections come to
     /// the local one. Problems are warnings, as for the agent.
     pub async fn x11(&self, auth: super::x11::X11Auth, quiet: bool) {
-        if self.conn.server_version() < 6 {
+        if self.conn().server_version() < 6 {
             if !quiet {
                 say("qsh: warning: the server's qshd is too old for X11 forwarding\n");
             }
@@ -471,7 +550,7 @@ impl Forwarder {
         self.routes.lock().unwrap().x11 = Some(Arc::new(auth));
         self.dispatch();
         let attempt = async {
-            let (mut send, mut recv) = self.conn.open_bi().await?;
+            let (mut send, mut recv) = self.conn().open_bi().await?;
             write_msg(&mut send, &request).await?;
             expect_ok(&mut recv).await?;
             anyhow::Ok((send, recv))
@@ -492,11 +571,11 @@ impl Forwarder {
     pub async fn tunnel(&self, ethernet: bool, units: (Option<u32>, Option<u32>)) -> Result<String> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            if self.conn.server_version() < 6 {
+            if self.conn().server_version() < 6 {
                 bail!("the server's qshd is too old for tunnels (-w)");
             }
             let (dev, name) = crate::tunnel::open(ethernet, units.0)?;
-            let (mut send, mut recv) = self.conn.open_bi().await?;
+            let (mut send, mut recv) = self.conn().open_bi().await?;
             write_msg(&mut send, &Request::Tunnel { ethernet, unit: units.1 }).await?;
             expect_ok(&mut recv).await?;
             let task = tokio::spawn(async move {
@@ -505,7 +584,7 @@ impl Forwarder {
                 }
             });
             let fwd = Forward { listen: Listen::Unix(name.clone()), dest: Dest::Socks };
-            self.active.lock().unwrap().push(Active { kind: 'w', fwd, tasks: vec![task.abort_handle()], _request: None, bound: None });
+            self.active.lock().unwrap().push(Active { kind: 'w', fwd, tasks: vec![task.abort_handle()], _request: None, bound: None, _socket: None });
             Ok(name)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -601,7 +680,7 @@ impl Forwarder {
         if slot.is_some() {
             return;
         }
-        let (conn, routes) = (self.conn.clone(), self.routes.clone());
+        let (conn, routes) = (self.conn(), self.routes.clone());
         let task = tokio::spawn(async move {
             while let Some((send, mut recv)) = conn.accept_bi().await {
                 let routes = routes.clone();
@@ -649,14 +728,16 @@ impl Forwarder {
     }
 }
 
-/// A local Unix socket listener (`-L /path:...`), private to this user.
+/// A local Unix socket listener (`-L /path:...`), private to this user,
+/// and its file (removed when the forward ends).
 #[cfg(unix)]
-fn bind_local_unix(path: &str) -> Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
+fn bind_local_unix(path: &str) -> Result<(tokio::net::UnixListener, SocketFile)> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let l = tokio::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
-    // Like ssh's default StreamLocalBindMask 0177.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
+    let file = SocketFile { path: PathBuf::from(path), ino: std::fs::symlink_metadata(path)?.ino() };
+    // Like ssh's default StreamLocalBindMask 0177 (on failure, the file goes with `file`).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("cannot restrict {path}"))?;
+    Ok((l, file))
 }
 
 /// `-W host:port`: connects stdin/stdout to `host:port` through the server.

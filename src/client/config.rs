@@ -90,12 +90,17 @@ pub struct HostConfig {
     pub wants_final: bool,
     /// `CanonicalizeFallbackLocal no` and the name could not be canonicalized.
     pub canonicalize_failed: Option<String>,
+    /// A config file of the user's that others could have written (ssh
+    /// refuses to go on then too).
+    pub bad_file: Option<String>,
     pub clear_all_forwardings: Option<bool>,
     pub escape_char: Option<String>,
     /// `AddressFamily` (`any`, `inet`, `inet6`).
     pub address_family: Option<String>,
     pub log_level: Option<String>,
     pub forward_agent: Option<bool>,
+    /// `ForwardAgent` given a socket (a path or `$VARIABLE`) instead of yes.
+    pub forward_agent_socket: Option<String>,
     /// `ObscureKeystrokeTiming` (`yes`, `no`, `interval:MS`).
     pub obscure_keystrokes: Option<String>,
     /// Only offer agent keys that match an IdentityFile.
@@ -143,6 +148,9 @@ pub struct HostConfig {
     /// qsh's config says (a name only `qsh ui` saved, say), so that ssh
     /// reaches the same host.
     pub for_ssh: Vec<String>,
+    /// Keywords set to `none` (`proxy` for ProxyJump/ProxyCommand): later
+    /// values of them do not count, as in ssh.
+    pub none_set: Vec<String>,
 }
 
 /// Adds `v` to `list` unless it is there already.
@@ -238,6 +246,8 @@ struct Parser<'a> {
     final_pass: bool,
     /// A `Match final` was seen: the config is read once more at the end.
     wants_final: bool,
+    /// Reading the user's files (whose includes must be safe too), not the system's.
+    users_file: bool,
 }
 
 /// A proxy setting that is not `none`.
@@ -259,8 +269,8 @@ impl Parser<'_> {
             let this = match criterion.as_str() {
                 "all" => Applies::Yes,
                 "host" => {
-                    let name = self.out.hostname.as_deref().unwrap_or(self.host);
-                    if host_matches(&patterns(words.next()), name) { Applies::Yes } else { Applies::No }
+                    let name = self.out.hostname.as_deref().map_or(self.host.to_string(), |h| h.replace("%h", self.host));
+                    if host_matches(&patterns(words.next()), &name) { Applies::Yes } else { Applies::No }
                 }
                 "originalhost" => {
                     if host_matches(&patterns(words.next()), &self.original) { Applies::Yes } else { Applies::No }
@@ -321,6 +331,21 @@ impl Parser<'_> {
             if keyword == "match" && args.iter().any(|a| a.trim_start_matches('!').eq_ignore_ascii_case("final")) {
                 self.wants_final = true;
             }
+            // `none` decides these, like any first value: later ones are ignored.
+            let slot = match keyword.as_str() {
+                "proxyjump" | "proxycommand" => Some("proxy"),
+                "remotecommand" | "knownhostscommand" => Some(keyword.as_str()),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                if self.out.none_set.iter().any(|n| n == slot) {
+                    continue;
+                }
+                if active == Applies::Yes && first.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("none")) {
+                    self.out.none_set.push(slot.to_string());
+                    continue;
+                }
+            }
             if is_proxy(&keyword, first.as_deref()) && !self.ours {
                 // A proxy that may apply: do not connect around it.
                 if active == Applies::Maybe {
@@ -344,6 +369,10 @@ impl Parser<'_> {
                 "include" if depth < MAX_INCLUDE_DEPTH => {
                     for pattern in &args {
                         for file in self.expand_include(pattern) {
+                            if let Some(why) = insecure_file(&file).filter(|_| self.users_file) {
+                                self.out.bad_file.get_or_insert(why);
+                                continue;
+                            }
                             if let Ok(t) = std::fs::read_to_string(&file) {
                                 self.feed(&t, depth + 1);
                             }
@@ -358,6 +387,8 @@ impl Parser<'_> {
                 // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
                 "localforward" if self.full && args.len() == 2 => push_new(&mut o.local_forwards, Some(format!("{}:{}", args[0], args[1]))),
                 "remoteforward" if self.full && args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                // `RemoteForward [bind:]port` alone: a SOCKS proxy on the server.
+                "remoteforward" if self.full && args.len() == 1 => push_new(&mut o.remote_forwards, first),
                 "dynamicforward" if self.full => push_new(&mut o.dynamic_forwards, first),
                 "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
                 // ProxyJump and ProxyCommand compete: the first one found wins (as in ssh).
@@ -441,7 +472,11 @@ impl Parser<'_> {
                 "escapechar" if o.escape_char.is_none() => o.escape_char = first,
                 "addressfamily" if o.address_family.is_none() => o.address_family = first.map(|v| v.to_ascii_lowercase()),
                 "loglevel" if o.log_level.is_none() => o.log_level = first.map(|v| v.to_ascii_lowercase()),
-                "forwardagent" if o.forward_agent.is_none() => o.forward_agent = first.as_deref().map(yes),
+                "forwardagent" if o.forward_agent.is_none() => match first.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("yes" | "true" | "on" | "no" | "false" | "off") | None => o.forward_agent = first.as_deref().map(yes),
+                    // A path or $VARIABLE: forward that agent.
+                    Some(_) => (o.forward_agent, o.forward_agent_socket) = (Some(true), first),
+                },
                 "identitiesonly" if o.identities_only.is_none() => o.identities_only = first.as_deref().map(yes),
                 "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
                 "certificatefile" => push_new(&mut o.certificate_files, first),
@@ -478,6 +513,7 @@ impl Parser<'_> {
             canonical: false,
             final_pass: false,
             wants_final: false,
+            users_file: true,
         }
     }
 
@@ -542,8 +578,10 @@ impl Parser<'_> {
 fn local_networks_match(patterns: &[String]) -> Option<bool> {
     #[cfg(unix)]
     {
+        // Interfaces that are up, as ssh counts them.
         let addrs: Vec<std::net::IpAddr> = nix::ifaddrs::getifaddrs()
             .ok()?
+            .filter(|i| i.flags.contains(nix::net::if_::InterfaceFlags::IFF_UP))
             .filter_map(|i| {
                 let a = i.address?;
                 a.as_sockaddr_in().map(|v4| std::net::IpAddr::V4(v4.ip())).or_else(|| a.as_sockaddr_in6().map(|v6| std::net::IpAddr::V6(v6.ip())))
@@ -555,6 +593,23 @@ fn local_networks_match(patterns: &[String]) -> Option<bool> {
     #[cfg(not(unix))]
     {
         let _ = patterns;
+        None
+    }
+}
+
+/// Why a config file of the user's cannot be trusted: owned by someone but
+/// the user or root, or writable by others (as ssh checks them).
+fn insecure_file(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        let me = crate::platform::uid();
+        ((m.uid() != 0 && m.uid() != me) || m.mode() & 0o022 != 0).then(|| format!("Bad owner or permissions on {}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
         None
     }
 }
@@ -774,7 +829,10 @@ fn lookup_pass(
     );
     let mut ours = Parser::new(host, &qsh_dir, true, true);
     (ours.original, ours.canonical, ours.final_pass, ours.out) = (original.to_string(), canonical, final_pass, ours_seed);
-    let ours = ours.run(&ours_text);
+    let mut ours = ours.run(&ours_text);
+    if ours.bad_file.is_none() {
+        ours.bad_file = [qsh_dir.join("config"), qsh_dir.join(UI_HOSTS), ssh_file.clone()].iter().find_map(|f| insecure_file(f));
+    }
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
     let mut ssh = Parser::new(host, &ssh_dir, sources.full, false);
@@ -786,6 +844,7 @@ fn lookup_pass(
     ssh.feed_file(&read(&ssh_file), &ssh_dir);
     if sources.ssh_config.is_none() {
         let system = Path::new(SYSTEM_SSH_CONFIG);
+        ssh.users_file = false;
         ssh.feed_file(&read(system), system.parent().unwrap_or(Path::new("/")));
     }
     (ours, ssh.finish())
@@ -793,7 +852,9 @@ fn lookup_pass(
 
 /// One host's settings from qsh's part and ssh's part of the configs.
 fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
-    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && ours.proxy_jump.is_none() && ours.proxy_command.is_none());
+    // A proxy (or `none`) in qsh's config or -o takes care of ssh's.
+    let ours_decides = ours.proxy_jump.is_some() || ours.proxy_command.is_some() || ours.none_set.iter().any(|n| n == "proxy");
+    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && !ours_decides);
     let mut set_env = ours.set_env.clone();
     for e in &ssh.set_env {
         let name = e.split('=').next();
@@ -849,10 +910,12 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
         password_prompts: ours.password_prompts.or(ssh.password_prompts),
         wants_final: ours.wants_final || ssh.wants_final,
         canonicalize_failed: None,
+        bad_file: ours.bad_file.or(ssh.bad_file),
         clear_all_forwardings: ours.clear_all_forwardings.or(ssh.clear_all_forwardings),
         escape_char: ours.escape_char.or(ssh.escape_char),
         address_family: ours.address_family.or(ssh.address_family),
         log_level: ours.log_level.or(ssh.log_level),
+        forward_agent_socket: if ours.forward_agent.is_some() { ours.forward_agent_socket } else { ssh.forward_agent_socket },
         forward_agent: ours.forward_agent.or(ssh.forward_agent),
         // A privacy preference, so ssh's setting applies to qsh sessions as well.
         obscure_keystrokes: ours.obscure_keystrokes.or(ssh.obscure_keystrokes),
@@ -883,6 +946,7 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
         connect_timeout: ours.connect_timeout.or(ssh.connect_timeout),
         connection_attempts: ours.connection_attempts.or(ssh.connection_attempts),
         for_ssh,
+        none_set: ours.none_set.into_iter().chain(ssh.none_set).collect(),
     }
 }
 
@@ -1119,6 +1183,41 @@ mod match_tests {
         let c = lookup(home.path(), "h", &Sources::default());
         assert_eq!((c.hostname.as_deref(), c.proxy_jump.as_deref()), (Some("real"), Some("gate")));
         assert_eq!(c.identity_files, ["~/k", "~/all"], "no repeats from the second pass");
+    }
+
+    /// Config files others could write are refused, as by ssh.
+    #[cfg(unix)]
+    #[test]
+    fn writable_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "Include extra\n").unwrap();
+        std::fs::write(dir.join("extra"), "Host h\n  ProxyCommand evil\n").unwrap();
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert!(c.bad_file.is_none());
+        std::fs::set_permissions(dir.join("extra"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert!(c.bad_file.as_deref().is_some_and(|b| b.contains("extra")), "{c:?}");
+        std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(lookup(home.path(), "x", &Sources::default()).bad_file.is_some());
+    }
+
+    /// `none` is a first value like any other: later ones do not count.
+    #[test]
+    fn none_decides() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "Host h\n  ProxyJump gate\n  RemoteCommand top\n").unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        std::fs::write(home.path().join(".ssh/config"), "Host h\n  ProxyCommand nc %h %p\n").unwrap();
+        let o = Sources { overrides: vec!["ProxyJump none".into(), "RemoteCommand none".into()], ssh_config: Some(home.path().join(".ssh/config")), ..Default::default() };
+        let c = lookup(home.path(), "h", &o);
+        assert_eq!((c.proxy_jump, c.remote_command, c.needs_proxy), (None, None, false));
+        let c = lookup(home.path(), "h", &Sources { ssh_config: Some(home.path().join(".ssh/config")), ..Default::default() });
+        assert_eq!(c.proxy_jump.as_deref(), Some("gate"));
     }
 
     /// The command line's user is what `Match user` and `%r` see, ahead of `User`.

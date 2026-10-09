@@ -25,6 +25,9 @@ pub struct X11Auth {
     pub real: Vec<u8>,
     /// The screen number of the display (`:0.1` → 1).
     pub screen: u32,
+    /// Untrusted forwarding: the generated cookie expires then
+    /// (ForwardX11Timeout), and so do new connections, as in ssh.
+    pub refuse_after: Option<std::time::Instant>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -82,7 +85,14 @@ fn screen_of(display: &str) -> u32 {
 /// one xauth generates for untrusted access, valid for `timeout` seconds.
 pub fn prepare(display: &str, trusted: bool, xauth: &str, timeout: u32) -> Result<X11Auth> {
     let (proto, real) = if trusted {
-        list_cookie(xauth, None, display)?
+        match list_cookie(xauth, None, display) {
+            Ok(c) => c,
+            // Like ssh: a display without access control may still work.
+            Err(e) => {
+                tracing::warn!("{e:#}; using fake authentication data for X11 forwarding");
+                ("MIT-MAGIC-COOKIE-1".to_string(), (0..16).map(|_| rand::random::<u8>()).collect())
+            }
+        }
     } else {
         let dir = private_dir()?;
         let file = dir.join("xauthfile");
@@ -102,7 +112,8 @@ pub fn prepare(display: &str, trusted: bool, xauth: &str, timeout: u32) -> Resul
         result?
     };
     let fake: Vec<u8> = (0..real.len()).map(|_| rand::random::<u8>()).collect();
-    Ok(X11Auth { display: display.to_string(), proto, fake, real, screen: screen_of(display) })
+    let refuse_after = (!trusted).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout.into()));
+    Ok(X11Auth { display: display.to_string(), proto, fake, real, screen: screen_of(display), refuse_after })
 }
 
 /// A new directory only this user can enter, for xauth's temporary file.
@@ -175,7 +186,9 @@ async fn rewrite_setup<R: AsyncRead + Unpin>(r: &mut R, auth: &X11Auth) -> Resul
     if name != auth.proto.as_bytes() {
         bail!("X11 connection uses another authentication protocol");
     }
-    if data != auth.fake.as_slice() {
+    // In constant time: how much of a guess matched must not show.
+    let differs = data.len() != auth.fake.len() || data.iter().zip(&auth.fake).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0;
+    if differs {
         bail!("X11 authentication data does not match the fake cookie");
     }
     let real_len = u16::try_from(auth.real.len()).context("cookie too long")?;
@@ -195,6 +208,9 @@ async fn rewrite_setup<R: AsyncRead + Unpin>(r: &mut R, auth: &X11Auth) -> Resul
 /// Serves a connection to the forwarded display: checks and replaces its
 /// cookie, then relays it to the local display.
 pub async fn serve(auth: &X11Auth, send: SendHalf, mut recv: RecvHalf) -> Result<()> {
+    if auth.refuse_after.is_some_and(|t| std::time::Instant::now() >= t) {
+        bail!("rejected X11 connection after ForwardX11Timeout expired");
+    }
     let setup = rewrite_setup(&mut recv, auth).await?;
     let mut display = connect_display(&auth.display).await?;
     display.write_all(&setup).await?;
@@ -224,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_cookie_is_replaced() {
-        let auth = X11Auth { display: ":0".into(), proto: "MIT-MAGIC-COOKIE-1".into(), fake: vec![1; 16], real: vec![2; 16], screen: 0 };
+        let auth = X11Auth { display: ":0".into(), proto: "MIT-MAGIC-COOKIE-1".into(), fake: vec![1; 16], real: vec![2; 16], screen: 0, refuse_after: None };
         for order in *b"lB" {
             let input = setup(order, b"MIT-MAGIC-COOKIE-1", &[1; 16]);
             let out = rewrite_setup(&mut input.as_slice(), &auth).await.unwrap();
@@ -232,6 +248,8 @@ mod tests {
         }
         let wrong = setup(b'l', b"MIT-MAGIC-COOKIE-1", &[3; 16]);
         assert!(rewrite_setup(&mut wrong.as_slice(), &auth).await.is_err());
+        let short = setup(b'l', b"MIT-MAGIC-COOKIE-1", &[1; 15]);
+        assert!(rewrite_setup(&mut short.as_slice(), &auth).await.is_err());
         let other = setup(b'l', b"XDM-AUTHORIZATION-1", &[1; 16]);
         assert!(rewrite_setup(&mut other.as_slice(), &auth).await.is_err());
         assert_eq!(screen_of("localhost:10.2"), 2);

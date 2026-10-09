@@ -332,6 +332,9 @@ fn enter_chroot(root: &Path) -> Result<()> {
     if !root.is_absolute() {
         bail!("chroot_directory {} is not an absolute path", root.display());
     }
+    // The real path is what is checked and entered (a symlink on the way
+    // would otherwise lead past directories nobody checked).
+    let root = &fs::canonicalize(root).with_context(|| format!("chroot_directory {}", root.display()))?;
     let mut path = PathBuf::from("/");
     for part in std::iter::once(None).chain(root.components().skip(1).map(Some)) {
         if let Some(part) = part {

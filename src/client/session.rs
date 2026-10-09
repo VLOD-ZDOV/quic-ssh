@@ -185,6 +185,9 @@ struct Escapes {
     pending: bool,
     /// `~C`: the command line being typed.
     command: Option<String>,
+    /// Inside an escape sequence (an arrow key...) typed on the `~C` line:
+    /// 1 after ESC, 2 inside `ESC [`/`ESC O`.
+    in_seq: u8,
     /// `~C` is allowed (EnableEscapeCommandline).
     commandline: bool,
 }
@@ -207,7 +210,7 @@ enum EscapeAction {
 
 impl Escapes {
     fn new(ch: u8) -> Escapes {
-        Escapes { ch, at_line_start: true, pending: false, command: None, commandline: true }
+        Escapes { ch, at_line_start: true, pending: false, command: None, commandline: true, in_seq: 0 }
     }
 
     /// Returns the bytes to send and the escapes completed in `input`.
@@ -215,8 +218,25 @@ impl Escapes {
     fn process(&mut self, input: &[u8]) -> (Vec<u8>, Vec<EscapeAction>) {
         let mut out = Vec::with_capacity(input.len());
         let mut actions = Vec::new();
-        for b in input.iter().copied() {
+        for (i, b) in input.iter().copied().enumerate() {
             if let Some(line) = self.command.as_mut() {
+                // Keys that send sequences are not part of the line.
+                match (self.in_seq, b) {
+                    (1, b'[' | b'O') => {
+                        self.in_seq = 2;
+                        continue;
+                    }
+                    (1, _) => {
+                        self.in_seq = 0;
+                        continue;
+                    }
+                    (2, 0x40..=0x7e) => {
+                        self.in_seq = 0;
+                        continue;
+                    }
+                    (2, _) => continue,
+                    _ => {}
+                }
                 match b {
                     b'\r' | b'\n' => {
                         let line = self.command.take().unwrap_or_default();
@@ -224,6 +244,8 @@ impl Escapes {
                         actions.push(EscapeAction::Command(line));
                         self.at_line_start = true;
                     }
+                    // A sequence (more follows in the same read: a key, not Esc).
+                    0x1b if i + 1 < input.len() => self.in_seq = 1,
                     // ^C, ^U or Esc: forget the line.
                     0x03 | 0x15 | 0x1b => {
                         self.command = None;
@@ -274,8 +296,9 @@ impl Escapes {
                         continue;
                     }
                 };
+                // Still at the start of a line (as in ssh): `~.` works right after `~?`.
+                self.at_line_start = !matches!(action, EscapeAction::Echo(_));
                 actions.push(action);
-                self.at_line_start = false;
                 continue;
             }
             if self.at_line_start && b == self.ch {
@@ -306,7 +329,6 @@ impl Escapes {
 /// Runs a `~C` line (`-L spec`, `-R spec`, `-D spec`, `-KL listen`,
 /// `-KR listen`, `-KD listen`) and returns what to tell the user.
 async fn escape_command(line: &str, forwarder: Option<&super::forward::Forwarder>) -> String {
-    use super::forward::Forward;
     let line = line.trim();
     if line.is_empty() {
         return String::new();
@@ -321,34 +343,25 @@ async fn escape_command(line: &str, forwarder: Option<&super::forward::Forwarder
         return help.into();
     }
     let Some(f) = forwarder else { return "forwarding cannot be changed in this session\r\n".into() };
-    let (flag, spec) = line.split_at(line.find(|c: char| c.is_whitespace() || c.is_ascii_digit() || c == '[' || c == '/').unwrap_or(line.len()));
-    let spec = spec.trim();
-    let result = match flag {
-        "-L" => match Forward::parse(spec) {
-            Ok(fwd) => f.local('L', fwd).await.map(|()| "Forwarding port.".to_string()),
-            Err(e) => Err(e),
-        },
-        "-D" => match Forward::parse_dynamic(spec) {
-            Ok(fwd) => f.local('D', fwd).await.map(|()| "Forwarding port.".to_string()),
-            Err(e) => Err(e),
-        },
-        "-R" => match Forward::parse_remote(spec) {
-            Ok(fwd) => f.remote(fwd).await.map(|bound| match bound {
-                Some(p) => format!("Allocated port {p} for remote forward."),
-                None => "Forwarding port.".to_string(),
-            }),
-            Err(e) => Err(e),
-        },
-        "-KL" | "-KR" | "-KD" => {
-            let kind = flag.as_bytes()[2] as char;
-            match f.cancel(kind, spec) {
-                Ok(true) => Ok(format!("Canceled forwarding {spec}.")),
-                Ok(false) => Err(anyhow::anyhow!("no such forward: {spec}")),
-                Err(e) => Err(e),
-            }
-        }
+    // As ssh reads it: an optional '-', an optional 'K' (cancel), the kind,
+    // then the spec (spaces before it optional).
+    let rest = line.strip_prefix('-').unwrap_or(line);
+    let (cancel, rest) = match rest.strip_prefix('K') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let mut chars = rest.chars();
+    let kind = match chars.next() {
+        Some(k @ ('L' | 'R' | 'D')) => k,
         _ => return format!("Invalid command.\r\n{help}"),
     };
+    let spec = chars.as_str().trim();
+    // A cancel may name the whole forward or only where it listens.
+    let result = f.request(kind, spec, cancel).await.map(|reply| match (cancel, kind, reply.is_empty()) {
+        (true, ..) => format!("Canceled forwarding {spec}."),
+        (false, 'R', false) => format!("Allocated port {reply} for remote forward."),
+        _ => "Forwarding port.".to_string(),
+    });
     match result {
         Ok(msg) => format!("{msg}\r\n"),
         Err(e) => format!("{e:#}\r\n"),
@@ -553,7 +566,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                                 }
                                 EscapeAction::Suspend => {
                                     #[cfg(unix)]
-                                    suspend();
+                                    {
+                                        suspend();
+                                        // The window may have changed meanwhile (no SIGWINCH reached us).
+                                        if let Ok((cols, rows)) = crossterm::terminal::size() {
+                                            let _ = stdin_tx.send(ClientMsg::Resize { cols, rows }).await;
+                                        }
+                                    }
                                     #[cfg(not(unix))]
                                     let _ = notice_tx.send("\r\nqsh cannot be suspended here\r\n".into());
                                 }
@@ -701,7 +720,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                             show(&mut stdout, &mut predictor, &d).await?;
                         }
                         ServerMsg::Stderr(d) => show(&mut stderr, &mut predictor, &d).await?,
-                        ServerMsg::Exit { code, signal } => break code.or(signal.map(|s| 128 + s)).unwrap_or(255),
+                        ServerMsg::Exit { code, signal } => break code.or(signal.map(|s| s.saturating_add(128))).unwrap_or(255),
                         ServerMsg::Pong(_) => {}
                     }
                     false
@@ -786,6 +805,14 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         }
         let _ = sink_tx.send(new_send).await;
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
+        // Forwards added on the way were the old connection's.
+        if let Some(f) = &opts.forwarder {
+            let gone = f.reconnected(conn.clone());
+            if !gone.is_empty() {
+                let text = format!("[qsh: these forwards ended with the old connection (~C adds them again): {}]\r\n", gone.join(", "));
+                let _ = stderr.write_all(text.as_bytes()).await;
+            }
+        }
         // Two size changes make full-screen programs redraw what was lost.
         if let Ok((cols, rows)) = crossterm::terminal::size() {
             if rows > 1 {
@@ -851,5 +878,13 @@ mod tests {
         assert!(!a.iter().any(|x| matches!(x, EscapeAction::Command(_))));
         assert_eq!(e.process(b"~#").1, vec![EscapeAction::ListForwards]);
         assert_eq!(e.process(b"\r~\x1a").1, vec![EscapeAction::Suspend]);
+        // Still at a line start after a local escape, as in ssh.
+        assert_eq!(e.process(b"~.").1, vec![EscapeAction::Disconnect]);
+        // Arrow keys on the ~C line neither end it nor leak into the session.
+        let mut e = Escapes::new(b'~');
+        let (out, a) = e.process(b"~C-D 10\x1b[D80\r");
+        assert!(out.is_empty(), "{out:?}");
+        let commands: Vec<_> = a.iter().filter_map(|x| if let EscapeAction::Command(c) = x { Some(c.as_str()) } else { None }).collect();
+        assert_eq!(commands, vec!["-D 1080"]);
     }
 }
