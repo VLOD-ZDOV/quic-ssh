@@ -616,13 +616,25 @@ impl Server {
                 if let Some(denied) = self.writable(id) {
                     return Some(denied);
                 }
-                // SFTP v3 rename does not replace an existing target.
-                if fs::symlink_metadata(&to).is_ok() {
-                    return Some(status(id, FAILURE, "target exists"));
-                }
-                match fs::rename(&from, &to) {
-                    Ok(()) => ok(id),
-                    Err(e) => io_status(id, &e),
+                // SFTP v3 rename does not replace an existing target: as in
+                // sftp-server, a new link and then away with the old name
+                // (which fails if the target exists, with no window between
+                // a check and the rename), else a check and a rename.
+                match fs::hard_link(&from, &to) {
+                    Ok(()) => match fs::remove_file(&from) {
+                        Ok(()) => ok(id),
+                        Err(e) => {
+                            let _ = fs::remove_file(&to);
+                            io_status(id, &e)
+                        }
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => status(id, FAILURE, "target exists"),
+                    // Directories, file systems without links...
+                    Err(_) if fs::symlink_metadata(&to).is_ok() => status(id, FAILURE, "target exists"),
+                    Err(_) => match fs::rename(&from, &to) {
+                        Ok(()) => ok(id),
+                        Err(e) => io_status(id, &e),
+                    },
                 }
             }
             READLINK => {
@@ -679,6 +691,10 @@ impl Server {
             "lsetstat@openssh.com" => {
                 let path = m.path()?;
                 let attrs = m.attrs()?;
+                // As in sftp-server: truncating would go through a symlink.
+                if attrs.size.is_some() {
+                    return Some(status(id, BAD_MESSAGE, "lsetstat cannot change the size"));
+                }
                 match apply_attrs(&path, &attrs, false) {
                     Ok(()) => ok(id),
                     Err(e) => io_status(id, &e),

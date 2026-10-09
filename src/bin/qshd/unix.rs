@@ -192,10 +192,11 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
             let user = user.context("-C needs user=NAME")?;
             let groups = server::user_group_names(&user);
             let who = qsh::config::Login { user: &user, groups: &groups, addr: addr.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()) };
-            if let Some(reason) = cfg.login_refused(&who) {
+            let login = cfg.for_login(&who);
+            if let Some(reason) = server::login_verdict(&login, &who) {
                 println!("# {user} may not log in: {reason}");
             }
-            cfg.for_login(&who)
+            login
         }
     };
     print!("{}", cfg.dump()?);

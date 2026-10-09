@@ -133,7 +133,19 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
     } else {
         Display { display: format!("{host}:{number}.{screen}"), auth_display: format!("{host}/unix:{number}.{screen}"), proto, cookie }
     };
-    *x11.display.lock().unwrap() = Some(display);
+    // Checked again with the display taken: two requests at once must not
+    // both get one (the first to end would clear the other's).
+    let taken = {
+        let mut slot = x11.display.lock().unwrap();
+        let taken = slot.is_some();
+        if !taken {
+            *slot = Some(display);
+        }
+        taken
+    };
+    if taken {
+        return write_msg(&mut send, &Reply::Err("X11 forwarding is already on for this connection".into())).await;
+    }
     let _clear = Clear(x11);
     write_msg(&mut send, &Reply::Ok).await?;
     info!("{}: X11 forwarding on display {number}", conn.remote_addr());

@@ -2489,6 +2489,7 @@ dependencies = [
  "x509-parser",
  "yamux",
  "yescrypt",
+ "zeroize",
 ]
 
 [[package]]

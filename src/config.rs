@@ -111,12 +111,12 @@ pub struct ServerConfig {
     /// How long an interactive session survives without its client (seconds),
     /// so it can be resumed after a network outage. 0 turns this off.
     pub session_timeout: u64,
-    /// Only these users may log in: name patterns, or `user@address` with a
-    /// pattern or CIDR for the client address (like AllowUsers).
-    #[serde(deserialize_with = "names")]
+    /// Only these users may log in: name patterns, or `user@address` with
+    /// patterns or CIDRs for the client address, comma-separated (like AllowUsers).
+    #[serde(deserialize_with = "user_entries")]
     pub allow_users: Vec<String>,
     /// These users may not log in (like DenyUsers; checked first).
-    #[serde(deserialize_with = "names")]
+    #[serde(deserialize_with = "user_entries")]
     pub deny_users: Vec<String>,
     /// Only members of these groups may log in (like AllowGroups).
     #[serde(deserialize_with = "names")]
@@ -418,6 +418,26 @@ fn opt_names<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::
     names(d).map(Some)
 }
 
+/// `allow_users`/`deny_users`: like [`names`], but split at spaces only, as
+/// the address part of `user@address` may be a comma-separated list.
+fn user_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        One(String),
+        Many(Vec<String>),
+    }
+    let words = match Raw::deserialize(d)? {
+        Raw::One(s) => vec![s],
+        Raw::Many(v) => v,
+    };
+    Ok(words.iter().flat_map(|w| w.split([' ', '\t'])).filter(|w| !w.is_empty()).map(str::to_string).collect())
+}
+
+fn opt_user_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    user_entries(d).map(Some)
+}
+
 /// `[[match]]` settings that replace the global ones.
 macro_rules! overrides {
     (
@@ -465,13 +485,13 @@ overrides! {
         allow_stream_local_forwarding: Forwarding,
         stream_local_bind_mask: String,
         stream_local_bind_unlink: bool,
-        #[serde(deserialize_with = "opt_names")]
+        #[serde(deserialize_with = "opt_user_entries")]
         allow_users: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
         authorized_keys_file: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
         deny_groups: Vec<String>,
-        #[serde(deserialize_with = "opt_names")]
+        #[serde(deserialize_with = "opt_user_entries")]
         deny_users: Vec<String>,
         disable_forwarding: bool,
         gateway_ports: GatewayPorts,
@@ -534,16 +554,42 @@ fn groups_match(patterns: &[String], groups: &[String]) -> bool {
     !excluded && groups.iter().any(|g| name_matches(patterns, g))
 }
 
-/// `user` or `user@address` (address: wildcard pattern or CIDR) from AllowUsers/DenyUsers.
+/// `user` or `user@addresses` from AllowUsers/DenyUsers. The addresses are
+/// a comma-separated list of wildcard patterns and CIDRs, `!` negating (a
+/// negated match rules the entry out), as in sshd.
 fn user_entry_matches(entry: &str, who: &Login) -> bool {
     let (user, host) = match entry.rsplit_once('@') {
         Some((u, h)) => (u, Some(h)),
         None => (entry, None),
     };
+    let addr = who.addr.to_canonical();
+    let one = |p: &str| if p.contains('/') { cidr_contains(p, addr).unwrap_or(false) } else { wildcard(p, &addr.to_string()) };
     wildcard(user, who.user)
         && host.is_none_or(|h| {
-            if h.contains('/') { cidr_contains(h, who.addr).unwrap_or(false) } else { wildcard(h, &who.addr.to_canonical().to_string()) }
+            let mut found = false;
+            for p in h.split(',') {
+                match p.strip_prefix('!') {
+                    Some(neg) if one(neg) => return false,
+                    Some(_) => {}
+                    None => found |= one(p),
+                }
+            }
+            found
         })
+}
+
+/// Checks the address ranges of AllowUsers/DenyUsers entries: a broken one
+/// would never match, which for deny_users means letting users in.
+fn check_user_entries(what: &str, entries: &[String]) -> Result<()> {
+    for entry in entries {
+        let Some((_, host)) = entry.rsplit_once('@') else { continue };
+        for cidr in host.split(',').map(|p| p.trim_start_matches('!')).filter(|p| p.contains('/')) {
+            if cidr_contains(cidr, IpAddr::from([0u8; 4])).is_none() {
+                bail!("{what}: bad address range {cidr:?} in {entry:?}");
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for ServerConfig {
@@ -638,7 +684,11 @@ impl ServerConfig {
                 bail!("stream_local_bind_mask: {mask:?} is not an octal mask like \"0177\"");
             }
         }
+        check_user_entries("allow_users", &self.allow_users)?;
+        check_user_entries("deny_users", &self.deny_users)?;
         for (i, m) in self.matches.iter().enumerate() {
+            check_user_entries(&format!("match block {}: allow_users", i + 1), m.allow_users.as_deref().unwrap_or_default())?;
+            check_user_entries(&format!("match block {}: deny_users", i + 1), m.deny_users.as_deref().unwrap_or_default())?;
             if m.max_auth_tries == Some(0) {
                 bail!("match block {}: max_auth_tries must be at least 1", i + 1);
             }
@@ -747,6 +797,17 @@ impl ServerConfig {
         endpoint_list_allows(&self.permit_listen, |p| crate::pattern::endpoint_matches(p, bind, port, true))
     }
 
+    /// `permit_open` / `permit_listen` limit forwarding to some addresses:
+    /// then Unix sockets, which they cannot name, are not forwarded either
+    /// (a limit must not leave a way around it).
+    pub fn limits_open(&self) -> bool {
+        !(self.permit_open.is_empty() || self.permit_open == ["any"])
+    }
+
+    pub fn limits_listen(&self) -> bool {
+        !(self.permit_listen.is_empty() || self.permit_listen == ["any"])
+    }
+
     /// Whether a client may set variable `name` (`accept_env`). Only plain
     /// names: no `=`, NUL or other tricks (compare CVE-2014-2532).
     pub fn accepts_env(&self, name: &str) -> bool {
@@ -841,6 +902,15 @@ mod tests {
         assert!(cfg.login_refused(&who("bob", none, "192.0.2.66")).is_some(), "denied first");
         assert!(cfg.login_refused(&who("carol", none, "10.1.2.3")).is_none());
         assert!(cfg.login_refused(&who("mallory", none, "10.1.2.3")).is_some());
+        // Address lists, with negation.
+        let cfg = parse("allow_users = \"dave@192.0.2.0/24,!192.0.2.9,198.51.100.*\"\n");
+        assert!(cfg.login_refused(&who("dave", none, "192.0.2.1")).is_none());
+        assert!(cfg.login_refused(&who("dave", none, "198.51.100.7")).is_none());
+        assert!(cfg.login_refused(&who("dave", none, "192.0.2.9")).is_some(), "negated");
+        // A broken range is an error, not an entry that never matches.
+        let text = "deny_users = \"bob@192.0.2.0/99\"\n";
+        let parsed: ServerConfig = toml::from_str(text).unwrap();
+        assert!(parsed.validate().is_err());
 
         let cfg = parse("allow_groups = [\"staff\"]\ndeny_groups = \"guests\"\n");
         let staff = ["users".to_string(), "staff".to_string()];

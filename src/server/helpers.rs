@@ -318,6 +318,8 @@ pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
         ("internal-send", [path]) => send(path),
         ("internal-untar", [path, name]) => untar(path, name),
         ("internal-tar", [path]) => tar(path),
+        ("internal-connect-unix", [path]) => connect_unix(path),
+        ("internal-listen-unix", [path, mask, unlink]) => listen_unix(path, mask, unlink),
         _ => bail!("{program} cannot run here"),
     }
 }

@@ -2876,3 +2876,31 @@ fn tunnel_needs_rights() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("tunnel"), "{}", stderr(&out));
 }
+
+/// Under load, QUIC clients must first prove their address (a Retry), and
+/// still get in.
+#[test]
+fn quic_retry_under_load() {
+    let s = Server::start_with("127.0.0.1", "max_startups = 2\n");
+    let c = Client::paired(&s);
+    // A TCP connection that never starts TLS holds one of the two slots.
+    let _idle = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    sleep(Duration::from_millis(200));
+    let out = c.run(&["--transport", "quic", "-p", &s.port.to_string(), &dest(), "echo", "in"]);
+    assert_eq!(stdout(&out), "in\n", "{}", stderr(&out));
+}
+
+/// permit_open limits forwarding to some addresses: Unix sockets, which it
+/// cannot name, are refused then (and permit_listen likewise).
+#[test]
+fn permit_open_also_limits_sockets() {
+    let s = Server::start_with("127.0.0.1", "permit_open = [\"127.0.0.1:9\"]\npermit_listen = [\"127.0.0.1:9\"]\n");
+    let c = Client::paired(&s);
+    let dir = tempfile::tempdir().unwrap();
+    let remote_sock = unix_echo_server(dir.path());
+    let out = c.run(&["-p", &s.port.to_string(), "-W", remote_sock.to_str().unwrap(), &dest()]);
+    assert!(!out.status.success() && stderr(&out).contains("permit_open"), "{}", stderr(&out));
+    let back = dir.path().join("back.sock");
+    let out = c.run(&["-p", &s.port.to_string(), "-o", "ExitOnForwardFailure=yes", "-R", &format!("{}:127.0.0.1:9", back.display()), &dest(), "true"]);
+    assert!(!out.status.success() && !back.exists(), "{}", stderr(&out));
+}

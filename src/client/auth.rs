@@ -298,7 +298,13 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
                     None
                 };
                 match answer {
-                    Some(p) => write_msg(send, &Auth::Response(p)).await?,
+                    Some(p) => {
+                        let mut msg = Auth::Response(p);
+                        write_msg(send, &msg).await?;
+                        if let Auth::Response(p) = &mut msg {
+                            zeroize::Zeroize::zeroize(p);
+                        }
+                    }
                     None => write_msg(send, &Auth::Done).await?,
                 }
                 read_msg(recv).await?

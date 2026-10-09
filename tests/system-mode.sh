@@ -375,6 +375,20 @@ EOF
     check "qsh cp into a chroot lands inside it" q cp "$T/jail-src" qsh-bob@127.0.0.1:/bob/x.txt
     check "... in the jail directory" cmp -s "$T/jail-src" "$JAIL/bob/x.txt"
     check "files outside the chroot are out of reach (cp)" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-bob@127.0.0.1:/etc/passwd' '$T/escaped2' 2>/dev/null"
+    # Unix socket forwarding happens inside the chroot too.
+    python3 -c "import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); c,_=s.accept(); c.sendall(b'outside\n'); time.sleep(5)" "$T/shared/open.sock" &
+    OPEN_SERVER=$!
+    for _ in $(seq 50); do [[ -S $T/shared/open.sock ]] && break; sleep 0.1; done
+    chmod 777 "$T/shared/open.sock"
+    OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -W "$T/shared/open.sock" qsh-bob@127.0.0.1 </dev/null 2>&1 || true)
+    check "sockets outside the chroot are out of reach (-W)" test "$(grep -c outside <<<"$OUT")" = 0
+    kill "$OPEN_SERVER" 2>/dev/null || true
+    HOME="$T/client" timeout 20 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -N -R "/bob/r.sock:127.0.0.1:9" qsh-bob@127.0.0.1 </dev/null >/dev/null 2>&1 &
+    FWD_CLIENT=$!
+    for _ in $(seq 100); do [[ -S $JAIL/bob/r.sock ]] && break; sleep 0.1; done
+    check "-R sockets are made inside the chroot" test -S "$JAIL/bob/r.sock"
+    kill "$FWD_CLIENT" 2>/dev/null || true
+    wait "$FWD_CLIENT" 2>/dev/null || true
     chmod 775 "$JAIL"
     check "a group-writable chroot is refused" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT '$T/jail-src' qsh-bob@127.0.0.1:/bob/y.txt 2>/dev/null"
     check "... and nothing is written there" test ! -e "$JAIL/bob/y.txt"

@@ -19,21 +19,58 @@ fn account_expired(_name: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn account_expired(name: &str) -> bool {
     let Ok(text) = std::fs::read_to_string("/etc/shadow") else { return false };
-    let today = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_secs() / 86400) as i64)
-        .unwrap_or(0);
-    shadow_expired(&text, name, today)
+    shadow_expired(&text, name, today())
 }
 
+/// Field `i` of `name`'s shadow entry as a number (unset: `None`).
 #[cfg(target_os = "linux")]
-fn shadow_expired(shadow: &str, name: &str, today: i64) -> bool {
+fn shadow_field(shadow: &str, name: &str, i: usize) -> Option<i64> {
     shadow
         .lines()
         .map(|l| l.split(':').collect::<Vec<_>>())
         .find(|f| f.first() == Some(&name))
-        .and_then(|f| f.get(7).and_then(|e| e.parse::<i64>().ok()))
-        .is_some_and(|expire| expire >= 0 && today >= expire)
+        .and_then(|f| f.get(i).and_then(|e| e.parse::<i64>().ok()))
+        .filter(|v| *v >= 0)
+}
+
+/// The account has expired (`chage -E`), or its password expired longer
+/// than the inactivity period (`chage -I`) ago, which locks it like pam_unix.
+#[cfg(target_os = "linux")]
+fn shadow_expired(shadow: &str, name: &str, today: i64) -> bool {
+    let field = |i| shadow_field(shadow, name, i);
+    let expired = field(7).is_some_and(|expire| today >= expire);
+    let inactive = match (field(2).filter(|c| *c > 0), field(4), field(6)) {
+        (Some(changed), Some(max), Some(inact)) => today - changed > max.saturating_add(inact),
+        _ => false,
+    };
+    expired || inactive
+}
+
+/// The password has expired (`chage -M`) or must be changed (`chage -d 0`).
+#[cfg(target_os = "linux")]
+fn shadow_password_expired(shadow: &str, name: &str, today: i64) -> bool {
+    match (shadow_field(shadow, name, 2), shadow_field(shadow, name, 4)) {
+        (Some(0), _) => true,
+        (Some(changed), Some(max)) => today - changed > max,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn today() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| (d.as_secs() / 86400) as i64).unwrap_or(0)
+}
+
+/// Whether `name`'s password may no longer be used to log in (see
+/// `shadow_password_expired`).
+#[cfg(target_os = "linux")]
+pub fn password_expired(name: &str) -> bool {
+    std::fs::read_to_string("/etc/shadow").is_ok_and(|text| shadow_password_expired(&text, name, today()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn password_expired(_name: &str) -> bool {
+    false
 }
 
 /// The password hash of `name` in /etc/shadow (readable by root only).
@@ -329,6 +366,17 @@ impl User {
         Ok(cmd)
     }
 
+    /// Like [`User::helper`], inside the user's chroot if there is one (for
+    /// helpers that work with files: Unix sockets). See `helpers::run_internal`.
+    pub fn confined_helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
+        let Some(root) = &self.chroot else { return self.helper(args) };
+        let prelude = Prelude { chroot: Some(root.clone()), ..Default::default() };
+        let argv = helper_argv(args);
+        let mut cmd = self.command_as(&argv[0], None, &prelude, self.env());
+        cmd.args(&argv[1..]);
+        Ok(cmd)
+    }
+
     /// Like [`User::helper`], but started through the user's shell
     /// (`$SHELL -c`), as sshd does for scp and sftp: a restricted shell
     /// (nologin, git-shell) then also restricts file transfers. The arguments
@@ -336,12 +384,8 @@ impl User {
     pub fn shell_helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
         // Confined: `internal-become` runs the helper itself inside the
         // chroot (where neither the shell nor qshd's binary may exist).
-        if let Some(root) = &self.chroot {
-            let prelude = Prelude { chroot: Some(root.clone()), ..Default::default() };
-            let argv = helper_argv(args);
-            let mut cmd = self.command_as(&argv[0], None, &prelude, self.env());
-            cmd.args(&argv[1..]);
-            return Ok(cmd);
+        if self.chroot.is_some() {
+            return self.confined_helper(args);
         }
         // Through a shell `/proc/self/exe` would be the shell: the path it is.
         let exe = exe_path()?;
@@ -453,6 +497,12 @@ mod tests {
         assert!(!shadow_expired(shadow, "old", 19499));
         assert!(shadow_expired(shadow, "zero", 1), "0 is a date too (1970-01-01)");
         assert!(!shadow_expired(shadow, "missing", 1));
+        // Password aging: max 30 days, then 7 days of inactivity lock the account.
+        let shadow = "aged:$6$x:20000:0:30:7:7::\nnow:$6$x:0:0:99999:7:::\nfree:$6$x:20000::::::\n";
+        assert!(!shadow_password_expired(shadow, "aged", 20030) && shadow_password_expired(shadow, "aged", 20031));
+        assert!(!shadow_expired(shadow, "aged", 20037) && shadow_expired(shadow, "aged", 20038));
+        assert!(shadow_password_expired(shadow, "now", 1), "must be changed first");
+        assert!(!shadow_password_expired(shadow, "free", 90000) && !shadow_expired(shadow, "free", 90000));
     }
 
     #[test]

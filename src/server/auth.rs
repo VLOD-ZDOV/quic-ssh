@@ -258,18 +258,20 @@ fn dummy_hash() -> String {
 /// [`PASSWORD_TRIES`] times. `user` is `None` for an unknown or refused user,
 /// who gets the same questions and the same work done.
 pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Option<&User>, empty_ok: bool, login: &Login<'_>) -> Result<bool> {
-    // Only root reads /etc/shadow: without it no password can match.
+    // Only root reads /etc/shadow: without it no password can match. An
+    // expired password (or one that must be changed first) does not either,
+    // as qshd cannot have it changed; keys still work.
     let hash = match user.filter(|u| u.switches()) {
         Some(u) => {
             let name = u.name.clone();
-            tokio::task::spawn_blocking(move || super::users::shadow_hash(&name)).await?
+            tokio::task::spawn_blocking(move || super::users::shadow_hash(&name).filter(|_| !super::users::password_expired(&name))).await?
         }
         None => None,
     };
     for _ in 0..PASSWORD_TRIES {
         write_msg(send, &Reply::Password).await?;
         let password = match read_msg::<_, Auth>(recv).await? {
-            Auth::Response(p) => p,
+            Auth::Response(p) => zeroize::Zeroizing::new(p),
             Auth::Done => return Ok(false),
             _ => bail!("unexpected message while asking for a password"),
         };
@@ -278,8 +280,9 @@ pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Optio
             Some(h) if usable_hash(h) || (h.is_empty() && empty_ok) => (h.clone(), true),
             _ => (dummy_hash(), false),
         };
+        // An empty password only with permit_empty_passwords, whatever the hash.
         let ok = password.len() <= MAX_PASSWORD
-            && tokio::task::spawn_blocking(move || password_matches(&hash, &password, empty_ok)).await?
+            && tokio::task::spawn_blocking(move || password_matches(&hash, &password, empty_ok) && (empty_ok || !password.is_empty())).await?
             && known;
         if ok {
             return Ok(true);

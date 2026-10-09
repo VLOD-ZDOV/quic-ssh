@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use device::{open, relay};
+pub use device::{device_name, open, relay};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod device {
@@ -22,6 +22,18 @@ mod device {
     /// Largest packet carried (a jumbo frame and then some).
     const MAX_PACKET: usize = 65536;
 
+    /// The name of device number `unit` (`tun3`, `tap3`, `utun3`).
+    pub fn device_name(ethernet: bool, unit: u32) -> String {
+        let prefix = if cfg!(target_os = "macos") {
+            "utun"
+        } else if ethernet {
+            "tap"
+        } else {
+            "tun"
+        };
+        format!("{prefix}{unit}")
+    }
+
     /// `unit`: the device number (`tun3`), or `None` for the next free one.
     pub fn open(ethernet: bool, unit: Option<u32>) -> Result<(tun_rs::AsyncDevice, String)> {
         let mut b = tun_rs::DeviceBuilder::new().layer(if ethernet {
@@ -30,14 +42,7 @@ mod device {
             tun_rs::Layer::L3
         });
         if let Some(u) = unit {
-            let prefix = if cfg!(target_os = "macos") {
-                "utun"
-            } else if ethernet {
-                "tap"
-            } else {
-                "tun"
-            };
-            b = b.name(format!("{prefix}{u}"));
+            b = b.name(device_name(ethernet, u));
         }
         let dev = b.build_async().context("cannot create the tunnel device")?;
         let name = dev.name().unwrap_or_default();
@@ -54,11 +59,16 @@ mod device {
         let up = {
             let dev = dev.clone();
             async move {
-                let mut buf = vec![0u8; MAX_PACKET];
+                // The length and the packet in one write, sent right away.
+                let mut buf = vec![0u8; 4 + MAX_PACKET];
                 loop {
-                    let n = dev.recv(&mut buf).await?;
-                    send.write_all(&(n as u32).to_be_bytes()).await?;
-                    send.write_all(&buf[..n]).await?;
+                    let n = dev.recv(&mut buf[4..]).await?;
+                    if n == 0 {
+                        continue;
+                    }
+                    buf[..4].copy_from_slice(&(n as u32).to_be_bytes());
+                    send.write_all(&buf[..4 + n]).await?;
+                    send.flush().await?;
                 }
                 #[allow(unreachable_code)]
                 anyhow::Ok(())
@@ -76,6 +86,9 @@ mod device {
                 };
                 if len > MAX_PACKET {
                     bail!("tunnel packet of {len} bytes");
+                }
+                if len == 0 {
+                    continue;
                 }
                 recv.read_exact(&mut buf[..len]).await?;
                 // A packet the device does not take (down, wrong family) is dropped, as by a network.

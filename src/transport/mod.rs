@@ -518,6 +518,25 @@ impl Incoming {
         }
     }
 
+    /// Whether the peer showed that it receives packets at its address (TCP
+    /// did; QUIC only after a Retry).
+    pub fn validated(&self) -> bool {
+        match self {
+            Incoming::Quic(i) => i.remote_address_validated(),
+            Incoming::Tcp(..) => true,
+        }
+    }
+
+    /// Answers with a QUIC Retry, which keeps no state; the client comes
+    /// back with a token that validates its address.
+    pub fn retry(self) {
+        if let Incoming::Quic(i) = self {
+            if let Err(e) = i.retry() {
+                e.into_incoming().ignore();
+            }
+        }
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         match self {
             Incoming::Quic(i) => i.remote_address(),

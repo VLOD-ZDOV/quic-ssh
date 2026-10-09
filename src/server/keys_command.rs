@@ -142,28 +142,33 @@ pub struct KeysCommand<'a> {
 }
 
 impl<'a> KeysCommand<'a> {
-    /// The command for logging in `user`, if one is configured and may run.
-    pub fn new(cfg: &ServerConfig, user: &'a User) -> Option<KeysCommand<'a>> {
-        let argv = split(cfg.authorized_keys_command.as_deref()?);
-        let runner = if nix::unistd::geteuid().is_root() {
-            let Some(name) = &cfg.authorized_keys_command_user else {
-                warn!("authorized_keys_command is set but authorized_keys_command_user is not; not running it");
-                return None;
-            };
-            match User::lookup(name) {
-                Ok(u) if u.uid != 0 => u,
-                Ok(_) => {
-                    warn!("authorized_keys_command_user must not be root; not running the command");
-                    return None;
-                }
-                Err(e) => {
-                    warn!("authorized_keys_command_user {name:?}: {e:#}");
-                    return None;
-                }
-            }
-        } else {
-            user.clone()
+    /// Who runs the command for logging in `user`, if one is configured and
+    /// may run. Looks users up (NSS): call it where blocking is fine.
+    pub fn runner(cfg: &ServerConfig, user: &User) -> Option<User> {
+        cfg.authorized_keys_command.as_ref()?;
+        if !nix::unistd::geteuid().is_root() {
+            return Some(user.clone());
+        }
+        let Some(name) = &cfg.authorized_keys_command_user else {
+            warn!("authorized_keys_command is set but authorized_keys_command_user is not; not running it");
+            return None;
         };
+        match User::lookup(name) {
+            Ok(u) if u.uid != 0 => Some(u),
+            Ok(_) => {
+                warn!("authorized_keys_command_user must not be root; not running the command");
+                None
+            }
+            Err(e) => {
+                warn!("authorized_keys_command_user {name:?}: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// The command for logging in `user`, run by `runner` (see [`KeysCommand::runner`]).
+    pub fn new(cfg: &ServerConfig, user: &'a User, runner: User) -> Option<KeysCommand<'a>> {
+        let argv = split(cfg.authorized_keys_command.as_deref()?);
         let per_key = uses_key(&argv);
         Some(KeysCommand { argv, runner, user, per_key, cache: Mutex::default() })
     }

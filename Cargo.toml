@@ -48,6 +48,7 @@ libc = "0.2"
 vt100 = "0.16.2"
 async-compression = { version = "0.4.50", features = ["tokio", "zstd"] }
 socket2 = { version = "0.6", features = ["all"] }
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 jiff = "0.2.38"

@@ -136,8 +136,26 @@ impl Startups {
         Arc::new(Startups { total, per_ip, counts: Default::default() })
     }
 
+    /// What an address counts as: itself, or its /64 for IPv6 (one host
+    /// usually has the whole /64).
+    fn key(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !(u128::MAX >> 64)).into()),
+            v4 => v4,
+        }
+    }
+
+    /// Half the slots in use, in total or for `ip`: time to make QUIC
+    /// clients prove their address first (a Retry), so that spoofed ones
+    /// cannot hold the slots.
+    fn busy(&self, ip: IpAddr) -> bool {
+        let c = self.counts.lock().unwrap();
+        let n = c.1.get(&Self::key(ip)).copied().unwrap_or(0);
+        2 * c.0 >= self.total || 2 * n >= self.per_ip
+    }
+
     fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<Startup> {
-        let ip = ip.to_canonical();
+        let ip = Self::key(ip);
         let mut c = self.counts.lock().unwrap();
         let n = c.1.get(&ip).copied().unwrap_or(0);
         if c.0 >= self.total || n >= self.per_ip {
@@ -172,7 +190,21 @@ fn refused(cfg: &ServerConfig, who: &crate::config::Login, user: &User) -> Optio
     if user.uid == 0 && cfg.permit_root_login == PermitRootLogin::No {
         return Some("root login is not permitted (permit_root_login)".into());
     }
+    // Like sshd: an account whose shell is missing is not one to log in to.
+    use std::os::unix::fs::PermissionsExt;
+    if !std::fs::metadata(&user.shell).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+        return Some(format!("shell {} does not exist or is not executable", user.shell.display()));
+    }
     cfg.login_refused(who)
+}
+
+/// Why the user of `who` may not log in with `cfg` (that login's
+/// settings), as a login would find: for `qshd -T -C`.
+pub fn login_verdict(cfg: &ServerConfig, who: &crate::config::Login) -> Option<String> {
+    match User::lookup(who.user) {
+        Ok(u) => refused(cfg, who, &u),
+        Err(e) => Some(format!("{e:#}")),
+    }
 }
 
 /// Largest banner sent (like sshd, which reads the whole file, but bounded).
@@ -268,6 +300,14 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
             Err(e) => return Err(e),
         };
         let addr = incoming.remote_addr();
+        // A QUIC Initial's source address proves nothing: under load, the
+        // client must show it gets packets there first (stateless Retry).
+        let validated = incoming.validated();
+        if !validated && startups.busy(addr.ip()) {
+            debug!("{addr}: asking for a QUIC retry");
+            incoming.retry();
+            continue;
+        }
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             warn!("connection limit reached, dropping {addr}");
             incoming.reject();
@@ -301,7 +341,10 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
                 }
                 Err(e) => {
                     debug!("{addr}: handshake failed: {e:#}");
-                    state.penalties.record(addr.ip(), Outcome::NoAuth);
+                    // Not for an address that may be someone else's (a spoofed QUIC Initial).
+                    if validated {
+                        state.penalties.record(addr.ip(), Outcome::NoAuth);
+                    }
                 }
             }
             drop(permit);
@@ -311,6 +354,7 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
 
 /// Serves one connection; `outcome` tells how its login went (for penalties).
 async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outcome: &mut Outcome) -> Result<()> {
+    let started = tokio::time::Instant::now();
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let (mut send, mut recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -335,10 +379,16 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     let global = state.cfg();
     let looked_up = if valid_user_name(&name) {
         let (n, groups) = (name.clone(), global.needs_groups());
-        tokio::task::spawn_blocking(move || User::lookup(&n).map(|u| {
+        tokio::task::spawn_blocking(move || {
+            let u = User::lookup(&n)?;
+            // Policies match the name as given: it must be the account's own
+            // (a case-insensitive directory finds "ALICE" for "alice").
+            if u.name != n {
+                bail!("the account's name is {:?}", u.name);
+            }
             let names = if groups { u.group_names() } else { Vec::new() };
-            (u, names)
-        }))
+            Ok((u, names))
+        })
         .await?
     } else {
         Err(anyhow::anyhow!("invalid user name"))
@@ -370,10 +420,12 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
             write_msg(&mut send, &Reply::Banner(text)).await?;
         }
     }
+    // For the whole login, like sshd's LoginGraceTime (not for each step).
     let grace = match cfg.login_grace_time {
         0 => Duration::MAX,
         s => Duration::from_secs(s),
     };
+    let left = || grace.saturating_sub(started.elapsed());
     if pairing {
         match user {
             // A pairing that does not add a key counts as a failed login,
@@ -396,7 +448,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     }
 
     // An unknown user goes through the same steps with no keys, so names cannot be probed.
-    let (entries, cas, revoked, principals) = {
+    let (entries, cas, revoked, principals, runner) = {
         let (cfg, user) = (cfg.clone(), user.clone());
         tokio::task::spawn_blocking(move || {
             let entries = user.as_ref().map(|u| auth::authorized_entries(&cfg, u)).unwrap_or_default();
@@ -404,11 +456,13 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
                 Some(u) => auth::authorized_principals(&cfg, u),
                 None => cfg.authorized_principals_file.as_ref().map(|_| Vec::new()),
             };
-            (entries, auth::trusted_cas(&cfg), revoked::Revocation::load(cfg.revoked_keys.as_deref()), principals)
+            // KeysCommand looks its user up (NSS) too.
+            let runner = user.as_ref().and_then(|u| keys_command::KeysCommand::runner(&cfg, u));
+            (entries, auth::trusted_cas(&cfg), revoked::Revocation::load(cfg.revoked_keys.as_deref()), principals, runner)
         })
         .await?
     };
-    let command = user.as_ref().and_then(|u| keys_command::KeysCommand::new(&cfg, u));
+    let command = user.as_ref().zip(runner).and_then(|(u, runner)| keys_command::KeysCommand::new(&cfg, u, runner));
     let checker = auth::Checker {
         entries: &entries,
         cas: &cas,
@@ -420,7 +474,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     let mut granted = checker.check(&auth::tls_key(key)).await.ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
     if granted.is_none() && version >= 4 {
         let attempt = auth::key_auth(&mut send, &mut recv, &checker, cfg.max_auth_tries);
-        granted = match tokio::time::timeout(grace, attempt).await {
+        granted = match tokio::time::timeout(left(), attempt).await {
             Ok(result) => result?,
             Err(_) => {
                 *outcome = Outcome::GraceExceeded;
@@ -431,9 +485,11 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     // Passwords, if allowed, when no key worked (never for root unless
     // permit_root_login = "yes"). Unknown users are asked too.
     if granted.is_none() && version >= 6 && cfg.password_authentication {
+        // Guessing passwords counts as a failed login even if the client hangs up midway.
+        *outcome = Outcome::AuthFailed;
         let root_ok = user.as_ref().is_none_or(|u| u.uid != 0) || cfg.permit_root_login == PermitRootLogin::Yes;
         let attempt = auth::password_auth(&mut send, &mut recv, user.as_ref().filter(|_| root_ok), cfg.permit_empty_passwords, &checker.login);
-        match tokio::time::timeout(grace, attempt).await {
+        match tokio::time::timeout(left(), attempt).await {
             Ok(Ok(true)) => granted = Some((crate::authkeys::Grant::default(), "password".to_string())),
             Ok(Ok(false)) => {}
             Ok(Err(e)) => return Err(e),
@@ -467,13 +523,15 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
             return Ok(());
         }
     }
+    // Likewise for one-time codes.
+    *outcome = Outcome::AuthFailed;
     let second = async {
         if resume.is_some() {
             return Ok(Ok(()));
         }
         auth::second_factor(&mut send, &mut recv, &user, cfg.totp, version, &state.totp_used).await
     };
-    match tokio::time::timeout(grace, second).await {
+    match tokio::time::timeout(left(), second).await {
         Err(_) => {
             *outcome = Outcome::GraceExceeded;
             bail!("login took too long");
@@ -592,7 +650,10 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     };
     let limits = &grant.restrictions;
     // Sessions hold one of the connection's slots while they run.
-    let _slot = if matches!(request, Request::Exec { .. } | Request::Persistent { .. } | Request::Resume { .. } | Request::Subsystem { .. }) {
+    let _slot = if matches!(
+        request,
+        Request::Exec { .. } | Request::Persistent { .. } | Request::Resume { .. } | Request::Subsystem { .. } | Request::Tunnel { .. }
+    ) {
         match sessions.clone().try_acquire_owned() {
             Ok(slot) => Some(slot),
             Err(_) => {
@@ -738,6 +799,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.local_stream_forwarding() || limits.no_port_forwarding {
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
             }
+            if !limits.permit_open.is_empty() || cfg.limits_open() {
+                return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed with permit_open/permitopen".into())).await;
+            }
             if user.switches() {
                 return forward_as_user(send, recv, user, &["internal-connect-unix", &path]).await;
             }
@@ -754,6 +818,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         Request::RemoteForwardStreamLocal { path } => {
             if !cfg.remote_stream_forwarding() || limits.no_port_forwarding {
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
+            }
+            if !limits.permit_listen.is_empty() || cfg.limits_listen() {
+                return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed with permit_listen/permitlisten".into())).await;
             }
             remote_forward_local(send, recv, conn.clone(), user, cfg, &path).await
         }
@@ -931,12 +998,31 @@ async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<t
     }
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     let mut child = user
-        .helper(&["internal-listen-unix", path, &mask, unlink])?
+        .confined_helper(&["internal-listen-unix", path, &mask, unlink])?
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stderr(Stdio::piped())
         .spawn()?;
-    let received = tokio::task::spawn_blocking(move || receive_fd(&ours)).await?;
+    // Waited for without a thread of its own, and not forever: the helper
+    // runs as the user, who can stop it.
+    ours.set_nonblocking(true)?;
+    let ours = tokio::net::UnixStream::from_std(ours)?;
+    let receive = async {
+        loop {
+            ours.readable().await?;
+            match ours.try_io(tokio::io::Interest::READABLE, || receive_fd(&ours)) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    };
+    let received = match tokio::time::timeout(CONNECT_TIMEOUT, receive).await {
+        Ok(r) => r.map_err(anyhow::Error::from).and_then(|fd| fd.context("no socket from the helper")),
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(anyhow::anyhow!("the helper did not answer"))
+        }
+    };
     let status = child.wait().await?;
     match received {
         Ok(fd) => {
@@ -955,8 +1041,9 @@ async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<t
     }
 }
 
-/// Takes a descriptor sent with SCM_RIGHTS (see `helpers::listen_unix`).
-fn receive_fd(sock: &std::os::unix::net::UnixStream) -> Result<std::os::fd::OwnedFd> {
+/// Takes a descriptor sent with SCM_RIGHTS (see `helpers::listen_unix`);
+/// `None` if the helper sent none.
+fn receive_fd(sock: impl std::os::fd::AsFd) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
     let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -971,11 +1058,11 @@ fn receive_fd(sock: &std::os::unix::net::UnixStream) -> Result<std::os::fd::Owne
             if let Some(fd) = fds.next() {
                 // Where the flag above does not exist: not for programs qshd starts.
                 nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
-                return Ok(fd);
+                return Ok(Some(fd));
             }
         }
     }
-    bail!("no socket from the helper")
+    Ok(None)
 }
 
 /// `-R` from a Unix socket: like [`remote_forward`], on a socket file of the user's.
@@ -1015,6 +1102,15 @@ async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<
 /// `-w`: a tunnel device here, its packets to and from the client.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn tunnel(mut send: SendHalf, recv: RecvHalf, conn: &Arc<Conn>, user: &User, ethernet: bool, unit: Option<u32>) -> Result<()> {
+    // qshd opens devices as root: other users get new ones only, not one
+    // that exists (another user's persistent device, say).
+    if user.uid != 0 {
+        if let Some(name) = unit.map(|u| crate::tunnel::device_name(ethernet, u)) {
+            if nix::net::if_::if_nametoindex(name.as_str()).is_ok() {
+                return write_msg(&mut send, &Reply::Err(format!("tunnel device {name} exists already"))).await;
+            }
+        }
+    }
     let (dev, name) = match crate::tunnel::open(ethernet, unit) {
         Ok(d) => d,
         Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
@@ -1059,12 +1155,13 @@ async fn speed_up(mut send: SendHalf, mut recv: RecvHalf, bytes: u64) -> Result<
     Ok(())
 }
 
-/// Forwarding through `qshd internal-connect` (or `internal-connect-unix`),
-/// which runs as the user; `args` is the helper and its arguments.
+/// Forwarding through `qshd internal-connect` (or `internal-connect-unix`,
+/// in the user's chroot), which runs as the user; `args` is the helper and
+/// its arguments.
 async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, args: &[&str]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-    let mut child = user
-        .helper(args)?
+    let mut helper = if args.first() == Some(&"internal-connect-unix") { user.confined_helper(args)? } else { user.helper(args)? };
+    let mut child = helper
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1072,7 +1169,7 @@ async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, args: 
     // The helper prints "ok" once connected; the rest of stdout is the socket's data.
     let mut out = BufReader::new(child.stdout.take().expect("piped"));
     let mut status = String::new();
-    out.read_line(&mut status).await?;
+    (&mut out).take(64).read_line(&mut status).await?;
     if status.trim() != "ok" {
         let mut err = String::new();
         if let Some(e) = child.stderr.take() {
@@ -1087,19 +1184,24 @@ async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, args: 
     result
 }
 
-/// Runs a helper as the user and returns its trimmed stdout, or its stderr as the error.
+/// Runs a helper as the user and returns its trimmed stdout, or its stderr
+/// as the error (at most 4 KiB of each).
 async fn run_helper(user: &User, args: &[&str]) -> Result<String> {
-    let out = user
-        .helper(args)?
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    use tokio::io::AsyncReadExt;
+    let mut child = user.helper(args)?.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let (mut stdout, mut stderr) = (child.stdout.take().expect("piped").take(4096), child.stderr.take().expect("piped").take(4096));
+    let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+    a?;
+    b?;
+    if out.len() == 4096 || err.len() == 4096 {
+        let _ = child.start_kill();
+    }
+    let status = child.wait().await?;
+    if status.success() {
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
     } else {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim())
+        bail!("{}", String::from_utf8_lossy(&err).trim())
     }
 }
 
@@ -1171,5 +1273,14 @@ mod tests {
         assert!(s.try_acquire(b).is_none(), "total limit");
         drop(a1);
         assert!(s.try_acquire(b).is_some(), "slot released on drop");
+
+        // IPv6 counts per /64; half the slots in use asks for a Retry.
+        let s = Startups::new(10, 4);
+        let c: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!s.busy(c));
+        let _c1 = s.try_acquire(c).unwrap();
+        let _c2 = s.try_acquire("2001:db8::2".parse().unwrap()).unwrap();
+        assert!(s.busy("2001:db8::3".parse().unwrap()), "same /64");
+        assert!(!s.busy("2001:db8:1::1".parse().unwrap()));
     }
 }

@@ -117,11 +117,14 @@ pub fn close_inherited_fds() {
     #[cfg(unix)]
     {
         let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        let fds: Vec<std::os::fd::RawFd> = entries
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|&fd| fd > 2)
-            .collect();
+        let fds: Vec<std::os::fd::RawFd> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).filter(|&fd| fd > 2).collect(),
+            // No /proc (a chroot, a container): every possible descriptor.
+            Err(_) => {
+                let (soft, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap_or((1024, 1024));
+                (3..soft.min(65536) as std::os::fd::RawFd).collect()
+            }
+        };
         // The listing's own descriptor is closed by now; closing it again fails harmlessly.
         for fd in fds {
             let _ = nix::unistd::close(fd);
