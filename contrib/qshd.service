@@ -6,7 +6,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+ExecStartPre=/usr/local/bin/qshd -t
 ExecStart=/usr/local/bin/qshd serve
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 

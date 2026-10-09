@@ -359,7 +359,7 @@ upload        70.1 Mbit/s  (41.8 MiB in 5.0 s)
 listen = "[::]:4422"            # UDP и TCP; если IPv6 выключен, используется 0.0.0.0
 # host_key = "/etc/qsh/host_ed25519"
 use_ssh_authorized_keys = true  # принимать и ~/.ssh/authorized_keys
-allow_tcp_forwarding = true
+allow_tcp_forwarding = true     # или "no", "local" (только -L/-D/-W), "remote" (только -R)
 max_connections = 256
 max_startups = 64               # одновременно неаутентифицированных подключений (как MaxStartups у sshd)
 max_startups_per_ip = 8         # ... с одного IP
@@ -376,11 +376,47 @@ session_timeout = 3600          # сколько секунд хранить о�
 # authorized_keys_command = "/usr/local/bin/get-keys %u"   # дополнительные ключи от программы, как в sshd
 # authorized_keys_command_user = "nobody"                 # от этого пользователя она запускается (обязательно под root)
 
+# Кому можно входить (проверяется в этом порядке, как в sshd): шаблоны, `user@адрес` с CIDR
+# deny_users = ["guest"]
+# allow_users = ["alice", "bob@192.0.2.0/24"]
+# deny_groups = ["nossh"]
+# allow_groups = ["staff"]
+permit_root_login = "prohibit-password"   # = "yes" (паролей нет); "no"; "forced-commands-only"
+login_grace_time = 120          # секунд на вход; 0 = без ограничения
+# banner = "/etc/issue.net"     # показывается до входа
+print_motd = true               # /etc/motd для входных оболочек (~/.hushlogin выключает)
+print_last_log = true           # «Last login: ...» (системный режим, из lastlog или wtmp)
+permit_user_rc = true           # запускать ~/.ssh/rc (или /etc/ssh/sshrc) перед сессией
+max_sessions = 10               # одновременных сессий на соединение
+permit_tty = true
+accept_env = ["LANG", "LC_*", "COLORTERM"]   # переменные, которые может задать клиент
+# force_command = "/usr/local/bin/menu"   # заменяет любую команду; исходная — в SSH_ORIGINAL_COMMAND
+# permit_open = ["db.internal:5432"]      # куда можно -L/-D/-W; "none" — никуда
+# permit_listen = ["8080", "localhost:9000"]   # где может слушать -R
+disable_forwarding = false      # true: никаких пробросов портов и агента
+client_alive_interval = 0       # секунд между проверками молчащего клиента; 0 = встроенная (~60 с)
+client_alive_count_max = 3
+
+[set_env]                       # переменные для каждой сессии
+# TZ = "UTC"
+
 [subsystems]                    # для `qsh -s` и sftp; запускаются как `$SHELL -c команда`
 # sftp = "/usr/lib/openssh/sftp-server"   # находится сам, если установлен
+
+# Настройки для части входов, как Match в sshd (user, group, address; должны выполняться все заданные).
+# Если подходят несколько блоков, побеждает первый, где настройка задана; "none" убирает значение.
+# [[match]]
+# group = "sftponly"
+# force_command = "/usr/lib/openssh/sftp-server"
+# allow_tcp_forwarding = false
+# permit_tty = false
 ```
 
 Обратные пробросы (`-R`) слушают там, где разрешает `gateway_ports`; все, кроме root, не могут слушать порты ниже 1024. `allow_tcp_forwarding = false` выключает `-L`, `-R`, `-D` и `-W`.
+
+**Проверка и перечитывание.** `qshd -t` проверяет конфиг и ключ хоста; `qshd -T` печатает действующие настройки, а `qshd -T -C user=alice,addr=192.0.2.7` — настройки для одного входа (с учётом `[[match]]` и того, можно ли пользователю войти вообще). По SIGHUP (`systemctl reload qshd`) qshd перечитывает конфиг: новые входы получают новые настройки, работающие сессии сохраняют свои. О сломанном конфиге пишется в лог, и остаётся старый. Изменения `listen`, `tcp`, ключа хоста, лимитов подключений, `session_timeout` и `client_alive_*` вступают в силу после перезапуска.
+
+Пользователи, которых не пускают `deny_users`/`allow_users`/`deny_groups`/`allow_groups` или `permit_root_login = "no"`, обрабатываются как несуществующие: они получают тот же ответ «access denied», так что по нему не узнать, какие аккаунты есть.
 
 Ключи пользователя хранятся в `~/.config/qsh/authorized_keys` и (если включено) в `~/.ssh/authorized_keys`. Подходят все типы ключей, кроме DSA и RSA короче 2048 бит. Соблюдаются такие опции:
 
@@ -476,7 +512,7 @@ python3 bench/bench.py
 
 ## Ограничения
 
-- Нет PAM (`pam_access`, `pam_limits`) и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
+- Нет PAM (`pam_limits`; вместо `pam_access` — `allow_users`/`allow_groups`) и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
 - Нет X11 и туннелей (`-w`).
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.

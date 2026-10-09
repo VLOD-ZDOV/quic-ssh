@@ -44,6 +44,34 @@ pub fn host_matches<S: AsRef<str>>(patterns: &[S], host: &str) -> bool {
     matched
 }
 
+/// Like [`host_matches`], but case-sensitive (user and group names).
+pub fn name_matches<S: AsRef<str>>(patterns: &[S], name: &str) -> bool {
+    let mut matched = false;
+    for p in patterns {
+        let p = p.as_ref();
+        if let Some(neg) = p.strip_prefix('!') {
+            if wildcard(neg, name) {
+                return false;
+            }
+        } else if wildcard(p, name) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// `host:port`, `[v6]:port` or (for listeners) just `port`; `*` matches any port or host.
+pub fn endpoint_matches(pattern: &str, host: &str, port: u16, listen: bool) -> bool {
+    let (p_host, p_port) = match pattern.rsplit_once(':') {
+        Some((h, p)) => (h.trim_start_matches('[').trim_end_matches(']'), p),
+        None if listen => ("", pattern),
+        None => return false,
+    };
+    let port_ok = p_port == "*" || p_port.parse::<u16>().ok() == Some(port);
+    let host_ok = p_host == "*" || p_host.eq_ignore_ascii_case(host) || (listen && p_host.is_empty() && matches!(host, "" | "localhost"));
+    port_ok && host_ok
+}
+
 /// Whether `ip` is inside `cidr` (`192.0.2.0/24`, `2001:db8::/32`, or a plain address).
 pub fn cidr_contains(cidr: &str, ip: IpAddr) -> Option<bool> {
     let (addr, bits) = match cidr.split_once('/') {

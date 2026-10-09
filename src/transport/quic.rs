@@ -18,14 +18,20 @@ pub struct QuicConn {
 const RECEIVE_WINDOW: u32 = 32 << 20;
 
 /// `server`: start with the limits for a client that has not logged in
-/// yet (see [`QuicConn::logged_in`]).
-fn transport_config(server: bool) -> Arc<TransportConfig> {
+/// yet (see [`QuicConn::logged_in`]). `alive`: the server's probe
+/// interval and how many probes may go unanswered.
+fn transport_config(server: bool, alive: Option<super::Alive>) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     let (streams, window) = if server { (super::PREAUTH_STREAMS, super::PREAUTH_WINDOW) } else { (super::MAX_STREAMS, RECEIVE_WINDOW) };
     t.max_concurrent_bidi_streams(VarInt::from_u32(streams));
     t.max_concurrent_uni_streams(VarInt::from_u32(0));
-    t.keep_alive_interval(Some(super::KEEPALIVE));
-    t.max_idle_timeout(Some(super::IDLE_TIMEOUT.try_into().expect("valid idle timeout")));
+    let (keepalive, idle) = match alive {
+        Some(a) => (a.interval, a.interval.saturating_mul(a.count.max(1))),
+        None => (super::KEEPALIVE, super::IDLE_TIMEOUT),
+    };
+    t.keep_alive_interval(Some(keepalive));
+    // QUIC allows idle timeouts up to 2^62 ms; ours are far below.
+    t.max_idle_timeout(idle.try_into().ok());
     // Larger windows than the defaults so bulk copies are not window-limited on long links.
     t.stream_receive_window(VarInt::from_u32(8 << 20));
     t.receive_window(VarInt::from_u32(window));
@@ -36,10 +42,10 @@ fn transport_config(server: bool) -> Arc<TransportConfig> {
     Arc::new(t)
 }
 
-pub fn server_endpoint(tls: Arc<rustls::ServerConfig>, addr: SocketAddr) -> Result<Endpoint> {
+pub fn server_endpoint(tls: Arc<rustls::ServerConfig>, addr: SocketAddr, alive: Option<super::Alive>) -> Result<Endpoint> {
     let crypto = QuicServerConfig::try_from(tls)?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    cfg.transport_config(transport_config(true));
+    cfg.transport_config(transport_config(true, alive));
     Ok(Endpoint::server(cfg, addr)?)
 }
 
@@ -65,7 +71,7 @@ pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr, local: Op
     let bind = local.unwrap_or(any);
     let endpoint = Endpoint::client(bind)?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    cfg.transport_config(transport_config(false));
+    cfg.transport_config(transport_config(false, None));
     let conn = endpoint.connect_with(cfg, addr, crate::tls::SERVER_NAME)?.await?;
     finish(Some(endpoint), conn)
 }

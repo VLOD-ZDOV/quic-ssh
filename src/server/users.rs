@@ -50,6 +50,56 @@ fn group_list(_name: &str, _gid: Gid) -> Result<Vec<libc::gid_t>> {
     Ok(Vec::new())
 }
 
+/// What `internal-become` does before it runs a session's program, as the
+/// user: show the last login and /etc/motd (unless `~/.hushlogin` exists),
+/// then run `~/.ssh/rc` or `/etc/ssh/sshrc`, like sshd.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prelude {
+    pub rc: bool,
+    pub motd: bool,
+    /// "Last login: ..." line.
+    pub last_login: Option<String>,
+}
+
+impl Prelude {
+    pub fn is_empty(&self) -> bool {
+        *self == Prelude::default()
+    }
+
+    /// One argument for `internal-become` (`-` for nothing).
+    fn encode(&self) -> String {
+        if self.is_empty() {
+            return "-".into();
+        }
+        let mut items = Vec::new();
+        if self.rc {
+            items.push("rc".to_string());
+        }
+        if self.motd {
+            items.push("motd".to_string());
+        }
+        if let Some(l) = &self.last_login {
+            items.push(format!("last={l}"));
+        }
+        encode_args(&items)
+    }
+
+    pub fn decode(arg: &str) -> Option<Prelude> {
+        let mut p = Prelude::default();
+        if arg == "-" {
+            return Some(p);
+        }
+        for item in decode_args(arg)? {
+            match item.as_str() {
+                "rc" => p.rc = true,
+                "motd" => p.motd = true,
+                _ => p.last_login = Some(item.strip_prefix("last=")?.to_string()),
+            }
+        }
+        Some(p)
+    }
+}
+
 /// A user sessions run as.
 #[derive(Clone, Debug)]
 pub struct User {
@@ -93,6 +143,17 @@ impl User {
         })
     }
 
+    /// Names of the user's groups (for allow_groups and `[[match]]`).
+    /// Blocks on NSS lookups.
+    pub fn group_names(&self) -> Vec<String> {
+        let gid = Gid::from_raw(self.gid);
+        let mut gids = if self.groups.is_empty() { group_list(&self.name, gid).unwrap_or_default() } else { self.groups.clone() };
+        if !gids.contains(&self.gid) {
+            gids.insert(0, self.gid);
+        }
+        gids.into_iter().filter_map(|g| nix::unistd::Group::from_gid(Gid::from_raw(g)).ok().flatten()).map(|g| g.name).collect()
+    }
+
     /// True when the server runs as root and switches to this user.
     pub fn switches(&self) -> bool {
         self.switch
@@ -126,8 +187,10 @@ impl User {
     /// process of its own and then runs it. `arg0` replaces the program's
     /// argv[0] (a login shell's `-bash`); `tty` hands the terminal on stdin
     /// to the user.
-    fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
-        if !self.switch {
+    /// `prelude`: for sessions; it needs `internal-become` even when the
+    /// server does not switch users.
+    fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool, prelude: &Prelude) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+        if !self.wraps(prelude) {
             return (program.to_owned(), Vec::new());
         }
         let exe = self_program();
@@ -140,23 +203,30 @@ impl User {
             self.home.clone().into_os_string(),
             if tty { "tty" } else { "-" }.into(),
             arg0.unwrap_or("").into(),
+            prelude.encode().into(),
             "--".into(),
         ];
         args.push(program.to_owned());
         (exe.into_os_string(), args)
     }
 
-    /// A command that runs as this user with a clean environment in their home.
-    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-        self.command_as(program, None)
+    /// Whether programs start through `internal-become`.
+    fn wraps(&self, prelude: &Prelude) -> bool {
+        self.switch || !prelude.is_empty()
     }
 
-    /// Like [`User::command`], with `arg0` as the program's argv[0].
-    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>) -> tokio::process::Command {
-        let (exe, args) = self.launch(program.as_ref(), arg0, false);
+    /// A command that runs as this user with a clean environment in their home.
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+        self.command_as(program, None, &Prelude::default())
+    }
+
+    /// Like [`User::command`], with `arg0` as the program's argv[0], for a
+    /// session with `prelude`.
+    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, prelude: &Prelude) -> tokio::process::Command {
+        let (exe, args) = self.launch(program.as_ref(), arg0, false, prelude);
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args).env_clear().envs(self.env()).kill_on_drop(true);
-        if self.switch {
+        if self.wraps(prelude) {
             name_self(&mut cmd);
         } else {
             cmd.current_dir(&self.home);
@@ -168,10 +238,10 @@ impl User {
     }
 
     /// A command on a terminal, as this user (the terminal is handed to them).
-    pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>) -> pty_process::Command {
-        let (exe, args) = self.launch(program.as_ref(), arg0, true);
+    pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>, prelude: &Prelude) -> pty_process::Command {
+        let (exe, args) = self.launch(program.as_ref(), arg0, true, prelude);
         let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(env).kill_on_drop(true);
-        if self.switch {
+        if self.wraps(prelude) {
             if let Ok(p) = exe_path() {
                 cmd = cmd.arg0(p);
             }

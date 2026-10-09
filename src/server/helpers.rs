@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
-pub use super::users::{decode_args, BECOME, HELPER_ARGS, HELPER_FROM_ENV};
+pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV};
 
 /// Copies `r` to `w` with plain reads and writes. Not `io::copy`: between a
 /// socket or file and a pipe it uses `splice()`, which keeps the pipe locked
@@ -140,25 +140,32 @@ pub fn tar(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// `qshd internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]`,
-/// run as root (see `User::launch`): hands the terminal on stdin to the user
+/// `qshd internal-become UID GID GROUPS HOME TTY ARG0 PRELUDE -- PROGRAM [ARGS...]`
+/// (see `User::launch`). As root: hands the terminal on stdin to the user
 /// if TTY is `tty` (group `tty`, mode 0620, like sshd), switches to the
-/// user's groups, group and user, changes to HOME (or `/`), and runs PROGRAM
-/// with ARG0 (if not empty) as its argv[0]. Nothing here can raise
-/// privileges: as anyone but root, switching users fails.
+/// user's groups, group and user. Then changes to HOME (or `/`), does what
+/// PRELUDE asks for (see [`Prelude`]) and runs PROGRAM with ARG0 (if not
+/// empty) as its argv[0]. Nothing here can raise privileges: as anyone but
+/// root, it only runs as the user it already is.
 pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     use nix::sys::stat::{fchmod, Mode};
     use nix::unistd::{fchown, Gid, Group, Uid};
     use std::os::unix::process::CommandExt;
-    let [uid, gid, groups, home, tty, arg0, dashes, program, rest @ ..] = args else {
-        bail!("usage: internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]")
+    let [uid, gid, groups, home, tty, arg0, prelude, dashes, program, rest @ ..] = args else {
+        bail!("usage: internal-become UID GID GROUPS HOME TTY ARG0 PRELUDE -- PROGRAM [ARGS...]")
     };
     if dashes != "--" {
         bail!("bad arguments");
     }
+    let prelude = Prelude::decode(prelude).context("bad prelude")?;
     crate::platform::close_inherited_fds();
     let (uid, gid) = (Uid::from_raw(uid.parse()?), Gid::from_raw(gid.parse()?));
-    if tty == "tty" {
+    // Without root, only for the user qshd runs as (sessions with a prelude).
+    let switch = nix::unistd::geteuid().is_root();
+    if !switch && uid != nix::unistd::geteuid() {
+        bail!("cannot switch users without root");
+    }
+    if switch && tty == "tty" {
         let (group, mode) = match Group::from_name("tty") {
             Ok(Some(g)) => (Some(g.gid), 0o620),
             _ => (None, 0o600),
@@ -175,7 +182,7 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
         cmd.arg0(arg0);
     }
     #[cfg(not(target_vendor = "apple"))]
-    {
+    if switch {
         let groups: Vec<Gid> = match groups.as_str() {
             "-" => Vec::new(),
             list => list.split(',').map(|g| g.parse().map(Gid::from_raw)).collect::<Result<_, _>>()?,
@@ -187,19 +194,60 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
         if !uid.is_root() && nix::unistd::setuid(Uid::from_raw(0)).is_ok() {
             bail!("failed to drop privileges");
         }
-        if std::env::set_current_dir(home).is_err() {
-            std::env::set_current_dir("/")?;
-        }
     }
     // macOS: the system drops root's supplementary groups when it switches
-    // the user (membership is looked up dynamically there).
+    // the user (membership is looked up dynamically there); the rc file
+    // below runs as the user the same way.
+    #[cfg(target_vendor = "apple")]
+    let as_user = |c: &mut std::process::Command| {
+        if switch {
+            c.uid(uid.as_raw()).gid(gid.as_raw());
+        }
+    };
     #[cfg(target_vendor = "apple")]
     {
         let _ = groups;
-        cmd.uid(uid.as_raw()).gid(gid.as_raw());
-        cmd.current_dir(if std::path::Path::new(home).is_dir() { home.as_str() } else { "/" });
+        as_user(&mut cmd);
     }
+    #[cfg(not(target_vendor = "apple"))]
+    let as_user = |_: &mut std::process::Command| {};
+    let home = Path::new(home);
+    if std::env::set_current_dir(home).is_err() {
+        std::env::set_current_dir("/")?;
+    }
+    run_prelude(&prelude, home, as_user);
     Err(anyhow::Error::from(cmd.exec()).context(format!("cannot run {program}")))
+}
+
+/// What sshd does before a session's program: the last login and the
+/// message of the day for a login shell (both skipped with `~/.hushlogin`),
+/// then the user's `~/.ssh/rc`, or else the system's `/etc/ssh/sshrc`,
+/// through `/bin/sh` and with the session's output.
+fn run_prelude(prelude: &Prelude, home: &Path, as_user: impl Fn(&mut std::process::Command)) {
+    if (prelude.motd || prelude.last_login.is_some()) && !home.join(".hushlogin").exists() {
+        let mut out = io::stdout();
+        if let Some(last) = &prelude.last_login {
+            let _ = writeln!(out, "{last}");
+        }
+        if prelude.motd {
+            if let Ok(f) = fs::File::open("/etc/motd") {
+                let _ = pump(f.take(64 * 1024), &mut out);
+            }
+        }
+        let _ = out.flush();
+    }
+    if prelude.rc {
+        let user_rc = home.join(".ssh/rc");
+        let rc = if user_rc.is_file() { Some(user_rc) } else { Some(PathBuf::from("/etc/ssh/sshrc")).filter(|p| p.is_file()) };
+        if let Some(rc) = rc {
+            let mut sh = std::process::Command::new("/bin/sh");
+            sh.arg(&rc).stdin(std::process::Stdio::null());
+            as_user(&mut sh);
+            if let Err(e) = sh.status() {
+                eprintln!("qshd: {}: {e}", rc.display());
+            }
+        }
+    }
 }
 
 /// Prints and consumes the pending pairing code.

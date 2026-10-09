@@ -169,7 +169,7 @@ impl Sessions {
         }
         let env = session.env(user);
         let spec = session.pty.clone().expect("persistent sessions have a terminal");
-        let (mut child, pty, tty) = match exec::spawn_pty(user, session.command.take(), env, &spec) {
+        let (mut child, pty, tty) = match exec::spawn_pty(user, session.command.take(), env, &spec, &session.prelude) {
             Ok(x) => x,
             Err(e) => {
                 self.map.lock().unwrap().release(user.uid);

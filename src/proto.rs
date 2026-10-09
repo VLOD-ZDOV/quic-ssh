@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -50,6 +50,10 @@ pub enum Reply {
     Prompt { text: String, echo: bool },
     /// Answer to `Request::Persistent` / `Request::Resume`: the session's token.
     Session { token: Vec<u8> },
+    // --- protocol version 6 ---
+    /// Text to show before logging in (the server's `banner`); the login
+    /// goes on with the next reply.
+    Banner(String),
 }
 
 /// Client messages on the hello stream while logging in (protocol version 4).

@@ -62,6 +62,15 @@ pub fn login(user: &str, tty: &str, pid: u32, host: IpAddr) -> LoginRecord {
     record
 }
 
+/// "Last login: Thu Oct  9 12:00:00 2026 from 192.0.2.1", as sshd shows
+/// it, from lastlog or else wtmp; `None` without an earlier login there.
+pub fn last_login(uid: u32, user: &str) -> Option<String> {
+    let (secs, host) = imp::last(uid, user)?;
+    let zone = jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC);
+    let when = jiff::Timestamp::from_second(secs).ok()?.to_zoned(zone).strftime("%a %b %e %H:%M:%S %Y").to_string();
+    Some(if host.is_empty() { format!("Last login: {when}") } else { format!("Last login: {when} from {host}") })
+}
+
 impl Drop for LoginRecord {
     fn drop(&mut self) {
         send(Job { line: std::mem::take(&mut self.line), pid: self.pid, who: None, at: now() });
@@ -198,6 +207,49 @@ mod imp {
         f.write_all(&rec)
     }
 
+    /// Reads a NUL-padded text field.
+    fn text(field: &[u8]) -> String {
+        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).chars().filter(|c| !c.is_control()).collect()
+    }
+
+    fn get_int(buf: &[u8], at: usize, width: usize) -> i64 {
+        if width == 8 {
+            i64::from_ne_bytes(buf[at..at + 8].try_into().unwrap())
+        } else {
+            i32::from_ne_bytes(buf[at..at + 4].try_into().unwrap()) as i64
+        }
+    }
+
+    /// How much of wtmp's end is searched for a login.
+    const WTMP_TAIL: u64 = 4 << 20;
+
+    /// The user's last login (time, host): lastlog's entry, or else the
+    /// newest login of theirs in the end of wtmp.
+    pub(super) fn last(uid: u32, user: &str) -> Option<(i64, String)> {
+        let from_lastlog = || -> io::Result<Option<(i64, String)>> {
+            let mut f = File::open(LASTLOG)?;
+            let mut rec = [0u8; LASTLOG_SIZE];
+            f.seek(SeekFrom::Start(uid as u64 * LASTLOG_SIZE as u64))?;
+            f.read_exact(&mut rec)?;
+            let t = get_int(&rec, 0, LASTLOG_TIME);
+            Ok((t > 0).then(|| (t, text(&rec[LASTLOG_TIME + 32..]))))
+        };
+        if let Ok(Some(found)) = from_lastlog() {
+            return Some(found);
+        }
+        let mut f = File::open(WTMP).ok()?;
+        let len = f.metadata().ok()?.len();
+        let start = len.saturating_sub(WTMP_TAIL) / SIZE as u64 * SIZE as u64;
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut data = Vec::new();
+        f.read_to_end(&mut data).ok()?;
+        data.as_chunks::<SIZE>().0.iter().rev().find_map(|e| {
+            let kind = i16::from_ne_bytes([e[0], e[1]]);
+            (kind == USER_PROCESS && text(&e[USER]) == user).then(|| (get_int(e, TV, TV_FIELD), text(&e[HOST])))
+        })
+    }
+
     pub(super) fn write(job: &Job) -> io::Result<()> {
         let who = job.who.as_ref().map(|(u, h)| (u.as_str(), *h));
         let rec = entry(&job.line, job.pid, who, job.at);
@@ -218,6 +270,10 @@ mod imp {
     pub(super) fn write(job: &super::Job) -> std::io::Result<()> {
         let _ = (job.pid, &job.who, job.at);
         Ok(())
+    }
+
+    pub(super) fn last(_uid: u32, _user: &str) -> Option<(i64, String)> {
+        None
     }
 }
 

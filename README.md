@@ -359,7 +359,7 @@ The config file is optional. Defaults:
 listen = "[::]:4422"            # UDP and TCP; falls back to 0.0.0.0 if IPv6 is disabled
 # host_key = "/etc/qsh/host_ed25519"
 use_ssh_authorized_keys = true  # also accept ~/.ssh/authorized_keys
-allow_tcp_forwarding = true
+allow_tcp_forwarding = true     # or "no", "local" (-L/-D/-W only), "remote" (-R only)
 max_connections = 256
 max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
 max_startups_per_ip = 8         # ... from one IP address
@@ -376,11 +376,47 @@ session_timeout = 3600          # seconds a disconnected terminal session is kep
 # authorized_keys_command = "/usr/local/bin/get-keys %u"   # more keys from a program, like sshd's
 # authorized_keys_command_user = "nobody"                 # it runs as this user (required as root)
 
+# Who may log in (checked in this order, like sshd): patterns, `user@address` with CIDR
+# deny_users = ["guest"]
+# allow_users = ["alice", "bob@192.0.2.0/24"]
+# deny_groups = ["nossh"]
+# allow_groups = ["staff"]
+permit_root_login = "prohibit-password"   # = "yes" (no passwords); "no"; "forced-commands-only"
+login_grace_time = 120          # seconds to log in; 0 = no limit
+# banner = "/etc/issue.net"     # shown before login
+print_motd = true               # /etc/motd for login shells (~/.hushlogin turns it off)
+print_last_log = true           # "Last login: ..." (system mode, from lastlog or wtmp)
+permit_user_rc = true           # run ~/.ssh/rc (or /etc/ssh/sshrc) before the session
+max_sessions = 10               # sessions at once per connection
+permit_tty = true
+accept_env = ["LANG", "LC_*", "COLORTERM"]   # variables clients may set
+# force_command = "/usr/local/bin/menu"   # replaces any command; the original is in SSH_ORIGINAL_COMMAND
+# permit_open = ["db.internal:5432"]      # -L/-D/-W destinations; "none" = none
+# permit_listen = ["8080", "localhost:9000"]   # -R listeners
+disable_forwarding = false      # true: no port or agent forwarding at all
+client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
+client_alive_count_max = 3
+
+[set_env]                       # variables every session gets
+# TZ = "UTC"
+
 [subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
 # sftp = "/usr/lib/openssh/sftp-server"   # found automatically if installed
+
+# Settings for some logins, like sshd's Match (user, group, address; all given must hold).
+# If several blocks match, the first one that sets a setting wins; "none" removes a value.
+# [[match]]
+# group = "sftponly"
+# force_command = "/usr/lib/openssh/sftp-server"
+# allow_tcp_forwarding = false
+# permit_tty = false
 ```
 
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
+
+**Checking and reloading.** `qshd -t` checks the config and the host key; `qshd -T` prints the settings in effect, and `qshd -T -C user=alice,addr=192.0.2.7` those for one login (with `[[match]]` applied, and whether the user may log in at all). On SIGHUP (`systemctl reload qshd`) qshd reads its config again: new logins use the new settings, running sessions keep theirs. A broken config is reported and the old one kept. Changes to `listen`, `tcp`, the host key, the connection limits, `session_timeout` and `client_alive_*` take effect after a restart.
+
+Users that `deny_users`/`allow_users`/`deny_groups`/`allow_groups` or `permit_root_login = "no"` keep out are treated like unknown users: they get the same "access denied", so the answer does not tell which accounts exist.
 
 User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. All key types work, except DSA and RSA below 2048 bits. These options are enforced:
 
@@ -476,7 +512,7 @@ This is still a young project and has not had an external audit. For critical sy
 
 ## Limitations
 
-- No PAM (`pam_access`, `pam_limits`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
+- No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
 - No X11 or tunnels (`-w`).
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.

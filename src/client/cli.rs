@@ -237,6 +237,9 @@ impl SshArgs {
         if let Some(l) = &self.login {
             lines.push(format!("User {l}"));
         }
+        if self.quiet {
+            lines.push("LogLevel quiet".into());
+        }
         if self.ipv4 {
             lines.push("AddressFamily inet".into());
         } else if self.ipv6 {

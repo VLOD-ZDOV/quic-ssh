@@ -254,6 +254,9 @@ fi
 check "pty session runs as alice" grep -qE "UID=$ALICE_UID\b" <<<"$OUT"
 if [[ -z ${QSH_TEST_NS:-} && -f /var/log/wtmp ]] && command -v last >/dev/null; then
     check "the terminal login is in wtmp (last)" bash -c "last -w | grep -q '^qsh-alice '"
+    OUT=$( (sleep 3; printf 'exit\n') | HOME="$T/client" timeout 15 script -qec "'$QSH' -tt -p $PORT qsh-alice@127.0.0.1" /dev/null 2>&1 || true)
+    [[ -n ${QSH_DEBUG:-} ]] && { echo "LOGIN SHELL OUTPUT:"; cat -v <<<"$OUT"; }
+    check "a login shell shows the last login" grep -q "Last login:" <<<"$OUT"
 else
     echo "  skip login records (need real root and /var/log/wtmp)"
 fi

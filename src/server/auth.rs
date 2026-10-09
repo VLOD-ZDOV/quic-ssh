@@ -15,8 +15,6 @@ use crate::keys::{qsh_dir, read_strict, read_strict_private, PublicKey};
 use crate::proto::{auth_data, read_msg, write_msg, Auth, Reply};
 use crate::transport::{RecvHalf, SendHalf};
 
-/// Time for the whole key exchange after the hello (security keys need a touch).
-pub const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Keys a client may ask about before giving up (agents can hold many).
 const MAX_QUERIES: u32 = 32;
 /// Smallest accepted RSA modulus.

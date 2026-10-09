@@ -201,6 +201,17 @@ fn server_text(text: &str) -> String {
     format!("(server) {clean}")
 }
 
+/// A server's banner, made safe to show: no control characters except line
+/// breaks and tabs (like sshd's banner through ssh's `strnvis`), ending
+/// with a line break.
+fn banner_text(text: &str) -> String {
+    let mut out: String = text.chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t').collect();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// Answers a server question (a one-time code) on the terminal or through askpass.
 fn ask(text: &str, echo: bool, batch: bool) -> Result<String> {
     let text = server_text(text);
@@ -232,6 +243,12 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             Reply::Err(e) => {
                 let reason = server_text(&e).trim_start_matches("(server) ").to_string();
                 return Ok(Outcome::Denied { reason, asked_for_keys: keyring.is_some() });
+            }
+            Reply::Banner(text) => {
+                if !target.quiet {
+                    eprint!("{}", banner_text(&text));
+                }
+                read_msg(recv).await?
             }
             Reply::Prompt { text, echo } => {
                 let answer = ask(&text, echo, target.batch_mode)?;
@@ -287,5 +304,6 @@ mod tests {
         assert!(!t.chars().any(char::is_control), "{t:?}");
         assert!(t.starts_with("(server) "));
         assert!(super::server_text(&"x".repeat(1000)).len() < 220);
+        assert_eq!(super::banner_text("Hi\x1b[2J\r\nthere"), "Hi[2J\nthere\n");
     }
 }

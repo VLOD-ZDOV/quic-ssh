@@ -8,7 +8,7 @@ use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::users::User;
+use super::users::{Prelude, User};
 use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg};
 use crate::transport::{RecvHalf, SendHalf};
 
@@ -16,24 +16,20 @@ use crate::transport::{RecvHalf, SendHalf};
 /// jobs may hold the pipes/pty open forever).
 pub(super) const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Client variables passed through to the session (like sshd's AcceptEnv).
-fn accept_env(name: &str) -> bool {
-    // Only plain names: no `=`, NUL or other tricks (compare CVE-2014-2532).
-    let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-    plain && (matches!(name, "LANG" | "COLORTERM") || name.starts_with("LC_"))
-}
-
 /// What to start: `$SHELL -c command`, or a login shell for `None`.
 pub struct Session {
     pub command: Option<String>,
-    /// Variables from the client (filtered by [`accept_env`]).
+    /// Variables from the client (already filtered by `accept_env`).
     pub client_env: Vec<(String, String)>,
-    /// Variables set by the server (e.g. `SSH_ORIGINAL_COMMAND`).
+    /// Variables set by the server (`set_env`, `SSH_ORIGINAL_COMMAND`...);
+    /// they replace the client's.
     pub extra_env: Vec<(String, String)>,
     pub pty: Option<PtySpec>,
     /// Where the client connects from: in system mode, terminal sessions get
     /// a login record (utmp/wtmp/lastlog) for it.
     pub remote: Option<std::net::IpAddr>,
+    /// What runs first (motd, `~/.ssh/rc`...).
+    pub prelude: Prelude,
 }
 
 impl Session {
@@ -41,7 +37,7 @@ impl Session {
     /// variables, server-set ones, and `TERM` for a terminal.
     pub(super) fn env(&mut self, user: &User) -> Vec<(String, String)> {
         let mut env = user.env();
-        env.extend(std::mem::take(&mut self.client_env).into_iter().filter(|(k, _)| accept_env(k)));
+        env.extend(std::mem::take(&mut self.client_env));
         env.extend(std::mem::take(&mut self.extra_env));
         if let Some(p) = &self.pty {
             env.push(("TERM".into(), p.term.clone()));
@@ -54,11 +50,11 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
     let env = session.env(user);
     let mut record = None;
     let spawned = match session.pty {
-        Some(spec) => spawn_pty(user, session.command, env, &spec).map(|(c, p, tty)| {
+        Some(spec) => spawn_pty(user, session.command, env, &spec, &session.prelude).map(|(c, p, tty)| {
             record = login_record(user, &tty, &c, session.remote);
             (c, Io::Pty(p))
         }),
-        None => spawn_pipes(user, session.command, env),
+        None => spawn_pipes(user, session.command, env, &session.prelude),
     };
     let (child, io) = match spawned {
         Ok(x) => x,
@@ -96,9 +92,9 @@ enum Io {
     Pty(pty_process::Pty),
 }
 
-fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>) -> Result<(tokio::process::Child, Io)> {
+fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>, prelude: &Prelude) -> Result<(tokio::process::Child, Io)> {
     let arg0 = command.is_none().then(|| user.login_arg0());
-    let mut cmd = user.command_as(&user.shell, arg0.as_deref());
+    let mut cmd = user.command_as(&user.shell, arg0.as_deref(), prelude);
     cmd.envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);
@@ -119,12 +115,13 @@ pub(super) fn spawn_pty(
     command: Option<String>,
     env: Vec<(String, String)>,
     spec: &PtySpec,
+    prelude: &Prelude,
 ) -> Result<(tokio::process::Child, pty_process::Pty, Option<String>)> {
     let (pty, pts) = pty_process::open()?;
     pty.resize(pty_process::Size::new(spec.rows, spec.cols))?;
     let tty = nix::unistd::ttyname(&pts).ok().map(|p| p.to_string_lossy().into_owned());
     let arg0 = command.is_none().then(|| user.login_arg0());
-    let mut cmd = user.pty_command(&user.shell, arg0.as_deref(), env);
+    let mut cmd = user.pty_command(&user.shell, arg0.as_deref(), env, prelude);
     if let Some(c) = command {
         cmd = cmd.arg("-c").arg(c);
     }
@@ -289,17 +286,4 @@ async fn supervise(
     drop(tx);
     let _ = writer.await;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::accept_env;
-
-    #[test]
-    fn env_filter() {
-        assert!(accept_env("LANG") && accept_env("LC_ALL") && accept_env("COLORTERM"));
-        for bad in ["LD_PRELOAD", "PATH", "LC_X=LD_PRELOAD", "LC_\0", "LC_ ", "", "BASH_ENV"] {
-            assert!(!accept_env(bad), "{bad:?}");
-        }
-    }
 }

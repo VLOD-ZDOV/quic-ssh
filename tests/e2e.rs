@@ -2346,3 +2346,76 @@ fn connection_sharing_edge_cases() {
         sleep(Duration::from_millis(200));
     }
 }
+
+/// sshd-style server settings: allow/deny lists, `[[match]]`, forced
+/// commands, environment, banner, limits, `~/.ssh/rc`, `-t`/`-T` and SIGHUP.
+#[test]
+fn server_policy() {
+    let me = user();
+    let banner_dir = tempfile::tempdir().unwrap();
+    let banner = banner_dir.path().join("banner");
+    std::fs::write(&banner, "Authorized use only\x1b[2J\n").unwrap();
+    let config = format!(
+        "allow_users = [\"{me}@127.0.0.0/8\"]\nbanner = \"{}\"\npermit_tty = false\n[set_env]\nQSH_TEST_SET = \"from-config\"\n\n[[match]]\naddress = \"127.0.0.1\"\nmax_sessions = 3\n",
+        banner.display()
+    );
+    let s = Server::start_with("127.0.0.1", &config);
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+
+    let out = c.run(&["-p", &port, &dest(), "echo $QSH_TEST_SET"]);
+    assert_eq!(stdout(&out), "from-config\n", "{}", stderr(&out));
+    assert!(stderr(&out).contains("Authorized use only"), "no banner: {}", stderr(&out));
+    assert!(!stderr(&out).contains('\x1b'), "control characters in the banner reached the terminal");
+    let out = c.run(&["-q", "-p", &port, &dest(), "true"]);
+    assert!(!stderr(&out).contains("Authorized"), "-q shows no banner");
+    let out = c.run(&["-tt", "-p", &port, &dest(), "/bin/sh", "-c", "'tty -s; echo $?'"]);
+    assert_eq!(stdout(&out).trim(), "1", "permit_tty = false gave a terminal: {}", stderr(&out));
+
+    // ~/.ssh/rc runs before the command, as the user.
+    let ssh_dir = s.home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::fs::write(ssh_dir.join("rc"), "echo rc-ran > \"$HOME/rc-marker\"\n").unwrap();
+    let out = c.run(&["-p", &port, &dest(), "cat \"$HOME/rc-marker\""]);
+    assert_eq!(stdout(&out), "rc-ran\n", "{}", stderr(&out));
+    std::fs::remove_file(ssh_dir.join("rc")).unwrap();
+
+    // `-t` checks a config, `-T` prints the settings for a login.
+    let cfg_path = s.home.path().join(".config/qsh/qshd.toml");
+    let check = |args: &[&str]| Command::new(QSHD).args(args).env("HOME", s.home.path()).output().unwrap();
+    let out = check(&["-t"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = check(&["-T", "-C", &format!("user={me},addr=127.0.0.1")]);
+    assert!(stdout(&out).contains("max_sessions = 3"), "{}", stdout(&out));
+    let out = check(&["-T", "-C", &format!("user={me},addr=192.0.2.1")]);
+    assert!(stdout(&out).contains("max_sessions = 10") && stdout(&out).contains("may not log in"), "{}", stdout(&out));
+
+    // A broken config on SIGHUP keeps the old one; a good one applies to new logins.
+    std::fs::write(&cfg_path, "allow_users = 5").unwrap();
+    assert!(!check(&["-t"]).status.success());
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(out.status.success(), "broken reload must keep the old config: {}", stderr(&out));
+    std::fs::write(
+        &cfg_path,
+        format!("deny_users = \"{me}\"\n[[match]]\nuser = \"{me}\"\nforce_command = \"echo forced:$SSH_ORIGINAL_COMMAND\"\n"),
+    )
+    .unwrap();
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(!out.status.success() && stderr(&out).contains("denied"), "deny_users: {}", stderr(&out));
+    std::fs::write(&cfg_path, format!("max_sessions = 0\n[[match]]\nuser = \"{me}\"\nforce_command = \"echo forced:$SSH_ORIGINAL_COMMAND\"\n")).unwrap();
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(stderr(&out).contains("max_sessions"), "{}", stderr(&out));
+    std::fs::write(&cfg_path, format!("[[match]]\nuser = \"{me}\"\nforce_command = \"echo forced:$SSH_ORIGINAL_COMMAND\"\n")).unwrap();
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-p", &port, &dest(), "uname"]);
+    assert_eq!(stdout(&out), "forced:uname\n", "{}", stderr(&out));
+    let out = c.run(&["-p", &port, "cp", "/etc/hostname", &format!("{}:x", dest())]);
+    assert!(!out.status.success(), "file transfer must be refused with a forced command");
+}

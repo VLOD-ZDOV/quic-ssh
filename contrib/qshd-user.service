@@ -7,7 +7,9 @@
 Description=qsh server for this user (secure shell over QUIC)
 
 [Service]
+ExecStartPre=/usr/local/bin/qshd -t
 ExecStart=/usr/local/bin/qshd serve
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 

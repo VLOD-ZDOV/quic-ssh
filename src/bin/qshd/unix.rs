@@ -18,6 +18,18 @@ struct Cli {
     /// Config file (default /etc/qsh/config.toml as root, ~/.config/qsh/qshd.toml otherwise)
     #[arg(short = 'c', long, global = true)]
     config: Option<PathBuf>,
+
+    /// Check the config file and the host key, then exit (like sshd -t)
+    #[arg(short = 't', long = "test")]
+    test: bool,
+
+    /// Print the settings in effect and exit (like sshd -T); with -C, for one login
+    #[arg(short = 'T', long = "print-config")]
+    print_config: bool,
+
+    /// The login -T shows settings for: user=NAME,addr=ADDRESS
+    #[arg(short = 'C', value_name = "SPEC", requires = "print_config")]
+    connection: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -114,6 +126,14 @@ pub fn main() {
         }
         _ => Cli::parse(),
     };
+    if cli.test || cli.print_config {
+        let result = check_config(cli.config, cli.print_config, cli.connection.as_deref());
+        if let Err(e) = result {
+            eprintln!("qshd: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = match cli.cmd {
         Some(Cmd::InternalRecv { path, name, size, mode }) => helpers::recv(&path, &name, size, &mode),
         Some(Cmd::InternalSend { path }) => helpers::send(&path),
@@ -132,6 +152,40 @@ pub fn main() {
         eprintln!("qshd: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `qshd -t` / `-T`: loads the config (and host key) like the server would.
+fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) -> Result<()> {
+    let (cfg, key_path) = load_config(config)?;
+    if key_path.exists() {
+        Identity::load(&key_path).with_context(|| format!("host key {}", key_path.display()))?;
+    }
+    if !print {
+        return Ok(());
+    }
+    let cfg = match connection {
+        None => cfg,
+        Some(spec) => {
+            let (mut user, mut addr) = (None, None);
+            for part in spec.split(',') {
+                match part.split_once('=') {
+                    Some(("user", v)) => user = Some(v.to_string()),
+                    Some(("addr", v)) => addr = Some(v.parse::<std::net::IpAddr>().with_context(|| format!("bad address {v:?}"))?),
+                    Some(("host" | "laddr" | "lport" | "rdomain", _)) => {}
+                    _ => anyhow::bail!("bad -C {part:?} (user=NAME,addr=ADDRESS)"),
+                }
+            }
+            let user = user.context("-C needs user=NAME")?;
+            let groups = server::user_group_names(&user);
+            let who = qsh::config::Login { user: &user, groups: &groups, addr: addr.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()) };
+            if let Some(reason) = cfg.login_refused(&who) {
+                println!("# {user} may not log in: {reason}");
+            }
+            cfg.for_login(&who)
+        }
+    };
+    print!("{}", cfg.dump()?);
+    Ok(())
 }
 
 fn init(config: Option<PathBuf>) -> Result<()> {
@@ -255,10 +309,17 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
         .with_writer(std::io::stderr)
         .init();
     raise_fd_limit();
-    let (mut cfg, key_path) = load_config(config)?;
+    let (mut cfg, key_path) = load_config(config.clone())?;
     if let Some(l) = listen {
         cfg.listen = l;
     }
+    let reload: server::Reload = Box::new(move || {
+        let (mut cfg, _) = load_config(config.clone())?;
+        if let Some(l) = listen {
+            cfg.listen = l;
+        }
+        Ok(cfg)
+    });
     let host = host_key(&key_path)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -269,6 +330,6 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
             listener.transports(),
             host.public().fingerprint()
         );
-        server::serve(listener, cfg, &host).await
+        server::serve(listener, cfg, &host, Some(reload)).await
     })
 }

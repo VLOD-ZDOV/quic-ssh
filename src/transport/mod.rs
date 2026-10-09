@@ -385,33 +385,42 @@ async fn udp_port_closed(addr: SocketAddr, local: Option<SocketAddr>) {
     }
 }
 
+/// How the server notices clients that went away (client_alive_interval):
+/// a probe every `interval`, given up after `count` unanswered ones.
+#[derive(Clone, Copy, Debug)]
+pub struct Alive {
+    pub interval: Duration,
+    pub count: u32,
+}
+
 /// Server listener bound to the same port on UDP (QUIC) and, optionally, TCP.
 pub struct Listener {
     quic: quinn::Endpoint,
     tcp: Option<tokio::net::TcpListener>,
     tls: Arc<rustls::ServerConfig>,
+    alive: Option<Alive>,
 }
 
 /// A connection attempt whose handshake has not completed yet.
 pub enum Incoming {
     Quic(Box<quinn::Incoming>),
-    Tcp(tokio::net::TcpStream, SocketAddr, Arc<rustls::ServerConfig>),
+    Tcp(tokio::net::TcpStream, SocketAddr, Arc<rustls::ServerConfig>, Option<Alive>),
 }
 
 impl Listener {
-    pub async fn bind(addr: SocketAddr, tls: rustls::ServerConfig, tcp: bool) -> Result<Listener> {
+    pub async fn bind(addr: SocketAddr, tls: rustls::ServerConfig, tcp: bool, alive: Option<Alive>) -> Result<Listener> {
         let tls = Arc::new(tls);
         // Port 0: TCP goes on whatever port UDP got so both share one number;
         // if that TCP port is taken, try another pair.
         let attempts = if addr.port() == 0 && tcp { 20 } else { 1 };
         for attempt in 1..=attempts {
-            let quic = quic::server_endpoint(tls.clone(), addr).with_context(|| format!("cannot listen on udp {addr}"))?;
+            let quic = quic::server_endpoint(tls.clone(), addr, alive).with_context(|| format!("cannot listen on udp {addr}"))?;
             if !tcp {
-                return Ok(Listener { quic, tcp: None, tls });
+                return Ok(Listener { quic, tcp: None, tls, alive });
             }
             let tcp_addr = SocketAddr::new(addr.ip(), quic.local_addr()?.port());
             match tokio::net::TcpListener::bind(tcp_addr).await {
-                Ok(l) => return Ok(Listener { quic, tcp: Some(l), tls }),
+                Ok(l) => return Ok(Listener { quic, tcp: Some(l), tls, alive }),
                 Err(e) if attempt == attempts => return Err(e).with_context(|| format!("cannot listen on tcp {tcp_addr}")),
                 Err(_) => {}
             }
@@ -440,7 +449,7 @@ impl Listener {
             res = tcp_accept => {
                 // A plain io::Error: the caller tells it from a closed endpoint.
                 let (sock, addr) = res.map_err(anyhow::Error::new)?;
-                Ok(Incoming::Tcp(sock, addr, self.tls.clone()))
+                Ok(Incoming::Tcp(sock, addr, self.tls.clone(), self.alive))
             }
         }
     }
@@ -458,7 +467,7 @@ impl Incoming {
     pub fn remote_addr(&self) -> SocketAddr {
         match self {
             Incoming::Quic(i) => i.remote_address(),
-            Incoming::Tcp(_, addr, _) => *addr,
+            Incoming::Tcp(_, addr, ..) => *addr,
         }
     }
 
@@ -467,7 +476,7 @@ impl Incoming {
         let fut = async move {
             match self {
                 Incoming::Quic(i) => quic::accept(*i).await,
-                Incoming::Tcp(sock, addr, tls) => tcp::accept(tls, sock, addr).await,
+                Incoming::Tcp(sock, addr, tls, alive) => tcp::accept(tls, sock, addr, alive).await,
             }
         };
         tokio::time::timeout(HANDSHAKE_TIMEOUT, fut).await.context("handshake timed out")?

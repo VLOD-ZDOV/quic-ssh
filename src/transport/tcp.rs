@@ -135,13 +135,22 @@ where
 /// TCP keepalive (QUIC has its own): a peer that vanished without a word
 /// (sleep, a changed network, a NAT that forgot the connection) is noticed
 /// after about a minute instead of never, on both sides.
-fn keep_alive(sock: &TcpStream) {
+/// `alive`: the server's own probe interval and count instead.
+fn keep_alive(sock: &TcpStream, alive: Option<super::Alive>) {
     use std::time::Duration;
-    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    let (time, interval, retries) = match alive {
+        Some(a) => (a.interval, a.interval, a.count.max(1)),
+        None => (Duration::from_secs(30), Duration::from_secs(10), 3),
+    };
+    let ka = socket2::TcpKeepalive::new().with_time(time);
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
-    let ka = ka.with_interval(Duration::from_secs(10));
+    let ka = ka.with_interval(interval);
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    let ka = ka.with_retries(3);
+    let ka = ka.with_retries(retries);
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let _ = retries;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    let _ = interval;
     if let Err(e) = socket2::SockRef::from(sock).set_tcp_keepalive(&ka) {
         tracing::debug!("TCP keepalive: {e}");
     }
@@ -158,7 +167,7 @@ pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr, local: Op
         }
     };
     sock.set_nodelay(true)?;
-    keep_alive(&sock);
+    keep_alive(&sock, None);
     let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
     let stream = tokio_rustls::TlsConnector::from(tls).connect(name, sock).await?;
     let info = tls_info(stream.get_ref().1)?;
@@ -177,9 +186,9 @@ where
     Ok(finish(stream, Mode::Client, info, remote))
 }
 
-pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: SocketAddr) -> Result<Conn> {
+pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: SocketAddr, alive: Option<super::Alive>) -> Result<Conn> {
     sock.set_nodelay(true)?;
-    keep_alive(&sock);
+    keep_alive(&sock, alive);
     let stream = tokio_rustls::TlsAcceptor::from(tls).accept(sock).await?;
     let info = tls_info(stream.get_ref().1)?;
     Ok(finish(stream, Mode::Server, info, addr))
