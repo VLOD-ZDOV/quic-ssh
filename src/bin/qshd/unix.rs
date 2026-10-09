@@ -114,6 +114,14 @@ pub fn main() {
         eprintln!("qshd: {e:#}");
         std::process::exit(126);
     }
+    // The built-in SFTP server, started like a program (macOS runs it this way).
+    if argv.get(1).map(String::as_str) == Some(server::INTERNAL_SFTP) {
+        if let Err(e) = helpers::run_internal(server::INTERNAL_SFTP, &argv[2..]) {
+            eprintln!("qshd: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let cli = match std::env::args().nth(1).as_deref() {
         // A helper started through the user's shell: the real arguments are in the environment.
         Some(helpers::HELPER_FROM_ENV) => {

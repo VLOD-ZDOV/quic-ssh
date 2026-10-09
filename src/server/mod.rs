@@ -7,6 +7,7 @@ mod files;
 pub mod helpers;
 mod login_record;
 pub mod keys_command;
+mod penalty;
 mod persist;
 mod sftp;
 pub mod revoked;
@@ -28,6 +29,8 @@ use crate::keys::{Identity, PublicKey};
 use crate::authkeys::Grant;
 use crate::proto::{read_msg, valid_user_name, write_msg, Hello, PtySpec, Reply, Request, MIN_VERSION, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
+use penalty::Outcome;
+pub use users::INTERNAL_SFTP;
 use users::User;
 
 /// Time a connected client has to open its first stream and say hello.
@@ -49,6 +52,7 @@ struct State {
     /// The current settings; replaced when qshd reloads its config (SIGHUP).
     cfg: std::sync::RwLock<Arc<ServerConfig>>,
     host_key: PublicKey,
+    penalties: penalty::Penalties,
     totp_used: auth::UsedCodes,
     sessions: Arc<persist::Sessions>,
 }
@@ -76,6 +80,8 @@ fn restart_needed(old: &ServerConfig, new: &ServerConfig) -> Vec<&'static str> {
         ("session_timeout", old.session_timeout != new.session_timeout),
         ("client_alive_interval", old.client_alive_interval != new.client_alive_interval),
         ("client_alive_count_max", old.client_alive_count_max != new.client_alive_count_max),
+        ("per_source_penalties", old.per_source_penalties != new.per_source_penalties),
+        ("per_source_penalty_exempt_list", old.per_source_penalty_exempt_list != new.per_source_penalty_exempt_list),
     ] {
         if differs {
             changed.push(name);
@@ -229,7 +235,17 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
     let sessions = Arc::new(persist::Sessions::new(Duration::from_secs(cfg.session_timeout)));
-    let state = Arc::new(State { cfg: std::sync::RwLock::new(Arc::new(cfg)), host_key: host.public(), totp_used: Default::default(), sessions });
+    let penalties = penalty::Penalties::new(crate::config::Penalties {
+        exempt: cfg.per_source_penalty_exempt_list.clone(),
+        ..cfg.per_source_penalties.clone()
+    });
+    let state = Arc::new(State {
+        cfg: std::sync::RwLock::new(Arc::new(cfg)),
+        host_key: host.public(),
+        penalties,
+        totp_used: Default::default(),
+        sessions,
+    });
     #[cfg(unix)]
     if let Some(reload) = reload {
         reload_on_hangup(state.clone(), reload);
@@ -252,6 +268,11 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
             incoming.reject();
             continue;
         };
+        if let Some(left) = state.penalties.refused(addr.ip()) {
+            debug!("dropping {addr}: penalty for {}s more", left.as_secs());
+            incoming.reject();
+            continue;
+        }
         let Some(startup) = startups.try_acquire(addr.ip()) else {
             debug!("too many unauthenticated connections, dropping {addr}");
             incoming.reject();
@@ -262,21 +283,29 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
             match incoming.handshake().await {
                 Ok(conn) => {
                     let conn = Arc::new(conn);
-                    if let Err(e) = handle_conn(&conn, state, startup).await {
+                    let mut outcome = Outcome::NoAuth;
+                    if let Err(e) = handle_conn(&conn, state.clone(), startup, &mut outcome).await {
                         debug!("{addr}: {e:#}");
+                    }
+                    if state.penalties.record(addr.ip(), outcome) {
+                        warn!("{addr}: too many failed logins; dropping its connections for a while (per_source_penalties)");
                     }
                     // Dropping a QUIC connection discards unsent data, so let the
                     // client read the final reply (e.g. "access denied") and hang up first.
                     let _ = tokio::time::timeout(LINGER, conn.closed()).await;
                 }
-                Err(e) => debug!("{addr}: handshake failed: {e:#}"),
+                Err(e) => {
+                    debug!("{addr}: handshake failed: {e:#}");
+                    state.penalties.record(addr.ip(), Outcome::NoAuth);
+                }
             }
             drop(permit);
         });
     }
 }
 
-async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> Result<()> {
+/// Serves one connection; `outcome` tells how its login went (for penalties).
+async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outcome: &mut Outcome) -> Result<()> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let (mut send, mut recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -342,19 +371,35 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     };
     if pairing {
         match user {
-            Some(user) => return pair(conn, &state, &user, send, recv).await,
+            // A pairing that does not add a key counts as a failed login,
+            // for unknown users too (penalties must not tell them apart).
+            Some(user) => {
+                if pair(conn, &state, &user, send, recv).await? {
+                    *outcome = Outcome::LoggedIn;
+                } else {
+                    *outcome = Outcome::AuthFailed;
+                }
+                return Ok(());
+            }
             // Same answer, after the same time, as for an existing user
             // without a code, so names cannot be probed.
-            None => return refuse_pairing(&mut send, tokio::time::Instant::now()).await,
+            None => {
+                *outcome = Outcome::AuthFailed;
+                return refuse_pairing(&mut send, tokio::time::Instant::now()).await;
+            }
         }
     }
 
     // An unknown user goes through the same steps with no keys, so names cannot be probed.
-    let (entries, cas, revoked) = {
+    let (entries, cas, revoked, principals) = {
         let (cfg, user) = (cfg.clone(), user.clone());
         tokio::task::spawn_blocking(move || {
             let entries = user.as_ref().map(|u| auth::authorized_entries(&cfg, u)).unwrap_or_default();
-            (entries, auth::trusted_cas(&cfg), revoked::Revocation::load(cfg.revoked_keys.as_deref()))
+            let principals = match &user {
+                Some(u) => auth::authorized_principals(&cfg, u),
+                None => cfg.authorized_principals_file.as_ref().map(|_| Vec::new()),
+            };
+            (entries, auth::trusted_cas(&cfg), revoked::Revocation::load(cfg.revoked_keys.as_deref()), principals)
         })
         .await?
     };
@@ -364,13 +409,19 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         cas: &cas,
         revoked: &revoked,
         command: command.as_ref(),
-        login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now() },
+        login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now(), principals: principals.as_deref() },
         exporter: conn.exporter(),
     };
     let mut granted = checker.check(&auth::tls_key(key)).await.ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
     if granted.is_none() && version >= 4 {
         let attempt = auth::key_auth(&mut send, &mut recv, &checker, cfg.max_auth_tries);
-        granted = tokio::time::timeout(grace, attempt).await.context("login took too long")??;
+        granted = match tokio::time::timeout(grace, attempt).await {
+            Ok(result) => result?,
+            Err(_) => {
+                *outcome = Outcome::GraceExceeded;
+                bail!("login took too long");
+            }
+        };
     }
     // Root with forced-commands-only: only keys with a forced command.
     let granted = granted.filter(|(grant, _)| {
@@ -382,6 +433,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         ok
     });
     let (Some(user), Some((mut grant, how))) = (user, granted) else {
+        *outcome = Outcome::AuthFailed;
         warn!("{addr}: no authorized key for {name} (TLS key {})", key.fingerprint());
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
@@ -401,12 +453,31 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
         }
         auth::second_factor(&mut send, &mut recv, &user, cfg.totp, version, &state.totp_used).await
     };
-    if let Err(msg) = tokio::time::timeout(grace, second).await.context("login took too long")?? {
-        warn!("{addr}: {name}: second factor failed");
-        write_msg(&mut send, &Reply::Err(msg)).await?;
-        return Ok(());
+    match tokio::time::timeout(grace, second).await {
+        Err(_) => {
+            *outcome = Outcome::GraceExceeded;
+            bail!("login took too long");
+        }
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(Err(msg))) => {
+            warn!("{addr}: {name}: second factor failed");
+            *outcome = Outcome::AuthFailed;
+            write_msg(&mut send, &Reply::Err(msg)).await?;
+            return Ok(());
+        }
+        Ok(Ok(Ok(()))) => {}
     }
+    let mut user = user;
+    user.chroot = match cfg.chroot_for(&user.name, user.uid, &user.home) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("{addr}: {name}: {e:#}");
+            write_msg(&mut send, &Reply::Err("access denied".into())).await?;
+            return Ok(());
+        }
+    };
     info!("{addr}: {name} logged in with {how} over {}", conn.transport_name());
+    *outcome = Outcome::LoggedIn;
     conn.logged_in();
     let welcome = if version >= 4 { Reply::Welcome { version: VERSION } } else { Reply::Ok };
     write_msg(&mut send, &welcome).await?;
@@ -420,15 +491,6 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     if !cfg.permit_tty {
         grant.restrictions.no_pty = true;
     }
-    let mut user = user;
-    user.chroot = match cfg.chroot_for(&user.name, user.uid, &user.home) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("{addr}: {name}: {e:#}");
-            write_msg(&mut send, &Reply::Err("access denied".into())).await?;
-            return Ok(());
-        }
-    };
     let user = Arc::new(user);
     let grant = Arc::new(grant);
     let sessions_limit = Arc::new(Semaphore::new(cfg.max_sessions));
@@ -836,7 +898,7 @@ async fn run_helper(user: &User, args: &[&str]) -> Result<String> {
     }
 }
 
-async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
+async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, mut recv: RecvHalf) -> Result<bool> {
     let addr = conn.remote_addr();
     let key = conn.peer_key();
     let started = tokio::time::Instant::now();
@@ -844,7 +906,8 @@ async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, 
         Ok(code) => code,
         Err(e) => {
             warn!("{addr}: pairing for {} refused: {e:#}", user.name);
-            return refuse_pairing(&mut send, started).await;
+            refuse_pairing(&mut send, started).await?;
+            return Ok(false);
         }
     };
     write_msg(&mut send, &Reply::Ok).await?;
@@ -861,18 +924,18 @@ async fn pair(conn: &Arc<Conn>, state: &State, user: &User, mut send: SendHalf, 
         Ok(v) => v,
         Err(e) => {
             warn!("{addr}: pairing for {} failed: {e:#}", user.name);
-            return Ok(());
+            return Ok(false);
         }
     };
     let line = key.to_openssh("qsh-paired");
     if let Err(e) = run_helper(user, &["internal-add-key", &line]).await {
         write_msg(&mut send, &Reply::Err(format!("cannot store key: {e:#}"))).await?;
-        return Ok(());
+        return Ok(false);
     }
     verified.confirm(&mut send).await?;
     send.shutdown().await?;
     info!("{addr}: paired key {} for {}", key.fingerprint(), user.name);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

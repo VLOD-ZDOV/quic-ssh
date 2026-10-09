@@ -96,6 +96,8 @@ mkdir -m 1777 "$T/shared"
 cat > "$T/config.toml" <<EOF
 listen = "127.0.0.1:0"
 host_key = "$T/host_ed25519"
+# The checks below fail logins on purpose.
+per_source_penalties = false
 
 [subsystems]
 probe = "touch $T/shared/probe-\$USER"

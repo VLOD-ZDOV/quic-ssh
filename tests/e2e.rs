@@ -60,6 +60,8 @@ impl Server {
     fn start_in(home: TempDir, listen: &str, config: &str) -> Server {
         let dir = home.path().join(".config/qsh");
         std::fs::create_dir_all(&dir).unwrap();
+        // Tests fail logins on purpose; penalties are tested on their own.
+        let config = if config.contains("per_source_penalties") { config.to_string() } else { format!("per_source_penalties = false\n{config}") };
         std::fs::write(dir.join("qshd.toml"), config).unwrap();
         let mut child = Command::new(QSHD)
             .args(["serve", "--listen", listen])
@@ -1426,6 +1428,16 @@ fn user_certificates() {
     assert_eq!(stdout(&out), "ca-line\n");
     let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), "-i", ed.to_str().unwrap(), &dest(), "true"]);
     assert!(!out.status.success(), "principal outside principals= accepted");
+
+    // authorized_principals_file: the principals listed there, not the user name.
+    let config = format!("trusted_user_ca_keys = \"{}\"\nauthorized_principals_file = \".ssh/principals\"\n", ca_file.display());
+    let (s, c) = server_with_keys(&config, &[]);
+    std::fs::write(s.home.path().join(".ssh/principals"), "command=\"echo via-principal\" somebody-else\n").unwrap();
+    let port = s.port.to_string();
+    let q = |key: &PathBuf| c.run(&["--accept-new-host", "-p", &port, "-i", key.to_str().unwrap(), &dest(), "id"]);
+    let out = q(&wrong);
+    assert_eq!(stdout(&out), "via-principal\n", "{}", stderr(&out));
+    assert!(!q(&ed).status.success(), "the user name counted although the principals file does not list it");
 }
 
 #[test]
@@ -2491,4 +2503,34 @@ fn internal_sftp() {
     let out = run(&batch);
     assert!(!out.status.success(), "upload to a read-only internal-sftp worked");
     assert!(!s.home.path().join("up.txt").exists());
+}
+
+/// Per-source penalties: repeated failed logins from an address get its
+/// connections dropped for a while; exempt addresses never are.
+#[test]
+fn per_source_penalties() {
+    let s = Server::start_with("127.0.0.1", "per_source_penalties = \"authfail:10s min:15s\"\n");
+    let paired = Client::paired(&s);
+    let stranger = Client::new();
+    let port = s.port.to_string();
+    let attempt = |c: &Client| c.run(&["--accept-new-host", "--transport", "tcp", "-o", "BatchMode=yes", "-p", &port, &dest(), "echo", "in"]);
+    assert_eq!(stdout(&attempt(&paired)), "in\n");
+    for _ in 0..2 {
+        let out = attempt(&stranger);
+        assert!(stderr(&out).contains("denied"), "{}", stderr(&out));
+    }
+    let started = Instant::now();
+    let out = attempt(&paired);
+    assert!(!out.status.success(), "the address should be dropped now");
+    assert!(started.elapsed() < Duration::from_secs(10), "dropping must be quick over TCP");
+    assert!(!stderr(&out).contains("denied"), "dropped before any login: {}", stderr(&out));
+
+    let s = Server::start_with("127.0.0.1", "per_source_penalties = \"authfail:10s min:15s\"\nper_source_penalty_exempt_list = \"127.0.0.0/8\"\n");
+    let paired = Client::paired(&s);
+    let port = s.port.to_string();
+    for _ in 0..3 {
+        stranger.run(&["--accept-new-host", "--transport", "tcp", "-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
+    }
+    let out = paired.run(&["--transport", "tcp", "-p", &port, &dest(), "echo", "exempt"]);
+    assert_eq!(stdout(&out), "exempt\n", "{}", stderr(&out));
 }

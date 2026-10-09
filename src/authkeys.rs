@@ -287,6 +287,46 @@ pub struct Login<'a> {
     pub user: &'a str,
     pub ip: IpAddr,
     pub now: u64,
+    /// `authorized_principals_file`: the principals that certificates from
+    /// `trusted_user_ca_keys` must name instead of the user name.
+    pub principals: Option<&'a [AuthorizedPrincipal]>,
+}
+
+/// One line of an authorized principals file: `[options] principal`, with
+/// the options of authorized_keys (`command=`, `from=`...).
+#[derive(Clone, Debug)]
+pub struct AuthorizedPrincipal {
+    pub name: String,
+    /// The options, held by an entry whose key is a placeholder.
+    pub entry: AuthorizedKey,
+}
+
+/// A key that only carries the options of a principals line.
+const PLACEHOLDER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// Parses an authorized principals file; bad lines are reported and skipped.
+pub fn parse_principals(text: &str, mut bad: impl FnMut(usize, anyhow::Error)) -> Vec<AuthorizedPrincipal> {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // The principal is the last word; anything before it is options.
+        let (options, name) = match line.rsplit_once(char::is_whitespace) {
+            Some((o, n)) => (o.trim(), n),
+            None => ("", line),
+        };
+        let parsed = if options.is_empty() { parse_line(PLACEHOLDER_KEY) } else { parse_line(&format!("{options} {PLACEHOLDER_KEY}")) };
+        match parsed {
+            Ok(Some(entry)) if !entry.cert_authority && entry.principals.is_none() => {
+                out.push(AuthorizedPrincipal { name: name.to_string(), entry })
+            }
+            Ok(_) => bad(i + 1, anyhow::anyhow!("cert-authority and principals= do not belong in a principals file")),
+            Err(e) => bad(i + 1, e),
+        }
+    }
+    out
 }
 
 fn is_security_key(k: &KeyData) -> bool {
@@ -343,10 +383,34 @@ fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyD
     // a CA trusted for the whole server leaves it to the certificate.
     let mut line_allows_no_touch = true;
     if trusted_cas.contains(ca) {
-        if !principals.iter().any(|p| p == login.user) {
-            return Err(format!("certificate is not valid for {}", login.user));
+        match login.principals {
+            None => {
+                if !principals.iter().any(|p| p == login.user) {
+                    return Err(format!("certificate is not valid for {}", login.user));
+                }
+                grant = Some(Grant::default());
+            }
+            Some(lines) => {
+                let mut reason = format!("certificate principals {principals:?} are not in the authorized principals file");
+                for line in lines.iter().filter(|l| principals.contains(&l.name)) {
+                    match entry_usable(&line.entry, login) {
+                        Ok(()) => {
+                            grant = Some(Grant {
+                                restrictions: line.entry.restrictions.clone(),
+                                require_presence: false,
+                                require_verified: line.entry.verify_required,
+                            });
+                            line_allows_no_touch = line.entry.no_touch_required;
+                            break;
+                        }
+                        Err(r) => reason = r,
+                    }
+                }
+                if grant.is_none() {
+                    return Err(reason);
+                }
+            }
         }
-        grant = Some(Grant::default());
     } else {
         let mut reason = "certificate authority is not trusted".to_string();
         for e in entries.iter().filter(|e| e.cert_authority && &e.key == ca) {
@@ -464,7 +528,7 @@ mod tests {
     #[test]
     fn from_and_expiry() {
         let e = parse_line(&format!("from=\"192.0.2.*\",expiry-time=\"20300101Z\" {KEY}")).unwrap().unwrap();
-        let login = |ip: &str, now| Login { user: "u", ip: ip.parse().unwrap(), now };
+        let login = |ip: &str, now| Login { user: "u", ip: ip.parse().unwrap(), now, principals: None };
         let offered = Offered::Key(e.key.clone());
         assert!(check(&offered, std::slice::from_ref(&e), &[], &login("192.0.2.5", 1_800_000_000)).is_ok());
         assert!(check(&offered, std::slice::from_ref(&e), &[], &login("198.51.100.5", 1_800_000_000)).is_err());
@@ -495,5 +559,21 @@ mod tests {
         let r = Restrictions { permit_listen: vec!["8080".into(), "localhost:9000".into()], ..Default::default() };
         assert!(r.may_listen("", 8080) && r.may_listen("localhost", 9000));
         assert!(!r.may_listen("", 9001) && !r.may_listen("0.0.0.0", 8080));
+    }
+
+    #[test]
+    fn principals_file() {
+        let mut bad = 0;
+        let list = parse_principals(
+            "# comment\nalice\ncommand=\"echo hi\",from=\"10.0.0.0/8\" deploy\ncert-authority x\nno-such-option y\n",
+            |_, _| bad += 1,
+        );
+        assert_eq!(bad, 2);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "alice");
+        assert!(list[0].entry.restrictions.command.is_none());
+        assert_eq!(list[1].name, "deploy");
+        assert_eq!(list[1].entry.restrictions.command.as_deref(), Some("echo hi"));
+        assert_eq!(list[1].entry.from.as_deref(), Some("10.0.0.0/8"));
     }
 }

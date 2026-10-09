@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,8 +25,19 @@ pub struct ServerConfig {
     /// Host key path; defaults to `host_ed25519` next to the config file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key: Option<PathBuf>,
-    /// Also accept keys from `~/.ssh/authorized_keys`.
+    /// Also accept keys from `~/.ssh/authorized_keys` (the files in
+    /// `authorized_keys_file`).
     pub use_ssh_authorized_keys: bool,
+    /// The OpenSSH key files read with `use_ssh_authorized_keys` (like
+    /// AuthorizedKeysFile): relative to the home, `%h` home, `%u` user,
+    /// `%U` uid, `%%`. qsh's own `~/.config/qsh/authorized_keys` is always read.
+    #[serde(deserialize_with = "names")]
+    pub authorized_keys_file: Vec<String>,
+    /// Principals that certificates from `trusted_user_ca_keys` must name,
+    /// one per line with optional authorized_keys options (like
+    /// AuthorizedPrincipalsFile); without it, the user name. Same tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_principals_file: Option<String>,
     /// Port forwarding (`-L`/`-D`/`-W` and `-R`): `true`/`"yes"`/`"all"`,
     /// `false`/`"no"`, `"local"` or `"remote"` (like AllowTcpForwarding).
     pub allow_tcp_forwarding: Forwarding,
@@ -135,6 +147,13 @@ pub struct ServerConfig {
     pub client_alive_count_max: u32,
     /// Refuse the connection (like RefuseConnection; for `[[match]]`).
     pub refuse_connection: bool,
+    /// Drop connections from addresses that keep failing to log in (like
+    /// PerSourcePenalties): `true`, `false`, or sshd's settings, e.g.
+    /// `"authfail:5s noauth:1s grace-exceeded:10s min:15s max:10m"`.
+    pub per_source_penalties: Penalties,
+    /// Addresses (patterns or CIDR) that never get penalties.
+    #[serde(deserialize_with = "names")]
+    pub per_source_penalty_exempt_list: Vec<String>,
     /// Settings for some logins only.
     #[serde(rename = "match", skip_serializing_if = "Vec::is_empty")]
     pub matches: Vec<MatchBlock>,
@@ -224,6 +243,115 @@ impl Serialize for Forwarding {
     }
 }
 
+/// `per_source_penalties` (sshd's defaults).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Penalties {
+    pub enabled: bool,
+    pub authfail: Duration,
+    pub noauth: Duration,
+    pub grace_exceeded: Duration,
+    /// Penalty a source must collect before its connections are dropped.
+    pub min: Duration,
+    pub max: Duration,
+    /// Sources remembered at most (more are not penalized).
+    pub max_sources: usize,
+    /// `per_source_penalty_exempt_list` (filled in from the config).
+    pub exempt: Vec<String>,
+}
+
+impl Default for Penalties {
+    fn default() -> Self {
+        Penalties {
+            enabled: true,
+            authfail: Duration::from_secs(5),
+            noauth: Duration::from_secs(1),
+            grace_exceeded: Duration::from_secs(10),
+            min: Duration::from_secs(15),
+            max: Duration::from_secs(600),
+            max_sources: 65536,
+            exempt: Vec::new(),
+        }
+    }
+}
+
+/// `30`, `30s`, `5m`, `1h` (sshd's time format, without combinations).
+fn seconds(v: &str) -> Option<Duration> {
+    let (n, unit) = match v.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => v.split_at(i),
+        None => (v, "s"),
+    };
+    let n: u64 = n.parse().ok()?;
+    let mult = match unit.to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return None,
+    };
+    Some(Duration::from_secs(n.checked_mul(mult)?))
+}
+
+impl Penalties {
+    fn parse(text: &str) -> Result<Penalties, String> {
+        let mut p = Penalties::default();
+        match text.trim().to_ascii_lowercase().as_str() {
+            "yes" => return Ok(p),
+            "no" => return Ok(Penalties { enabled: false, ..p }),
+            _ => {}
+        }
+        for word in text.split_whitespace() {
+            let (key, value) = word.split_once(':').ok_or_else(|| format!("bad per_source_penalties item {word:?}"))?;
+            if key == "max-sources4" || key == "max-sources6" || key == "max-sources" {
+                p.max_sources = value.parse().map_err(|_| format!("bad {key} {value:?}"))?;
+                continue;
+            }
+            let d = seconds(value).ok_or_else(|| format!("bad time {value:?} for {key}"))?;
+            match key {
+                "authfail" => p.authfail = d,
+                "noauth" => p.noauth = d,
+                "grace-exceeded" => p.grace_exceeded = d,
+                "min" => p.min = d,
+                "max" => p.max = d,
+                // Penalties for events qshd does not have.
+                "crash" | "refuseconnection" => {}
+                _ => return Err(format!("unknown per_source_penalties item {key:?}")),
+            }
+        }
+        Ok(p)
+    }
+}
+
+impl<'de> Deserialize<'de> for Penalties {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bool(enabled) => Ok(Penalties { enabled, ..Penalties::default() }),
+            Raw::Text(t) => Penalties::parse(&t).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl Serialize for Penalties {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if !self.enabled {
+            return s.serialize_bool(false);
+        }
+        s.serialize_str(&format!(
+            "authfail:{}s noauth:{}s grace-exceeded:{}s min:{}s max:{}s max-sources:{}",
+            self.authfail.as_secs(),
+            self.noauth.as_secs(),
+            self.grace_exceeded.as_secs(),
+            self.min.as_secs(),
+            self.max.as_secs(),
+            self.max_sources
+        ))
+    }
+}
+
 /// A list given as an array or as one string of comma- or space-separated words.
 fn names<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
@@ -290,6 +418,8 @@ overrides! {
         #[serde(deserialize_with = "opt_names")]
         allow_users: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
+        authorized_keys_file: Vec<String>,
+        #[serde(deserialize_with = "opt_names")]
         deny_groups: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
         deny_users: Vec<String>,
@@ -312,6 +442,7 @@ overrides! {
     optional {
         authorized_keys_command: String,
         authorized_keys_command_user: String,
+        authorized_principals_file: String,
         banner: PathBuf,
         chroot_directory: String,
         force_command: String,
@@ -366,6 +497,8 @@ impl Default for ServerConfig {
             tcp: true,
             host_key: None,
             use_ssh_authorized_keys: true,
+            authorized_keys_file: vec![".ssh/authorized_keys".into()],
+            authorized_principals_file: None,
             allow_tcp_forwarding: Forwarding::All,
             disable_forwarding: false,
             permit_open: Vec::new(),
@@ -403,6 +536,8 @@ impl Default for ServerConfig {
             client_alive_interval: 0,
             client_alive_count_max: 3,
             refuse_connection: false,
+            per_source_penalties: Penalties::default(),
+            per_source_penalty_exempt_list: Vec::new(),
             matches: Vec::new(),
         }
     }
@@ -532,28 +667,43 @@ impl ServerConfig {
     /// `chroot_directory` for a user, with its tokens replaced.
     pub fn chroot_for(&self, user: &str, uid: u32, home: &Path) -> Result<Option<PathBuf>> {
         let Some(dir) = &self.chroot_directory else { return Ok(None) };
-        let mut out = String::new();
-        let mut chars = dir.chars();
-        while let Some(c) = chars.next() {
-            if c != '%' {
-                out.push(c);
-                continue;
-            }
-            match chars.next() {
-                Some('h') => out.push_str(&home.to_string_lossy()),
-                Some('u') => out.push_str(user),
-                Some('U') => out.push_str(&uid.to_string()),
-                Some('%') => out.push('%'),
-                other => bail!("chroot_directory: unknown token %{}", other.map(String::from).unwrap_or_default()),
-            }
-        }
-        Ok(Some(PathBuf::from(out)))
+        expand_user_path(dir, user, uid, home).map(Some)
     }
 
+    /// The authorized_keys files to read for a user (`none` reads none).
+    pub fn authorized_keys_files(&self, user: &str, uid: u32, home: &Path) -> Vec<Result<PathBuf>> {
+        self.authorized_keys_file
+            .iter()
+            .filter(|f| f.as_str() != "none")
+            .map(|f| expand_user_path(f, user, uid, home).map(|p| home.join(p)))
+            .collect()
+    }
+
+    /// The text for `qshd -T`.
     /// The text for `qshd -T`.
     pub fn dump(&self) -> Result<String> {
         Ok(toml::to_string(self)?)
     }
+}
+
+/// Replaces sshd's path tokens: `%h` home, `%u` user, `%U` uid, `%%`.
+pub fn expand_user_path(text: &str, user: &str, uid: u32, home: &Path) -> Result<PathBuf> {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('h') => out.push_str(&home.to_string_lossy()),
+            Some('u') => out.push_str(user),
+            Some('U') => out.push_str(&uid.to_string()),
+            Some('%') => out.push('%'),
+            other => bail!("unknown token %{} in {text:?}", other.map(String::from).unwrap_or_default()),
+        }
+    }
+    Ok(PathBuf::from(out))
 }
 
 /// PermitOpen/PermitListen lists: empty or `any` allows all, `none` nothing.
@@ -658,6 +808,16 @@ mod tests {
             assert!(parsed.is_err(), "{bad}");
         }
         assert_eq!(parse("permit_root_login = \"without-password\"").permit_root_login, PermitRootLogin::ProhibitPassword);
+    }
+
+    #[test]
+    fn penalties() {
+        assert_eq!(parse("").per_source_penalties, Penalties::default());
+        assert!(!parse("per_source_penalties = false").per_source_penalties.enabled);
+        let p = parse("per_source_penalties = \"authfail:30s min:1m max:2h crash:90\"").per_source_penalties;
+        assert_eq!((p.authfail, p.min, p.max), (Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(7200)));
+        assert!(toml::from_str::<ServerConfig>("per_source_penalties = \"authfail:x\"").is_err());
+        assert!(toml::from_str::<ServerConfig>("per_source_penalties = \"bogus:1\"").is_err());
     }
 
     #[test]

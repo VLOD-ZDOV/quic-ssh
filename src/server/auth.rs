@@ -21,11 +21,17 @@ const MAX_QUERIES: u32 = 32;
 const MIN_RSA_BITS: usize = 2048;
 
 /// The user's authorized_keys entries (`~/.config/qsh/authorized_keys`, and
-/// `~/.ssh/authorized_keys` if enabled), read with StrictModes checks.
+/// `authorized_keys_file` if `use_ssh_authorized_keys`), read with
+/// StrictModes checks.
 pub fn authorized_entries(cfg: &ServerConfig, user: &User) -> Vec<AuthorizedKey> {
     let mut files = vec![qsh_dir(&user.home).join("authorized_keys")];
     if cfg.use_ssh_authorized_keys {
-        files.push(user.home.join(".ssh").join("authorized_keys"));
+        for f in cfg.authorized_keys_files(&user.name, user.uid, &user.home) {
+            match f {
+                Ok(path) => files.push(path),
+                Err(e) => warn!("authorized_keys_file: {e:#}"),
+            }
+        }
     }
     let mut entries = Vec::new();
     for path in files {
@@ -37,6 +43,26 @@ pub fn authorized_entries(cfg: &ServerConfig, user: &User) -> Vec<AuthorizedKey>
         }
     }
     entries
+}
+
+/// The user's `authorized_principals_file`, if one is configured (an
+/// unreadable one allows no principal, as in sshd).
+pub fn authorized_principals(cfg: &ServerConfig, user: &User) -> Option<Vec<authkeys::AuthorizedPrincipal>> {
+    let file = cfg.authorized_principals_file.as_ref()?;
+    let path = match crate::config::expand_user_path(file, &user.name, user.uid, &user.home) {
+        Ok(p) => user.home.join(p),
+        Err(e) => {
+            warn!("authorized_principals_file: {e:#}");
+            return Some(Vec::new());
+        }
+    };
+    match read_strict(&path, &user.home, user.uid) {
+        Ok(text) => Some(authkeys::parse_principals(&text, |line, e| warn!("{}:{line}: line ignored: {e:#}", path.display()))),
+        Err(e) => {
+            warn!("ignoring {}: {e:#}", path.display());
+            Some(Vec::new())
+        }
+    }
 }
 
 /// CA keys from `trusted_user_ca_keys`, trusted to sign certificates for any user.

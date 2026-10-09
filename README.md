@@ -397,6 +397,10 @@ accept_env = ["LANG", "LC_*", "COLORTERM"]   # variables clients may set
 disable_forwarding = false      # true: no port or agent forwarding at all
 client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
 client_alive_count_max = 3
+per_source_penalties = true     # drop addresses that keep failing; or "authfail:5s noauth:1s min:15s max:10m"
+# per_source_penalty_exempt_list = ["192.0.2.0/24"]
+# authorized_keys_file = [".ssh/authorized_keys", "/etc/ssh/keys/%u"]   # read with use_ssh_authorized_keys
+# authorized_principals_file = ".ssh/principals"   # principals for trusted_user_ca_keys certificates
 
 [set_env]                       # variables every session gets
 # TZ = "UTC"
@@ -419,6 +423,8 @@ client_alive_count_max = 3
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
 
 **Checking and reloading.** `qshd -t` checks the config and the host key; `qshd -T` prints the settings in effect, and `qshd -T -C user=alice,addr=192.0.2.7` those for one login (with `[[match]]` applied, and whether the user may log in at all). On SIGHUP (`systemctl reload qshd`) qshd reads its config again: new logins use the new settings, running sessions keep theirs. A broken config is reported and the old one kept. Changes to `listen`, `tcp`, the host key, the connection limits, `session_timeout` and `client_alive_*` take effect after a restart.
+
+**Penalties.** As in sshd 9.8 and newer, an address whose connections fail to log in collects penalty time (5 s per failed login, 1 s for a connection that never tries, 10 s for running out of `login_grace_time`); once it has 15 s, its new connections are dropped until the time runs out (at most 10 minutes). IPv6 addresses count per /64. Unknown users and refused pairings count like failed logins, so penalties do not tell which accounts exist.
 
 Users that `deny_users`/`allow_users`/`deny_groups`/`allow_groups` or `permit_root_login = "no"` keep out are treated like unknown users: they get the same "access denied", so the answer does not tell which accounts exist.
 
