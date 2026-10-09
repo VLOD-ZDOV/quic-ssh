@@ -309,6 +309,36 @@ OUT=$(pw_login 'wrong horse' || true)
 check "a wrong password is refused" test -z "$OUT"
 check "no password for users without it enabled" bash -c "! HOME='$T/client-pw' SSH_ASKPASS='$T/askpass' SSH_ASKPASS_REQUIRE=force QSH_TEST_PASSWORD=x '$QSH' -p $PORT qsh-alice@127.0.0.1 true </dev/null 2>/dev/null"
 
+# --- tunnel devices (-w) ---------------------------------------------------------------------
+if [[ -n ${QSH_TEST_NS:-} || ! -c /dev/net/tun ]] || ! command -v ip >/dev/null; then
+    echo "  skip tunnel devices (need real root and /dev/net/tun)"
+else
+    cat >> "$T/config.toml" <<EOF
+
+[[match]]
+user = "qsh-alice"
+permit_tunnel = "point-to-point"
+EOF
+    kill -HUP "$SERVER_PID"
+    sleep 0.5
+    HOME="$T/client" timeout 30 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -w 101:102 -N qsh-alice@127.0.0.1 </dev/null >/dev/null 2>"$T/tun.err" &
+    TUN_CLIENT=$!
+    for _ in $(seq 100); do [[ -e /sys/class/net/tun101 && -e /sys/class/net/tun102 ]] && break; sleep 0.1; done
+    check "-w creates both tunnel devices" test -e /sys/class/net/tun101 -a -e /sys/class/net/tun102
+    ip link set tun101 up 2>/dev/null || true
+    ip link set tun102 up 2>/dev/null || true
+    ip addr add 10.211.0.1/30 dev tun101 2>/dev/null || true
+    RX_BEFORE=$(cat /sys/class/net/tun102/statistics/rx_packets 2>/dev/null || echo 0)
+    ping -c 3 -W 1 -I tun101 10.211.0.2 >/dev/null 2>&1 || true
+    RX_AFTER=$(cat /sys/class/net/tun102/statistics/rx_packets 2>/dev/null || echo 0)
+    check "packets into one device come out of the other" test "$RX_AFTER" -gt "$RX_BEFORE"
+    OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -o Tunnel=ethernet -o ExitOnForwardFailure=yes -w any:any -N qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
+    check "an ethernet tunnel is refused by point-to-point" grep -q "not allowed" <<<"$OUT"
+    kill "$TUN_CLIENT" 2>/dev/null || true
+    wait "$TUN_CLIENT" 2>/dev/null || true
+    [[ -n ${QSH_DEBUG:-} ]] && cat "$T/tun.err"
+fi
+
 # --- chroot_directory and internal-sftp (after a config reload) -----------------------------
 if [[ -n ${QSH_TEST_NS:-} ]] || ! command -v sftp >/dev/null; then
     # In the namespace, / belongs to an unmapped uid, so no path passes the ownership check.

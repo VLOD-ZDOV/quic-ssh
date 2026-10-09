@@ -93,6 +93,9 @@ pub struct Target {
     pub known_hosts_extra: Option<Arc<String>>,
     /// `AddKeysToAgent`: `None` = no; else `yes`, `ask`, `confirm` or a time.
     pub add_keys_to_agent: Option<String>,
+    /// `-w`/`Tunnel`: `Some(ethernet)`, with `TunnelDevice`'s local and remote units.
+    pub tunnel: Option<bool>,
+    pub tunnel_units: (Option<u32>, Option<u32>),
     /// Answer password questions (`PasswordAuthentication`), at most this
     /// many times (`NumberOfPasswordPrompts`).
     pub password_authentication: bool,
@@ -386,6 +389,13 @@ impl Target {
             known_hosts_command: cfg.known_hosts_command,
             known_hosts_extra: None,
             add_keys_to_agent: cfg.add_keys_to_agent.filter(|v| v != "no"),
+            tunnel: match cfg.tunnel.as_deref() {
+                None | Some("no") => None,
+                Some("yes" | "point-to-point") => Some(false),
+                Some("ethernet") => Some(true),
+                Some(other) => bail!("unknown Tunnel {other:?} (yes, point-to-point, ethernet, no)"),
+            },
+            tunnel_units: crate::tunnel::parse_units(cfg.tunnel_device.as_deref().unwrap_or("any:any"))?,
             password_authentication: cfg.password_authentication.unwrap_or(true),
             password_prompts: cfg.password_prompts.unwrap_or(3),
             forward_x11: cfg.forward_x11.unwrap_or(false).then_some(cfg.forward_x11_trusted.unwrap_or(false)),

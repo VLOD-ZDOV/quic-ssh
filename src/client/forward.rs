@@ -479,6 +479,34 @@ impl Forwarder {
         }
     }
 
+    /// `-w`: a tunnel device here and one on the server (`units`: local,
+    /// remote), with the packets between them.
+    pub async fn tunnel(&self, ethernet: bool, units: (Option<u32>, Option<u32>)) -> Result<String> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.conn.server_version() < 6 {
+                bail!("the server's qshd is too old for tunnels (-w)");
+            }
+            let (dev, name) = crate::tunnel::open(ethernet, units.0)?;
+            let (mut send, mut recv) = self.conn.open_bi().await?;
+            write_msg(&mut send, &Request::Tunnel { ethernet, unit: units.1 }).await?;
+            expect_ok(&mut recv).await?;
+            let task = tokio::spawn(async move {
+                if let Err(e) = crate::tunnel::relay(dev, send, recv).await {
+                    debug!("tunnel: {e:#}");
+                }
+            });
+            let fwd = Forward { listen: Listen::Unix(name.clone()), dest: Dest::Socks };
+            self.active.lock().unwrap().push(Active { kind: 'w', fwd, tasks: vec![task.abort_handle()], _request: None, bound: None });
+            Ok(name)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (ethernet, units);
+            bail!("tunnel devices (-w) are not supported on this system")
+        }
+    }
+
     /// Cancels the `kind` forward listening at `listen` (`[bind:]port` or a
     /// path, as given when it was added). Returns whether there was one.
     pub fn cancel(&self, kind: char, listen: &str) -> Result<bool> {

@@ -151,6 +151,7 @@ qsh -J bastion user@internal           # through a jump host (both run qshd)
 qsh -f -N -L 5432:db:5432 host         # log in, then go to the background
 qsh -A host                            # forward your ssh-agent
 qsh -Y host xterm                      # X11 forwarding (-X: untrusted, as in ssh)
+sudo qsh -w 0:0 -N root@host           # tunnel devices tun0 <-> tun0 (root on both sides)
 qsh cp file.txt user@host:dir/         # upload
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
@@ -241,7 +242,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` and `ProxyCommand` (in `~/.config/qsh/config`; qsh then runs over the program's stdin/stdout, e.g. `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` with `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` and `GlobalKnownHostsFile` (default `/etc/qsh/known_hosts`) `KnownHostsCommand` and `HashKnownHosts` (in `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tag` (or `-P`), `CanonicalizeHostname` with `CanonicalDomains`, `CanonicalizeMaxDots` and `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). A `Match` block whose conditions qsh cannot check (`version`...) is not used, but a `ProxyCommand` or `ProxyJump` in it still counts, so qsh never connects around a proxy that may apply. known_hosts entries may be hashed (`ssh-keygen -H`) or patterns. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), and `#` starts a comment anywhere on a line. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` and `ProxyCommand` (in `~/.config/qsh/config`; qsh then runs over the program's stdin/stdout, e.g. `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` with `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` and `GlobalKnownHostsFile` (default `/etc/qsh/known_hosts`) `KnownHostsCommand` and `HashKnownHosts` (in `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (or `-P`), `CanonicalizeHostname` with `CanonicalDomains`, `CanonicalizeMaxDots` and `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). A `Match` block whose conditions qsh cannot check (`version`...) is not used, but a `ProxyCommand` or `ProxyJump` in it still counts, so qsh never connects around a proxy that may apply. known_hosts entries may be hashed (`ssh-keygen -H`) or patterns. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), and `#` starts a comment anywhere on a line. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -407,6 +408,7 @@ x11_forwarding = false          # allow qsh -X/-Y (DISPLAY=localhost:10 and up)
 x11_display_offset = 10
 x11_use_localhost = true
 xauth_location = "/usr/bin/xauth"
+permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS
 client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
 client_alive_count_max = 3
 per_source_penalties = true     # drop addresses that keep failing; or "authfail:5s noauth:1s min:15s max:10m"
@@ -535,7 +537,6 @@ This is still a young project and has not had an external audit. For critical sy
 ## Limitations
 
 - No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
-- No tunnels (`-w`).
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.

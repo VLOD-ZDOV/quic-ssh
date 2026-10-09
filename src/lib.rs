@@ -18,6 +18,7 @@ pub mod tls;
 pub mod totp;
 pub mod transport;
 pub mod tree;
+pub mod tunnel;
 
 /// Default port for both UDP (QUIC) and TCP (fallback).
 pub const DEFAULT_PORT: u16 = 4422;

@@ -78,6 +78,9 @@ pub struct HostConfig {
     pub forward_x11_trusted: Option<bool>,
     pub forward_x11_timeout: Option<String>,
     pub xauth_location: Option<String>,
+    /// `Tunnel` (`yes`, `point-to-point`, `ethernet`, `no`) and `TunnelDevice`.
+    pub tunnel: Option<String>,
+    pub tunnel_device: Option<String>,
     /// `PasswordAuthentication` and `NumberOfPasswordPrompts`.
     pub password_authentication: Option<bool>,
     pub password_prompts: Option<u32>,
@@ -407,6 +410,8 @@ impl Parser<'_> {
                     o.known_hosts_command = (!raw.eq_ignore_ascii_case("none")).then_some(raw);
                 }
                 "tag" if o.tag.is_none() => o.tag = first,
+                "tunnel" if self.full && o.tunnel.is_none() => o.tunnel = first.map(|v| v.to_ascii_lowercase()),
+                "tunneldevice" if self.full && o.tunnel_device.is_none() => o.tunnel_device = first,
                 "passwordauthentication" if o.password_authentication.is_none() => o.password_authentication = first.as_deref().map(yes),
                 "numberofpasswordprompts" if o.password_prompts.is_none() => o.password_prompts = first.and_then(|v| v.parse().ok()),
                 "forwardx11" if o.forward_x11.is_none() => o.forward_x11 = first.as_deref().map(yes),
@@ -806,6 +811,8 @@ fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canon
         forward_x11_trusted: ours.forward_x11_trusted.or(ssh.forward_x11_trusted),
         forward_x11_timeout: ours.forward_x11_timeout.or(ssh.forward_x11_timeout),
         xauth_location: ours.xauth_location.or(ssh.xauth_location),
+        tunnel: ours.tunnel.or(ssh.tunnel),
+        tunnel_device: ours.tunnel_device.or(ssh.tunnel_device),
         password_authentication: ours.password_authentication.or(ssh.password_authentication),
         password_prompts: ours.password_prompts.or(ssh.password_prompts),
         wants_final: ours.wants_final || ssh.wants_final,

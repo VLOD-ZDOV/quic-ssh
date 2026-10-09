@@ -59,6 +59,9 @@ pub struct ServerConfig {
     pub x11_use_localhost: bool,
     /// The xauth program (like XAuthLocation).
     pub xauth_location: PathBuf,
+    /// Tunnel devices (`qsh -w`, like PermitTunnel): `no`, `yes`,
+    /// `point-to-point` (TUN only) or `ethernet` (TAP only). Root only.
+    pub permit_tunnel: PermitTunnel,
     /// Destinations `-L`/`-D`/`-W` may connect to: `host:port` patterns with
     /// `*` (like PermitOpen). Empty or `["any"]`: any; `["none"]`: none.
     #[serde(deserialize_with = "names")]
@@ -211,6 +214,28 @@ pub enum PermitRootLogin {
     ProhibitPassword,
     ForcedCommandsOnly,
     No,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermitTunnel {
+    #[default]
+    No,
+    Yes,
+    PointToPoint,
+    Ethernet,
+}
+
+impl PermitTunnel {
+    /// Whether a tunnel of this kind (TAP with `ethernet`) is allowed.
+    pub fn allows(self, ethernet: bool) -> bool {
+        match self {
+            PermitTunnel::No => false,
+            PermitTunnel::Yes => true,
+            PermitTunnel::PointToPoint => !ethernet,
+            PermitTunnel::Ethernet => ethernet,
+        }
+    }
 }
 
 /// Which way forwarding may go (sshd's `yes`/`all`, `no`, `local`, `remote`).
@@ -460,6 +485,7 @@ overrides! {
         permit_open: Vec<String>,
         permit_root_login: PermitRootLogin,
         permit_tty: bool,
+        permit_tunnel: PermitTunnel,
         permit_user_rc: bool,
         refuse_connection: bool,
         set_env: BTreeMap<String, String>,
@@ -538,6 +564,7 @@ impl Default for ServerConfig {
             x11_display_offset: 10,
             x11_use_localhost: true,
             xauth_location: PathBuf::from("/usr/bin/xauth"),
+            permit_tunnel: PermitTunnel::No,
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
             max_connections: 256,

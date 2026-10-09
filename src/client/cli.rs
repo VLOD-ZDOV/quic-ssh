@@ -153,7 +153,10 @@ impl SshArgs {
             'b' => self.options.push(format!("BindAddress {v}")),
             'P' => self.options.push(format!("Tag {v}")),
             'B' => self.options.push(format!("BindInterface {v}")),
-            'w' => return Err("tunnel devices (-w) are not supported".into()),
+            'w' => {
+                self.options.push("Tunnel yes".into());
+                self.options.push(format!("TunnelDevice {v}"));
+            }
             // Bind address/interface, ciphers, MACs, logging, PKCS#11, tags, queries.
             _ => self.ignored.push(format!("-{c} {v}")),
         }

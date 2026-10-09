@@ -2854,3 +2854,17 @@ print(d.split(":")[0], s.recv(16).decode())
     let out = c.cmd(&["-Y", "-p", &s.port.to_string(), &dest(), "echo", "${DISPLAY:-none}"]).env("DISPLAY", &display).env("XAUTHORITY", &xauthority).output().unwrap();
     assert!(stderr(&out).contains("X11 forwarding refused"), "{}", stderr(&out));
 }
+
+/// `-w` without the rights to create devices (or the server's consent)
+/// fails with a reason; with ExitOnForwardFailure it ends qsh.
+#[test]
+fn tunnel_needs_rights() {
+    if nix_is_root() {
+        return;
+    }
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let out = c.run(&["-w", "any", "-o", "ExitOnForwardFailure=yes", "-N", "-p", &s.port.to_string(), &dest()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("tunnel"), "{}", stderr(&out));
+}

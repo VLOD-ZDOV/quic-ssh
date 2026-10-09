@@ -750,6 +750,12 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             x11::forward(send, recv, conn.clone(), cfg, x11, x11::Request { proto, cookie, screen }).await
         }
+        Request::Tunnel { ethernet, unit } => {
+            if !cfg.permit_tunnel.allows(ethernet) || cfg.disable_forwarding || limits.no_port_forwarding {
+                return write_msg(&mut send, &Reply::Err("tunnel forwarding is not allowed".into())).await;
+            }
+            tunnel(send, recv, conn, user, ethernet, unit).await
+        }
         Request::Ping => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
@@ -984,6 +990,25 @@ async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<
         }
     }
     Ok(())
+}
+
+/// `-w`: a tunnel device here, its packets to and from the client.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn tunnel(mut send: SendHalf, recv: RecvHalf, conn: &Arc<Conn>, user: &User, ethernet: bool, unit: Option<u32>) -> Result<()> {
+    let (dev, name) = match crate::tunnel::open(ethernet, unit) {
+        Ok(d) => d,
+        Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
+    };
+    write_msg(&mut send, &Reply::Ok).await?;
+    info!("{}: {} opened tunnel device {name}", conn.remote_addr(), user.name);
+    let result = crate::tunnel::relay(dev, send, recv).await;
+    info!("{}: tunnel device {name} closed", conn.remote_addr());
+    result
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn tunnel(mut send: SendHalf, _recv: RecvHalf, _conn: &Arc<Conn>, _user: &User, _ethernet: bool, _unit: Option<u32>) -> Result<()> {
+    write_msg(&mut send, &Reply::Err("tunnel devices are not supported on this system".into())).await
 }
 
 /// Largest speed test transfer the server agrees to.

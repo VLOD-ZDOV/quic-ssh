@@ -58,6 +58,9 @@ sha-crypt = "0.6"
 yescrypt = { version = "0.1", default-features = false, features = ["password-hash"] }
 
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+tun-rs = { version = "2", default-features = false, features = ["async_tokio"] }
+
 [dev-dependencies]
 tempfile = "3"
 

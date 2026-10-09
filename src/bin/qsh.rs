@@ -716,7 +716,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
-    let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some();
+    let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some() || target.tunnel.is_some();
     for f in remotes {
         let spec = f.describe();
         match forwarder.remote(f.clone()).await {
@@ -733,6 +733,13 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     }
     if let Some(path) = agent {
         forwarder.agent(path, quiet).await;
+    }
+    if let Some(ethernet) = target.tunnel {
+        match forwarder.tunnel(ethernet, target.tunnel_units).await {
+            Ok(name) => tracing::info!("tunnel device {name}"),
+            Err(e) if !target.exit_on_forward_failure => eprintln!("qsh: warning: tunnel (-w): {e:#}"),
+            Err(e) => return Err(e.context("tunnel (-w)")),
+        }
     }
     if let Some(trusted) = target.forward_x11 {
         match std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()) {

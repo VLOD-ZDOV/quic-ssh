@@ -159,6 +159,10 @@ pub enum Request {
     /// with [`Opened::X11`]. `proto` and `cookie` (hex) are the fake
     /// authentication the sessions use. Closing this stream ends it.
     X11Forward { proto: String, cookie: String, screen: u32 },
+    /// A tunnel device on the server (`-w`): TUN, or TAP with `ethernet`;
+    /// `unit` picks its number. After `Reply::Ok`, packets follow both
+    /// ways, each with a 4-byte big-endian length in front.
+    Tunnel { ethernet: bool, unit: Option<u32> },
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
