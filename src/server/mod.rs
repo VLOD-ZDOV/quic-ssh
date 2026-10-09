@@ -916,10 +916,16 @@ fn receive_fd(sock: &std::os::unix::net::UnixStream) -> Result<std::os::fd::Owne
     let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
     let mut byte = [0u8; 1];
-    recvmsg(sock, &mut [std::io::IoSliceMut::new(&mut byte)], &mut control, RecvFlags::CMSG_CLOEXEC)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = RecvFlags::empty();
+    recvmsg(sock, &mut [std::io::IoSliceMut::new(&mut byte)], &mut control, flags)?;
     for msg in control.drain() {
         if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
             if let Some(fd) = fds.next() {
+                // Where the flag above does not exist: not for programs qshd starts.
+                nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
                 return Ok(fd);
             }
         }
