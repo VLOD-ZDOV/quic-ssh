@@ -197,7 +197,7 @@ qsh входит теми же ключами, что и ssh, в таком по
 - Переход с Wi-Fi на мобильную сеть, сон ноутбука и короткие обрывы больше не убивают shell. По QUIC смена адреса (NAT rebinding) обычно вообще не требует переподключения.
 - Нажатия во время обрыва теряются, а `~.` прекращает ожидание.
 - Обычный выход (exit, `~.`, закрытие терминала) завершает сессию на сервере, как раньше.
-- Выключить можно через `PersistSession no` в `~/.config/qsh/config` (или `-o PersistSession=no`). Сессии с пробросом портов, агента или X11 не сохраняются.
+- Выключить можно через `PersistSession no` в `~/.config/qsh/config` (или `-o PersistSession=no`). Сессии с пробросом портов, агента или X11 не сохраняются; пробросы, добавленные позже через `~C`, заканчиваются вместе с потерянным соединением (qsh говорит, какие).
 - `ServerAliveInterval` и `ServerAliveCountMax` задают, как быстро замечается мёртвое соединение. Для остальных сессий они работают как в ssh. qsh проверяет связь пингами в отдельных потоках, поэтому непрочитанный вывод или ввод, который удалённая команда пока не читает, не выдают живое соединение за мёртвое.
 
 ### Общее соединение (`ControlMaster`)
@@ -243,7 +243,7 @@ Host myserver
     Port 8080
 ```
 
-Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `Compression` (для `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` и `ProxyCommand` (в `~/.config/qsh/config`; тогда qsh работает через stdin/stdout программы, например `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` вместе с `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` и `GlobalKnownHostsFile` (по умолчанию `/etc/qsh/known_hosts`), `KnownHostsCommand` и `HashKnownHosts` (в `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (или `-P`), `CanonicalizeHostname` с `CanonicalDomains`, `CanonicalizeMaxDots` и `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` и `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). Блок `Match` с условиями, которые qsh проверить не может (`version`…), не применяется, но `ProxyCommand` или `ProxyJump` в нём всё равно учитывается: qsh никогда не подключается в обход прокси, который может действовать. Записи known_hosts могут быть хэшированными (`ssh-keygen -H`) или шаблонами. Как и ssh, qsh читает `/etc/ssh/ssh_config` после `~/.ssh/config` (кроме случая с `-F`), а `#` начинает комментарий в любом месте строки. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
+Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `Compression` (для `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` и `ProxyCommand` (в `~/.config/qsh/config`; тогда qsh работает через stdin/stdout программы, например `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` вместе с `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` и `GlobalKnownHostsFile` (по умолчанию `/etc/qsh/known_hosts`), `KnownHostsCommand` и `HashKnownHosts` (в `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (или `-P`), `CanonicalizeHostname` с `CanonicalDomains`, `CanonicalizeMaxDots` и `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` и `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). Блок `Match` с условиями, которые qsh проверить не может (`version`…), не применяется, но `ProxyCommand` или `ProxyJump` в нём всё равно учитывается: qsh никогда не подключается в обход прокси, который может действовать. Записи known_hosts могут быть хэшированными (`ssh-keygen -H`) или шаблонами. Как и ssh, qsh читает `/etc/ssh/ssh_config` после `~/.ssh/config` (кроме случая с `-F`), `#` начинает комментарий в любом месте строки, а файлы конфигурации (и их Include), которые могут менять другие пользователи, не принимаются. Значения из командной строки (`user@`, `-l`, `:port`, `-p`, `-i`) всегда главнее; пользователя из командной строки видят и `Match user`, и `%r`.
 
 ### Режим совместимости с OpenSSH (`--full`)
 
@@ -383,24 +383,24 @@ session_timeout = 3600          # сколько секунд хранить о�
 
 # Кому можно входить (проверяется в этом порядке, как в sshd): шаблоны, `user@адрес` с CIDR
 # deny_users = ["guest"]
-# allow_users = ["alice", "bob@192.0.2.0/24"]
+# allow_users = ["alice", "bob@192.0.2.0/24,!192.0.2.9"]
 # deny_groups = ["nossh"]
 # allow_groups = ["staff"]
 permit_root_login = "prohibit-password"   # root только по ключам; "yes", "no", "forced-commands-only"
-password_authentication = false # принимать пароли из /etc/shadow, если ключи не подошли (системный режим, Linux)
+password_authentication = false # принимать пароли из /etc/shadow, если ключи не подошли (системный режим, Linux; кроме просроченных)
 permit_empty_passwords = false
 login_grace_time = 120          # секунд на вход; 0 = без ограничения
 # banner = "/etc/issue.net"     # показывается до входа
 print_motd = true               # /etc/motd для входных оболочек (~/.hushlogin выключает)
 print_last_log = true           # «Last login: ...» (системный режим, из lastlog или wtmp)
-permit_user_rc = true           # запускать ~/.ssh/rc (или /etc/ssh/sshrc) перед сессией
+permit_user_rc = true           # запускать ~/.ssh/rc через оболочку пользователя (не для подсистем и не при force_command), иначе /etc/ssh/sshrc
 max_sessions = 10               # одновременных сессий на соединение
 permit_tty = true
 accept_env = ["LANG", "LC_*", "COLORTERM"]   # переменные, которые может задать клиент
 # force_command = "/usr/local/bin/menu"   # заменяет любую команду; исходная — в SSH_ORIGINAL_COMMAND
 # chroot_directory = "/srv/jail/%u"       # запереть сессии и qsh cp (системный режим; путь root)
-# permit_open = ["db.internal:5432"]      # куда можно -L/-D/-W; "none" — никуда
-# permit_listen = ["8080", "localhost:9000"]   # где может слушать -R
+# permit_open = ["db.internal:5432"]      # куда можно -L/-D/-W; "none" — никуда; если задано, Unix-сокеты нельзя
+# permit_listen = ["8080", "localhost:9000"]   # где может слушать -R; если задано, Unix-сокеты нельзя
 disable_forwarding = false      # true: никаких пробросов портов, сокетов и агента
 allow_stream_local_forwarding = true   # проброс Unix-сокетов: или "no", "local", "remote"
 stream_local_bind_mask = "0177" # какие права убрать у сокетов -R на сервере
@@ -409,7 +409,7 @@ x11_forwarding = false          # разрешить qsh -X/-Y (DISPLAY=localhos
 x11_display_offset = 10
 x11_use_localhost = true
 xauth_location = "/usr/bin/xauth"
-permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS
+permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; существующие устройства — только root
 client_alive_interval = 0       # секунд между проверками молчащего клиента; 0 = встроенная (~60 с)
 client_alive_count_max = 3
 per_source_penalties = true     # отбрасывать адреса, с которых раз за разом не входят; или "authfail:5s noauth:1s min:15s max:10m"
@@ -421,7 +421,7 @@ per_source_penalties = true     # отбрасывать адреса, с кот
 # TZ = "UTC"
 
 [subsystems]                    # для `qsh -s` и sftp; запускаются как `$SHELL -c команда`
-# sftp = "internal-sftp"       # встроенный сервер; по умолчанию, если sftp-server из OpenSSH не установлен
+# sftp = "internal-sftp"       # встроенный сервер; по умолчанию (через оболочку пользователя), если sftp-server из OpenSSH не установлен
 
 # Настройки для части входов, как Match в sshd (user, group, address; должны выполняться все заданные).
 # Если подходят несколько блоков, побеждает первый, где настройка задана; "none" убирает значение.
@@ -429,11 +429,11 @@ per_source_penalties = true     # отбрасывать адреса, с кот
 # group = "sftponly"
 # chroot_directory = "/srv/sftp/%u"
 # force_command = "internal-sftp"
-# allow_tcp_forwarding = false
+# disable_forwarding = true
 # permit_tty = false
 ```
 
-**SFTP и chroot.** В qshd есть встроенный SFTP-сервер `internal-sftp`, как в sshd: ему не нужна оболочка (он работает и для аккаунтов с `nologin`) и не нужны файлы внутри chroot. Его можно указать подсистемой `sftp` или в `force_command`, с опциями sshd `-R` (только чтение), `-u UMASK` и `-d DIR` (начальный каталог; `%u` пользователь, `%d` домашний каталог). Он же используется для `sftp`, если sftp-server из OpenSSH не установлен. `chroot_directory` запирает программы входа и его передачи `qsh cp` в каталоге; как и в sshd, сам каталог и все каталоги выше должны принадлежать root и никому больше не быть доступны на запись, иначе вход не удаётся. Классическая схема «только SFTP» — блок `[[match]]` выше.
+**SFTP и chroot.** В qshd есть встроенный SFTP-сервер `internal-sftp`, как в sshd: ему не нужна оболочка (он работает и для аккаунтов с `nologin`) и не нужны файлы внутри chroot. Его можно указать подсистемой `sftp` или в `force_command`, с опциями sshd `-R` (только чтение), `-u UMASK` и `-d DIR` (начальный каталог; `%u` пользователь, `%d` домашний каталог). Он же используется для `sftp`, если sftp-server из OpenSSH не установлен; тогда он запускается через оболочку пользователя, так что аккаунты с `nologin` и `git-shell` так SFTP не получат. Встроенным qshd запускает его только там, где его назвал сервер (подсистема, `force_command`, `command=` ключа); если клиент просит выполнить `internal-sftp`, это обычная команда для оболочки пользователя. `chroot_directory` запирает программы входа и его передачи `qsh cp` в каталоге; как и в sshd, сам каталог и все каталоги выше должны принадлежать root и никому больше не быть доступны на запись, иначе вход не удаётся. Классическая схема «только SFTP» — блок `[[match]]` выше.
 
 Обратные пробросы (`-R`) слушают там, где разрешает `gateway_ports`; все, кроме root, не могут слушать порты ниже 1024. `allow_tcp_forwarding = false` выключает `-L`, `-R`, `-D` и `-W`.
 

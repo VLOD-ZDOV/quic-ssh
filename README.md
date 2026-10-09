@@ -197,7 +197,7 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - Wi-Fi to mobile switches, laptop sleep and short outages no longer kill your shell. Over QUIC, a change of address (NAT rebinding) usually needs no reconnect at all.
 - Keys typed during an outage are dropped, and `~.` gives up waiting.
 - Quitting normally (exit, `~.`, closing the terminal) ends the session on the server as usual.
-- Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port, agent or X11 forwarding are not kept.
+- Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port, agent or X11 forwarding are not kept; forwards added later with `~C` end when the connection is lost (qsh says which).
 - `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
 
 ### Connection sharing (`ControlMaster`)
@@ -243,7 +243,7 @@ Host myserver
     Port 8080
 ```
 
-Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` and `ProxyCommand` (in `~/.config/qsh/config`; qsh then runs over the program's stdin/stdout, e.g. `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` with `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` and `GlobalKnownHostsFile` (default `/etc/qsh/known_hosts`), `KnownHostsCommand` and `HashKnownHosts` (in `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (or `-P`), `CanonicalizeHostname` with `CanonicalDomains`, `CanonicalizeMaxDots` and `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). A `Match` block whose conditions qsh cannot check (`version`...) is not used, but a `ProxyCommand` or `ProxyJump` in it still counts, so qsh never connects around a proxy that may apply. known_hosts entries may be hashed (`ssh-keygen -H`) or patterns. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), and `#` starts a comment anywhere on a line. Command-line values (`user@`, `:port`, `-p`, `-i`) always win.
+Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` and `ProxyCommand` (in `~/.config/qsh/config`; qsh then runs over the program's stdin/stdout, e.g. `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` with `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` and `GlobalKnownHostsFile` (default `/etc/qsh/known_hosts`), `KnownHostsCommand` and `HashKnownHosts` (in `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (or `-P`), `CanonicalizeHostname` with `CanonicalDomains`, `CanonicalizeMaxDots` and `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). A `Match` block whose conditions qsh cannot check (`version`...) is not used, but a `ProxyCommand` or `ProxyJump` in it still counts, so qsh never connects around a proxy that may apply. known_hosts entries may be hashed (`ssh-keygen -H`) or patterns. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), `#` starts a comment anywhere on a line, and config files (and their Includes) that other users could write are refused. Command-line values (`user@`, `-l`, `:port`, `-p`, `-i`) always win; the user from the command line is also what `Match user` and `%r` see.
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -383,24 +383,24 @@ session_timeout = 3600          # seconds a disconnected terminal session is kep
 
 # Who may log in (checked in this order, like sshd): patterns, `user@address` with CIDR
 # deny_users = ["guest"]
-# allow_users = ["alice", "bob@192.0.2.0/24"]
+# allow_users = ["alice", "bob@192.0.2.0/24,!192.0.2.9"]
 # deny_groups = ["nossh"]
 # allow_groups = ["staff"]
 permit_root_login = "prohibit-password"   # root with keys only; "yes", "no", "forced-commands-only"
-password_authentication = false # accept /etc/shadow passwords when no key works (system mode, Linux)
+password_authentication = false # accept /etc/shadow passwords when no key works (system mode, Linux; not expired ones)
 permit_empty_passwords = false
 login_grace_time = 120          # seconds to log in; 0 = no limit
 # banner = "/etc/issue.net"     # shown before login
 print_motd = true               # /etc/motd for login shells (~/.hushlogin turns it off)
 print_last_log = true           # "Last login: ..." (system mode, from lastlog or wtmp)
-permit_user_rc = true           # run ~/.ssh/rc (or /etc/ssh/sshrc) before the session
+permit_user_rc = true           # run ~/.ssh/rc via the user's shell (not for subsystems or under force_command), else /etc/ssh/sshrc
 max_sessions = 10               # sessions at once per connection
 permit_tty = true
 accept_env = ["LANG", "LC_*", "COLORTERM"]   # variables clients may set
 # force_command = "/usr/local/bin/menu"   # replaces any command; the original is in SSH_ORIGINAL_COMMAND
 # chroot_directory = "/srv/jail/%u"       # confine sessions and qsh cp (system mode; root-owned path)
-# permit_open = ["db.internal:5432"]      # -L/-D/-W destinations; "none" = none
-# permit_listen = ["8080", "localhost:9000"]   # -R listeners
+# permit_open = ["db.internal:5432"]      # -L/-D/-W destinations; "none" = none; set: no Unix sockets
+# permit_listen = ["8080", "localhost:9000"]   # -R listeners; set: no Unix sockets
 disable_forwarding = false      # true: no port, socket or agent forwarding at all
 allow_stream_local_forwarding = true   # Unix socket forwarding: or "no", "local", "remote"
 stream_local_bind_mask = "0177" # permissions taken from -R sockets on the server
@@ -409,7 +409,7 @@ x11_forwarding = false          # allow qsh -X/-Y (DISPLAY=localhost:10 and up)
 x11_display_offset = 10
 x11_use_localhost = true
 xauth_location = "/usr/bin/xauth"
-permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS
+permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; only root may use existing devices
 client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
 client_alive_count_max = 3
 per_source_penalties = true     # drop addresses that keep failing; or "authfail:5s noauth:1s min:15s max:10m"
@@ -421,7 +421,7 @@ per_source_penalties = true     # drop addresses that keep failing; or "authfail
 # TZ = "UTC"
 
 [subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
-# sftp = "internal-sftp"       # built-in server; default when OpenSSH's sftp-server is not installed
+# sftp = "internal-sftp"       # built-in server; default (through the user's shell) when OpenSSH's sftp-server is not installed
 
 # Settings for some logins, like sshd's Match (user, group, address; all given must hold).
 # If several blocks match, the first one that sets a setting wins; "none" removes a value.
@@ -429,11 +429,11 @@ per_source_penalties = true     # drop addresses that keep failing; or "authfail
 # group = "sftponly"
 # chroot_directory = "/srv/sftp/%u"
 # force_command = "internal-sftp"
-# allow_tcp_forwarding = false
+# disable_forwarding = true
 # permit_tty = false
 ```
 
-**SFTP and chroot.** qshd has a built-in SFTP server, `internal-sftp`, like sshd's: it needs no shell (it works for accounts with a `nologin` shell) and no files inside a chroot. Use it as the `sftp` subsystem or as `force_command`, with sshd's options `-R` (read-only), `-u UMASK` and `-d DIR` (start directory; `%u` user, `%d` home). It is also used for `sftp` when OpenSSH's sftp-server is not installed. `chroot_directory` confines a login's programs and its `qsh cp` transfers to a directory; as with sshd, the directory and all above it must belong to root and be writable by nobody else, or the login fails. The classic SFTP-only setup is the `[[match]]` block above.
+**SFTP and chroot.** qshd has a built-in SFTP server, `internal-sftp`, like sshd's: it needs no shell (it works for accounts with a `nologin` shell) and no files inside a chroot. Use it as the `sftp` subsystem or as `force_command`, with sshd's options `-R` (read-only), `-u UMASK` and `-d DIR` (start directory; `%u` user, `%d` home). It is also used for `sftp` when OpenSSH's sftp-server is not installed, started through the user's shell then, so `nologin` and `git-shell` accounts get no SFTP that way. qshd runs it built in only where the server names it (a subsystem, `force_command`, a key's `command=`); a client asking to run `internal-sftp` gets the user's shell like any command. `chroot_directory` confines a login's programs and its `qsh cp` transfers to a directory; as with sshd, the directory and all above it must belong to root and be writable by nobody else, or the login fails. The classic SFTP-only setup is the `[[match]]` block above.
 
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
 
