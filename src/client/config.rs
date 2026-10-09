@@ -393,7 +393,8 @@ impl Parser<'_> {
                     o.more_known_hosts_files = args.iter().skip(1).cloned().collect();
                 }
                 "globalknownhostsfile" if self.ours && o.global_known_hosts_files.is_none() => o.global_known_hosts_files = Some(args.clone()),
-                "hashknownhosts" if o.hash_known_hosts.is_none() => o.hash_known_hosts = first.as_deref().map(yes),
+                // qsh's own: distributions turn it on in ssh_config for ssh's file.
+                "hashknownhosts" if self.ours && o.hash_known_hosts.is_none() => o.hash_known_hosts = first.as_deref().map(yes),
                 "knownhostscommand" if self.ours && o.known_hosts_command.is_none() && !raw.is_empty() => {
                     o.known_hosts_command = (!raw.eq_ignore_ascii_case("none")).then_some(raw);
                 }
@@ -779,7 +780,7 @@ fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canon
         user_known_hosts_file: ours.user_known_hosts_file,
         more_known_hosts_files: ours.more_known_hosts_files,
         global_known_hosts_files: ours.global_known_hosts_files,
-        hash_known_hosts: ours.hash_known_hosts.or(ssh.hash_known_hosts),
+        hash_known_hosts: ours.hash_known_hosts,
         known_hosts_command: ours.known_hosts_command,
         tag: ours.tag.or(ssh.tag),
         canonicalize_hostname: ours.canonicalize_hostname.or(ssh.canonicalize_hostname),
