@@ -112,6 +112,48 @@ pub fn connect(host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Connects to the Unix socket `path` and relays stdin/stdout to it (`-L`
+/// to a socket, as the user). Prints "ok" first, or an error on stderr.
+pub fn connect_unix(path: &str) -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    let sock = UnixStream::connect(path).with_context(|| format!("connect {path}"))?;
+    let mut out = io::stdout();
+    writeln!(out, "ok")?;
+    out.flush()?;
+    let mut to_sock = sock.try_clone()?;
+    let upstream = std::thread::spawn(move || {
+        let _ = pump(io::stdin().lock(), &mut to_sock);
+        let _ = to_sock.shutdown(std::net::Shutdown::Write);
+    });
+    let mut from_sock = sock;
+    let _ = pump(&mut from_sock, io::stdout().lock());
+    let _ = upstream.join();
+    Ok(())
+}
+
+/// Listens on the Unix socket `path` as the user (`-R` from a socket) and
+/// hands the listening socket to qshd over stdout, which is a Unix socket:
+/// qshd accepts the connections, but the file is the user's. `mask` (octal)
+/// is taken away from the socket's permissions; with `unlink` = "yes", a
+/// stale socket file is removed first.
+pub fn listen_unix(path: &str, mask: &str, unlink: &str) -> Result<()> {
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    let mask = u32::from_str_radix(mask, 8).context("bad mask")? & 0o777;
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask as libc::mode_t));
+    if unlink == "yes" && fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+        let _ = fs::remove_file(path);
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
+    let fds = [listener.as_fd()];
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    control.push(SendAncillaryMessage::ScmRights(&fds));
+    sendmsg(io::stdout().as_fd(), &[io::IoSlice::new(b"L")], &mut control, SendFlags::empty()).context("cannot hand the socket to qshd")?;
+    Ok(())
+}
+
 /// Receives a tar stream on stdin into `path` (or `path/name` if `path` is a
 /// directory). Prints "ok" once the target directory exists.
 pub fn untar(path: &str, name: &str) -> Result<()> {

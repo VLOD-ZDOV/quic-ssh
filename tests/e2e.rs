@@ -2637,3 +2637,159 @@ fn known_hosts_sources_and_agent_adds() {
     let out = c.cmd(&["-p", &port, &dest(), "echo", "via-agent"]).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
     assert_eq!(stdout(&out), "via-agent\n", "{}", stderr(&out));
 }
+
+/// A Unix socket echo server (like `echo_server`) at a new path.
+fn unix_echo_server(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join(format!("echo-{}.sock", rand_suffix()));
+    let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf);
+                let _ = s.write_all(b"unix:");
+                let _ = s.write_all(&buf);
+            });
+        }
+    });
+    path
+}
+
+fn rand_suffix() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+}
+
+fn talk_tcp(port: u16, text: &[u8]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "port {port} did not come up");
+        sleep(Duration::from_millis(50));
+    };
+    sock.write_all(text).unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    let _ = sock.read_to_string(&mut reply);
+    reply
+}
+
+fn talk_unix(path: &std::path::Path, text: &[u8]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        if let Ok(s) = std::os::unix::net::UnixStream::connect(path) {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "{} did not come up", path.display());
+        sleep(Duration::from_millis(50));
+    };
+    sock.write_all(text).unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    let _ = sock.read_to_string(&mut reply);
+    reply
+}
+
+/// Unix socket forwarding both ways, `-R port` as a SOCKS proxy on the
+/// server, `-O forward`/`-O cancel` through a master, and `~C`.
+#[test]
+fn socket_forwards_and_runtime_changes() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let remote_sock = unix_echo_server(dir.path());
+    let tcp_echo = echo_server();
+
+    // -L local socket -> remote socket; -L port -> remote socket;
+    // -R remote socket -> local TCP; -R port (SOCKS on the server).
+    let local_sock = dir.path().join("local.sock");
+    let back_sock = dir.path().join("back.sock");
+    let (lport, socks) = (free_port(), free_port());
+    let mut child = c
+        .cmd(&[
+            "-p",
+            &port,
+            "-N",
+            "-L",
+            &format!("{}:{}", local_sock.display(), remote_sock.display()),
+            "-L",
+            &format!("{lport}:{}", remote_sock.display()),
+            "-R",
+            &format!("{}:127.0.0.1:{tcp_echo}", back_sock.display()),
+            "-R",
+            &socks.to_string(),
+            &dest(),
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(talk_unix(&local_sock, b"a"), "unix:a");
+    assert_eq!(talk_tcp(lport, b"b"), "unix:b");
+    assert_eq!(talk_unix(&back_sock, b"c"), "echo:c");
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&back_sock).unwrap().permissions()) & 0o777;
+    assert_eq!(mode, 0o600, "stream_local_bind_mask 0177");
+    // SOCKS5 to the server's port; the target is reached from the client side.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", socks)) {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "remote SOCKS port did not come up");
+        sleep(Duration::from_millis(50));
+    };
+    sock.write_all(&[5, 1, 0]).unwrap();
+    let mut buf = [0u8; 2];
+    sock.read_exact(&mut buf).unwrap();
+    let [hi, lo] = tcp_echo.to_be_bytes();
+    sock.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, hi, lo]).unwrap();
+    let mut rep = [0u8; 10];
+    sock.read_exact(&mut rep).unwrap();
+    assert_eq!(rep[1], 0, "remote SOCKS request failed");
+    sock.write_all(b"d").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = String::new();
+    sock.read_to_string(&mut reply).unwrap();
+    assert_eq!(reply, "echo:d");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    // -O forward / -O cancel through a master.
+    let master = dir.path().join("m.sock");
+    let master = master.to_str().unwrap();
+    let status = c.cmd(&["-M", "-f", "-N", "-S", master, "-p", &port, &dest()]).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+    assert!(status.success());
+    let fport = free_port();
+    let spec = format!("{fport}:127.0.0.1:{tcp_echo}");
+    let out = c.run(&["-S", master, "-O", "forward", "-L", &spec, &dest()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(talk_tcp(fport, b"e"), "echo:e");
+    let out = c.run(&["-S", master, "-O", "cancel", "-L", &spec, &dest()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    sleep(Duration::from_millis(200));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", fport)).is_err(), "the forward was not cancelled");
+    let _ = c.run(&["-S", master, "-O", "exit", &dest()]);
+
+    // ~C in a terminal session.
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "-p", &port, &dest(), "sleep", "30"])
+        .env("HOME", c.home.path())
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut term = std::fs::File::from(pty.master);
+    sleep(Duration::from_millis(800));
+    let cport = free_port();
+    term.write_all(format!("\r~C-L {cport}:127.0.0.1:{tcp_echo}\r").as_bytes()).unwrap();
+    assert_eq!(talk_tcp(cport, b"f"), "echo:f");
+    term.write_all(format!("\r~C-KL {cport}\r").as_bytes()).unwrap();
+    sleep(Duration::from_millis(300));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", cport)).is_err(), "~C-KL did not cancel");
+    term.write_all(b"\r~.").unwrap();
+    let _ = child.wait();
+}

@@ -244,6 +244,21 @@ fi
 OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -N -R 80:127.0.0.1:9 qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
 check "non-root user cannot listen on a privileged port (-R 80)" grep -q "only root may listen" <<<"$OUT"
 
+# --- Unix socket forwarding as the user -------------------------------------------------
+HOME="$T/client" timeout 20 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -N -R "$T/shared/alice-fwd.sock:127.0.0.1:9" qsh-alice@127.0.0.1 </dev/null >/dev/null 2>&1 &
+FWD_CLIENT=$!
+for _ in $(seq 100); do [[ -S $T/shared/alice-fwd.sock ]] && break; sleep 0.1; done
+check "-R socket belongs to alice, mode 600" test "$(stat -c '%u %a' "$T/shared/alice-fwd.sock" 2>/dev/null)" = "$ALICE_UID 600"
+kill "$FWD_CLIENT" 2>/dev/null || true
+wait "$FWD_CLIENT" 2>/dev/null || true
+install -d -m 700 "$T/rootsock"
+python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); import time; time.sleep(30)" "$T/rootsock/s" &
+SOCK_SERVER=$!
+for _ in $(seq 50); do [[ -S $T/rootsock/s ]] && break; sleep 0.1; done
+OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -W "$T/rootsock/s" qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
+check "alice cannot reach root's socket (-W /path)" grep -qi "permission denied" <<<"$OUT"
+kill "$SOCK_SERVER" 2>/dev/null || true
+
 # --- PTY ------------------------------------------------------------------------------
 # `script` gives qsh a terminal; markers keep the values apart from terminal noise.
 OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'echo TTY=\$(stat -c %u:%g:%a \$(tty)) UID=\$(id -u)'" /dev/null < /dev/null || true)

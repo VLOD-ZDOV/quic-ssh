@@ -426,7 +426,8 @@ async fn master_main(a: SshArgs) -> Result<i32> {
         }
         Err(e) => return Err(e),
     };
-    let master = match Master::start(conn.clone(), &path) {
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports);
+    let master = match Master::start(conn.clone(), &path, Some(forward_hook(&forwarder))) {
         Ok(m) => m,
         // Another qsh got there first: use that one.
         Err(e) if e.is::<InUse>() => {
@@ -469,7 +470,7 @@ fn prepare_control_dir(path: &Path) -> Result<()> {
 }
 
 /// `-O check|exit|stop`.
-async fn control_command(target: &Target, command: &str) -> Result<i32> {
+async fn control_command(target: &Target, command: &str, a: &SshArgs) -> Result<i32> {
     #[cfg(unix)]
     {
         use qsh::transport::shared::{control, Command};
@@ -478,13 +479,40 @@ async fn control_command(target: &Target, command: &str) -> Result<i32> {
             .path
             .as_ref()
             .context("no control socket for this host (set ControlMaster or ControlPath, or use -S)")?;
+        if matches!(command, "forward" | "cancel") {
+            // `-O forward -L ... -R ...`: each forward goes to the master.
+            let cancel = command == "cancel";
+            let specs: Vec<(char, &String)> = a
+                .local_forwards
+                .iter()
+                .map(|s| ('L', s))
+                .chain(a.remote_forwards.iter().map(|s| ('R', s)))
+                .chain(a.dynamic_forwards.iter().map(|s| ('D', s)))
+                .collect();
+            if specs.is_empty() {
+                bail!("-O {command} needs forwards (-L, -R or -D)");
+            }
+            let mut code = 0;
+            for (kind, spec) in specs {
+                match control(path, Command::Forward { kind, spec: spec.clone(), cancel }).await {
+                    // ssh prints the port a `-R 0:...` got.
+                    Ok((_, msg)) if !msg.is_empty() => println!("{msg}"),
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("qsh: -{kind} {spec}: {e:#}");
+                        code = 255;
+                    }
+                }
+            }
+            return Ok(code);
+        }
         let (cmd, done) = match command {
             "check" => (Command::Check, None),
             "exit" => (Command::Exit, Some("Exit request sent.")),
             _ => (Command::Stop, Some("Stop listening request sent.")),
         };
         match control(path, cmd).await {
-            Ok(pid) => {
+            Ok((pid, _)) => {
                 eprintln!("{}", done.map(str::to_string).unwrap_or_else(|| format!("Master running (pid={pid})")));
                 Ok(0)
             }
@@ -496,9 +524,19 @@ async fn control_command(target: &Target, command: &str) -> Result<i32> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (target, command);
+        let _ = (target, command, a);
         bail!("connection sharing (-O) is not supported on this system")
     }
+}
+
+/// `-O forward` / `-O cancel` for a master, through its forwards.
+#[cfg(unix)]
+fn forward_hook(forwarder: &Arc<forward::Forwarder>) -> qsh::transport::shared::ForwardHook {
+    let forwarder = forwarder.clone();
+    Arc::new(move |kind, spec, cancel| {
+        let forwarder = forwarder.clone();
+        Box::pin(async move { forwarder.request(kind, &spec, cancel).await })
+    })
 }
 
 fn sources(a: &SshArgs) -> Sources {
@@ -575,7 +613,11 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     if let Some(cmd) = &a.control_command {
-        return control_command(&target, cmd).await;
+        // With --full, a master qsh does not have is ssh's.
+        if a.full && !target.sharing.path.as_ref().is_some_and(|p| p.exists()) {
+            return exec_openssh("ssh", without_qsh_options(&args[1..]), "no qsh connection master for -O");
+        }
+        return control_command(&target, cmd, &a).await;
     }
     // Session settings from the config, as if given on the command line.
     if let Some(remote) = &target.remote_command {
@@ -602,7 +644,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let clear = target.clear_all_forwardings;
     let mut locals = Vec::new();
     let mut remotes = Vec::new();
-    let mut dynamics: Vec<(String, bool)> = Vec::new();
+    let mut dynamics: Vec<(Forward, bool)> = Vec::new();
     if !clear {
         for (specs, required) in [(&a.local_forwards, true), (&target.local_forwards, false)] {
             for s in specs {
@@ -610,10 +652,13 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             }
         }
         for s in a.remote_forwards.iter().chain(&target.remote_forwards) {
-            remotes.push(Forward::parse(s).with_context(|| format!("-R {s}"))?);
+            remotes.push(Forward::parse_remote(s).with_context(|| format!("-R {s}"))?);
         }
-        dynamics.extend(a.dynamic_forwards.iter().map(|s| (s.clone(), true)));
-        dynamics.extend(target.dynamic_forwards.iter().map(|s| (s.clone(), false)));
+        for (specs, required) in [(&a.dynamic_forwards, true), (&target.dynamic_forwards, false)] {
+            for s in specs {
+                dynamics.push((Forward::parse_dynamic(s).with_context(|| format!("-D {s}"))?, required));
+            }
+        }
     }
 
     let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
@@ -656,32 +701,44 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         conn.close().await;
         return Ok(0);
     }
-    for (f, required) in locals {
-        let spec = f.describe();
-        match forward::start_local(conn.clone(), f, a.gateway_ports).await {
-            Ok(()) => {}
-            // Like ssh: a forward from the config that cannot bind is only a warning.
-            Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: LocalForward {spec}: {e:#}"),
-            Err(e) => return Err(e),
-        }
-    }
-    for (spec, required) in dynamics {
-        match forward::start_dynamic(conn.clone(), &spec, a.gateway_ports).await {
-            Ok(()) => {}
-            Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: DynamicForward {spec}: {e:#}"),
-            Err(e) => return Err(e),
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports);
+    for (kind, list) in [('L', locals), ('D', dynamics)] {
+        for (f, required) in list {
+            let spec = f.describe();
+            match forwarder.local(kind, f).await {
+                Ok(()) => {}
+                // Like ssh: a forward from the config that cannot bind is only a warning.
+                Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: forward {spec}: {e:#}"),
+                Err(e) => return Err(e.context(format!("-{kind} {spec}"))),
+            }
         }
     }
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
     let uses_forwards = uses_forwards || agent.is_some();
-    let _remote = forward::start_remote(&conn, &remotes, agent, quiet, target.exit_on_forward_failure).await?;
+    for f in remotes {
+        let spec = f.describe();
+        match forwarder.remote(f.clone()).await {
+            Ok(Some(port)) if matches!(f.listen, forward::Listen::Tcp { port: 0, .. }) && !quiet => {
+                eprintln!("Allocated port {port} for remote forward {spec}");
+            }
+            Ok(_) => {}
+            // As in ssh: a refused remote forward is a warning, unless ExitOnForwardFailure.
+            Err(e) if !target.exit_on_forward_failure && e.is::<qsh::proto::Refused>() => {
+                eprintln!("qsh: warning: remote port forwarding failed for {spec}: {e:#}");
+            }
+            Err(e) => return Err(e.context(format!("remote forward {spec}"))),
+        }
+    }
+    if let Some(path) = agent {
+        forwarder.agent(path, quiet).await;
+    }
     if let Some(command) = &target.local_command {
         run_local_command(&target.expand_tokens(command)?);
     }
     #[cfg(unix)]
-    let master = start_master(&conn, &target, quiet);
+    let master = start_master(&conn, &target, quiet, &forwarder);
     #[cfg(unix)]
     if a.background {
         detach(DAEMON_FD, "ok", false)?;
@@ -757,6 +814,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             server_alive: target.server_alive,
             predict: target.predict,
             quit: quit.clone(),
+            forwarder: Some(forwarder.clone()),
         },
     );
     // `-O exit` ends a master that runs a session too, like ssh's.
@@ -805,13 +863,13 @@ fn run_local_command(line: &str) {
 
 /// `ControlMaster`: offers this connection to later qsh runs.
 #[cfg(unix)]
-fn start_master(conn: &Arc<qsh::transport::Conn>, target: &Target, quiet: bool) -> Option<qsh::transport::shared::Master> {
+fn start_master(conn: &Arc<qsh::transport::Conn>, target: &Target, quiet: bool, forwarder: &Arc<forward::Forwarder>) -> Option<qsh::transport::shared::Master> {
     use qsh::client::control::ControlMaster;
     let path = target.sharing.path.as_ref()?;
     if conn.is_shared() || target.sharing.master == ControlMaster::No {
         return None;
     }
-    let started = prepare_control_dir(path).and_then(|()| qsh::transport::shared::Master::start(conn.clone(), path));
+    let started = prepare_control_dir(path).and_then(|()| qsh::transport::shared::Master::start(conn.clone(), path, Some(forward_hook(forwarder))));
     match started {
         Ok(m) => {
             tracing::debug!("sharing the connection at {}", path.display());

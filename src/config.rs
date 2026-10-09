@@ -41,8 +41,16 @@ pub struct ServerConfig {
     /// Port forwarding (`-L`/`-D`/`-W` and `-R`): `true`/`"yes"`/`"all"`,
     /// `false`/`"no"`, `"local"` or `"remote"` (like AllowTcpForwarding).
     pub allow_tcp_forwarding: Forwarding,
-    /// Turns all forwarding off: ports, agent (like DisableForwarding).
+    /// Turns all forwarding off: ports, Unix sockets, agent (like DisableForwarding).
     pub disable_forwarding: bool,
+    /// Unix socket forwarding (`-L`/`-R` with paths), like
+    /// AllowStreamLocalForwarding: `yes`, `no`, `local`, `remote`.
+    pub allow_stream_local_forwarding: Forwarding,
+    /// Permissions taken away from `-R` sockets on the server (octal, like
+    /// StreamLocalBindMask): "0177" leaves them to their owner.
+    pub stream_local_bind_mask: String,
+    /// Remove a stale socket file before listening on it (StreamLocalBindUnlink).
+    pub stream_local_bind_unlink: bool,
     /// Destinations `-L`/`-D`/`-W` may connect to: `host:port` patterns with
     /// `*` (like PermitOpen). Empty or `["any"]`: any; `["none"]`: none.
     #[serde(deserialize_with = "names")]
@@ -415,6 +423,9 @@ overrides! {
         #[serde(deserialize_with = "opt_names")]
         allow_groups: Vec<String>,
         allow_tcp_forwarding: Forwarding,
+        allow_stream_local_forwarding: Forwarding,
+        stream_local_bind_mask: String,
+        stream_local_bind_unlink: bool,
         #[serde(deserialize_with = "opt_names")]
         allow_users: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
@@ -501,6 +512,9 @@ impl Default for ServerConfig {
             authorized_principals_file: None,
             allow_tcp_forwarding: Forwarding::All,
             disable_forwarding: false,
+            allow_stream_local_forwarding: Forwarding::All,
+            stream_local_bind_mask: "0177".into(),
+            stream_local_bind_unlink: false,
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
             max_connections: 256,
@@ -565,6 +579,11 @@ impl ServerConfig {
         ] {
             if value == 0 {
                 bail!("{name} must be at least 1");
+            }
+        }
+        for mask in std::iter::once(&self.stream_local_bind_mask).chain(self.matches.iter().flat_map(|m| &m.stream_local_bind_mask)) {
+            if u32::from_str_radix(mask, 8).map_or(true, |m| m > 0o777) {
+                bail!("stream_local_bind_mask: {mask:?} is not an octal mask like \"0177\"");
             }
         }
         for (i, m) in self.matches.iter().enumerate() {
@@ -641,6 +660,21 @@ impl ServerConfig {
     /// `-R` allowed at all.
     pub fn remote_forwarding(&self) -> bool {
         !self.disable_forwarding && self.allow_tcp_forwarding.remote()
+    }
+
+    /// `-L` to a Unix socket on the server.
+    pub fn local_stream_forwarding(&self) -> bool {
+        !self.disable_forwarding && self.allow_stream_local_forwarding.local()
+    }
+
+    /// `-R` from a Unix socket on the server.
+    pub fn remote_stream_forwarding(&self) -> bool {
+        !self.disable_forwarding && self.allow_stream_local_forwarding.remote()
+    }
+
+    /// `stream_local_bind_mask` as a number.
+    pub fn bind_mask(&self) -> u32 {
+        u32::from_str_radix(&self.stream_local_bind_mask, 8).unwrap_or(0o177) & 0o777
     }
 
     pub fn agent_forwarding(&self) -> bool {

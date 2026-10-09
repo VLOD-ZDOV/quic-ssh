@@ -71,6 +71,10 @@ enum Cmd {
     #[command(hide = true)]
     InternalConnect { host: String, port: u16 },
     #[command(hide = true)]
+    InternalConnectUnix { path: String },
+    #[command(hide = true)]
+    InternalListenUnix { path: String, mask: String, unlink: String },
+    #[command(hide = true)]
     InternalUntar { path: String, name: String },
     #[command(hide = true)]
     InternalTar { path: String },
@@ -148,6 +152,8 @@ pub fn main() {
         Some(Cmd::InternalPairTake) => helpers::pair_take(),
         Some(Cmd::InternalAddKey { line }) => helpers::add_key(&line),
         Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),
+        Some(Cmd::InternalConnectUnix { path }) => helpers::connect_unix(&path),
+        Some(Cmd::InternalListenUnix { path, mask, unlink }) => helpers::listen_unix(&path, &mask, &unlink),
         Some(Cmd::InternalUntar { path, name }) => helpers::untar(&path, &name),
         Some(Cmd::InternalTar { path }) => helpers::tar(&path),
         Some(Cmd::Init) => init(cli.config),

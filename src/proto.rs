@@ -142,6 +142,15 @@ pub enum Request {
     /// side that sends the data compresses everything it sends on the
     /// stream, to its end (including a final reply after a tree download).
     Compressed(Transfer),
+    // --- protocol version 6 ---
+    /// Connect to the Unix socket `path` on the server (`-L ...:/path`);
+    /// after `Reply::Ok` the stream carries raw bytes.
+    DirectStreamLocal { path: String },
+    /// Listen on the Unix socket `path` on the server (`-R /path:...`).
+    /// Answered with `Reply::Ok`; connections arrive as server-opened
+    /// streams starting with [`Opened::ForwardedStreamLocal`]. Closing this
+    /// stream cancels the forward.
+    RemoteForwardStreamLocal { path: String },
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
@@ -173,6 +182,9 @@ pub enum Opened {
     Forwarded { port: u16, origin: String },
     /// A program on the server talks to the forwarded agent; raw bytes follow.
     Agent,
+    // --- protocol version 6 ---
+    /// A connection to a `-R` Unix socket listener at `path`; raw bytes follow.
+    ForwardedStreamLocal { path: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

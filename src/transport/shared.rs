@@ -42,6 +42,9 @@ pub enum MuxRequest {
     Stop,
     /// Like `Info`, but answered once and not counted as a client (`-O check`).
     Check { version: u32 },
+    /// Add (`-O forward`) or cancel (`-O cancel`) a forward of the master's
+    /// connection: `kind` is 'L', 'R' or 'D', `spec` as on the command line.
+    Forward { kind: char, spec: String, cancel: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -50,6 +53,8 @@ pub enum MuxReply {
     Opened,
     Ok,
     Err(String),
+    /// Done, with a message for the user (`-O forward`).
+    Done(String),
 }
 
 /// Client side: a connection whose streams go through a master.
@@ -144,30 +149,41 @@ async fn try_attach(path: &Path) -> Result<Conn> {
 }
 
 /// `-O` commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Check,
     Exit,
     Stop,
+    Forward { kind: char, spec: String, cancel: bool },
 }
 
-/// Sends a control command to the master at `path`; returns its process id.
-pub async fn control(path: &Path, command: Command) -> Result<u32> {
+/// How a master adds or cancels forwards (`-O forward`/`-O cancel`): gets
+/// the kind ('L', 'R', 'D'), the spec and whether to cancel; answers with a
+/// message for the user.
+pub type ForwardHook = Arc<dyn Fn(char, String, bool) -> futures::future::BoxFuture<'static, Result<String>> + Send + Sync>;
+
+/// Sends a control command to the master at `path`; returns its process id
+/// and, for forwards, the master's message.
+pub async fn control(path: &Path, command: Command) -> Result<(u32, String)> {
     let connect = async {
         let mut sock = connect(path).await?;
         write_msg(&mut sock, &MuxRequest::Check { version: MUX_VERSION }).await?;
         let MuxReply::Info { pid, .. } = read_msg(&mut sock).await? else { bail!("unexpected answer") };
         let request = match command {
-            Command::Check => return Ok(pid),
+            Command::Check => return Ok((pid, String::new())),
             Command::Exit => MuxRequest::Exit,
             Command::Stop => MuxRequest::Stop,
+            Command::Forward { kind, spec, cancel } => MuxRequest::Forward { kind, spec, cancel },
         };
         let mut sock = connect(path).await?;
         write_msg(&mut sock, &request).await?;
-        match read_msg(&mut sock).await? {
-            MuxReply::Ok => Ok(pid),
-            MuxReply::Err(e) => bail!("{e}"),
-            other => bail!("unexpected answer {other:?}"),
+        match read_msg(&mut sock).await {
+            Ok(MuxReply::Ok) => Ok((pid, String::new())),
+            Ok(MuxReply::Done(msg)) => Ok((pid, msg)),
+            Ok(MuxReply::Err(e)) => bail!("{e}"),
+            Ok(other) => bail!("unexpected answer {other:?}"),
+            // A master from before -O forward drops the request.
+            Err(_) => bail!("the master does not understand this request (update qsh and start a new master)"),
         }
     };
     tokio::time::timeout(ANSWER_TIMEOUT, connect)
@@ -263,7 +279,8 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
 impl Master {
     /// Starts sharing `conn` at `path`. Fails with [`InUse`] if another
     /// master is there.
-    pub fn start(conn: Arc<Conn>, path: &Path) -> Result<Master> {
+    /// `hook` serves `-O forward` and `-O cancel`.
+    pub fn start(conn: Arc<Conn>, path: &Path, hook: Option<ForwardHook>) -> Result<Master> {
         let (listener, file) = bind(path)?;
         let file = Arc::new(file);
         let active = Arc::new(AtomicUsize::new(0));
@@ -289,9 +306,9 @@ impl Master {
                         _ => continue,
                     }
                     let (conn, active, changed, exit, exit_rx) = (conn.clone(), active.clone(), changed.clone(), exit.clone(), exit_rx.clone());
-                    let (file, stopped) = (file.clone(), stopped.clone());
+                    let (file, stopped, hook) = (file.clone(), stopped.clone(), hook.clone());
                     tokio::spawn(async move {
-                        let shared = Shared { active: &active, changed: &changed, exit: &exit, stopped: &stopped, file: &file };
+                        let shared = Shared { hook: hook.as_ref(), active: &active, changed: &changed, exit: &exit, stopped: &stopped, file: &file };
                         if let Err(e) = serve_client(sock, &conn, shared, exit_rx).await {
                             debug!("shared connection client: {e:#}");
                         }
@@ -386,6 +403,7 @@ async fn relay(sock: UnixStream, mut send: SendHalf, mut recv: RecvHalf) -> Resu
 
 /// What every client connection of a master shares.
 struct Shared<'a> {
+    hook: Option<&'a ForwardHook>,
     active: &'a AtomicUsize,
     changed: &'a Notify,
     exit: &'a watch::Sender<bool>,
@@ -451,6 +469,16 @@ async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>
             shared.file.remove();
             shared.stopped.store(true, Ordering::SeqCst);
             shared.changed.notify_waiters();
+        }
+        MuxRequest::Forward { kind, spec, cancel } => {
+            let reply = match shared.hook {
+                Some(hook) => match hook(kind, spec, cancel).await {
+                    Ok(msg) => MuxReply::Done(msg),
+                    Err(e) => MuxReply::Err(format!("{e:#}")),
+                },
+                None => MuxReply::Err("this master cannot change forwards".into()),
+            };
+            write_msg(&mut sock, &reply).await?;
         }
     }
     Ok(())

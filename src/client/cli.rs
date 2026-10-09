@@ -144,8 +144,8 @@ impl SshArgs {
             'W' => self.stdio_forward = Some(v),
             'e' => self.escape_char = Some(v),
             'O' => match v.as_str() {
-                "check" | "exit" | "stop" => self.control_command = Some(v),
-                _ => return Err(format!("unsupported -O command {v:?} (check, exit, stop)")),
+                "check" | "exit" | "stop" | "forward" | "cancel" => self.control_command = Some(v),
+                _ => return Err(format!("unsupported -O command {v:?} (check, exit, stop, forward, cancel)")),
             },
             'S' => self.options.push(format!("ControlPath {v}")),
             'b' => self.options.push(format!("BindAddress {v}")),
@@ -253,7 +253,7 @@ impl SshArgs {
 pub const USAGE: &str = "\
 usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfile]
            [-i identity] [-J [user@]host[:port]] [-L [bind:]port:host:hostport]
-           [-l login] [-O check|exit|stop] [-o option] [-p port]
+           [-l login] [-O check|exit|stop|forward|cancel] [-o option] [-p port]
            [-R [bind:]port:host:hostport] [-S ctl_path] [-W host:port]
            [--full] [--transport auto|quic|tcp] [--accept-new-host]
            [user@]host[:port] [command [argument ...]]
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_input() {
-        for bad in ["-p", "-p notaport h", "-Z h", "--nope h", "-O forward h"] {
+        for bad in ["-p", "-p notaport h", "-Z h", "--nope h", "-O proxy h"] {
             assert!(SshArgs::parse(bad.split_whitespace().map(String::from)).is_err(), "{bad}");
         }
         assert_eq!(option_line("Port=22").unwrap(), "Port 22");

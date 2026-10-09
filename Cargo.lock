@@ -2091,6 +2091,7 @@ dependencies = [
  "rcgen",
  "rpassword",
  "rsa",
+ "rustix",
  "rustls",
  "serde",
  "sha1",

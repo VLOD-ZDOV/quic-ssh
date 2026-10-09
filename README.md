@@ -145,6 +145,8 @@ qsh -L 8080:localhost:80 user@host     # port forward (+ shell)
 qsh -N -L 5432:db.internal:5432 host   # port forward only
 qsh -N -R 8080:localhost:3000 host     # remote forward: host's port 8080 -> your port 3000
 qsh -N -D 1080 host                    # SOCKS4/5 proxy on localhost:1080
+qsh -N -R 1080 host                    # SOCKS proxy on the server, connections go out from here
+qsh -L /tmp/docker.sock:/var/run/docker.sock host   # Unix sockets on either side of -L/-R
 qsh -J bastion user@internal           # through a jump host (both run qshd)
 qsh -f -N -L 5432:db:5432 host         # log in, then go to the background
 qsh -A host                            # forward your ssh-agent
@@ -166,7 +168,7 @@ qsh doctor myserver                    # does not connect? checks each step and 
 
 Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`, `-b` and `-B` (the local address or interface connections leave from). Other ssh flags are accepted and ignored (`-v` lists them). `-C` on a session is ignored too; for compressed copies use `qsh cp -C`.
 
-In a session, `~.` at the start of a line disconnects, even when the server no longer responds; `~?` lists the escapes and `~~` sends a literal `~`.
+In a session, `~.` at the start of a line disconnects, even when the server no longer responds. `~C` opens a command line to add forwards (`-L`, `-R`, `-D`) or cancel them (`-KL`, `-KR`, `-KD`), `~#` lists them, `~^Z` suspends qsh, `~?` lists the escapes and `~~` sends a literal `~`.
 
 ### Keys, ssh-agent and certificates
 
@@ -209,7 +211,7 @@ Host *
 - `ControlMaster auto`: use a running master, or become one. `yes` (or `-M`) always becomes one. The default `no` uses a master only if `ControlPath` is set.
 - `ControlPersist 10m` keeps the master in the background for 10 minutes after the last session (`yes` until `-O exit`). Without it the first qsh is the master and, when its own session ends, waits for the others.
 - The socket is in `~/.config/qsh/ctl/` by default (`ControlPath`, or `-S path`; tokens `%h %p %r %C`). ssh's `ControlPath` is not used: those sockets speak ssh's protocol.
-- `qsh -O check host`, `-O exit`, `-O stop` as in ssh.
+- `qsh -O check host`, `-O exit`, `-O stop`, `-O forward -L ...` and `-O cancel -L ...` as in ssh.
 - Runs with `-R` or `-A` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it.
 - Not on Windows.
 
@@ -394,7 +396,10 @@ accept_env = ["LANG", "LC_*", "COLORTERM"]   # variables clients may set
 # chroot_directory = "/srv/jail/%u"       # confine sessions and qsh cp (system mode; root-owned path)
 # permit_open = ["db.internal:5432"]      # -L/-D/-W destinations; "none" = none
 # permit_listen = ["8080", "localhost:9000"]   # -R listeners
-disable_forwarding = false      # true: no port or agent forwarding at all
+disable_forwarding = false      # true: no port, socket or agent forwarding at all
+allow_stream_local_forwarding = true   # Unix socket forwarding: or "no", "local", "remote"
+stream_local_bind_mask = "0177" # permissions taken from -R sockets on the server
+stream_local_bind_unlink = false   # remove a stale socket file before listening
 client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
 client_alive_count_max = 3
 per_source_penalties = true     # drop addresses that keep failing; or "authfail:5s noauth:1s min:15s max:10m"

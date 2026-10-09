@@ -172,6 +172,8 @@ pub struct SessionOptions {
     /// Ends the session (a persistent one for good) when notified, as `~.`
     /// does: `-O exit` to a master that runs this session.
     pub quit: Arc<tokio::sync::Notify>,
+    /// The connection's forwards, for `~C` and `~#`.
+    pub forwarder: Option<Arc<super::forward::Forwarder>>,
 }
 
 /// Local handling of escape sequences (`~.`, `~?`, `~~`) typed at the start of a line.
@@ -179,57 +181,182 @@ struct Escapes {
     ch: u8,
     at_line_start: bool,
     pending: bool,
+    /// `~C`: the command line being typed.
+    command: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
 enum EscapeAction {
     Disconnect,
     Help,
+    /// Text for the terminal (the echo of the `~C` line).
+    Echo(String),
+    /// A finished `~C` line.
+    Command(String),
+    /// `~#`: list the forwards.
+    ListForwards,
+    /// `~^Z`: suspend qsh.
+    Suspend,
+    /// An escape qsh knows but cannot do (`~B`, `~R`...): why.
+    Note(&'static str),
 }
 
 impl Escapes {
     fn new(ch: u8) -> Escapes {
-        Escapes { ch, at_line_start: true, pending: false }
+        Escapes { ch, at_line_start: true, pending: false, command: None }
     }
 
-    /// Returns the bytes to send and an action, if an escape was completed.
-    /// Input after `~.` is dropped; input after `~?` is still sent.
-    fn process(&mut self, input: &[u8]) -> (Vec<u8>, Option<EscapeAction>) {
+    /// Returns the bytes to send and the escapes completed in `input`.
+    /// Input after `~.` is dropped; input after the others is still sent.
+    fn process(&mut self, input: &[u8]) -> (Vec<u8>, Vec<EscapeAction>) {
         let mut out = Vec::with_capacity(input.len());
-        let mut action = None;
-        for &b in input {
+        let mut actions = Vec::new();
+        for b in input.iter().copied() {
+            if let Some(line) = self.command.as_mut() {
+                match b {
+                    b'\r' | b'\n' => {
+                        let line = self.command.take().unwrap_or_default();
+                        actions.push(EscapeAction::Echo("\r\n".into()));
+                        actions.push(EscapeAction::Command(line));
+                        self.at_line_start = true;
+                    }
+                    // ^C, ^U or Esc: forget the line.
+                    0x03 | 0x15 | 0x1b => {
+                        self.command = None;
+                        actions.push(EscapeAction::Echo("\r\n".into()));
+                        self.at_line_start = true;
+                    }
+                    0x7f | 0x08 => {
+                        if line.pop().is_some() {
+                            actions.push(EscapeAction::Echo("\x08 \x08".into()));
+                        }
+                    }
+                    b if (0x20..0x7f).contains(&b) && line.len() < 512 => {
+                        line.push(b as char);
+                        actions.push(EscapeAction::Echo((b as char).to_string()));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             if self.pending {
                 self.pending = false;
-                match b {
-                    b'.' => return (out, Some(EscapeAction::Disconnect)),
-                    b'?' => {
+                let action = match b {
+                    b'.' => {
+                        actions.push(EscapeAction::Disconnect);
+                        return (out, actions);
+                    }
+                    b'?' => EscapeAction::Help,
+                    b'C' => {
+                        self.command = Some(String::new());
+                        EscapeAction::Echo("\r\nqsh> ".into())
+                    }
+                    b'#' => EscapeAction::ListForwards,
+                    0x1a => EscapeAction::Suspend,
+                    b'B' => EscapeAction::Note("qsh cannot send a BREAK"),
+                    b'R' => EscapeAction::Note("keys are renewed automatically (TLS 1.3 key updates)"),
+                    b'V' | b'v' => EscapeAction::Note("the log level is set when qsh starts (-v, LogLevel)"),
+                    b'&' => EscapeAction::Note("qsh does not wait for forwarded connections at logout"),
+                    b if b == self.ch => {
+                        out.push(b);
                         self.at_line_start = false;
-                        action = Some(EscapeAction::Help);
                         continue;
                     }
-                    b if b == self.ch => out.push(b),
                     b => {
                         out.push(self.ch);
                         out.push(b);
+                        self.at_line_start = b == b'\r' || b == b'\n';
+                        continue;
                     }
-                }
-            } else if self.at_line_start && b == self.ch {
+                };
+                actions.push(action);
+                self.at_line_start = false;
+                continue;
+            }
+            if self.at_line_start && b == self.ch {
                 self.pending = true;
                 continue;
-            } else {
-                out.push(b);
             }
+            out.push(b);
             self.at_line_start = b == b'\r' || b == b'\n';
         }
-        (out, action)
+        (out, actions)
     }
 
     fn help(&self) -> String {
         let c = self.ch as char;
         format!(
-            "\r\nSupported escape sequences:\r\n {c}.   - terminate connection\r\n {c}?   - this message\r\n              {c}{c}   - send the escape character by typing it twice\r\n\
+            "\r\nSupported escape sequences:\r\n\
+             \x20{c}.   - terminate connection\r\n\
+             \x20{c}C   - open a command line (-L, -R, -D to add forwards; -KL, -KR, -KD to cancel)\r\n\
+             \x20{c}#   - list forwarded connections\r\n\
+             \x20{c}^Z  - suspend qsh\r\n\
+             \x20{c}?   - this message\r\n\
+             \x20{c}{c}   - send the escape character by typing it twice\r\n\
              (Note that escapes are only recognized immediately after newline.)\r\n"
         )
     }
+}
+
+/// Runs a `~C` line (`-L spec`, `-R spec`, `-D spec`, `-KL listen`,
+/// `-KR listen`, `-KD listen`) and returns what to tell the user.
+async fn escape_command(line: &str, forwarder: Option<&super::forward::Forwarder>) -> String {
+    use super::forward::Forward;
+    let line = line.trim();
+    if line.is_empty() {
+        return String::new();
+    }
+    let help = "Commands:\r\n      -L[bind_address:]port:host:hostport    Request local forward\r\n      \
+                -R[bind_address:]port:host:hostport    Request remote forward\r\n      \
+                -D[bind_address:]port                  Request dynamic forward\r\n      \
+                -KL[bind_address:]port                 Cancel local forward\r\n      \
+                -KR[bind_address:]port                 Cancel remote forward\r\n      \
+                -KD[bind_address:]port                 Cancel dynamic forward\r\n";
+    if matches!(line, "?" | "-h" | "help") {
+        return help.into();
+    }
+    let Some(f) = forwarder else { return "forwarding cannot be changed in this session\r\n".into() };
+    let (flag, spec) = line.split_at(line.find(|c: char| c.is_whitespace() || c.is_ascii_digit() || c == '[' || c == '/').unwrap_or(line.len()));
+    let spec = spec.trim();
+    let result = match flag {
+        "-L" => match Forward::parse(spec) {
+            Ok(fwd) => f.local('L', fwd).await.map(|()| "Forwarding port.".to_string()),
+            Err(e) => Err(e),
+        },
+        "-D" => match Forward::parse_dynamic(spec) {
+            Ok(fwd) => f.local('D', fwd).await.map(|()| "Forwarding port.".to_string()),
+            Err(e) => Err(e),
+        },
+        "-R" => match Forward::parse_remote(spec) {
+            Ok(fwd) => f.remote(fwd).await.map(|bound| match bound {
+                Some(p) => format!("Allocated port {p} for remote forward."),
+                None => "Forwarding port.".to_string(),
+            }),
+            Err(e) => Err(e),
+        },
+        "-KL" | "-KR" | "-KD" => {
+            let kind = flag.as_bytes()[2] as char;
+            match f.cancel(kind, spec) {
+                Ok(true) => Ok(format!("Canceled forwarding {spec}.")),
+                Ok(false) => Err(anyhow::anyhow!("no such forward: {spec}")),
+                Err(e) => Err(e),
+            }
+        }
+        _ => return format!("Invalid command.\r\n{help}"),
+    };
+    match result {
+        Ok(msg) => format!("{msg}\r\n"),
+        Err(e) => format!("{e:#}\r\n"),
+    }
+}
+
+/// `~^Z`: gives the terminal back and stops qsh until the shell resumes it.
+#[cfg(unix)]
+fn suspend() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP);
+    // Running again (fg).
+    let _ = crossterm::terminal::enable_raw_mode();
 }
 
 /// Logs in again after a lost connection, to resume the session with this
@@ -372,6 +499,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let _ = stdin_tx.send(ClientMsg::StdinEof).await;
     } else {
         let disconnect = disconnect.clone();
+        let forwarder = opts.forwarder.clone();
         let mut input = Input::new(raw.is_some(), cursor_keys.clone());
         tokio::spawn(async move {
             loop {
@@ -381,9 +509,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                         break;
                     }
                     Some(chunk) => {
-                        let (data, action) = match escapes.as_mut() {
+                        let (data, actions) = match escapes.as_mut() {
                             Some(e) => e.process(&chunk),
-                            None => (chunk, None),
+                            None => (chunk, Vec::new()),
                         };
                         if !data.is_empty() {
                             if let Some(t) = &typed_tx {
@@ -393,15 +521,44 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                                 break;
                             }
                         }
-                        match action {
-                            Some(EscapeAction::Disconnect) => {
-                                disconnect.notify_one();
-                                break;
+                        let mut quit = false;
+                        for action in actions {
+                            match action {
+                                EscapeAction::Disconnect => {
+                                    disconnect.notify_one();
+                                    quit = true;
+                                }
+                                EscapeAction::Help => {
+                                    let _ = notice_tx.send(escapes.as_ref().map(Escapes::help).unwrap_or_default());
+                                }
+                                EscapeAction::Echo(text) => {
+                                    let _ = notice_tx.send(text);
+                                }
+                                EscapeAction::Command(line) => {
+                                    let (forwarder, notice_tx) = (forwarder.clone(), notice_tx.clone());
+                                    tokio::spawn(async move {
+                                        let reply = escape_command(&line, forwarder.as_deref()).await;
+                                        let _ = notice_tx.send(reply);
+                                    });
+                                }
+                                EscapeAction::ListForwards => {
+                                    let list = forwarder.as_ref().map(|f| f.list()).unwrap_or_default();
+                                    let text = if list.is_empty() { "No forwarded connections.".to_string() } else { list.join("\r\n") };
+                                    let _ = notice_tx.send(format!("\r\n{text}\r\n"));
+                                }
+                                EscapeAction::Suspend => {
+                                    #[cfg(unix)]
+                                    suspend();
+                                    #[cfg(not(unix))]
+                                    let _ = notice_tx.send("\r\nqsh cannot be suspended here\r\n".into());
+                                }
+                                EscapeAction::Note(why) => {
+                                    let _ = notice_tx.send(format!("\r\nqsh: {why}\r\n"));
+                                }
                             }
-                            Some(EscapeAction::Help) => {
-                                let _ = notice_tx.send(escapes.as_ref().map(Escapes::help).unwrap_or_default());
-                            }
-                            None => {}
+                        }
+                        if quit {
+                            break;
                         }
                     }
                 }
@@ -650,30 +807,44 @@ mod tests {
         let mut e = Escapes::new(b'~');
         let (out, a) = e.process(b"a~.b");
         assert_eq!(out, b"a~.b");
-        assert!(a.is_none());
+        assert!(a.is_empty());
         let (out, a) = e.process(b"\r~~x");
         assert_eq!(out, b"\r~x");
-        assert!(a.is_none());
+        assert!(a.is_empty());
         let (out, a) = e.process(b"\r~");
         assert_eq!(out, b"\r");
-        assert!(a.is_none(), "waits for the next byte");
+        assert!(a.is_empty(), "waits for the next byte");
         let (out, a) = e.process(b".");
         assert!(out.is_empty());
-        assert!(matches!(a, Some(EscapeAction::Disconnect)));
+        assert_eq!(a, vec![EscapeAction::Disconnect]);
     }
 
     #[test]
     fn escape_at_session_start_and_unknown_sequences() {
         let mut e = Escapes::new(b'~');
-        assert!(matches!(e.process(b"~?").1, Some(EscapeAction::Help)));
+        assert_eq!(e.process(b"~?").1, vec![EscapeAction::Help]);
         let mut e = Escapes::new(b'~');
         assert_eq!(e.process(b"~z").0, b"~z");
         let mut e = Escapes::new(b'%');
-        assert!(matches!(e.process(b"%.").1, Some(EscapeAction::Disconnect)));
+        assert_eq!(e.process(b"%.").1, vec![EscapeAction::Disconnect]);
         // Input after ~? in the same read is kept.
         let mut e = Escapes::new(b'~');
         let (out, a) = e.process(b"\r~?ls\r");
         assert_eq!(out, b"\rls\r");
-        assert!(matches!(a, Some(EscapeAction::Help)));
+        assert_eq!(a, vec![EscapeAction::Help]);
+    }
+
+    #[test]
+    fn command_line_escape() {
+        let mut e = Escapes::new(b'~');
+        let (out, a) = e.process(b"~C-L 80x\x7f80:h:80\rls\r");
+        assert_eq!(out, b"ls\r", "typing goes to the line, then to the session again");
+        let commands: Vec<_> = a.iter().filter_map(|x| if let EscapeAction::Command(c) = x { Some(c.as_str()) } else { None }).collect();
+        assert_eq!(commands, vec!["-L 8080:h:80"]);
+        let (out, a) = e.process(b"~Cxyz\x03echo\r");
+        assert_eq!(out, b"echo\r", "^C drops the line");
+        assert!(!a.iter().any(|x| matches!(x, EscapeAction::Command(_))));
+        assert_eq!(e.process(b"~#").1, vec![EscapeAction::ListForwards]);
+        assert_eq!(e.process(b"\r~\x1a").1, vec![EscapeAction::Suspend]);
     }
 }

@@ -53,6 +53,7 @@ socket2 = { version = "0.6", features = ["all"] }
 jiff = "0.2.38"
 nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource", "net"] }
 pty-process = { version = "0.5", features = ["async"] }
+rustix = { version = "1", features = ["net"] }
 
 
 [dev-dependencies]

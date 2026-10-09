@@ -667,7 +667,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if user.switches() {
                 // Connect as the user, not as root, so uid-based firewall rules
                 // (iptables --uid-owner) apply (compare CVE-2016-10010).
-                return forward_as_user(send, recv, user, &host, port).await;
+                return forward_as_user(send, recv, user, &["internal-connect", &host, &port.to_string()]).await;
             }
             let connect = tokio::net::TcpStream::connect((host.as_str(), port));
             match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
@@ -689,6 +689,29 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
             }
             agent::forward(send, recv, conn.clone(), user, agent).await
+        }
+        Request::DirectStreamLocal { path } => {
+            if !cfg.local_stream_forwarding() || limits.no_port_forwarding {
+                return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
+            }
+            if user.switches() {
+                return forward_as_user(send, recv, user, &["internal-connect-unix", &path]).await;
+            }
+            match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(&path)).await {
+                Ok(Ok(sock)) => {
+                    write_msg(&mut send, &Reply::Ok).await?;
+                    let (r, w) = sock.into_split();
+                    crate::transport::bridge(r, w, send, recv).await
+                }
+                Ok(Err(e)) => write_msg(&mut send, &Reply::Err(format!("connect {path}: {e}"))).await,
+                Err(_) => write_msg(&mut send, &Reply::Err(format!("connect {path}: timed out"))).await,
+            }
+        }
+        Request::RemoteForwardStreamLocal { path } => {
+            if !cfg.remote_stream_forwarding() || limits.no_port_forwarding {
+                return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
+            }
+            remote_forward_local(send, recv, conn.clone(), user, cfg, &path).await
         }
         Request::Ping => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
@@ -827,6 +850,99 @@ async fn remote_forward(
     Ok(())
 }
 
+/// A listening Unix socket at `path` that belongs to the user: bound by a
+/// helper running as them (system mode), which hands the socket over.
+async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<tokio::net::UnixListener> {
+    use tokio::io::AsyncReadExt;
+    let mask = format!("{:o}", cfg.bind_mask());
+    let unlink = if cfg.stream_local_bind_unlink { "yes" } else { "no" };
+    if !user.switches() {
+        // The server is the user: bind here, then narrow the permissions.
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        if cfg.stream_local_bind_unlink && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+            let _ = std::fs::remove_file(path);
+        }
+        let l = tokio::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666 & !cfg.bind_mask()))?;
+        return Ok(l);
+    }
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+    let mut child = user
+        .helper(&["internal-listen-unix", path, &mask, unlink])?
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let received = tokio::task::spawn_blocking(move || receive_fd(&ours)).await?;
+    let status = child.wait().await?;
+    match received {
+        Ok(fd) => {
+            let std = std::os::unix::net::UnixListener::from(fd);
+            std.set_nonblocking(true)?;
+            Ok(tokio::net::UnixListener::from_std(std)?)
+        }
+        Err(e) => {
+            let mut err = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = (&mut stderr).take(4096).read_to_string(&mut err).await;
+            }
+            let msg = err.trim().trim_start_matches("qshd: ");
+            bail!("{}", if msg.is_empty() { format!("{e:#} ({status})") } else { msg.to_string() })
+        }
+    }
+}
+
+/// Takes a descriptor sent with SCM_RIGHTS (see `helpers::listen_unix`).
+fn receive_fd(sock: &std::os::unix::net::UnixStream) -> Result<std::os::fd::OwnedFd> {
+    use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut byte = [0u8; 1];
+    recvmsg(sock, &mut [std::io::IoSliceMut::new(&mut byte)], &mut control, RecvFlags::CMSG_CLOEXEC)?;
+    for msg in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(mut fds) = msg {
+            if let Some(fd) = fds.next() {
+                return Ok(fd);
+            }
+        }
+    }
+    bail!("no socket from the helper")
+}
+
+/// `-R` from a Unix socket: like [`remote_forward`], on a socket file of the user's.
+async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, user: &User, cfg: &ServerConfig, path: &str) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let listener = match listen_unix_as(user, cfg, path).await {
+        Ok(l) => l,
+        Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
+    };
+    write_msg(&mut send, &Reply::Ok).await?;
+    info!("{}: {} listens on {path} (-R)", conn.remote_addr(), user.name);
+    let mut probe = [0u8; 1];
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((sock, _)) = accepted else { break };
+                let (conn, path) = (conn.clone(), path.to_string());
+                tokio::spawn(async move {
+                    let result = async {
+                        let (mut s, r) = conn.open_bi().await?;
+                        write_msg(&mut s, &crate::proto::Opened::ForwardedStreamLocal { path }).await?;
+                        let (sr, sw) = sock.into_split();
+                        crate::transport::bridge(sr, sw, s, r).await
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        debug!("-R socket connection: {e:#}");
+                    }
+                });
+            }
+            _ = recv.read(&mut probe) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Largest speed test transfer the server agrees to.
 const SPEED_TEST_MAX: u64 = 4 << 30;
 
@@ -855,11 +971,12 @@ async fn speed_up(mut send: SendHalf, mut recv: RecvHalf, bytes: u64) -> Result<
     Ok(())
 }
 
-/// Port forwarding through `qshd internal-connect`, which runs as the user.
-async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, host: &str, port: u16) -> Result<()> {
+/// Forwarding through `qshd internal-connect` (or `internal-connect-unix`),
+/// which runs as the user; `args` is the helper and its arguments.
+async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, args: &[&str]) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     let mut child = user
-        .helper(&["internal-connect", host, &port.to_string()])?
+        .helper(args)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
