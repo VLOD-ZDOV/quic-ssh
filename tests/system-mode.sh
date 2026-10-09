@@ -24,6 +24,7 @@ chmod 755 "$T"
 PASS=0
 FAIL=0
 SERVER_PID=
+JAIL=
 
 ok() { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
@@ -37,6 +38,7 @@ cleanup() {
         userdel -r qsh-nol 2>/dev/null || true
         groupdel qsh-team 2>/dev/null || true
     fi
+    [[ -n ${JAIL:-} ]] && rm -rf "$JAIL"
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -259,6 +261,45 @@ if [[ -z ${QSH_TEST_NS:-} && -f /var/log/wtmp ]] && command -v last >/dev/null; 
     check "a login shell shows the last login" grep -q "Last login:" <<<"$OUT"
 else
     echo "  skip login records (need real root and /var/log/wtmp)"
+fi
+
+# --- chroot_directory and internal-sftp (after a config reload) -----------------------------
+if [[ -n ${QSH_TEST_NS:-} ]] || ! command -v sftp >/dev/null; then
+    # In the namespace, / belongs to an unmapped uid, so no path passes the ownership check.
+    echo "  skip chroot_directory and internal-sftp (need real root and sftp)"
+else
+    JAIL=$(mktemp -d -p / qsh-jail.XXXXXX)
+    chmod 755 "$JAIL"
+    install -d -o "$NOL_UID" -g "$NOL_UID" "$JAIL/upload"
+    install -d -o "$BOB_UID" -g "$BOB_UID" "$JAIL/bob"
+    cat >> "$T/config.toml" <<EOF
+
+[[match]]
+user = "qsh-nol"
+chroot_directory = "$JAIL"
+force_command = "internal-sftp"
+
+[[match]]
+user = "qsh-bob"
+chroot_directory = "$JAIL"
+EOF
+    kill -HUP "$SERVER_PID"
+    sleep 0.5
+    echo "in jail" > "$T/jail-src"
+    printf 'put %s upload/in.txt\nls /\n' "$T/jail-src" > "$T/batch"
+    OUT=$(HOME="$T/client" sftp -S "$QSH" -P "$PORT" -b "$T/batch" qsh-nol@127.0.0.1 2>&1 </dev/null || true)
+    [[ -n ${QSH_DEBUG:-} ]] && { echo "SFTP OUTPUT:"; cat <<<"$OUT"; }
+    check "nologin user gets internal-sftp in the chroot" cmp -s "$T/jail-src" "$JAIL/upload/in.txt"
+    check "the upload belongs to the user" test "$(stat -c %u "$JAIL/upload/in.txt" 2>/dev/null)" = "$NOL_UID"
+    printf 'get /etc/passwd %s\n' "$T/escaped" > "$T/batch"
+    HOME="$T/client" sftp -S "$QSH" -P "$PORT" -b "$T/batch" qsh-nol@127.0.0.1 </dev/null >/dev/null 2>&1 || true
+    check "files outside the chroot are out of reach (sftp)" test ! -e "$T/escaped"
+    check "qsh cp into a chroot lands inside it" q cp "$T/jail-src" qsh-bob@127.0.0.1:/bob/x.txt
+    check "... in the jail directory" cmp -s "$T/jail-src" "$JAIL/bob/x.txt"
+    check "files outside the chroot are out of reach (cp)" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT 'qsh-bob@127.0.0.1:/etc/passwd' '$T/escaped2' 2>/dev/null"
+    chmod 775 "$JAIL"
+    check "a group-writable chroot is refused" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT '$T/jail-src' qsh-bob@127.0.0.1:/bob/y.txt 2>/dev/null"
+    check "... and nothing is written there" test ! -e "$JAIL/bob/y.txt"
 fi
 
 # --- pairing hardening ------------------------------------------------------------------

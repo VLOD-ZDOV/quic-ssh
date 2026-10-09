@@ -122,6 +122,12 @@ pub struct ServerConfig {
     /// `SSH_ORIGINAL_COMMAND` (like ForceCommand).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force_command: Option<String>,
+    /// Confine sessions and file transfers to this directory (like
+    /// ChrootDirectory; `%h` home, `%u` user, `%U` uid, `%%`). It and every
+    /// directory above it must belong to root and be writable only by root.
+    /// Usually with `force_command = "internal-sftp"`. System mode only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chroot_directory: Option<String>,
     /// Probe a silent client every this many seconds and drop it after
     /// `client_alive_count_max` probes go unanswered (like
     /// ClientAliveInterval). 0: the transports' own defaults (about a minute).
@@ -307,6 +313,7 @@ overrides! {
         authorized_keys_command: String,
         authorized_keys_command_user: String,
         banner: PathBuf,
+        chroot_directory: String,
         force_command: String,
         revoked_keys: PathBuf,
         trusted_user_ca_keys: PathBuf,
@@ -392,6 +399,7 @@ impl Default for ServerConfig {
             accept_env: vec!["LANG".into(), "LC_*".into(), "COLORTERM".into()],
             set_env: BTreeMap::new(),
             force_command: None,
+            chroot_directory: None,
             client_alive_interval: 0,
             client_alive_count_max: 3,
             refuse_connection: false,
@@ -519,6 +527,27 @@ impl ServerConfig {
     pub fn accepts_env(&self, name: &str) -> bool {
         let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
         plain && name_matches(&self.accept_env, name)
+    }
+
+    /// `chroot_directory` for a user, with its tokens replaced.
+    pub fn chroot_for(&self, user: &str, uid: u32, home: &Path) -> Result<Option<PathBuf>> {
+        let Some(dir) = &self.chroot_directory else { return Ok(None) };
+        let mut out = String::new();
+        let mut chars = dir.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('h') => out.push_str(&home.to_string_lossy()),
+                Some('u') => out.push_str(user),
+                Some('U') => out.push_str(&uid.to_string()),
+                Some('%') => out.push('%'),
+                other => bail!("chroot_directory: unknown token %{}", other.map(String::from).unwrap_or_default()),
+            }
+        }
+        Ok(Some(PathBuf::from(out)))
     }
 
     /// The text for `qshd -T`.

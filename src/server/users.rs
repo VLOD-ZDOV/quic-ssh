@@ -59,6 +59,8 @@ pub struct Prelude {
     pub motd: bool,
     /// "Last login: ..." line.
     pub last_login: Option<String>,
+    /// `chroot_directory`, with its tokens replaced.
+    pub chroot: Option<PathBuf>,
 }
 
 impl Prelude {
@@ -81,6 +83,9 @@ impl Prelude {
         if let Some(l) = &self.last_login {
             items.push(format!("last={l}"));
         }
+        if let Some(c) = &self.chroot {
+            items.push(format!("chroot={}", c.display()));
+        }
         encode_args(&items)
     }
 
@@ -93,6 +98,7 @@ impl Prelude {
             match item.as_str() {
                 "rc" => p.rc = true,
                 "motd" => p.motd = true,
+                _ if item.starts_with("chroot=") => p.chroot = Some(PathBuf::from(&item["chroot=".len()..])),
                 _ => p.last_login = Some(item.strip_prefix("last=")?.to_string()),
             }
         }
@@ -111,6 +117,9 @@ pub struct User {
     groups: Vec<libc::gid_t>,
     /// True when the server runs as root and must switch to this user.
     switch: bool,
+    /// Where this login's programs and file transfers are confined
+    /// (`chroot_directory`), set once the login is accepted.
+    pub chroot: Option<PathBuf>,
 }
 
 impl User {
@@ -140,6 +149,7 @@ impl User {
             shell,
             groups,
             switch,
+            chroot: None,
         })
     }
 
@@ -190,7 +200,7 @@ impl User {
     /// `prelude`: for sessions; it needs `internal-become` even when the
     /// server does not switch users.
     fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool, prelude: &Prelude) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
-        if !self.wraps(prelude) {
+        if !self.wraps(program, prelude) {
             return (program.to_owned(), Vec::new());
         }
         let exe = self_program();
@@ -210,9 +220,10 @@ impl User {
         (exe.into_os_string(), args)
     }
 
-    /// Whether programs start through `internal-become`.
-    fn wraps(&self, prelude: &Prelude) -> bool {
-        self.switch || !prelude.is_empty()
+    /// Whether programs start through `internal-become`: always as root,
+    /// and for a prelude or qshd's own `internal-sftp`.
+    fn wraps(&self, program: &std::ffi::OsStr, prelude: &Prelude) -> bool {
+        self.switch || !prelude.is_empty() || program == INTERNAL_SFTP
     }
 
     /// A command that runs as this user with a clean environment in their home.
@@ -226,7 +237,7 @@ impl User {
         let (exe, args) = self.launch(program.as_ref(), arg0, false, prelude);
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args).env_clear().envs(self.env()).kill_on_drop(true);
-        if self.wraps(prelude) {
+        if self.wraps(program.as_ref(), prelude) {
             name_self(&mut cmd);
         } else {
             cmd.current_dir(&self.home);
@@ -241,7 +252,7 @@ impl User {
     pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>, prelude: &Prelude) -> pty_process::Command {
         let (exe, args) = self.launch(program.as_ref(), arg0, true, prelude);
         let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(env).kill_on_drop(true);
-        if self.wraps(prelude) {
+        if self.wraps(program.as_ref(), prelude) {
             if let Ok(p) = exe_path() {
                 cmd = cmd.arg0(p);
             }
@@ -271,6 +282,15 @@ impl User {
     /// (nologin, git-shell) then also restricts file transfers. The arguments
     /// travel in the environment, so the shell never parses client input.
     pub fn shell_helper(&self, args: &[&str]) -> Result<tokio::process::Command> {
+        // Confined: `internal-become` runs the helper itself inside the
+        // chroot (where neither the shell nor qshd's binary may exist).
+        if let Some(root) = &self.chroot {
+            let prelude = Prelude { chroot: Some(root.clone()), ..Default::default() };
+            let argv = helper_argv(args);
+            let mut cmd = self.command_as(&argv[0], None, &prelude);
+            cmd.args(&argv[1..]);
+            return Ok(cmd);
+        }
         // Through a shell `/proc/self/exe` would be the shell: the path it is.
         let exe = exe_path()?;
         let exe = exe.to_str().context("qshd path is not UTF-8")?;
@@ -313,6 +333,9 @@ fn name_self(cmd: &mut tokio::process::Command) {
         cmd.arg0(p);
     }
 }
+
+/// The command name that runs qshd's built-in SFTP server (as in sshd).
+pub const INTERNAL_SFTP: &str = "internal-sftp";
 
 /// Subcommand that switches to a user and runs a program (see `User::launch`).
 pub const BECOME: &str = "internal-become";

@@ -391,6 +391,7 @@ max_sessions = 10               # одновременных сессий на �
 permit_tty = true
 accept_env = ["LANG", "LC_*", "COLORTERM"]   # переменные, которые может задать клиент
 # force_command = "/usr/local/bin/menu"   # заменяет любую команду; исходная — в SSH_ORIGINAL_COMMAND
+# chroot_directory = "/srv/jail/%u"       # запереть сессии и qsh cp (системный режим; путь root)
 # permit_open = ["db.internal:5432"]      # куда можно -L/-D/-W; "none" — никуда
 # permit_listen = ["8080", "localhost:9000"]   # где может слушать -R
 disable_forwarding = false      # true: никаких пробросов портов и агента
@@ -401,16 +402,19 @@ client_alive_count_max = 3
 # TZ = "UTC"
 
 [subsystems]                    # для `qsh -s` и sftp; запускаются как `$SHELL -c команда`
-# sftp = "/usr/lib/openssh/sftp-server"   # находится сам, если установлен
+# sftp = "internal-sftp"       # встроенный сервер; по умолчанию, если sftp-server из OpenSSH не установлен
 
 # Настройки для части входов, как Match в sshd (user, group, address; должны выполняться все заданные).
 # Если подходят несколько блоков, побеждает первый, где настройка задана; "none" убирает значение.
 # [[match]]
 # group = "sftponly"
-# force_command = "/usr/lib/openssh/sftp-server"
+# chroot_directory = "/srv/sftp/%u"
+# force_command = "internal-sftp"
 # allow_tcp_forwarding = false
 # permit_tty = false
 ```
+
+**SFTP и chroot.** В qshd есть встроенный SFTP-сервер `internal-sftp`, как в sshd: ему не нужна оболочка (он работает и для аккаунтов с `nologin`) и не нужны файлы внутри chroot. Его можно указать подсистемой `sftp` или в `force_command`, с опциями sshd `-R` (только чтение), `-u UMASK` и `-d DIR` (начальный каталог; `%u` пользователь, `%d` домашний каталог). Он же используется для `sftp`, если sftp-server из OpenSSH не установлен. `chroot_directory` запирает программы входа и его передачи `qsh cp` в каталоге; как и в sshd, сам каталог и все каталоги выше должны принадлежать root и никому больше не быть доступны на запись, иначе вход не удаётся. Классическая схема «только SFTP» — блок `[[match]]` выше.
 
 Обратные пробросы (`-R`) слушают там, где разрешает `gateway_ports`; все, кроме root, не могут слушать порты ниже 1024. `allow_tcp_forwarding = false` выключает `-L`, `-R`, `-D` и `-W`.
 

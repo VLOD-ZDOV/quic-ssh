@@ -391,6 +391,7 @@ max_sessions = 10               # sessions at once per connection
 permit_tty = true
 accept_env = ["LANG", "LC_*", "COLORTERM"]   # variables clients may set
 # force_command = "/usr/local/bin/menu"   # replaces any command; the original is in SSH_ORIGINAL_COMMAND
+# chroot_directory = "/srv/jail/%u"       # confine sessions and qsh cp (system mode; root-owned path)
 # permit_open = ["db.internal:5432"]      # -L/-D/-W destinations; "none" = none
 # permit_listen = ["8080", "localhost:9000"]   # -R listeners
 disable_forwarding = false      # true: no port or agent forwarding at all
@@ -401,16 +402,19 @@ client_alive_count_max = 3
 # TZ = "UTC"
 
 [subsystems]                    # for `qsh -s` and sftp; run as `$SHELL -c command`
-# sftp = "/usr/lib/openssh/sftp-server"   # found automatically if installed
+# sftp = "internal-sftp"       # built-in server; default when OpenSSH's sftp-server is not installed
 
 # Settings for some logins, like sshd's Match (user, group, address; all given must hold).
 # If several blocks match, the first one that sets a setting wins; "none" removes a value.
 # [[match]]
 # group = "sftponly"
-# force_command = "/usr/lib/openssh/sftp-server"
+# chroot_directory = "/srv/sftp/%u"
+# force_command = "internal-sftp"
 # allow_tcp_forwarding = false
 # permit_tty = false
 ```
+
+**SFTP and chroot.** qshd has a built-in SFTP server, `internal-sftp`, like sshd's: it needs no shell (it works for accounts with a `nologin` shell) and no files inside a chroot. Use it as the `sftp` subsystem or as `force_command`, with sshd's options `-R` (read-only), `-u UMASK` and `-d DIR` (start directory; `%u` user, `%d` home). It is also used for `sftp` when OpenSSH's sftp-server is not installed. `chroot_directory` confines a login's programs and its `qsh cp` transfers to a directory; as with sshd, the directory and all above it must belong to root and be writable by nobody else, or the login fails. The classic SFTP-only setup is the `[[match]]` block above.
 
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
 

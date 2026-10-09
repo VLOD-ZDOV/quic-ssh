@@ -2419,3 +2419,76 @@ fn server_policy() {
     let out = c.run(&["-p", &port, "cp", "/etc/hostname", &format!("{}:x", dest())]);
     assert!(!out.status.success(), "file transfer must be refused with a forced command");
 }
+
+/// The built-in SFTP server, with OpenSSH's sftp and scp (which uses SFTP).
+#[test]
+fn internal_sftp() {
+    if !have("sftp") {
+        return;
+    }
+    let s = Server::start_with("127.0.0.1", "[subsystems]\nsftp = \"internal-sftp\"\n");
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let sftp = |batch: &str| {
+        let file = c.home.path().join("batch");
+        std::fs::write(&file, batch).unwrap();
+        Command::new("sftp")
+            .args(["-S", QSH, "-P", &port, "-b", file.to_str().unwrap(), &dest()])
+            .env("HOME", c.home.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let local = c.home.path().join("data.bin");
+    std::fs::write(&local, pseudo_random(300_000)).unwrap();
+    let got = c.home.path().join("got.bin");
+    let out = sftp(&format!(
+        "mkdir d\ncd d\nput {} a.bin\nchmod 600 a.bin\nrename a.bin b.bin\nln -s b.bin link\nls -l\ndf\nget link {}\nrm link\n",
+        local.display(),
+        got.display()
+    ));
+    assert!(out.status.success(), "sftp: {}{}", stdout(&out), stderr(&out));
+    assert_eq!(std::fs::read(&got).unwrap(), std::fs::read(&local).unwrap());
+    let stored = s.home.path().join("d/b.bin");
+    assert_eq!(std::fs::read(&stored).unwrap(), std::fs::read(&local).unwrap());
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&stored).unwrap().permissions()) & 0o777, 0o600);
+    assert!(stdout(&out).contains("-rw-------"), "ls -l: {}", stdout(&out));
+    assert!(!s.home.path().join("d/link").exists());
+    let out = sftp("rm d/b.bin\nrmdir d\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!s.home.path().join("d").exists());
+
+    if have("scp") {
+        let out = Command::new("scp")
+            .args(["-S", QSH, "-P", &port, local.to_str().unwrap(), &format!("{}:via-scp", dest())])
+            .env("HOME", c.home.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "scp: {}", stderr(&out));
+        assert_eq!(std::fs::read(s.home.path().join("via-scp")).unwrap(), std::fs::read(&local).unwrap());
+    }
+
+    // As a forced command, read-only: downloads work, uploads do not.
+    let s = Server::start_with("127.0.0.1", "force_command = \"internal-sftp -R -d %d\"\n");
+    let c2 = Client::paired(&s);
+    std::fs::write(s.home.path().join("ro.txt"), "read only").unwrap();
+    let batch = c2.home.path().join("batch");
+    let got = c2.home.path().join("ro-got.txt");
+    std::fs::write(&batch, format!("get ro.txt {}\n", got.display())).unwrap();
+    let run = |batch: &std::path::Path| {
+        Command::new("sftp")
+            .args(["-S", QSH, "-P", &s.port.to_string(), "-b", batch.to_str().unwrap(), &dest()])
+            .env("HOME", c2.home.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let out = run(&batch);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&got).unwrap(), "read only");
+    std::fs::write(&batch, format!("put {} up.txt\n", got.display())).unwrap();
+    let out = run(&batch);
+    assert!(!out.status.success(), "upload to a read-only internal-sftp worked");
+    assert!(!s.home.path().join("up.txt").exists());
+}

@@ -8,6 +8,7 @@ pub mod helpers;
 mod login_record;
 pub mod keys_command;
 mod persist;
+mod sftp;
 pub mod revoked;
 mod users;
 
@@ -419,6 +420,15 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup) -> R
     if !cfg.permit_tty {
         grant.restrictions.no_pty = true;
     }
+    let mut user = user;
+    user.chroot = match cfg.chroot_for(&user.name, user.uid, &user.home) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("{addr}: {name}: {e:#}");
+            write_msg(&mut send, &Reply::Err("access denied".into())).await?;
+            return Ok(());
+        }
+    };
     let user = Arc::new(user);
     let grant = Arc::new(grant);
     let sessions_limit = Arc::new(Semaphore::new(cfg.max_sessions));
@@ -516,6 +526,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 && login_shell(limits, &command, &pty)
                 && std::fs::metadata("/etc/motd").is_ok_and(|m| m.len() > 0),
             last_login: None,
+            chroot: user.chroot.clone(),
         },
         command: limits.command.clone().or(command.clone()),
         extra_env: cfg
@@ -543,7 +554,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             let mut spec = session(command, env, Some(pty));
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
             // Without a terminal (no-pty) or with sessions turned off: a plain session.
-            if spec.pty.is_none() || !state.sessions.enabled() {
+            if spec.pty.is_none() || !state.sessions.enabled() || exec::internal_sftp(&spec.command).is_some() {
                 return exec::run(send, recv, user, spec, closed).await;
             }
             state.sessions.start(send, recv, user, limits, spec, closed).await
@@ -654,7 +665,9 @@ fn subsystem_command(cfg: &ServerConfig, name: &str) -> Option<String> {
         return (!cmd.trim().is_empty()).then(|| cmd.clone());
     }
     if name == "sftp" {
-        return SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string());
+        // OpenSSH's sftp-server if installed, else the built-in one.
+        let installed = SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string());
+        return Some(installed.unwrap_or_else(|| users::INTERNAL_SFTP.to_string()));
     }
     None
 }

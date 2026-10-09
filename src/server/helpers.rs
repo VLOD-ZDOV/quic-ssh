@@ -181,6 +181,12 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     if !arg0.is_empty() {
         cmd.arg0(arg0);
     }
+    if let Some(root) = &prelude.chroot {
+        if !switch {
+            bail!("chroot_directory needs qshd to run as root");
+        }
+        enter_chroot(root)?;
+    }
     #[cfg(not(target_vendor = "apple"))]
     if switch {
         let groups: Vec<Gid> = match groups.as_str() {
@@ -216,7 +222,74 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
         std::env::set_current_dir("/")?;
     }
     run_prelude(&prelude, home, as_user);
+    // qshd's own programs run right here: inside a chroot neither a shell
+    // nor qshd's binary need to exist.
+    #[cfg(not(target_vendor = "apple"))]
+    if program.starts_with("internal-") {
+        let code = match run_internal(program, rest) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("qshd: {e:#}");
+                1
+            }
+        };
+        let _ = io::stdout().flush();
+        std::process::exit(code);
+    }
+    #[cfg(target_vendor = "apple")]
+    if program.starts_with("internal-") {
+        // Switched by exec (see above): run qshd itself.
+        let mut own = std::process::Command::new(super::users::exe_path()?);
+        own.arg(program).args(rest);
+        as_user(&mut own);
+        return Err(anyhow::Error::from(own.exec()).context(format!("cannot run {program}")));
+    }
     Err(anyhow::Error::from(cmd.exec()).context(format!("cannot run {program}")))
+}
+
+/// qshd's helpers that can run inside `internal-become` (sessions and
+/// file transfers of confined users); `args` as `helper_argv` makes them.
+pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
+    let args: Vec<&str> = args.iter().map(String::as_str).skip_while(|a| *a == "--").collect();
+    match (program, args.as_slice()) {
+        (super::users::INTERNAL_SFTP, opts) => {
+            let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
+            let user = std::env::var("USER").unwrap_or_default();
+            let home = std::env::var("HOME").unwrap_or_default();
+            super::sftp::serve(super::sftp::Options::parse(&opts, &user, &home)?)
+        }
+        ("internal-recv", [path, name, size, mode]) => recv(path, name, size.parse()?, mode),
+        ("internal-send", [path]) => send(path),
+        ("internal-untar", [path, name]) => untar(path, name),
+        ("internal-tar", [path]) => tar(path),
+        _ => bail!("{program} cannot run here"),
+    }
+}
+
+/// Like sshd's ChrootDirectory: the directory and every one above it must
+/// belong to root and be writable by nobody else, or the user could plant
+/// files (a fake /etc/passwd, a setuid binary's libraries) that root-run
+/// code inside would trust.
+fn enter_chroot(root: &Path) -> Result<()> {
+    if !root.is_absolute() {
+        bail!("chroot_directory {} is not an absolute path", root.display());
+    }
+    let mut path = PathBuf::from("/");
+    for part in std::iter::once(None).chain(root.components().skip(1).map(Some)) {
+        if let Some(part) = part {
+            path.push(part);
+        }
+        let meta = fs::metadata(&path).with_context(|| format!("chroot_directory {}", path.display()))?;
+        if !meta.is_dir() {
+            bail!("chroot_directory: {} is not a directory", path.display());
+        }
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            bail!("bad ownership or modes for chroot directory component {}", path.display());
+        }
+    }
+    nix::unistd::chroot(root).with_context(|| format!("chroot to {}", root.display()))?;
+    std::env::set_current_dir("/")?;
+    Ok(())
 }
 
 /// What sshd does before a session's program: the last login and the
