@@ -2098,6 +2098,7 @@ dependencies = [
  "signature",
  "socket2",
  "spake2",
+ "ssh-encoding",
  "ssh-key",
  "tar",
  "tempfile",

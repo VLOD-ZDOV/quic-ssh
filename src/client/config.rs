@@ -13,10 +13,11 @@
 //! `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand`,
 //! `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`,
 //! `ConnectionAttempts`, and qsh's own `PersistSession` and `PredictiveEcho`.
-//! `Match` blocks are evaluated for `all`, `host`, `originalhost`, `user` and
-//! `localuser`; a block whose conditions qsh cannot check (`exec`,
-//! `localnetwork`, `canonical`...) is not used, except that a proxy in it
-//! counts. Like ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config`
+//! `Match` blocks are evaluated for `all`, `host`, `originalhost`, `user`,
+//! `localuser`, `exec`, `localnetwork`, `tagged`, `canonical` and `final`
+//! (with `CanonicalizeHostname`, the configs are read again for the
+//! canonical name); a block whose conditions qsh cannot check (`version`...)
+//! is not used, except that a proxy in it counts. Like ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config`
 //! (not with `-F`), and `#` starts a comment anywhere on a line.
 //!
 //! From `~/.ssh/config`, settings that describe the ssh session itself (`Port`,
@@ -55,6 +56,27 @@ pub struct HostConfig {
     /// `StrictHostKeyChecking` (`yes`, `ask`, `accept-new`, `no`).
     pub strict_host_key_checking: Option<String>,
     pub user_known_hosts_file: Option<String>,
+    /// More `UserKnownHostsFile`s (read, not written).
+    pub more_known_hosts_files: Vec<String>,
+    /// `GlobalKnownHostsFile`s (qsh's config only; `none` for none).
+    pub global_known_hosts_files: Option<Vec<String>>,
+    pub hash_known_hosts: Option<bool>,
+    /// `KnownHostsCommand` (qsh's config only).
+    pub known_hosts_command: Option<String>,
+    /// `Tag` (or `-P`), for `Match tagged`.
+    pub tag: Option<String>,
+    /// `CanonicalizeHostname` (`no`, `yes`, `always`), `CanonicalDomains`,
+    /// `CanonicalizeMaxDots`, `CanonicalizeFallbackLocal`.
+    pub canonicalize_hostname: Option<String>,
+    pub canonical_domains: Option<Vec<String>>,
+    pub canonicalize_max_dots: Option<usize>,
+    pub canonicalize_fallback_local: Option<bool>,
+    /// `AddKeysToAgent` (`no`, `yes`, `ask`, `confirm`, a time).
+    pub add_keys_to_agent: Option<String>,
+    /// A `Match final` block exists (read the config once more at the end).
+    pub wants_final: bool,
+    /// `CanonicalizeFallbackLocal no` and the name could not be canonicalized.
+    pub canonicalize_failed: Option<String>,
     pub clear_all_forwardings: Option<bool>,
     pub escape_char: Option<String>,
     /// `AddressFamily` (`any`, `inet`, `inet6`).
@@ -187,11 +209,15 @@ struct Parser<'a> {
     /// qsh's own config or `-o` (as opposed to ssh's config).
     ours: bool,
     out: HostConfig,
-    /// `CanonicalizeHostname` is on: blocks may match the canonical name,
-    /// which qsh does not compute.
-    canonicalize: bool,
-    /// Some ProxyCommand/ProxyJump appears anywhere in the file.
-    any_proxy: bool,
+    /// The host as given (`Match originalhost`, `%n`), when `host` is its
+    /// canonical name.
+    original: String,
+    /// Reading again after canonicalization (`Match canonical`), and the
+    /// last pass (`Match final`).
+    canonical: bool,
+    final_pass: bool,
+    /// A `Match final` was seen: the config is read once more at the end.
+    wants_final: bool,
 }
 
 /// A proxy setting that is not `none`.
@@ -217,7 +243,7 @@ impl Parser<'_> {
                     if host_matches(&patterns(words.next()), name) { Applies::Yes } else { Applies::No }
                 }
                 "originalhost" => {
-                    if host_matches(&patterns(words.next()), self.host) { Applies::Yes } else { Applies::No }
+                    if host_matches(&patterns(words.next()), &self.original) { Applies::Yes } else { Applies::No }
                 }
                 "localuser" => {
                     let me = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
@@ -231,9 +257,23 @@ impl Parser<'_> {
                         None => Applies::Maybe,
                     }
                 }
-                // Evaluated on a second pass after canonicalization, which qsh does not do.
-                "canonical" | "final" => Applies::Maybe,
-                // `exec`, `localnetwork`, `tagged`, `version` and anything newer.
+                "canonical" => if self.canonical { Applies::Yes } else { Applies::No },
+                "final" => if self.final_pass { Applies::Yes } else { Applies::No },
+                "exec" => match words.next() {
+                    Some(cmd) => if self.exec_succeeds(cmd) { Applies::Yes } else { Applies::No },
+                    None => Applies::No,
+                },
+                "localnetwork" => match local_networks_match(&patterns(words.next())) {
+                    Some(true) => Applies::Yes,
+                    Some(false) => Applies::No,
+                    None => Applies::Maybe,
+                },
+                "tagged" => {
+                    let pats = patterns(words.next());
+                    let tag = self.out.tag.as_deref().unwrap_or("");
+                    if crate::pattern::name_matches(&pats, tag) || (tag.is_empty() && pats.iter().any(|p| p.is_empty())) { Applies::Yes } else { Applies::No }
+                }
+                // `version`, `sessiontype`, `command` and anything newer.
                 _ => {
                     words.next();
                     Applies::Maybe
@@ -259,8 +299,10 @@ impl Parser<'_> {
         for line in text.lines() {
             let Some((keyword, args, raw)) = split_line_raw(line) else { continue };
             let first = args.first().cloned();
+            if keyword == "match" && args.iter().any(|a| a.trim_start_matches('!').eq_ignore_ascii_case("final")) {
+                self.wants_final = true;
+            }
             if is_proxy(&keyword, first.as_deref()) && !self.ours {
-                self.any_proxy = true;
                 // A proxy that may apply: do not connect around it.
                 if active == Applies::Maybe {
                     self.out.needs_proxy = true;
@@ -280,7 +322,6 @@ impl Parser<'_> {
             let o = &mut self.out;
             match keyword.as_str() {
                 _ if active != Applies::Yes => {}
-                "canonicalizehostname" => self.canonicalize |= first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("no")),
                 "include" if depth < MAX_INCLUDE_DEPTH => {
                     for pattern in &args {
                         for file in self.expand_include(pattern) {
@@ -347,7 +388,25 @@ impl Parser<'_> {
                 "stricthostkeychecking" if o.strict_host_key_checking.is_none() => {
                     o.strict_host_key_checking = first.map(|v| v.to_ascii_lowercase());
                 }
-                "userknownhostsfile" if self.ours && o.user_known_hosts_file.is_none() => o.user_known_hosts_file = first,
+                "userknownhostsfile" if self.ours && o.user_known_hosts_file.is_none() => {
+                    o.user_known_hosts_file = first;
+                    o.more_known_hosts_files = args.iter().skip(1).cloned().collect();
+                }
+                "globalknownhostsfile" if self.ours && o.global_known_hosts_files.is_none() => o.global_known_hosts_files = Some(args.clone()),
+                "hashknownhosts" if o.hash_known_hosts.is_none() => o.hash_known_hosts = first.as_deref().map(yes),
+                "knownhostscommand" if self.ours && o.known_hosts_command.is_none() && !raw.is_empty() => {
+                    o.known_hosts_command = (!raw.eq_ignore_ascii_case("none")).then_some(raw);
+                }
+                "tag" if o.tag.is_none() => o.tag = first,
+                "canonicalizehostname" if o.canonicalize_hostname.is_none() => {
+                    o.canonicalize_hostname = first.map(|v| v.to_ascii_lowercase());
+                }
+                "canonicaldomains" if o.canonical_domains.is_none() => o.canonical_domains = Some(args.clone()),
+                "canonicalizemaxdots" if o.canonicalize_max_dots.is_none() => o.canonicalize_max_dots = first.and_then(|v| v.parse().ok()),
+                "canonicalizefallbacklocal" if o.canonicalize_fallback_local.is_none() => {
+                    o.canonicalize_fallback_local = first.as_deref().map(yes);
+                }
+                "addkeystoagent" if o.add_keys_to_agent.is_none() && !args.is_empty() => o.add_keys_to_agent = Some(args.join(" ").to_ascii_lowercase()),
                 "clearallforwardings" if o.clear_all_forwardings.is_none() => o.clear_all_forwardings = first.as_deref().map(yes),
                 "escapechar" if o.escape_char.is_none() => o.escape_char = first,
                 "addressfamily" if o.address_family.is_none() => o.address_family = first.map(|v| v.to_ascii_lowercase()),
@@ -379,7 +438,55 @@ impl Parser<'_> {
     }
 
     fn new<'h>(host: &'h str, base: &Path, full: bool, ours: bool) -> Parser<'h> {
-        Parser { host, base: base.to_path_buf(), full, ours, out: HostConfig::default(), canonicalize: false, any_proxy: false }
+        Parser {
+            host,
+            base: base.to_path_buf(),
+            full,
+            ours,
+            out: HostConfig::default(),
+            original: host.to_string(),
+            canonical: false,
+            final_pass: false,
+            wants_final: false,
+        }
+    }
+
+    /// `Match exec`: runs the command (with ssh's tokens) through /bin/sh;
+    /// it applies if the command succeeds.
+    fn exec_succeeds(&self, command: &str) -> bool {
+        let host = self.out.hostname.as_deref().unwrap_or(self.host);
+        let port = self.out.port.unwrap_or(if self.ours { crate::DEFAULT_PORT } else { 22 });
+        let local = crate::platform::local_user().unwrap_or_default();
+        let user = self.out.user.clone().unwrap_or_else(|| local.clone());
+        let home = dirs::home_dir().unwrap_or_default();
+        let mut line = String::new();
+        let mut chars = command.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                line.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => line.push('%'),
+                Some('C') => line.push_str(&crate::client::control::connection_hash(host, port, &user)),
+                Some('d') => line.push_str(&home.to_string_lossy()),
+                Some('h') => line.push_str(host),
+                Some('i') => line.push_str(&crate::platform::uid().to_string()),
+                Some('L') => line.push_str(crate::platform::hostname().split('.').next().unwrap_or("")),
+                Some('l') => line.push_str(&crate::platform::hostname()),
+                Some('n') => line.push_str(&self.original),
+                Some('p') => line.push_str(&port.to_string()),
+                Some('r') => line.push_str(&user),
+                Some('u') => line.push_str(&local),
+                // Unknown tokens make the condition fail, as in ssh.
+                _ => return false,
+            }
+        }
+        #[cfg(unix)]
+        let status = std::process::Command::new("/bin/sh").arg("-c").arg(&line).stdin(std::process::Stdio::null()).status();
+        #[cfg(not(unix))]
+        let status = std::process::Command::new("cmd").arg("/C").arg(&line).stdin(std::process::Stdio::null()).status();
+        status.is_ok_and(|s| s.success())
     }
 
     /// Feeds another file, with its own directory for `Include`.
@@ -390,16 +497,35 @@ impl Parser<'_> {
     }
 
     fn finish(mut self) -> HostConfig {
-        // Blocks may match a canonical name qsh does not know: any proxy then counts.
-        if self.canonicalize && self.any_proxy {
-            self.out.needs_proxy = true;
-        }
+        self.out.wants_final |= self.wants_final;
         self.out
     }
 
     fn run(mut self, text: &str) -> HostConfig {
         self.feed(text, 0);
         self.finish()
+    }
+}
+
+/// `Match localnetwork`: whether an address of this machine's interfaces is
+/// in one of the CIDR ranges (`!` excludes); `None` where qsh cannot tell.
+fn local_networks_match(patterns: &[String]) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        let addrs: Vec<std::net::IpAddr> = nix::ifaddrs::getifaddrs()
+            .ok()?
+            .filter_map(|i| {
+                let a = i.address?;
+                a.as_sockaddr_in().map(|v4| std::net::IpAddr::V4(v4.ip())).or_else(|| a.as_sockaddr_in6().map(|v6| std::net::IpAddr::V6(v6.ip())))
+            })
+            .collect();
+        let list = patterns.join(",");
+        Some(addrs.iter().any(|ip| crate::pattern::source_address_list_matches(&list, *ip)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = patterns;
+        None
     }
 }
 
@@ -536,8 +662,57 @@ pub struct Sources {
 }
 
 /// Settings for `host`: `-o` overrides, then `~/.config/qsh/config`, then
-/// `~/.ssh/config` (or the `-F` file).
+/// `~/.ssh/config` (or the `-F` file). Like ssh, with `CanonicalizeHostname`
+/// the configs are read again for the canonical name (`Match canonical`),
+/// and once more at the end if a `Match final` asks for it.
 pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
+    let first = lookup_pass(home, host, host, sources, false, false);
+    let mode = first.canonicalize_hostname.clone().unwrap_or_default();
+    let direct = first.proxy_jump.is_none() && first.proxy_command.is_none() && !first.needs_proxy;
+    let mut canonical = None;
+    if mode == "always" || (mode == "yes" && direct) {
+        let name = first.hostname.clone().unwrap_or_else(|| host.to_string());
+        let domains = first.canonical_domains.clone().unwrap_or_default();
+        canonical = canonicalize(&name, &domains, first.canonicalize_max_dots.unwrap_or(1));
+        if canonical.is_none() && first.canonicalize_fallback_local == Some(false) && !domains.is_empty() {
+            let mut failed = first;
+            failed.canonicalize_failed = Some(format!("could not canonicalize {name:?} with CanonicalDomains {}", domains.join(" ")));
+            return failed;
+        }
+    }
+    match &canonical {
+        Some(name) => {
+            let mut again = lookup_pass(home, name, host, sources, true, true);
+            if again.hostname.is_none() {
+                again.hostname = Some(name.clone());
+            }
+            again
+        }
+        None if first.wants_final => lookup_pass(home, host, host, sources, false, true),
+        None => first,
+    }
+}
+
+/// `CanonicalizeHostname`: `name` with the first of `domains` under which it
+/// resolves, if it has at most `max_dots` dots and is not an address.
+/// A trailing dot means the name is canonical already.
+fn canonicalize(name: &str, domains: &[String], max_dots: usize) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    if let Some(n) = name.strip_suffix('.') {
+        return Some(n.to_string());
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() || name.matches('.').count() > max_dots {
+        return None;
+    }
+    domains.iter().find_map(|d| {
+        let fqdn = format!("{name}.{}.", d.trim_end_matches('.'));
+        (fqdn.as_str(), 0).to_socket_addrs().ok()?.next()?;
+        Some(fqdn.trim_end_matches('.').to_string())
+    })
+}
+
+/// One reading of the configs (see [`lookup`]); `original` is the host as given.
+fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canonical: bool, final_pass: bool) -> HostConfig {
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
@@ -552,10 +727,15 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         read(&qsh_dir.join("config")),
         read(&qsh_dir.join(UI_HOSTS))
     );
-    let ours = Parser::new(host, &qsh_dir, true, true).run(&ours_text);
+    let mut ours = Parser::new(host, &qsh_dir, true, true);
+    (ours.original, ours.canonical, ours.final_pass) = (original.to_string(), canonical, final_pass);
+    let ours = ours.run(&ours_text);
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
     let mut ssh = Parser::new(host, &ssh_dir, sources.full, false);
+    (ssh.original, ssh.canonical, ssh.final_pass) = (original.to_string(), canonical, final_pass);
+    // A tag set by -P or qsh's config is the tag for ssh's `Match tagged` too.
+    ssh.out.tag = ours.tag.clone();
     ssh.feed_file(&read(&ssh_file), &ssh_dir);
     if sources.ssh_config.is_none() {
         let system = Path::new(SYSTEM_SSH_CONFIG);
@@ -597,6 +777,18 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         batch_mode: ours.batch_mode.or(ssh.batch_mode),
         strict_host_key_checking: ours.strict_host_key_checking.or(ssh.strict_host_key_checking),
         user_known_hosts_file: ours.user_known_hosts_file,
+        more_known_hosts_files: ours.more_known_hosts_files,
+        global_known_hosts_files: ours.global_known_hosts_files,
+        hash_known_hosts: ours.hash_known_hosts.or(ssh.hash_known_hosts),
+        known_hosts_command: ours.known_hosts_command,
+        tag: ours.tag.or(ssh.tag),
+        canonicalize_hostname: ours.canonicalize_hostname.or(ssh.canonicalize_hostname),
+        canonical_domains: ours.canonical_domains.or(ssh.canonical_domains),
+        canonicalize_max_dots: ours.canonicalize_max_dots.or(ssh.canonicalize_max_dots),
+        canonicalize_fallback_local: ours.canonicalize_fallback_local.or(ssh.canonicalize_fallback_local),
+        add_keys_to_agent: ours.add_keys_to_agent.or(ssh.add_keys_to_agent),
+        wants_final: ours.wants_final || ssh.wants_final,
+        canonicalize_failed: None,
         clear_all_forwardings: ours.clear_all_forwardings.or(ssh.clear_all_forwardings),
         escape_char: ours.escape_char.or(ssh.escape_char),
         address_family: ours.address_family.or(ssh.address_family),
@@ -819,12 +1011,46 @@ mod match_tests {
     /// What qsh cannot check: settings are not used, but a proxy counts.
     #[test]
     fn unknown_conditions_with_a_proxy() {
-        let c = cfg("Match exec \"test -e /tmp/vpn\"\n    ProxyJump bastion\n    User other\n", "h");
+        let c = cfg("Match version OpenSSH_9*\n    ProxyJump bastion\n    User other\n", "h");
         assert!(c.needs_proxy);
         assert_eq!(c.user, None);
-        let c = cfg("Match exec \"true\"\n    User other\n", "h");
-        assert!(!c.needs_proxy);
-        let c = cfg("CanonicalizeHostname yes\nHost *.corp.example\n    ProxyJump bastion\n", "box");
-        assert!(c.needs_proxy, "the canonical name could match");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_localnetwork_and_tagged() {
+        let c = cfg("Match exec \"test %h = h && test %n = h\"\n    User yes-exec\nMatch exec false\n    User no-exec\n", "h");
+        assert_eq!(c.user.as_deref(), Some("yes-exec"));
+        let c = cfg("Match exec false\n    User no-exec\n", "h");
+        assert_eq!(c.user, None);
+        let c = cfg("Match localnetwork 127.0.0.0/8\n    User lo\n", "h");
+        assert_eq!(c.user.as_deref(), Some("lo"));
+        let c = cfg("Match localnetwork 192.0.2.0/24,!127.0.0.0/8\n    User doc\n", "h");
+        assert_eq!(c.user, None);
+        let c = cfg("Tag work\nMatch tagged work\n    User tagged\n", "h");
+        assert_eq!(c.user.as_deref(), Some("tagged"));
+        let c = cfg("Match tagged work\n    User tagged\n", "h");
+        assert_eq!(c.user, None);
+    }
+
+    #[test]
+    fn canonical_and_final_passes() {
+        assert_eq!(canonicalize("host.example.", &[], 1), Some("host.example".into()));
+        assert_eq!(canonicalize("192.0.2.1", &["example.com".into()], 1), None);
+        assert_eq!(canonicalize("a.b.c", &["example.com".into()], 1), None, "too many dots");
+        assert_eq!(canonicalize("localhost", &["invalid".into()], 1), None, ".invalid never resolves");
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = "Host h\n  HostName real.\nMatch canonical host real\n  User canon\nMatch final\n  Port 2200\n";
+        std::fs::write(dir.join("config"), text).unwrap();
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert_eq!(c.user, None, "no canonicalization asked for");
+        std::fs::write(dir.join("config"), format!("CanonicalizeHostname yes\n{text}")).unwrap();
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert_eq!(c.user.as_deref(), Some("canon"));
+        assert_eq!(c.hostname.as_deref(), Some("real"));
+        let c = lookup(home.path(), "other", &Sources::default());
+        assert_eq!(c.port, Some(2200), "Match final applies on the last pass");
     }
 }

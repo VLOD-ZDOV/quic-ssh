@@ -81,6 +81,17 @@ pub struct Target {
     pub host_key_policy: HostKeyPolicy,
     /// `UserKnownHostsFile` (qsh config or `-o` only).
     pub known_hosts_file: Option<PathBuf>,
+    /// Further known_hosts files that are only read: more
+    /// `UserKnownHostsFile`s and `GlobalKnownHostsFile` (default
+    /// /etc/qsh/known_hosts).
+    pub known_hosts_read_also: Vec<PathBuf>,
+    /// `HashKnownHosts`: add host names hashed.
+    pub hash_known_hosts: bool,
+    /// `KnownHostsCommand` (run once per connection) and its output.
+    pub known_hosts_command: Option<String>,
+    pub known_hosts_extra: Option<Arc<String>>,
+    /// `AddKeysToAgent`: `None` = no; else `yes`, `ask`, `confirm` or a time.
+    pub add_keys_to_agent: Option<String>,
     pub clear_all_forwardings: bool,
     /// Session escape character; `None` disables escapes (`EscapeChar none`).
     pub escape_char: Option<u8>,
@@ -286,7 +297,17 @@ impl Target {
         let local = local_user().unwrap_or_default();
         let expand = |f: &str| home.map(|h| config::expand_path(f, h, &host, &user, &local));
         let identity_files = cfg.identity_files.iter().filter_map(|f| expand(f)).collect();
+        if let Some(why) = &cfg.canonicalize_failed {
+            bail!("{why}");
+        }
         let known_hosts_file = cfg.user_known_hosts_file.as_deref().and_then(expand);
+        let global = cfg.global_known_hosts_files.clone().unwrap_or_else(|| vec![GLOBAL_KNOWN_HOSTS.to_string()]);
+        let known_hosts_read_also = cfg
+            .more_known_hosts_files
+            .iter()
+            .chain(global.iter().filter(|g| !g.eq_ignore_ascii_case("none")))
+            .filter_map(|f| expand(f))
+            .collect();
         let certificate_files = cfg.certificate_files.iter().filter_map(|f| expand(f)).collect();
         let identity_agent = match cfg.identity_agent.as_deref() {
             None => None,
@@ -350,6 +371,11 @@ impl Target {
             batch_mode: cfg.batch_mode.unwrap_or(false),
             host_key_policy,
             known_hosts_file,
+            known_hosts_read_also,
+            hash_known_hosts: cfg.hash_known_hosts.unwrap_or(false),
+            known_hosts_command: cfg.known_hosts_command,
+            known_hosts_extra: None,
+            add_keys_to_agent: cfg.add_keys_to_agent.filter(|v| v != "no"),
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
             escape_char: parse_escape(cfg.escape_char.as_deref()),
             family,
@@ -523,13 +549,38 @@ fn known_hosts() -> Result<KnownHosts> {
     Ok(KnownHosts::new(qsh_dir(&home_dir()?).join("known_hosts")))
 }
 
-/// known_hosts for a target: its `UserKnownHostsFile`, or the default.
+/// The system-wide known_hosts for qshd keys (`GlobalKnownHostsFile`).
+const GLOBAL_KNOWN_HOSTS: &str = "/etc/qsh/known_hosts";
+
+/// known_hosts for a target: its `UserKnownHostsFile` (or the default),
+/// which new keys are added to, plus the files and command output that are
+/// only read. Returns the writable file's path too.
 fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
     let path = match &target.known_hosts_file {
         Some(p) => p.clone(),
         None => qsh_dir(&home_dir()?).join("known_hosts"),
     };
-    Ok((KnownHosts::new(path.clone()), path))
+    let kh = KnownHosts::with(path.clone(), target.known_hosts_read_also.clone(), target.known_hosts_extra.clone(), target.hash_known_hosts);
+    Ok((kh, path))
+}
+
+/// Runs `KnownHostsCommand` (tokens as for other commands; ssh's per-key
+/// tokens are not known before the handshake) and keeps its output, which
+/// is read like a known_hosts file.
+fn with_known_hosts_command(target: &Target) -> Result<Target> {
+    let mut t = target.clone();
+    let Some(command) = &target.known_hosts_command else { return Ok(t) };
+    let line = target.expand_tokens(command)?;
+    #[cfg(unix)]
+    let out = std::process::Command::new("/bin/sh").arg("-c").arg(&line).stdin(std::process::Stdio::null()).output();
+    #[cfg(not(unix))]
+    let out = std::process::Command::new("cmd").arg("/C").arg(&line).stdin(std::process::Stdio::null()).output();
+    match out {
+        Ok(o) if o.status.success() => t.known_hosts_extra = Some(Arc::new(String::from_utf8_lossy(&o.stdout).into_owned())),
+        Ok(o) => tracing::warn!("KnownHostsCommand {line:?} failed ({})", o.status),
+        Err(e) => tracing::warn!("KnownHostsCommand {line:?}: {e}"),
+    }
+    Ok(t)
 }
 
 /// Asks on the terminal whether to trust an unknown host key.
@@ -733,8 +784,9 @@ fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -
             CertVerdict::Invalid(why) => return Ok(HostTrust::Refused(format!("host '{hid}' is refused: {why}"))),
         }
     }
-    Ok(match kh.lookup(&hid)? {
-        Some(known) if known == key => HostTrust::Trusted("known_hosts".into()),
+    let keys = kh.keys(&hid)?;
+    Ok(match keys.first() {
+        _ if keys.contains(&key) => HostTrust::Trusted("known_hosts".into()),
         Some(known) => HostTrust::Refused(format!(
             "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n\
              Someone could be eavesdropping on you right now (man-in-the-middle attack),\n\
@@ -865,11 +917,33 @@ fn refuse_proxy(target: &Target) -> Result<()> {
 async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
     refuse_proxy(target)?;
     let own = find_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
-    match login_once(target, opts, via, own.as_ref(), false).await {
+    let result = match login_once(target, opts, via, own.as_ref(), false).await {
         // qshd before 0.5 knows only the TLS key: log in again with the own key
         // in the handshake (the host has been accepted by now, so this is no leak).
         Err(e) if e.is::<TlsKeyOnly>() => login_once(target, opts, via, own.as_ref(), true).await,
         result => result,
+    };
+    if let (Ok(_), Some(id), Some(policy)) = (&result, &own, &target.add_keys_to_agent) {
+        add_own_key_to_agent(target, id, policy).await;
+    }
+    result
+}
+
+/// AddKeysToAgent for the Ed25519 key qsh loaded from a file, unless the
+/// agent has it already.
+async fn add_own_key_to_agent(target: &Target, id: &Identity, policy: &str) {
+    let agent = match &target.identity_agent {
+        Some(None) => None,
+        Some(Some(path)) => crate::agent::Agent::connect(path).await.ok(),
+        None => crate::agent::Agent::from_env().await,
+    };
+    let Some(mut agent) = agent else { return };
+    let blob = id.public().ssh_blob();
+    if agent.keys().await.is_ok_and(|keys| keys.iter().any(|k| k.blob == blob)) {
+        return;
+    }
+    if let Ok(key) = id.to_private_key("") {
+        auth::add_to_agent(&mut agent, &key, policy, target.batch_mode, &format!("ED25519 {}", id.public().fingerprint())).await;
     }
 }
 
@@ -947,6 +1021,7 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     }
     // Before any jump host is contacted.
     refuse_proxy(target)?;
+    let target = &with_known_hosts_command(target)?;
     let hops = jump_hosts(target, opts).await?;
     let mut conn = establish(target, opts, hops.last().map(|c| c.as_ref())).await?;
     conn.set_hops(hops);

@@ -121,6 +121,11 @@ impl Identity {
         }
     }
 
+    /// The key as an OpenSSH private key (for `ssh-add`-style use).
+    pub fn to_private_key(&self, comment: &str) -> Result<PrivateKey> {
+        Ok(PrivateKey::new(KeypairData::Ed25519(Ed25519Keypair::from(&self.signing)), comment)?)
+    }
+
     /// Writes the key in OpenSSH format (mode 0600) plus a `.pub` file next to it.
     pub fn save(&self, path: &Path, comment: &str) -> Result<()> {
         if let Some(dir) = path.parent() {

@@ -149,6 +149,7 @@ impl SshArgs {
             },
             'S' => self.options.push(format!("ControlPath {v}")),
             'b' => self.options.push(format!("BindAddress {v}")),
+            'P' => self.options.push(format!("Tag {v}")),
             'B' => self.options.push(format!("BindInterface {v}")),
             'w' => return Err("tunnel devices (-w) are not supported".into()),
             // Bind address/interface, ciphers, MACs, logging, PKCS#11, tags, queries.

@@ -1,15 +1,61 @@
 //! `~/.config/qsh/known_hosts`: one `host ssh-ed25519 AAAA...` entry per line.
+//! Host names may be patterns (`*.example.com`, `!old.example.com`) or
+//! hashed (`|1|salt|hash`, as with OpenSSH's HashKnownHosts).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
+use base64::Engine;
 
 use crate::keys::{create_private_dir, PublicKey};
 
 pub struct KnownHosts {
+    /// The file new keys are added to.
     path: PathBuf,
+    /// More files that are only read (more `UserKnownHostsFile`s,
+    /// `GlobalKnownHostsFile`).
+    read_also: Vec<PathBuf>,
+    /// Output of `KnownHostsCommand`, read like a file.
+    extra: Option<Arc<String>>,
+    /// Add names hashed (`HashKnownHosts`).
+    hash: bool,
+}
+
+/// `|1|salt|hash`: HMAC-SHA1 of the name keyed with the salt (base64).
+fn hashed_matches(hashed: &str, name: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let Some((salt, hash)) = hashed.split_once('|') else { return false };
+    let (Ok(salt), Ok(hash)) = (b64.decode(salt), b64.decode(hash)) else { return false };
+    let Ok(mut mac) = Hmac::<sha1::Sha1>::new_from_slice(&salt) else { return false };
+    mac.update(name.as_bytes());
+    mac.verify_slice(&hash).is_ok()
+}
+
+/// `name` hashed with a new salt, as OpenSSH writes it.
+fn hash_name(name: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let salt: [u8; 20] = rand::random();
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&salt).expect("any key length");
+    mac.update(name.as_bytes());
+    format!("|1|{}|{}", b64.encode(salt), b64.encode(mac.finalize().into_bytes()))
+}
+
+/// Whether a line's host field (comma-separated names, patterns or hashes) names `id`.
+fn names_match(field: &str, id: &str) -> bool {
+    let mut plain = Vec::new();
+    for n in field.split(',') {
+        match n.strip_prefix("|1|") {
+            Some(h) if hashed_matches(h, id) => return true,
+            Some(_) => {}
+            None => plain.push(n),
+        }
+    }
+    crate::pattern::host_matches(&plain, id)
 }
 
 /// `host`, or `[host]:port` for a non-default port (same convention as OpenSSH).
@@ -23,29 +69,54 @@ pub fn host_id(host: &str, port: u16) -> String {
 
 impl KnownHosts {
     pub fn new(path: PathBuf) -> KnownHosts {
-        KnownHosts { path }
+        KnownHosts { path, read_also: Vec::new(), extra: None, hash: false }
     }
 
-    /// The file's text (empty if it does not exist). Bytes that are not
+    /// Also reads `files` and `extra` (never written), and hashes names it adds.
+    pub fn with(path: PathBuf, files: Vec<PathBuf>, extra: Option<Arc<String>>, hash: bool) -> KnownHosts {
+        KnownHosts { path, read_also: files, extra, hash }
+    }
+
+    /// The text of all sources (missing files are empty). Bytes that are not
     /// UTF-8 spoil only their own line, as with OpenSSH.
     fn text(&self) -> Result<String> {
-        match fs::read(&self.path) {
-            Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(anyhow::Error::from(e).context(format!("cannot read {}", self.path.display()))),
+        let mut text = String::new();
+        for (i, path) in std::iter::once(&self.path).chain(&self.read_also).enumerate() {
+            match fs::read(path) {
+                Ok(b) => text.push_str(&String::from_utf8_lossy(&b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Only the user's own file must be readable; others (the
+                // system's, which may be closed to users) are skipped as by ssh.
+                Err(e) if i > 0 => tracing::debug!("skipping {}: {e}", path.display()),
+                Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
+            }
+            text.push('\n');
         }
+        if let Some(extra) = &self.extra {
+            text.push_str(extra);
+        }
+        Ok(text)
     }
 
-    /// The key for `id`, from a line naming it (alone or in a comma-separated
-    /// list, as OpenSSH writes `host,address`).
+    /// Every key listed for `id` (lines naming it alone, in a list as
+    /// OpenSSH writes `host,address`, by a pattern or hashed).
+    pub fn keys(&self, id: &str) -> Result<Vec<PublicKey>> {
+        Ok(self
+            .text()?
+            .lines()
+            .filter_map(|line| {
+                let (names, key) = line.trim().split_once(char::is_whitespace)?;
+                if names.starts_with(['@', '#']) || !names_match(names, id) {
+                    return None;
+                }
+                PublicKey::parse_openssh(key.trim())
+            })
+            .collect())
+    }
+
+    /// The first key for `id`.
     pub fn lookup(&self, id: &str) -> Result<Option<PublicKey>> {
-        Ok(self.text()?.lines().find_map(|line| {
-            let (names, key) = line.trim().split_once(char::is_whitespace)?;
-            if names.starts_with(['@', '#']) || !names.split(',').any(|n| n == id) {
-                return None;
-            }
-            PublicKey::parse_openssh(key.trim())
-        }))
+        Ok(self.keys(id)?.into_iter().next())
     }
 
     /// All host ids in the file, in order.
@@ -55,11 +126,13 @@ impl KnownHosts {
             .lines()
             .filter_map(|l| l.split_whitespace().next().filter(|w| !w.starts_with(['@', '#'])))
             .flat_map(|names| names.split(',').map(str::to_string).collect::<Vec<_>>())
+            // Hashed names and patterns are no destinations.
+            .filter(|n| !n.starts_with('|') && !n.contains(['*', '?', '!']))
             .collect()
     }
 
     /// Keys on `@cert-authority` (or `@revoked`) lines whose host patterns
-    /// match one of `names` (OpenSSH syntax; hashed names are not matched).
+    /// match one of `names` (OpenSSH syntax).
     /// A file that exists but cannot be read is an error: its `@revoked`
     /// lines must not be skipped silently.
     pub fn marked(&self, marker: &str, names: &[String]) -> Result<Vec<ssh_key::public::KeyData>> {
@@ -71,9 +144,9 @@ impl KnownHosts {
                 if words.next()? != marker {
                     return None;
                 }
-                let patterns: Vec<&str> = words.next()?.split(',').collect();
+                let field = words.next()?;
                 let key = words.collect::<Vec<_>>().join(" ");
-                if !names.iter().any(|n| crate::pattern::host_matches(&patterns, n)) {
+                if !names.iter().any(|n| names_match(field, n)) {
                     return None;
                 }
                 ssh_key::PublicKey::from_openssh(&key).ok().map(|k| k.key_data().clone())
@@ -89,7 +162,8 @@ impl KnownHosts {
             create_private_dir(dir)?;
         }
         let mut f = OpenOptions::new().read(true).append(true).create(true).open(&self.path)?;
-        let mut line = format!("{id} {}\n", key.to_openssh(""));
+        let name = if self.hash { hash_name(id) } else { id.to_string() };
+        let mut line = format!("{name} {}\n", key.to_openssh(""));
         if !ends_with_newline(&mut f)? {
             line.insert(0, '\n');
         }
@@ -164,5 +238,28 @@ mod tests {
         assert!(kh.marked("@cert-authority", &names("example.org")).unwrap().is_empty());
         assert_eq!(kh.marked("@revoked", &names("anything")).unwrap().len(), 1);
         assert_eq!(kh.lookup("web.example.com").unwrap(), None, "marker lines are not host keys");
+    }
+
+    #[test]
+    fn hashed_patterns_and_more_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (Identity::generate().public(), Identity::generate().public(), Identity::generate().public());
+        let global = dir.path().join("global");
+        std::fs::write(&global, format!("*.example.com,!bad.example.com {}\n", b.to_openssh(""))).unwrap();
+        let kh = KnownHosts::with(dir.path().join("own"), vec![global], Some(Arc::new(format!("from-command {}\n", c.to_openssh("")))), true);
+        kh.add("[host.example]:2222", a).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("own")).unwrap();
+        assert!(text.starts_with("|1|") && !text.contains("host.example"), "{text}");
+        assert_eq!(kh.lookup("[host.example]:2222").unwrap(), Some(a));
+        assert_eq!(kh.lookup("host.example").unwrap(), None);
+        assert_eq!(kh.lookup("web.example.com").unwrap(), Some(b));
+        assert_eq!(kh.lookup("bad.example.com").unwrap(), None);
+        assert_eq!(kh.lookup("from-command").unwrap(), Some(c));
+        assert_eq!(kh.ids(), vec!["from-command"], "hashed names and patterns are not listed");
+        // Written by `ssh-keygen -H` for "example.com".
+        assert!(hashed_matches("jLzX8/hLVkOJ2dIUr06/FZ3KJrM=|PBvM/gMzzlJiXMqdTsQaWGCbOmU=", "example.com"));
+        assert!(!hashed_matches("jLzX8/hLVkOJ2dIUr06/FZ3KJrM=|PBvM/gMzzlJiXMqdTsQaWGCbOmU=", "example.org"));
+        let h = hash_name("example.com");
+        assert!(names_match(&h, "example.com") && !names_match(&h, "example.org"));
     }
 }

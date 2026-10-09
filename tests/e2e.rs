@@ -2579,3 +2579,61 @@ fn client_session_keywords() {
     let out = c.run(&["-l", &user(), "-R", "1:127.0.0.1:9", "h"]);
     assert!(!out.status.success() && stderr(&out).contains("only root"), "{}", stderr(&out));
 }
+
+/// known_hosts: hashed names (HashKnownHosts), a global file, and
+/// KnownHostsCommand; AddKeysToAgent with a real ssh-agent.
+#[test]
+fn known_hosts_sources_and_agent_adds() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let qsh_dir = c.home.path().join(".config/qsh");
+    let kh = qsh_dir.join("known_hosts");
+    let pinned = std::fs::read_to_string(&kh).unwrap();
+    let hid = format!("[127.0.0.1]:{port}");
+    assert!(pinned.contains(&hid));
+
+    // HashKnownHosts: a newly accepted host is stored hashed, and found again.
+    std::fs::remove_file(&kh).unwrap();
+    let out = c.run(&["-o", "HashKnownHosts=yes", "--accept-new-host", "-p", &port, &dest(), "echo", "hashed"]);
+    assert_eq!(stdout(&out), "hashed\n", "{}", stderr(&out));
+    let text = std::fs::read_to_string(&kh).unwrap();
+    assert!(text.starts_with("|1|") && !text.contains("127.0.0.1"), "{text}");
+    let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "echo", "again"]);
+    assert_eq!(stdout(&out), "again\n", "{}", stderr(&out));
+
+    // A global file (read only) and a command's output also vouch for a host.
+    std::fs::remove_file(&kh).unwrap();
+    let global = c.home.path().join("global_known_hosts");
+    std::fs::write(&global, &pinned).unwrap();
+    let out = c.run(&["-o", "BatchMode=yes", "-o", &format!("GlobalKnownHostsFile={}", global.display()), "-p", &port, &dest(), "echo", "global"]);
+    assert_eq!(stdout(&out), "global\n", "{}", stderr(&out));
+    assert!(!kh.exists(), "nothing was added to the user's file");
+    let out = c.run(&["-o", "BatchMode=yes", "-o", &format!("KnownHostsCommand=cat {}", global.display()), "-p", &port, &dest(), "echo", "command"]);
+    assert_eq!(stdout(&out), "command\n", "{}", stderr(&out));
+    let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "without them the host is unknown");
+
+    if !have("ssh-agent") || !have("ssh-add") || !have("ssh-keygen") {
+        return eprintln!("skipped AddKeysToAgent: no ssh-agent");
+    }
+    std::fs::write(&kh, &pinned).unwrap();
+    let keys = tempfile::tempdir().unwrap();
+    let rsa = keygen(keys.path(), "add_rsa", "rsa");
+    std::fs::write(s.home.path().join(".config/qsh/authorized_keys"), format!("{}\n", public(&rsa))).unwrap();
+    let agent = start_agent();
+    let listed = || Command::new("ssh-add").arg("-L").env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+    assert!(!stdout(&listed()).contains("ssh-rsa"));
+    let out = c
+        .cmd(&["-o", "AddKeysToAgent=yes", "-i", rsa.to_str().unwrap(), "-p", &port, &dest(), "echo", "added"])
+        .env("SSH_AUTH_SOCK", &agent.sock)
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out), "added\n", "{}", stderr(&out));
+    let keys_in_agent = stdout(&listed());
+    assert!(keys_in_agent.contains(public(&rsa).split_whitespace().nth(1).unwrap()), "{keys_in_agent}");
+    // The agent can now log in on its own.
+    std::fs::remove_file(&rsa).unwrap();
+    let out = c.cmd(&["-p", &port, &dest(), "echo", "via-agent"]).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+    assert_eq!(stdout(&out), "via-agent\n", "{}", stderr(&out));
+}

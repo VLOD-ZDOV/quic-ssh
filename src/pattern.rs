@@ -129,6 +129,24 @@ pub fn address_allowed(list: &str, ip: IpAddr) -> bool {
     allowed
 }
 
+/// A CIDR list with `!` exclusions (`Match localnetwork`): an excluded
+/// range denies, any other range allows; a malformed entry denies.
+pub fn source_address_list_matches(list: &str, ip: IpAddr) -> bool {
+    let mut allowed = false;
+    for c in list.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        let (neg, c) = match c.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, c),
+        };
+        match cidr_contains(c, ip) {
+            Some(true) if neg => return false,
+            Some(hit) => allowed |= hit && !neg,
+            None => return false,
+        }
+    }
+    allowed
+}
+
 /// A certificate's `source-address`: comma-separated CIDR list; any malformed entry denies.
 pub fn source_address_allowed(list: &str, ip: IpAddr) -> bool {
     let mut allowed = false;

@@ -63,6 +63,11 @@ pub fn parse_persist(v: &str) -> Persist {
     }
 }
 
+/// A time in sshd_config(5)'s format, in whole seconds.
+pub fn parse_time_secs(t: &str) -> Option<u32> {
+    parse_time(t).and_then(|d| u32::try_from(d.as_secs()).ok())
+}
+
 fn parse_time(t: &str) -> Option<Duration> {
     let mut total = 0u64;
     let mut num = String::new();

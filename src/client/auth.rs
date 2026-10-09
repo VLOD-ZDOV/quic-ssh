@@ -62,6 +62,42 @@ pub struct Keyring {
     agent: Option<Agent>,
     candidates: Vec<Candidate>,
     next: usize,
+    /// `AddKeysToAgent`: key files used are added to the agent.
+    add_to_agent: Option<String>,
+}
+
+/// `AddKeysToAgent` values: `yes`, `ask`, `confirm [TIME]` or a `TIME`.
+/// Returns (ask first, confirm each use, lifetime in seconds).
+fn add_keys_policy(v: &str) -> Option<(bool, bool, Option<u32>)> {
+    let mut words = v.split([' ', ',']).filter(|w| !w.is_empty());
+    let first = words.next()?;
+    let time = |w: Option<&str>| w.and_then(crate::client::control::parse_time_secs);
+    match first {
+        "no" => None,
+        "yes" => Some((false, false, None)),
+        "ask" => Some((true, false, None)),
+        "confirm" => Some((false, true, time(words.next()))),
+        t => time(Some(t)).map(|secs| (false, false, Some(secs))),
+    }
+}
+
+/// Adds a key loaded from a file to the agent (AddKeysToAgent), asking
+/// first if the setting says `ask`. Failures only go to the debug log.
+pub async fn add_to_agent(agent: &mut Agent, key: &PrivateKey, policy: &str, batch: bool, label: &str) {
+    let Some((ask_first, confirm, lifetime)) = add_keys_policy(policy) else { return };
+    if ask_first {
+        if batch {
+            return;
+        }
+        match crate::prompt::line(&format!("Add key {label} to the agent? (yes/no) ")) {
+            Ok(a) if a.trim().eq_ignore_ascii_case("yes") => {}
+            _ => return,
+        }
+    }
+    match agent.add(key, confirm, lifetime).await {
+        Ok(()) => debug!("added {label} to the agent"),
+        Err(e) => debug!("cannot add {label} to the agent: {e:#}"),
+    }
 }
 
 impl Keyring {
@@ -150,7 +186,7 @@ impl Keyring {
                 add(&mut out, blob, format!("{} {}", key.algorithm(), path.display()), Signer::File(path.clone()));
             }
         }
-        Keyring { agent, candidates: out, next: 0 }
+        Keyring { agent, candidates: out, next: 0, add_to_agent: target.add_keys_to_agent.clone() }
     }
 
     async fn sign(&mut self, index: usize, data: &[u8], own: &Identity, batch: bool) -> Result<Vec<u8>> {
@@ -160,6 +196,9 @@ impl Keyring {
             Signer::Agent => self.agent.as_mut().context("agent went away")?.sign(&c.blob, data).await,
             Signer::File(path) => {
                 let key = crate::keys::load_private_key(path, !batch)?;
+                if let (Some(policy), Some(agent)) = (&self.add_to_agent, self.agent.as_mut()) {
+                    add_to_agent(agent, &key, policy, batch, &path.display().to_string()).await;
+                }
                 let sig = sign_with(&key, data).with_context(|| format!("cannot sign with {}", path.display()))?;
                 Ok(Vec::try_from(sig)?)
             }

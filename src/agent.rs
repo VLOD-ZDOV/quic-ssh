@@ -8,6 +8,11 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const FAILURE: u8 = 5;
+const SUCCESS: u8 = 6;
+const ADD_IDENTITY: u8 = 17;
+const ADD_ID_CONSTRAINED: u8 = 25;
+const CONSTRAIN_LIFETIME: u8 = 1;
+const CONSTRAIN_CONFIRM: u8 = 2;
 const REQUEST_IDENTITIES: u8 = 11;
 const IDENTITIES_ANSWER: u8 = 12;
 const SIGN_REQUEST: u8 = 13;
@@ -125,6 +130,31 @@ impl Agent {
             keys.push(AgentKey { blob, comment });
         }
         Ok(keys)
+    }
+
+    /// Adds a private key, like `ssh-add` (`AddKeysToAgent`): with
+    /// `confirm`, the agent asks before each use; with `lifetime`, it
+    /// forgets the key after that many seconds.
+    pub async fn add(&mut self, key: &ssh_key::PrivateKey, confirm: bool, lifetime: Option<u32>) -> Result<()> {
+        use ssh_encoding::Encode;
+        let constrained = confirm || lifetime.is_some();
+        let mut body = vec![if constrained { ADD_ID_CONSTRAINED } else { ADD_IDENTITY }];
+        key.key_data().encode(&mut body).map_err(|e| anyhow::anyhow!("cannot encode the key: {e}"))?;
+        put_string(&mut body, key.comment().as_bytes());
+        if let Some(seconds) = lifetime {
+            body.push(CONSTRAIN_LIFETIME);
+            body.extend_from_slice(&seconds.to_be_bytes());
+        }
+        if confirm {
+            body.push(CONSTRAIN_CONFIRM);
+        }
+        let reply = self.request(&body).await;
+        // The private key must not linger in memory longer than needed.
+        body.iter_mut().for_each(|b| *b = 0);
+        match reply?.first() {
+            Some(&SUCCESS) => Ok(()),
+            _ => bail!("the agent refused the key"),
+        }
     }
 
     /// Signs `data` with the key `blob`; returns an SSH signature blob.
