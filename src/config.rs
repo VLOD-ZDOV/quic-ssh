@@ -51,6 +51,14 @@ pub struct ServerConfig {
     pub stream_local_bind_mask: String,
     /// Remove a stale socket file before listening on it (StreamLocalBindUnlink).
     pub stream_local_bind_unlink: bool,
+    /// Allow `qsh -X`/`-Y` (like X11Forwarding).
+    pub x11_forwarding: bool,
+    /// The first display number used (like X11DisplayOffset).
+    pub x11_display_offset: u32,
+    /// Displays listen on loopback only (like X11UseLocalhost).
+    pub x11_use_localhost: bool,
+    /// The xauth program (like XAuthLocation).
+    pub xauth_location: PathBuf,
     /// Destinations `-L`/`-D`/`-W` may connect to: `host:port` patterns with
     /// `*` (like PermitOpen). Empty or `["any"]`: any; `["none"]`: none.
     #[serde(deserialize_with = "names")]
@@ -449,6 +457,9 @@ overrides! {
         set_env: BTreeMap<String, String>,
         totp: Totp,
         use_ssh_authorized_keys: bool,
+        x11_display_offset: u32,
+        x11_forwarding: bool,
+        x11_use_localhost: bool,
     }
     optional {
         authorized_keys_command: String,
@@ -515,6 +526,10 @@ impl Default for ServerConfig {
             allow_stream_local_forwarding: Forwarding::All,
             stream_local_bind_mask: "0177".into(),
             stream_local_bind_unlink: false,
+            x11_forwarding: false,
+            x11_display_offset: 10,
+            x11_use_localhost: true,
+            xauth_location: PathBuf::from("/usr/bin/xauth"),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
             max_connections: 256,
@@ -675,6 +690,10 @@ impl ServerConfig {
     /// `stream_local_bind_mask` as a number.
     pub fn bind_mask(&self) -> u32 {
         u32::from_str_radix(&self.stream_local_bind_mask, 8).unwrap_or(0o177) & 0o777
+    }
+
+    pub fn x11(&self) -> bool {
+        !self.disable_forwarding && self.x11_forwarding
     }
 
     pub fn agent_forwarding(&self) -> bool {

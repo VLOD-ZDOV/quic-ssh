@@ -151,6 +151,11 @@ pub enum Request {
     /// streams starting with [`Opened::ForwardedStreamLocal`]. Closing this
     /// stream cancels the forward.
     RemoteForwardStreamLocal { path: String },
+    /// X11 forwarding (`-X`/`-Y`) for this connection's sessions: they get a
+    /// display whose connections arrive as server-opened streams starting
+    /// with [`Opened::X11`]. `proto` and `cookie` (hex) are the fake
+    /// authentication the sessions use. Closing this stream ends it.
+    X11Forward { proto: String, cookie: String, screen: u32 },
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
@@ -185,6 +190,9 @@ pub enum Opened {
     // --- protocol version 6 ---
     /// A connection to a `-R` Unix socket listener at `path`; raw bytes follow.
     ForwardedStreamLocal { path: String },
+    /// A program on the server opened the forwarded X11 display; raw bytes
+    /// of the X11 protocol follow.
+    X11 { origin: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

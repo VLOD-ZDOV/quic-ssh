@@ -55,7 +55,13 @@ fn group_list(_name: &str, _gid: Gid) -> Result<Vec<libc::gid_t>> {
 /// then run `~/.ssh/rc` or `/etc/ssh/sshrc`, like sshd.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prelude {
+    /// Run an rc file: `~/.ssh/rc` (if `user_rc`) or `/etc/ssh/sshrc`.
     pub rc: bool,
+    pub user_rc: bool,
+    /// X11 forwarding: the xauth display name, protocol and fake cookie,
+    /// given to the rc file on stdin or added with xauth.
+    pub x11: Option<(String, String, String)>,
+    pub xauth: Option<String>,
     pub motd: bool,
     /// "Last login: ..." line.
     pub last_login: Option<String>,
@@ -77,6 +83,15 @@ impl Prelude {
         if self.rc {
             items.push("rc".to_string());
         }
+        if self.user_rc {
+            items.push("user_rc".to_string());
+        }
+        if let Some((display, proto, cookie)) = &self.x11 {
+            items.push(format!("x11={display} {proto} {cookie}"));
+        }
+        if let Some(x) = &self.xauth {
+            items.push(format!("xauth={x}"));
+        }
         if self.motd {
             items.push("motd".to_string());
         }
@@ -97,6 +112,12 @@ impl Prelude {
         for item in decode_args(arg)? {
             match item.as_str() {
                 "rc" => p.rc = true,
+                "user_rc" => p.user_rc = true,
+                _ if item.starts_with("x11=") => {
+                    let mut f = item["x11=".len()..].split(' ').map(str::to_string);
+                    p.x11 = Some((f.next()?, f.next()?, f.next()?));
+                }
+                _ if item.starts_with("xauth=") => p.xauth = Some(item["xauth=".len()..].to_string()),
                 "motd" => p.motd = true,
                 _ if item.starts_with("chroot=") => p.chroot = Some(PathBuf::from(&item["chroot=".len()..])),
                 _ => p.last_login = Some(item.strip_prefix("last=")?.to_string()),

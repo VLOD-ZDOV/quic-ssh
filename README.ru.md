@@ -150,6 +150,7 @@ qsh -L /tmp/docker.sock:/var/run/docker.sock host   # Unix-сокеты с лю�
 qsh -J bastion user@internal           # через промежуточный хост (на обоих qshd)
 qsh -f -N -L 5432:db:5432 host         # войти и уйти в фон
 qsh -A host                            # пробросить ssh-agent
+qsh -Y host xterm                      # проброс X11 (-X: недоверенный, как в ssh)
 qsh cp file.txt user@host:dir/         # загрузить
 qsh cp user@host:logs/app.log .        # скачать
 qsh cp -r project/ user@host:src/      # скопировать каталог (в любую сторону)
@@ -194,7 +195,7 @@ qsh входит теми же ключами, что и ssh, в таком по
 - Переход с Wi-Fi на мобильную сеть, сон ноутбука и короткие обрывы больше не убивают shell. По QUIC смена адреса (NAT rebinding) обычно вообще не требует переподключения.
 - Нажатия во время обрыва теряются, а `~.` прекращает ожидание.
 - Обычный выход (exit, `~.`, закрытие терминала) завершает сессию на сервере, как раньше.
-- Выключить можно через `PersistSession no` в `~/.config/qsh/config` (или `-o PersistSession=no`). Сессии с пробросом портов или агента не сохраняются.
+- Выключить можно через `PersistSession no` в `~/.config/qsh/config` (или `-o PersistSession=no`). Сессии с пробросом портов, агента или X11 не сохраняются.
 - `ServerAliveInterval` и `ServerAliveCountMax` задают, как быстро замечается мёртвое соединение. Для остальных сессий они работают как в ssh. qsh проверяет связь пингами в отдельных потоках, поэтому непрочитанный вывод или ввод, который удалённая команда пока не читает, не выдают живое соединение за мёртвое.
 
 ### Общее соединение (`ControlMaster`)
@@ -240,7 +241,7 @@ Host myserver
     Port 8080
 ```
 
-Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `Compression` (для `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` и `ProxyCommand` (в `~/.config/qsh/config`; тогда qsh работает через stdin/stdout программы, например `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` вместе с `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` и `GlobalKnownHostsFile` (по умолчанию `/etc/qsh/known_hosts`) `KnownHostsCommand` и `HashKnownHosts` (в `~/.config/qsh/config`), `AddKeysToAgent`, `Tag` (или `-P`), `CanonicalizeHostname` с `CanonicalDomains`, `CanonicalizeMaxDots` и `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` и `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). Блок `Match` с условиями, которые qsh проверить не может (`version`…), не применяется, но `ProxyCommand` или `ProxyJump` в нём всё равно учитывается: qsh никогда не подключается в обход прокси, который может действовать. Записи known_hosts могут быть хэшированными (`ssh-keygen -H`) или шаблонами. Как и ssh, qsh читает `/etc/ssh/ssh_config` после `~/.ssh/config` (кроме случая с `-F`), а `#` начинает комментарий в любом месте строки. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
+Поддерживаются шаблоны `Host` (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` и `PredictiveEcho` (только qsh), `Compression` (для `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (в `~/.config/qsh/config`), `ProxyJump` и `ProxyCommand` (в `~/.config/qsh/config`; тогда qsh работает через stdin/stdout программы, например `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` вместе с `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` и `GlobalKnownHostsFile` (по умолчанию `/etc/qsh/known_hosts`) `KnownHostsCommand` и `HashKnownHosts` (в `~/.config/qsh/config`), `AddKeysToAgent`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tag` (или `-P`), `CanonicalizeHostname` с `CanonicalDomains`, `CanonicalizeMaxDots` и `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `Include` и `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). Блок `Match` с условиями, которые qsh проверить не может (`version`…), не применяется, но `ProxyCommand` или `ProxyJump` в нём всё равно учитывается: qsh никогда не подключается в обход прокси, который может действовать. Записи known_hosts могут быть хэшированными (`ssh-keygen -H`) или шаблонами. Как и ssh, qsh читает `/etc/ssh/ssh_config` после `~/.ssh/config` (кроме случая с `-F`), а `#` начинает комментарий в любом месте строки. Значения из командной строки (`user@`, `:port`, `-p`, `-i`) всегда главнее.
 
 ### Режим совместимости с OpenSSH (`--full`)
 
@@ -400,6 +401,10 @@ disable_forwarding = false      # true: никаких пробросов пор
 allow_stream_local_forwarding = true   # проброс Unix-сокетов: или "no", "local", "remote"
 stream_local_bind_mask = "0177" # какие права убрать у сокетов -R на сервере
 stream_local_bind_unlink = false   # удалять старый файл сокета перед прослушиванием
+x11_forwarding = false          # разрешить qsh -X/-Y (DISPLAY=localhost:10 и дальше)
+x11_display_offset = 10
+x11_use_localhost = true
+xauth_location = "/usr/bin/xauth"
 client_alive_interval = 0       # секунд между проверками молчащего клиента; 0 = встроенная (~60 с)
 client_alive_count_max = 3
 per_source_penalties = true     # отбрасывать адреса, с которых раз за разом не входят; или "authfail:5s noauth:1s min:15s max:10m"
@@ -528,7 +533,7 @@ python3 bench/bench.py
 ## Ограничения
 
 - Нет PAM (`pam_limits`; вместо `pam_access` — `allow_users`/`allow_groups`) и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
-- Нет X11 и туннелей (`-w`).
+- Нет туннелей (`-w`).
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.
 - `-J` работает, только если на всех промежуточных хостах есть qshd; с `--full` хосты с `ProxyJump`/`ProxyCommand` отдаются ssh.

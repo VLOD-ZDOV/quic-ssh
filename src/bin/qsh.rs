@@ -670,9 +670,9 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         },
         false => None,
     };
-    // Streams the server opens (-R, -A) would reach the master, not this qsh:
-    // such a run uses a connection of its own.
-    let share = remotes.is_empty() && agent.is_none();
+    // Streams the server opens (-R, -A, -X) would reach the master, not this
+    // qsh: such a run uses a connection of its own.
+    let share = remotes.is_empty() && agent.is_none() && target.forward_x11.is_none();
     let opts = ConnectOptions {
         identities: a.identities.clone(),
         transport: a.transport,
@@ -716,7 +716,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
-    let uses_forwards = uses_forwards || agent.is_some();
+    let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some();
     for f in remotes {
         let spec = f.describe();
         match forwarder.remote(f.clone()).await {
@@ -733,6 +733,17 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     }
     if let Some(path) = agent {
         forwarder.agent(path, quiet).await;
+    }
+    if let Some(trusted) = target.forward_x11 {
+        match std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()) {
+            None if !quiet => eprintln!("qsh: warning: X11 forwarding requested but DISPLAY is not set"),
+            None => {}
+            Some(display) => match qsh::client::x11::prepare(&display, trusted, &target.xauth, target.x11_timeout) {
+                Ok(auth) => forwarder.x11(auth, quiet).await,
+                Err(e) if !quiet => eprintln!("qsh: warning: X11 forwarding: {e:#}"),
+                Err(_) => {}
+            },
+        }
     }
     if let Some(command) = &target.local_command {
         run_local_command(&target.expand_tokens(command)?);

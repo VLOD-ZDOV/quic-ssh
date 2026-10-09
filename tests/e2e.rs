@@ -2793,3 +2793,64 @@ fn socket_forwards_and_runtime_changes() {
     term.write_all(b"\r~.").unwrap();
     let _ = child.wait();
 }
+
+/// X11 forwarding (-Y) end to end, with a fake X server that answers "OK"
+/// only to the real cookie, and a program on the server that connects to
+/// the forwarded display with the cookie its xauth entry holds.
+#[test]
+fn x11_forwarding() {
+    if !have("xauth") || !have("python3") {
+        return eprintln!("skipped: no xauth or python3");
+    }
+    // A fake X server on a free display.
+    let (fake_display, listener) = (40..100)
+        .find_map(|n| TcpListener::bind(("127.0.0.1", 6000 + n)).ok().map(|l| (n, l)))
+        .expect("a free X11 port");
+    let real = "0123456789abcdef0123456789abcdef";
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let mut head = [0u8; 12];
+            if s.read_exact(&mut head).is_err() {
+                continue;
+            }
+            let (n, d) = (u16::from_le_bytes([head[6], head[7]]) as usize, u16::from_le_bytes([head[8], head[9]]) as usize);
+            let pad = |x: usize| (4 - x % 4) % 4;
+            let mut rest = vec![0u8; n + pad(n) + d + pad(d)];
+            let _ = s.read_exact(&mut rest);
+            let data: String = rest[n + pad(n)..n + pad(n) + d].iter().map(|b| format!("{b:02x}")).collect();
+            let _ = s.write_all(if data == "0123456789abcdef0123456789abcdef" { b"OK" } else { b"BAD" });
+        }
+    });
+    let offset = (100..400).find(|n| TcpListener::bind(("127.0.0.1", 6000 + n)).is_ok()).unwrap();
+    let s = Server::start_with("127.0.0.1", &format!("x11_forwarding = true\nx11_display_offset = {offset}\n"));
+    let c = Client::paired(&s);
+    let xauthority = c.home.path().join(".Xauthority");
+    let display = format!("127.0.0.1:{fake_display}");
+    let out = Command::new("xauth").arg("-f").arg(&xauthority).args(["add", &display, "MIT-MAGIC-COOKIE-1", real]).output().unwrap();
+    assert!(out.status.success(), "xauth add: {}", stderr(&out));
+    // On the server: the display, its cookie from xauth, and an X11 setup.
+    let probe = r#"
+import os, socket, struct, subprocess
+d = os.environ["DISPLAY"]
+n = int(d.split(":")[1].split(".")[0])
+line = subprocess.run(["xauth", "list", "unix:" + d.split(":")[1]], capture_output=True, text=True).stdout.split()
+proto, cookie = line[1].encode(), bytes.fromhex(line[2])
+pad = lambda b: b + b"\0" * ((4 - len(b) % 4) % 4)
+s = socket.create_connection(("127.0.0.1", 6000 + n))
+s.sendall(struct.pack("<BxHHHHxx", ord("l"), 11, 0, len(proto), len(cookie)) + pad(proto) + pad(cookie))
+print(d.split(":")[0], s.recv(16).decode())
+"#;
+    let out = c
+        .cmd(&["-Y", "-p", &s.port.to_string(), &dest(), "python3", "-c", &format!("'{probe}'")])
+        .env("DISPLAY", &display)
+        .env("XAUTHORITY", &xauthority)
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out).trim(), "localhost OK", "{}", stderr(&out));
+
+    // Off on the server: a warning, and the session runs without a display.
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let out = c.cmd(&["-Y", "-p", &s.port.to_string(), &dest(), "echo", "${DISPLAY:-none}"]).env("DISPLAY", &display).env("XAUTHORITY", &xauthority).output().unwrap();
+    assert!(stderr(&out).contains("X11 forwarding refused"), "{}", stderr(&out));
+}

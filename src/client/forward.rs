@@ -292,6 +292,7 @@ struct Routes {
     ports: HashMap<u16, Dest>,
     paths: HashMap<String, Dest>,
     agent: Option<Arc<PathBuf>>,
+    x11: Option<Arc<super::x11::X11Auth>>,
 }
 
 /// One active forward.
@@ -322,8 +323,9 @@ pub struct Forwarder {
     active: Mutex<Vec<Active>>,
     routes: Arc<Mutex<Routes>>,
     dispatcher: Mutex<Option<AbortHandle>>,
-    /// Agent forwarding requested (its stream is kept here).
+    /// Agent and X11 forwarding requested (their streams are kept here).
     agent_request: Mutex<Option<(SendHalf, RecvHalf)>>,
+    x11_request: Mutex<Option<(SendHalf, RecvHalf)>>,
 }
 
 impl Drop for Forwarder {
@@ -343,6 +345,7 @@ impl Forwarder {
             routes: Arc::default(),
             dispatcher: Mutex::default(),
             agent_request: Mutex::default(),
+            x11_request: Mutex::default(),
         })
     }
 
@@ -447,6 +450,35 @@ impl Forwarder {
         }
     }
 
+    /// `-X`/`-Y`: asks the server for a display whose connections come to
+    /// the local one. Problems are warnings, as for the agent.
+    pub async fn x11(&self, auth: super::x11::X11Auth, quiet: bool) {
+        if self.conn.server_version() < 6 {
+            if !quiet {
+                eprintln!("qsh: warning: the server's qshd is too old for X11 forwarding");
+            }
+            return;
+        }
+        let request = Request::X11Forward { proto: auth.proto.clone(), cookie: auth.fake_hex(), screen: auth.screen };
+        self.routes.lock().unwrap().x11 = Some(Arc::new(auth));
+        self.dispatch();
+        let attempt = async {
+            let (mut send, mut recv) = self.conn.open_bi().await?;
+            write_msg(&mut send, &request).await?;
+            expect_ok(&mut recv).await?;
+            anyhow::Ok((send, recv))
+        };
+        match attempt.await {
+            Ok(streams) => *self.x11_request.lock().unwrap() = Some(streams),
+            Err(e) => {
+                self.routes.lock().unwrap().x11 = None;
+                if !quiet {
+                    eprintln!("qsh: warning: X11 forwarding refused: {e:#}");
+                }
+            }
+        }
+    }
+
     /// Cancels the `kind` forward listening at `listen` (`[bind:]port` or a
     /// path, as given when it was added). Returns whether there was one.
     pub fn cancel(&self, kind: char, listen: &str) -> Result<bool> {
@@ -543,28 +575,36 @@ impl Forwarder {
                         Err(_) => return,
                     };
                     // Looked up first: the lock must not be held across an await.
-                    let (dest, origin, agent) = {
+                    enum Next {
+                        Remote(Dest, String),
+                        Agent(Arc<PathBuf>),
+                        X11(Arc<super::x11::X11Auth>, String),
+                    }
+                    let next = {
                         let r = routes.lock().unwrap();
                         match opened {
-                            Opened::Forwarded { port, origin } => (r.ports.get(&port).cloned(), origin, None),
-                            Opened::ForwardedStreamLocal { path } => (r.paths.get(&path).cloned(), path, None),
-                            // Only if we asked for it: a server cannot reach our agent on its own.
-                            Opened::Agent => (None, String::new(), Some(r.agent.clone())),
+                            Opened::Forwarded { port, origin } => r.ports.get(&port).cloned().map(|d| Next::Remote(d, origin)),
+                            Opened::ForwardedStreamLocal { path } => r.paths.get(&path).cloned().map(|d| Next::Remote(d, path)),
+                            // Only if we asked for it: a server cannot reach our agent or display on its own.
+                            Opened::Agent => r.agent.clone().map(Next::Agent),
+                            Opened::X11 { origin } => r.x11.clone().map(|a| Next::X11(a, origin)),
                         }
                     };
-                    if let Some(agent) = agent {
-                        let Some(path) = agent else { return };
-                        match crate::agent::connect_raw(path.as_path()).await {
+                    match next {
+                        Some(Next::Remote(dest, origin)) => serve_remote(dest, send, recv, origin).await,
+                        Some(Next::Agent(path)) => match crate::agent::connect_raw(path.as_path()).await {
                             Ok(sock) => {
                                 let (ar, aw) = tokio::io::split(sock);
                                 let _ = crate::transport::bridge(ar, aw, send, recv).await;
                             }
                             Err(e) => warn!("forwarded agent: {e}"),
+                        },
+                        Some(Next::X11(auth, origin)) => {
+                            if let Err(e) = super::x11::serve(&auth, send, recv).await {
+                                debug!("X11 connection from {origin}: {e:#}");
+                            }
                         }
-                        return;
-                    }
-                    if let Some(dest) = dest {
-                        serve_remote(dest, send, recv, origin).await;
+                        None => {}
                     }
                 });
             }

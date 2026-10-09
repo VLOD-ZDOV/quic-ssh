@@ -351,16 +351,37 @@ fn run_prelude(prelude: &Prelude, home: &Path, as_user: impl Fn(&mut std::proces
         }
         let _ = out.flush();
     }
-    if prelude.rc {
-        let user_rc = home.join(".ssh/rc");
-        let rc = if user_rc.is_file() { Some(user_rc) } else { Some(PathBuf::from("/etc/ssh/sshrc")).filter(|p| p.is_file()) };
-        if let Some(rc) = rc {
-            let mut sh = std::process::Command::new("/bin/sh");
-            sh.arg(&rc).stdin(std::process::Stdio::null());
-            as_user(&mut sh);
-            if let Err(e) = sh.status() {
-                eprintln!("qshd: {}: {e}", rc.display());
-            }
+    // The X11 data goes to the rc file on stdin; without one, to xauth.
+    let x11_line = prelude.x11.as_ref().map(|(_, proto, cookie)| format!("{proto} {cookie}\n"));
+    let user_rc = home.join(".ssh/rc");
+    let rc = if !prelude.rc {
+        None
+    } else if prelude.user_rc && user_rc.is_file() {
+        Some(user_rc)
+    } else {
+        Some(PathBuf::from("/etc/ssh/sshrc")).filter(|p| p.is_file())
+    };
+    let feed = |mut cmd: std::process::Command, input: Option<String>| {
+        cmd.stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
+        as_user(&mut cmd);
+        let mut child = cmd.spawn()?;
+        if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait()
+    };
+    if let Some(rc) = rc {
+        let mut sh = std::process::Command::new("/bin/sh");
+        sh.arg(&rc);
+        if let Err(e) = feed(sh, x11_line) {
+            eprintln!("qshd: {}: {e}", rc.display());
+        }
+    } else if let (Some((display, proto, cookie)), Some(xauth)) = (&prelude.x11, &prelude.xauth) {
+        let mut cmd = std::process::Command::new(xauth);
+        cmd.args(["-q", "-"]).stdout(std::process::Stdio::null());
+        let script = format!("remove {display}\nadd {display} {proto} {cookie}\n");
+        if let Err(e) = feed(cmd, Some(script)) {
+            eprintln!("qshd: {xauth}: {e}");
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod keys_command;
 mod penalty;
 mod persist;
 mod sftp;
+mod x11;
 pub mod revoked;
 mod users;
 
@@ -495,17 +496,19 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     let grant = Arc::new(grant);
     let sessions_limit = Arc::new(Semaphore::new(cfg.max_sessions));
     let agent = Arc::new(agent::AgentSocket::default());
+    let x11 = Arc::new(x11::X11::default());
     // Lets running sessions notice a dead connection even after the client
     // finished sending on their stream.
     let (closed_tx, closed_rx) = watch::channel(false);
     while let Some((send, recv)) = conn.accept_bi().await {
-        let (user, state, closed, conn, grant, agent, resume, cfg, sessions_limit) = (
+        let (user, state, closed, conn, grant, agent, x11, resume, cfg, sessions_limit) = (
             user.clone(),
             state.clone(),
             closed_rx.clone(),
             conn.clone(),
             grant.clone(),
             agent.clone(),
+            x11.clone(),
             resume.clone(),
             cfg.clone(),
             sessions_limit.clone(),
@@ -519,6 +522,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
                 cfg: &cfg,
                 sessions: &sessions_limit,
                 agent: &agent,
+                x11: &x11,
                 resume_only: resume.as_deref(),
             };
             if let Err(e) = handle_stream(send, recv, ctx, closed).await {
@@ -542,12 +546,13 @@ struct StreamCtx<'a> {
     /// Session slots of this connection (max_sessions).
     sessions: &'a Arc<Semaphore>,
     agent: &'a agent::AgentSocket,
+    x11: &'a x11::X11,
     /// Logged in with `Hello::Resume` (no second factor): only this session may be resumed.
     resume_only: Option<&'a [u8]>,
 }
 
 async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_>, closed: watch::Receiver<bool>) -> Result<()> {
-    let StreamCtx { conn, user, grant, state, cfg, sessions, agent, resume_only } = ctx;
+    let StreamCtx { conn, user, grant, state, cfg, sessions, agent, x11, resume_only } = ctx;
     let request = match read_msg(&mut recv).await {
         Ok(r) => r,
         // A request type from a newer client: say so instead of dropping the stream.
@@ -579,11 +584,17 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     } else {
         None
     };
+    let user_rc = cfg.permit_user_rc && !limits.no_user_rc;
+    let display = x11.display();
     // A forced command (`command=`, a certificate's force-command) replaces
     // whatever the client asked to run, which is passed on like sshd does.
     let session = |command: Option<String>, client_env: Vec<(String, String)>, pty: Option<PtySpec>| exec::Session {
         prelude: users::Prelude {
-            rc: cfg.permit_user_rc && (user.home.join(".ssh/rc").is_file() || std::path::Path::new("/etc/ssh/sshrc").is_file()),
+            // ~/.ssh/rc as allowed, else the system's /etc/ssh/sshrc.
+            rc: (user_rc && user.home.join(".ssh/rc").is_file()) || std::path::Path::new("/etc/ssh/sshrc").is_file(),
+            user_rc,
+            x11: display.as_ref().map(|d| (d.auth_display.clone(), d.proto.clone(), d.cookie.clone())),
+            xauth: display.as_ref().map(|_| cfg.xauth_location.to_string_lossy().into_owned()),
             motd: cfg.print_motd
                 && login_shell(limits, &command, &pty)
                 && std::fs::metadata("/etc/motd").is_ok_and(|m| m.len() > 0),
@@ -600,6 +611,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 _ => None,
             })
             .chain(agent.path().map(|p| ("SSH_AUTH_SOCK".to_string(), p.to_string_lossy().into_owned())))
+            .chain(display.as_ref().map(|d| ("DISPLAY".to_string(), d.display.clone())))
             .collect(),
         client_env: client_env.into_iter().filter(|(k, _)| cfg.accepts_env(k)).collect(),
         pty: pty.filter(|_| !limits.no_pty),
@@ -712,6 +724,12 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
             }
             remote_forward_local(send, recv, conn.clone(), user, cfg, &path).await
+        }
+        Request::X11Forward { proto, cookie, screen } => {
+            if !cfg.x11() || limits.no_x11_forwarding {
+                return write_msg(&mut send, &Reply::Err("X11 forwarding is not allowed".into())).await;
+            }
+            x11::forward(send, recv, conn.clone(), cfg, x11, x11::Request { proto, cookie, screen }).await
         }
         Request::Ping => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,

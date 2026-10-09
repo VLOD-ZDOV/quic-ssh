@@ -103,11 +103,13 @@ impl SshArgs {
             't' => self.tty += 1,
             'V' => self.print_version = true,
             'v' => self.verbose += 1,
-            'X' | 'Y' => {
-                if !self.quiet {
-                    eprintln!("qsh: X11 forwarding is not supported (-{c} ignored)");
-                }
+            // X11 forwarding: untrusted (-X), trusted (-Y), off (-x).
+            'X' => self.options.push("ForwardX11 yes".into()),
+            'Y' => {
+                self.options.push("ForwardX11 yes".into());
+                self.options.push("ForwardX11Trusted yes".into());
             }
+            'x' => self.options.push("ForwardX11 no".into()),
             // Protocol/compression/GSSAPI/syslog/multiplexing switches: nothing to do.
             // Like `ControlMaster yes` (`-MM` asks in ssh; qsh does not ask).
             'M' => {
@@ -115,7 +117,7 @@ impl SshArgs {
                 // ssh would use its own sockets and protocol: not passed on.
                 return Ok(());
             }
-            '1' | '2' | 'C' | 'K' | 'k' | 'x' | 'y' => self.ignored.push(format!("-{c}")),
+            '1' | '2' | 'C' | 'K' | 'k' | 'y' => self.ignored.push(format!("-{c}")),
             _ => return Err(format!("unknown option -{c}")),
         }
         self.passthrough.push(format!("-{c}"));

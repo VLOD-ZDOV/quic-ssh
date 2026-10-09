@@ -7,6 +7,7 @@ pub mod control;
 pub mod copy;
 pub mod doctor;
 pub mod forward;
+pub mod x11;
 pub mod groups;
 pub mod keys_vt;
 pub mod keystroke;
@@ -92,6 +93,11 @@ pub struct Target {
     pub known_hosts_extra: Option<Arc<String>>,
     /// `AddKeysToAgent`: `None` = no; else `yes`, `ask`, `confirm` or a time.
     pub add_keys_to_agent: Option<String>,
+    /// X11 forwarding (`ForwardX11`, `-X`/`-Y`): `Some(trusted)`.
+    pub forward_x11: Option<bool>,
+    /// How long an untrusted cookie stays valid (seconds) and the xauth program.
+    pub x11_timeout: u32,
+    pub xauth: String,
     pub clear_all_forwardings: bool,
     /// Session escape character; `None` disables escapes (`EscapeChar none`).
     pub escape_char: Option<u8>,
@@ -376,6 +382,9 @@ impl Target {
             known_hosts_command: cfg.known_hosts_command,
             known_hosts_extra: None,
             add_keys_to_agent: cfg.add_keys_to_agent.filter(|v| v != "no"),
+            forward_x11: cfg.forward_x11.unwrap_or(false).then_some(cfg.forward_x11_trusted.unwrap_or(false)),
+            x11_timeout: cfg.forward_x11_timeout.as_deref().and_then(control::parse_time_secs).unwrap_or(1200),
+            xauth: cfg.xauth_location.clone().unwrap_or_else(|| "xauth".into()),
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
             escape_char: parse_escape(cfg.escape_char.as_deref()),
             family,

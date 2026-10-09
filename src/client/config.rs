@@ -73,6 +73,11 @@ pub struct HostConfig {
     pub canonicalize_fallback_local: Option<bool>,
     /// `AddKeysToAgent` (`no`, `yes`, `ask`, `confirm`, a time).
     pub add_keys_to_agent: Option<String>,
+    /// `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`.
+    pub forward_x11: Option<bool>,
+    pub forward_x11_trusted: Option<bool>,
+    pub forward_x11_timeout: Option<String>,
+    pub xauth_location: Option<String>,
     /// A `Match final` block exists (read the config once more at the end).
     pub wants_final: bool,
     /// `CanonicalizeFallbackLocal no` and the name could not be canonicalized.
@@ -399,6 +404,10 @@ impl Parser<'_> {
                     o.known_hosts_command = (!raw.eq_ignore_ascii_case("none")).then_some(raw);
                 }
                 "tag" if o.tag.is_none() => o.tag = first,
+                "forwardx11" if o.forward_x11.is_none() => o.forward_x11 = first.as_deref().map(yes),
+                "forwardx11trusted" if o.forward_x11_trusted.is_none() => o.forward_x11_trusted = first.as_deref().map(yes),
+                "forwardx11timeout" if o.forward_x11_timeout.is_none() => o.forward_x11_timeout = first,
+                "xauthlocation" if o.xauth_location.is_none() => o.xauth_location = first,
                 "canonicalizehostname" if o.canonicalize_hostname.is_none() => {
                     o.canonicalize_hostname = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -788,6 +797,10 @@ fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canon
         canonicalize_max_dots: ours.canonicalize_max_dots.or(ssh.canonicalize_max_dots),
         canonicalize_fallback_local: ours.canonicalize_fallback_local.or(ssh.canonicalize_fallback_local),
         add_keys_to_agent: ours.add_keys_to_agent.or(ssh.add_keys_to_agent),
+        forward_x11: ours.forward_x11.or(ssh.forward_x11),
+        forward_x11_trusted: ours.forward_x11_trusted.or(ssh.forward_x11_trusted),
+        forward_x11_timeout: ours.forward_x11_timeout.or(ssh.forward_x11_timeout),
+        xauth_location: ours.xauth_location.or(ssh.xauth_location),
         wants_final: ours.wants_final || ssh.wants_final,
         canonicalize_failed: None,
         clear_all_forwardings: ours.clear_all_forwardings.or(ssh.clear_all_forwardings),

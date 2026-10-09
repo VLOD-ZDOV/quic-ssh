@@ -21,6 +21,9 @@ pub struct Restrictions {
     pub no_pty: bool,
     pub no_port_forwarding: bool,
     pub no_agent_forwarding: bool,
+    pub no_x11_forwarding: bool,
+    /// `no-user-rc`: `~/.ssh/rc` is not run.
+    pub no_user_rc: bool,
     /// `permitopen="host:port"`: allowed `-L`/`-D`/`-W` destinations (empty = any).
     pub permit_open: Vec<String>,
     /// `permitlisten="[host:]port"`: allowed `-R` listeners (empty = any).
@@ -204,6 +207,8 @@ pub fn parse_line(line: &str) -> Result<Option<AuthorizedKey>> {
                 r.no_pty = true;
                 r.no_port_forwarding = true;
                 r.no_agent_forwarding = true;
+                r.no_x11_forwarding = true;
+                r.no_user_rc = true;
             }
             "no-pty" => r.no_pty = true,
             "pty" => r.no_pty = false,
@@ -213,8 +218,10 @@ pub fn parse_line(line: &str) -> Result<Option<AuthorizedKey>> {
             "agent-forwarding" => r.no_agent_forwarding = false,
             "no-touch-required" => entry.no_touch_required = true,
             "verify-required" => entry.verify_required = true,
-            // qsh has no X11 forwarding, user rc files or tunnels: nothing to allow or deny.
-            "no-x11-forwarding" | "x11-forwarding" | "no-user-rc" | "user-rc" => {}
+            "no-x11-forwarding" => r.no_x11_forwarding = true,
+            "x11-forwarding" => r.no_x11_forwarding = false,
+            "no-user-rc" => r.no_user_rc = true,
+            "user-rc" => r.no_user_rc = false,
             // Like sshd with PermitUserEnvironment off: ignored.
             "environment" => {}
             other => bail!("unsupported option {other:?}"),
@@ -458,6 +465,8 @@ fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyD
     r.no_pty |= !ext.contains_key("permit-pty");
     r.no_port_forwarding |= !ext.contains_key("permit-port-forwarding");
     r.no_agent_forwarding |= !ext.contains_key("permit-agent-forwarding");
+    r.no_x11_forwarding |= !ext.contains_key("permit-X11-forwarding");
+    r.no_user_rc |= !ext.contains_key("permit-user-rc");
     grant.require_presence = is_security_key(cert.public_key()) && !(ext.contains_key("no-touch-required") && line_allows_no_touch);
     Ok(grant)
 }
