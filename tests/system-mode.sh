@@ -280,6 +280,35 @@ else
     echo "  skip login records (need real root and /var/log/wtmp)"
 fi
 
+# --- password authentication (after a config reload) --------------------------------------
+PW_HASH=$(openssl passwd -6 -salt qshtest 'correct horse')
+if [[ -n ${QSH_TEST_NS:-} ]]; then
+    { grep -v '^qsh-bob:' /etc/shadow 2>/dev/null || true; echo "qsh-bob:$PW_HASH:19000:0:99999:7:::"; } > "$T/shadow"
+    chmod 600 "$T/shadow"
+    mount --bind "$T/shadow" /etc/shadow
+else
+    usermod -p "$PW_HASH" qsh-bob
+fi
+cat >> "$T/config.toml" <<EOF
+
+[[match]]
+user = "qsh-bob"
+password_authentication = true
+EOF
+kill -HUP "$SERVER_PID"
+sleep 0.5
+mkdir -p "$T/client-pw"
+printf '#!/bin/sh\necho "$QSH_TEST_PASSWORD"\n' > "$T/askpass"
+chmod 755 "$T/askpass"
+pw_login() {
+    HOME="$T/client-pw" SSH_ASKPASS="$T/askpass" SSH_ASKPASS_REQUIRE=force QSH_TEST_PASSWORD="$1" \
+        "$QSH" --accept-new-host -p "$PORT" qsh-bob@127.0.0.1 id -u </dev/null 2>/dev/null
+}
+check "password login with the right password" test "$(pw_login 'correct horse')" = "$BOB_UID"
+OUT=$(pw_login 'wrong horse' || true)
+check "a wrong password is refused" test -z "$OUT"
+check "no password for users without it enabled" bash -c "! HOME='$T/client-pw' SSH_ASKPASS='$T/askpass' SSH_ASKPASS_REQUIRE=force QSH_TEST_PASSWORD=x '$QSH' -p $PORT qsh-alice@127.0.0.1 true </dev/null 2>/dev/null"
+
 # --- chroot_directory and internal-sftp (after a config reload) -----------------------------
 if [[ -n ${QSH_TEST_NS:-} ]] || ! command -v sftp >/dev/null; then
     # In the namespace, / belongs to an unmapped uid, so no path passes the ownership check.

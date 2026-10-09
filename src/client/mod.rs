@@ -93,6 +93,10 @@ pub struct Target {
     pub known_hosts_extra: Option<Arc<String>>,
     /// `AddKeysToAgent`: `None` = no; else `yes`, `ask`, `confirm` or a time.
     pub add_keys_to_agent: Option<String>,
+    /// Answer password questions (`PasswordAuthentication`), at most this
+    /// many times (`NumberOfPasswordPrompts`).
+    pub password_authentication: bool,
+    pub password_prompts: u32,
     /// X11 forwarding (`ForwardX11`, `-X`/`-Y`): `Some(trusted)`.
     pub forward_x11: Option<bool>,
     /// How long an untrusted cookie stays valid (seconds) and the xauth program.
@@ -382,6 +386,8 @@ impl Target {
             known_hosts_command: cfg.known_hosts_command,
             known_hosts_extra: None,
             add_keys_to_agent: cfg.add_keys_to_agent.filter(|v| v != "no"),
+            password_authentication: cfg.password_authentication.unwrap_or(true),
+            password_prompts: cfg.password_prompts.unwrap_or(3),
             forward_x11: cfg.forward_x11.unwrap_or(false).then_some(cfg.forward_x11_trusted.unwrap_or(false)),
             x11_timeout: cfg.forward_x11_timeout.as_deref().and_then(control::parse_time_secs).unwrap_or(1200),
             xauth: cfg.xauth_location.clone().unwrap_or_else(|| "xauth".into()),

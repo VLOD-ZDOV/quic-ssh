@@ -225,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn setup_cookie_is_replaced() {
         let auth = X11Auth { display: ":0".into(), proto: "MIT-MAGIC-COOKIE-1".into(), fake: vec![1; 16], real: vec![2; 16], screen: 0 };
-        for order in [b'l', b'B'] {
+        for order in *b"lB" {
             let input = setup(order, b"MIT-MAGIC-COOKIE-1", &[1; 16]);
             let out = rewrite_setup(&mut input.as_slice(), &auth).await.unwrap();
             assert_eq!(out, setup(order, b"MIT-MAGIC-COOKIE-1", &[2; 16]));

@@ -54,6 +54,9 @@ pub enum Reply {
     /// Text to show before logging in (the server's `banner`); the login
     /// goes on with the next reply.
     Banner(String),
+    /// No key was accepted, but a password may be: answer with
+    /// [`Auth::Response`] (the password) or give up with [`Auth::Done`].
+    Password,
 }
 
 /// Client messages on the hello stream while logging in (protocol version 4).

@@ -233,6 +233,10 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reload: Option<Reload>) -> Result<()> {
     // Remember where qshd is while the path is still valid (see users::exe_path).
     let _ = users::exe_path();
+    let passwords = cfg.password_authentication || cfg.matches.iter().any(|m| m.password_authentication == Some(true));
+    if passwords && !(cfg!(target_os = "linux") && nix::unistd::geteuid().is_root()) {
+        warn!("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match");
+    }
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
     let sessions = Arc::new(persist::Sessions::new(Duration::from_secs(cfg.session_timeout)));
@@ -423,6 +427,21 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
                 bail!("login took too long");
             }
         };
+    }
+    // Passwords, if allowed, when no key worked (never for root unless
+    // permit_root_login = "yes"). Unknown users are asked too.
+    if granted.is_none() && version >= 6 && cfg.password_authentication {
+        let root_ok = user.as_ref().is_none_or(|u| u.uid != 0) || cfg.permit_root_login == PermitRootLogin::Yes;
+        let attempt = auth::password_auth(&mut send, &mut recv, user.as_ref().filter(|_| root_ok), cfg.permit_empty_passwords, &checker.login);
+        match tokio::time::timeout(grace, attempt).await {
+            Ok(Ok(true)) => granted = Some((crate::authkeys::Grant::default(), "password".to_string())),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                *outcome = Outcome::GraceExceeded;
+                bail!("login took too long");
+            }
+        }
     }
     // Root with forced-commands-only: only keys with a forced command.
     let granted = granted.filter(|(grant, _)| {

@@ -204,6 +204,69 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
 }
 
 
+/// Passwords a client may try per connection (like sshd's default 3 prompts).
+const PASSWORD_TRIES: u32 = 3;
+
+/// Whether `password` matches a crypt(3) hash: yescrypt (`$y$`) or
+/// SHA-crypt (`$5$`, `$6$`). Locked (`!`, `*`) and other hashes never match;
+/// an empty hash only for an empty password with `empty_ok`.
+pub fn password_matches(hash: &str, password: &str, empty_ok: bool) -> bool {
+    use sha_crypt::PasswordVerifier as _;
+    if hash.is_empty() {
+        return empty_ok && password.is_empty();
+    }
+    if hash.starts_with("$y$") {
+        yescrypt::Yescrypt::default().verify_password(password.as_bytes(), hash).is_ok()
+    } else if hash.starts_with("$5$") || hash.starts_with("$6$") {
+        sha_crypt::ShaCrypt::default().verify_password(password.as_bytes(), hash).is_ok()
+    } else {
+        false
+    }
+}
+
+/// A yescrypt hash of a random password, checked for unknown users so that
+/// they take as long as known ones.
+fn dummy_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use yescrypt::PasswordHasher as _;
+        let (password, salt): ([u8; 16], [u8; 16]) = (rand::random(), rand::random());
+        yescrypt::Yescrypt::default().hash_password_with_salt(&password, &salt).map(|h| h.to_string()).unwrap_or_default()
+    })
+}
+
+/// Password login after keys failed (`password_authentication`): asks up to
+/// [`PASSWORD_TRIES`] times. `user` is `None` for an unknown or refused user,
+/// who gets the same questions and the same work done.
+pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Option<&User>, empty_ok: bool, login: &Login<'_>) -> Result<bool> {
+    // Only root reads /etc/shadow: without it no password can match.
+    let hash = match user.filter(|u| u.switches()) {
+        Some(u) => {
+            let name = u.name.clone();
+            tokio::task::spawn_blocking(move || super::users::shadow_hash(&name)).await?
+        }
+        None => None,
+    };
+    for _ in 0..PASSWORD_TRIES {
+        write_msg(send, &Reply::Password).await?;
+        let password = match read_msg::<_, Auth>(recv).await? {
+            Auth::Response(p) => p,
+            Auth::Done => return Ok(false),
+            _ => bail!("unexpected message while asking for a password"),
+        };
+        let (hash, known) = match &hash {
+            Some(h) => (h.clone(), true),
+            None => (dummy_hash().to_string(), false),
+        };
+        let ok = tokio::task::spawn_blocking(move || password_matches(&hash, &password, empty_ok)).await? && known;
+        if ok {
+            return Ok(true);
+        }
+        warn!("{}: wrong password for {}", login.ip, login.user);
+    }
+    Ok(false)
+}
+
 /// Wrong one-time codes allowed per connection.
 const TOTP_TRIES: u32 = 3;
 
@@ -348,6 +411,24 @@ pub async fn second_factor(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_hashes() {
+        use super::password_matches;
+        // From `openssl passwd -6/-5` and yescrypt's reference test vectors.
+        let sha512 = "$6$qshtestsalt$i8JXuslD6mAnfXAKKecnuL/2Qdw1eDYSbLuWYv2qWaDfHIJnDSi1MThwYfHW5kMeXgnGwYOgjCfj0KlYRGljP1";
+        let sha256 = "$5$qshtestsalt$JdnCalLoja2O/VY64/yqVbHXNG0WEmGliMWddNSTwC4";
+        let yes = "$y$j80$LdJMENpBABJJ3h2$ysXVVJwuaVlI1BWoEKt/Bz3WNDDmdOWz/8KTQaHL1cC";
+        assert!(password_matches(sha512, "hunter2", false) && !password_matches(sha512, "hunter3", false));
+        assert!(password_matches(sha256, "hunter2", false) && !password_matches(sha256, "", false));
+        assert!(password_matches(yes, "pleaseletmein", false) && !password_matches(yes, "pleaseletmeout", false));
+        for locked in ["!", "*", "!$6$qshtestsalt$x", "$1$abc$def", "x"] {
+            assert!(!password_matches(locked, "hunter2", false), "{locked}");
+        }
+        assert!(!password_matches("", "", false));
+        assert!(password_matches("", "", true) && !password_matches("", "x", true));
+        assert!(!super::dummy_hash().is_empty());
+    }
+
     use super::*;
 
     fn rsa_with_modulus(n: &[u8]) -> KeyData {

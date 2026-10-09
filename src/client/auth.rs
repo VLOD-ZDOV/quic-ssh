@@ -274,6 +274,7 @@ pub enum Outcome {
 /// Ed25519 key (the same, unless the handshake used a throwaway key).
 pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, explicit: &[PathBuf], tls: &Identity, own: &Identity) -> Result<Outcome> {
     let mut keyring: Option<Keyring> = None;
+    let mut passwords = 0u32;
     let mut reply: Reply = read_msg(recv).await?;
     loop {
         reply = match reply {
@@ -286,6 +287,19 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             Reply::Banner(text) => {
                 if !target.quiet {
                     eprint!("{}", banner_text(&text));
+                }
+                read_msg(recv).await?
+            }
+            Reply::Password => {
+                let answer = if target.password_authentication && !target.batch_mode && passwords < target.password_prompts {
+                    passwords += 1;
+                    crate::prompt::secret(&format!("{}@{}'s password: ", target.user, target.host)).ok()
+                } else {
+                    None
+                };
+                match answer {
+                    Some(p) => write_msg(send, &Auth::Response(p)).await?,
+                    None => write_msg(send, &Auth::Done).await?,
                 }
                 read_msg(recv).await?
             }

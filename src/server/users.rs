@@ -36,6 +36,18 @@ fn shadow_expired(shadow: &str, name: &str, today: i64) -> bool {
         .is_some_and(|expire| expire >= 0 && today >= expire)
 }
 
+/// The password hash of `name` in /etc/shadow (readable by root only).
+#[cfg(target_os = "linux")]
+pub fn shadow_hash(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/shadow").ok()?;
+    text.lines().map(|l| l.split(':').collect::<Vec<_>>()).find(|f| f.first() == Some(&name)).and_then(|f| f.get(1).map(|h| h.to_string()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn shadow_hash(_name: &str) -> Option<String> {
+    None
+}
+
 /// The user's groups, including `gid` (resolved before starting processes).
 #[cfg(not(target_vendor = "apple"))]
 fn group_list(name: &str, gid: Gid) -> Result<Vec<libc::gid_t>> {

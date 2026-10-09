@@ -163,6 +163,12 @@ pub struct ServerConfig {
     pub client_alive_count_max: u32,
     /// Refuse the connection (like RefuseConnection; for `[[match]]`).
     pub refuse_connection: bool,
+    /// Accept passwords from /etc/shadow when no key works (like
+    /// PasswordAuthentication; off by default). System mode on Linux only;
+    /// yescrypt and SHA-crypt hashes.
+    pub password_authentication: bool,
+    /// Accept an empty password for accounts that have none (PermitEmptyPasswords).
+    pub permit_empty_passwords: bool,
     /// Drop connections from addresses that keep failing to log in (like
     /// PerSourcePenalties): `true`, `false`, or sshd's settings, e.g.
     /// `"authfail:5s noauth:1s grace-exceeded:10s min:15s max:10m"`.
@@ -446,6 +452,8 @@ overrides! {
         gateway_ports: GatewayPorts,
         max_auth_tries: u32,
         max_sessions: usize,
+        password_authentication: bool,
+        permit_empty_passwords: bool,
         #[serde(deserialize_with = "opt_names")]
         permit_listen: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
@@ -565,6 +573,8 @@ impl Default for ServerConfig {
             client_alive_interval: 0,
             client_alive_count_max: 3,
             refuse_connection: false,
+            password_authentication: false,
+            permit_empty_passwords: false,
             per_source_penalties: Penalties::default(),
             per_source_penalty_exempt_list: Vec::new(),
             matches: Vec::new(),
