@@ -12,7 +12,9 @@ Wants=network-online.target
 
 [Service]
 Environment=PORT=14422
-ExecStart=/usr/local/bin/qsh -N -o BatchMode=yes -R ${PORT}:127.0.0.1:4422 %i
+# ExitOnForwardFailure: if the port is still taken (an old connection), end
+# and let systemd retry, instead of running on without the forward.
+ExecStart=/usr/local/bin/qsh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -R ${PORT}:127.0.0.1:4422 %i
 Restart=always
 RestartSec=10
 

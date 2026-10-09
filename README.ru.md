@@ -285,7 +285,7 @@ ln -s "$(command -v qsh)" ~/.local/bin/ssh
 
 ```sh
 # на скрытом хосте (от пользователя, под которым будете входить):
-qsh -N -R 14422:127.0.0.1:4422 user@public.example.com
+qsh -N -o ExitOnForwardFailure=yes -R 14422:127.0.0.1:4422 user@public.example.com
 # откуда угодно:
 qsh -J user@public.example.com you@localhost:14422
 ```

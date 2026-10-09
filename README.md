@@ -285,7 +285,7 @@ A host behind NAT, or one you cannot open a port on, can keep a tunnel to any ho
 
 ```sh
 # on the hidden host (as the user who will log in there):
-qsh -N -R 14422:127.0.0.1:4422 user@public.example.com
+qsh -N -o ExitOnForwardFailure=yes -R 14422:127.0.0.1:4422 user@public.example.com
 # from anywhere:
 qsh -J user@public.example.com you@localhost:14422
 ```
