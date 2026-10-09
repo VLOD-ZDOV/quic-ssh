@@ -108,6 +108,9 @@ pub struct Target {
     pub clear_all_forwardings: bool,
     /// Session escape character; `None` disables escapes (`EscapeChar none`).
     pub escape_char: Option<u8>,
+    /// `~C` works (`EnableEscapeCommandline`; on by default, unlike ssh,
+    /// which turned it off for its sandbox).
+    pub escape_commandline: bool,
     pub family: transport::Family,
     /// Where connections leave from (`-b`/`BindAddress`, `-B`/`BindInterface`).
     pub bind: transport::Bind,
@@ -171,10 +174,15 @@ impl std::fmt::Display for LoginRefused {
 
 impl std::error::Error for LoginRefused {}
 
-/// Host names and aliases: no option-looking names, whitespace or control
-/// characters (they could reach ssh's argument list or %-expansions).
+/// Host names and aliases: no option-looking names, whitespace, control
+/// characters or shell metacharacters. They reach ssh's argument list and
+/// `%h` in commands (ProxyCommand, Match exec...), and may come from
+/// elsewhere (a git submodule's URL): as ssh does since 9.6, such names are
+/// refused (compare CVE-2023-51385).
 fn valid_host(host: &str) -> bool {
-    !host.is_empty() && !host.starts_with('-') && !host.chars().any(|c| c.is_whitespace() || c.is_control())
+    !host.is_empty()
+        && !host.starts_with('-')
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}".contains(c))
 }
 
 /// `EscapeChar`: `none`, a single character, or `^X` for a control character.
@@ -403,6 +411,7 @@ impl Target {
             xauth: cfg.xauth_location.clone().unwrap_or_else(|| "xauth".into()),
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
             escape_char: parse_escape(cfg.escape_char.as_deref()),
+            escape_commandline: cfg.escape_commandline.unwrap_or(true),
             family,
             bind,
             quiet: cfg.log_level.as_deref() == Some("quiet"),
@@ -1111,6 +1120,16 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_metacharacters_in_host_names() {
+        for bad in ["a$(id)", "a;b", "a`id`", "a|b", "a&b", "a>b", "-oProxyCommand=x", "a b", "a'b", "{a,b}"] {
+            assert!(Target::parse_with(bad, None, None, false).is_err(), "{bad}");
+        }
+        for good in ["host.example.com", "192.0.2.1", "[2001:db8::1]:22", "fe80::1%eth0", "user@host_1"] {
+            assert!(Target::parse_with(good, None, None, false).is_ok(), "{good}");
+        }
+    }
 
     #[test]
     fn parse_targets() {

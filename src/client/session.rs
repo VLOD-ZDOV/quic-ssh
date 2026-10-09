@@ -161,6 +161,8 @@ pub struct SessionOptions {
     pub keystroke_interval: Option<std::time::Duration>,
     /// Escape character for `~.` and friends (`None` = off).
     pub escape_char: Option<u8>,
+    /// `~C` allowed.
+    pub escape_commandline: bool,
     /// `-n`: do not read stdin.
     pub stdin_null: bool,
     /// Keep a terminal session across lost connections, reconnecting with this.
@@ -183,6 +185,8 @@ struct Escapes {
     pending: bool,
     /// `~C`: the command line being typed.
     command: Option<String>,
+    /// `~C` is allowed (EnableEscapeCommandline).
+    commandline: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -203,7 +207,7 @@ enum EscapeAction {
 
 impl Escapes {
     fn new(ch: u8) -> Escapes {
-        Escapes { ch, at_line_start: true, pending: false, command: None }
+        Escapes { ch, at_line_start: true, pending: false, command: None, commandline: true }
     }
 
     /// Returns the bytes to send and the escapes completed in `input`.
@@ -247,6 +251,7 @@ impl Escapes {
                         return (out, actions);
                     }
                     b'?' => EscapeAction::Help,
+                    b'C' if !self.commandline => EscapeAction::Note("the command line is disabled (EnableEscapeCommandline)"),
                     b'C' => {
                         self.command = Some(String::new());
                         EscapeAction::Echo("\r\nqsh> ".into())
@@ -478,7 +483,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     };
 
     // Escapes only apply when a person types into a terminal (as in ssh).
-    let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(Escapes::new);
+    let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(|c| Escapes { commandline: opts.escape_commandline, ..Escapes::new(c) });
     // Echo prediction, likewise; it sees what is typed and what comes back.
     // Only when the output goes to the terminal too (not `| tee log`).
     let mut predictor = (raw.is_some() && std::io::stdout().is_terminal() && opts.predict != Mode::Never).then(|| {

@@ -18,12 +18,13 @@ Features:
 
 - interactive shell with a PTY, window resizing and exit codes;
 - remote commands (`qsh host cmd`) with stdin/stdout/stderr;
-- port forwarding: local (`-L`), remote (`-R`), SOCKS proxy (`-D`), stdio (`-W`) and jump hosts (`-J`);
+- forwarding: local (`-L`), remote (`-R`), SOCKS proxies (`-D`, `-R port`), stdio (`-W`), Unix sockets, X11 (`-X`/`-Y`), tunnel devices (`-w`), jump hosts (`-J`) and `ProxyCommand`; added and cancelled while connected with `~C` or `-O forward`/`-O cancel`;
 - file copy, including directories (`qsh cp -r`);
 - the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
 - **sessions that survive network outages:** after a lost connection, qsh reconnects by itself and the shell is still there, with the output you missed;
 - key login with any SSH key (Ed25519, ECDSA, RSA, security keys), ssh-agent and agent forwarding (`-A`), OpenSSH user and host certificates;
-- optional one-time codes (TOTP) as a second factor, without PAM;
+- optional one-time codes (TOTP) as a second factor, without PAM, and optional passwords;
+- sshd's server controls: `allow_users`/`deny_users` and groups, `permit_root_login`, `[[match]]` blocks, `force_command`, `chroot_directory` with a built-in `internal-sftp`, banner, motd, `~/.ssh/rc`, per-source penalties, `qshd -t`/`-T` and reload on SIGHUP;
 - pairing with a one-time code, so you never copy keys by hand;
 - host aliases from your existing `~/.ssh/config` (`qsh myserver`).
 
@@ -539,12 +540,13 @@ This is still a young project and has not had an external audit. For critical sy
 - No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
-- `-J` works only when every hop runs qshd; with `--full`, `ProxyJump`/`ProxyCommand` hosts are handed to ssh.
+- `-J` works only when every hop runs qshd (for other hops, use `ProxyCommand ssh -W %h:%p bastion` in `~/.config/qsh/config` to reach qshd's TCP port); with `--full`, hosts with ssh's `ProxyJump`/`ProxyCommand` are handed to ssh.
+- No GSSAPI/Kerberos, PKCS#11 or FIDO keys without an agent, `UpdateHostKeys`, `VerifyHostKeyDNS` or `CheckHostIP` (qshd has one host key, and known_hosts entries are per name).
 - qshd runs on Linux, macOS and other Unix systems; on Windows there is only the client.
 
 ### Upgrading
 
-qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
+What v1.0 added on the protocol (banner, passwords, Unix sockets, X11, tunnels) needs qshd 1.0 on the server; with an older qshd, qsh reports that the feature is not supported and the rest works. qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
 
 ## Development
 

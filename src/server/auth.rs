@@ -224,15 +224,34 @@ pub fn password_matches(hash: &str, password: &str, empty_ok: bool) -> bool {
     }
 }
 
-/// A yescrypt hash of a random password, checked for unknown users so that
-/// they take as long as known ones.
-fn dummy_hash() -> &'static str {
+/// Longest password checked (as in sshd): hashing a huge one would let a
+/// client keep the server busy (compare CVE-2016-6515).
+const MAX_PASSWORD: usize = 1024;
+
+/// A hash qshd can check (yescrypt or SHA-crypt).
+fn usable_hash(h: &str) -> bool {
+    h.starts_with("$y$") || h.starts_with("$5$") || h.starts_with("$6$")
+}
+
+/// The hash unknown users are checked against, so they take as long as
+/// known ones (compare CVE-2016-6210): a real one from /etc/shadow (root's,
+/// or else the first usable), so its scheme and cost are the system's; a
+/// match against it never counts. Without one, a yescrypt hash of a random
+/// password.
+fn dummy_hash() -> String {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HASH.get_or_init(|| {
-        use yescrypt::PasswordHasher as _;
-        let (password, salt): ([u8; 16], [u8; 16]) = (rand::random(), rand::random());
-        yescrypt::Yescrypt::default().hash_password_with_salt(&password, &salt).map(|h| h.to_string()).unwrap_or_default()
+        let from_shadow = super::users::shadow_hash("root").filter(|h| usable_hash(h)).or_else(|| {
+            let text = std::fs::read_to_string("/etc/shadow").ok()?;
+            text.lines().filter_map(|l| l.split(':').nth(1)).find(|h| usable_hash(h)).map(str::to_string)
+        });
+        from_shadow.unwrap_or_else(|| {
+            use yescrypt::PasswordHasher as _;
+            let (password, salt): ([u8; 16], [u8; 16]) = (rand::random(), rand::random());
+            yescrypt::Yescrypt::default().hash_password_with_salt(&password, &salt).map(|h| h.to_string()).unwrap_or_default()
+        })
     })
+    .clone()
 }
 
 /// Password login after keys failed (`password_authentication`): asks up to
@@ -254,11 +273,14 @@ pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Optio
             Auth::Done => return Ok(false),
             _ => bail!("unexpected message while asking for a password"),
         };
+        // Locked accounts (`!`, `*`) take as long as others, too.
         let (hash, known) = match &hash {
-            Some(h) => (h.clone(), true),
-            None => (dummy_hash().to_string(), false),
+            Some(h) if usable_hash(h) || (h.is_empty() && empty_ok) => (h.clone(), true),
+            _ => (dummy_hash(), false),
         };
-        let ok = tokio::task::spawn_blocking(move || password_matches(&hash, &password, empty_ok)).await? && known;
+        let ok = password.len() <= MAX_PASSWORD
+            && tokio::task::spawn_blocking(move || password_matches(&hash, &password, empty_ok)).await?
+            && known;
         if ok {
             return Ok(true);
         }

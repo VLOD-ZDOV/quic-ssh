@@ -827,6 +827,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             pty,
             keystroke_interval: target.keystroke_interval,
             escape_char,
+            escape_commandline: target.escape_commandline,
             stdin_null: a.stdin_null || a.background,
             reconnect,
             server_alive: target.server_alive,
