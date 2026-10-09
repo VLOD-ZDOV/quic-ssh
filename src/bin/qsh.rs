@@ -545,7 +545,7 @@ fn sources(a: &SshArgs) -> Sources {
         overrides.push(format!("ProxyJump {j}"));
     }
     overrides.extend(a.override_lines());
-    Sources { full: a.full, overrides, ssh_config: a.config_file.clone() }
+    Sources { full: a.full, overrides, ssh_config: a.config_file.clone(), user: a.login.clone() }
 }
 
 async fn tool_main(cli: ToolCli) -> Result<i32> {

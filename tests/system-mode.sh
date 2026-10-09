@@ -186,6 +186,8 @@ check "subsystems run (through the user's shell)" test -e "$T/shared/probe-qsh-a
 check "nologin user cannot run commands" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-nol@127.0.0.1 true </dev/null &>/dev/null"
 HOME="$T/client" "$QSH" -p "$PORT" -s qsh-nol@127.0.0.1 probe </dev/null >/dev/null 2>&1 || true
 check "nologin user cannot run subsystems" test ! -e "$T/shared/probe-qsh-nol"
+check "nologin user gets no sftp subsystem" bash -c "! HOME='$T/client' '$QSH' -p $PORT -s qsh-nol@127.0.0.1 sftp </dev/null &>/dev/null"
+check "internal-sftp as a client command goes to the shell" bash -c "! HOME='$T/client' '$QSH' -p $PORT qsh-nol@127.0.0.1 internal-sftp </dev/null &>/dev/null"
 check "nologin user cannot upload" bash -c "! HOME='$T/client' '$QSH' cp -p $PORT '$T/payload' qsh-nol@127.0.0.1:up.bin 2>/dev/null"
 check "nothing was written to its home" test ! -e "$NOL_HOME/up.bin"
 echo hidden > "$NOL_HOME/file"

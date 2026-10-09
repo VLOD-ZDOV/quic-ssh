@@ -145,6 +145,13 @@ pub struct HostConfig {
     pub for_ssh: Vec<String>,
 }
 
+/// Adds `v` to `list` unless it is there already.
+fn push_new(list: &mut Vec<String>, v: Option<String>) {
+    if let Some(v) = v.filter(|v| !list.contains(v)) {
+        list.push(v);
+    }
+}
+
 fn yes(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "on")
 }
@@ -263,16 +270,15 @@ impl Parser<'_> {
                     if host_matches(&patterns(words.next()), &me) { Applies::Yes } else { Applies::No }
                 }
                 "user" => {
-                    let pats = patterns(words.next());
-                    match self.out.user.as_deref() {
-                        Some(u) if host_matches(&pats, u) => Applies::Yes,
-                        Some(_) => Applies::No,
-                        None => Applies::Maybe,
-                    }
+                    // Like ssh: the user so far (command line, earlier `User`), else the local one.
+                    let user = self.out.user.clone().unwrap_or_else(|| crate::platform::local_user().unwrap_or_default());
+                    if crate::pattern::name_matches(&patterns(words.next()), &user) { Applies::Yes } else { Applies::No }
                 }
                 "canonical" => if self.canonical { Applies::Yes } else { Applies::No },
                 "final" => if self.final_pass { Applies::Yes } else { Applies::No },
+                // Not run once the line cannot apply anyway (as in ssh).
                 "exec" => match words.next() {
+                    Some(_) if result == Applies::No => Applies::No,
                     Some(cmd) => if self.exec_succeeds(cmd) { Applies::Yes } else { Applies::No },
                     None => Applies::No,
                 },
@@ -347,11 +353,12 @@ impl Parser<'_> {
                 "hostname" if o.hostname.is_none() => o.hostname = first,
                 "user" if o.user.is_none() => o.user = first,
                 "port" if self.full && o.port.is_none() => o.port = first.and_then(|p| p.parse().ok()),
-                "identityfile" => o.identity_files.extend(first),
+                // Accumulated, without repeats (a later pass reads the same lines again).
+                "identityfile" => push_new(&mut o.identity_files, first),
                 // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
-                "localforward" if self.full && args.len() == 2 => o.local_forwards.push(format!("{}:{}", args[0], args[1])),
-                "remoteforward" if self.full && args.len() == 2 => o.remote_forwards.push(format!("{}:{}", args[0], args[1])),
-                "dynamicforward" if self.full => o.dynamic_forwards.extend(first),
+                "localforward" if self.full && args.len() == 2 => push_new(&mut o.local_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                "remoteforward" if self.full && args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                "dynamicforward" if self.full => push_new(&mut o.dynamic_forwards, first),
                 "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
                 // ProxyJump and ProxyCommand compete: the first one found wins (as in ssh).
                 "proxyjump" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
@@ -437,7 +444,7 @@ impl Parser<'_> {
                 "forwardagent" if o.forward_agent.is_none() => o.forward_agent = first.as_deref().map(yes),
                 "identitiesonly" if o.identities_only.is_none() => o.identities_only = first.as_deref().map(yes),
                 "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
-                "certificatefile" => o.certificate_files.extend(first),
+                "certificatefile" => push_new(&mut o.certificate_files, first),
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
                 "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
@@ -682,6 +689,9 @@ pub struct Sources {
     pub overrides: Vec<String>,
     /// `-F`: use this file instead of `~/.ssh/config`.
     pub ssh_config: Option<PathBuf>,
+    /// The user from the command line (`-l`, `user@host`): ahead of any
+    /// `User`, and what `Match user` and `%r` see.
+    pub user: Option<String>,
 }
 
 /// Settings for `host`: `-o` overrides, then `~/.config/qsh/config`, then
@@ -689,7 +699,9 @@ pub struct Sources {
 /// the configs are read again for the canonical name (`Match canonical`),
 /// and once more at the end if a `Match final` asks for it.
 pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
-    let first = lookup_pass(home, host, host, sources, false, false);
+    let seed = HostConfig { user: sources.user.clone(), ..Default::default() };
+    let first_pass = lookup_pass(home, host, host, sources, (false, false), (seed.clone(), seed));
+    let first = merge(first_pass.clone());
     let mode = first.canonicalize_hostname.clone().unwrap_or_default();
     let direct = first.proxy_jump.is_none() && first.proxy_command.is_none() && !first.needs_proxy;
     let mut canonical = None;
@@ -703,15 +715,16 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
             return failed;
         }
     }
+    // Later passes add to what the first one found (the first value still
+    // wins, as in ssh), so settings of the original name's blocks stay.
+    let (mut ours, mut ssh) = first_pass;
     match &canonical {
         Some(name) => {
-            let mut again = lookup_pass(home, name, host, sources, true, true);
-            if again.hostname.is_none() {
-                again.hostname = Some(name.clone());
-            }
-            again
+            ours.hostname = Some(name.clone());
+            ssh.hostname = Some(name.clone());
+            merge(lookup_pass(home, name, host, sources, (true, true), (ours, ssh)))
         }
-        None if first.wants_final => lookup_pass(home, host, host, sources, false, true),
+        None if first.wants_final => merge(lookup_pass(home, host, host, sources, (false, true), (ours, ssh))),
         None => first,
     }
 }
@@ -734,8 +747,17 @@ fn canonicalize(name: &str, domains: &[String], max_dots: usize) -> Option<Strin
     })
 }
 
-/// One reading of the configs (see [`lookup`]); `original` is the host as given.
-fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canonical: bool, final_pass: bool) -> HostConfig {
+/// One reading of the configs (see [`lookup`]) on top of what `seed` (qsh's
+/// part, ssh's part) has: those parts. `original` is the host as given;
+/// `pass` is (canonical, final).
+fn lookup_pass(
+    home: &Path,
+    host: &str,
+    original: &str,
+    sources: &Sources,
+    (canonical, final_pass): (bool, bool),
+    (ours_seed, ssh_seed): (HostConfig, HostConfig),
+) -> (HostConfig, HostConfig) {
     let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
@@ -751,20 +773,26 @@ fn lookup_pass(home: &Path, host: &str, original: &str, sources: &Sources, canon
         read(&qsh_dir.join(UI_HOSTS))
     );
     let mut ours = Parser::new(host, &qsh_dir, true, true);
-    (ours.original, ours.canonical, ours.final_pass) = (original.to_string(), canonical, final_pass);
+    (ours.original, ours.canonical, ours.final_pass, ours.out) = (original.to_string(), canonical, final_pass, ours_seed);
     let ours = ours.run(&ours_text);
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
     let mut ssh = Parser::new(host, &ssh_dir, sources.full, false);
-    (ssh.original, ssh.canonical, ssh.final_pass) = (original.to_string(), canonical, final_pass);
+    (ssh.original, ssh.canonical, ssh.final_pass, ssh.out) = (original.to_string(), canonical, final_pass, ssh_seed);
     // A tag set by -P or qsh's config is the tag for ssh's `Match tagged` too.
-    ssh.out.tag = ours.tag.clone();
+    if ssh.out.tag.is_none() {
+        ssh.out.tag = ours.tag.clone();
+    }
     ssh.feed_file(&read(&ssh_file), &ssh_dir);
     if sources.ssh_config.is_none() {
         let system = Path::new(SYSTEM_SSH_CONFIG);
         ssh.feed_file(&read(system), system.parent().unwrap_or(Path::new("/")));
     }
-    let ssh = ssh.finish();
+    (ours, ssh.finish())
+}
+
+/// One host's settings from qsh's part and ssh's part of the configs.
+fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
     let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && ours.proxy_jump.is_none() && ours.proxy_command.is_none());
     let mut set_env = ours.set_env.clone();
     for e in &ssh.set_env {
@@ -1084,5 +1112,37 @@ mod match_tests {
         assert_eq!(c.hostname.as_deref(), Some("real"));
         let c = lookup(home.path(), "other", &Sources::default());
         assert_eq!(c.port, Some(2200), "Match final applies on the last pass");
+
+        // The later pass keeps what the first found for the original name.
+        let text = "CanonicalizeHostname always\nHost h\n  HostName real.\n  ProxyJump gate\n  IdentityFile ~/k\nHost *\n  IdentityFile ~/all\n";
+        std::fs::write(dir.join("config"), text).unwrap();
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert_eq!((c.hostname.as_deref(), c.proxy_jump.as_deref()), (Some("real"), Some("gate")));
+        assert_eq!(c.identity_files, ["~/k", "~/all"], "no repeats from the second pass");
+    }
+
+    /// The command line's user is what `Match user` and `%r` see, ahead of `User`.
+    #[test]
+    fn command_line_user() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), "Host h\n  User other\nMatch user deploy\n  ProxyJump gate\n").unwrap();
+        let deploy = Sources { user: Some("deploy".into()), ..Default::default() };
+        let c = lookup(home.path(), "h", &deploy);
+        assert_eq!((c.user.as_deref(), c.proxy_jump.as_deref()), (Some("deploy"), Some("gate")));
+        let c = lookup(home.path(), "h", &Sources::default());
+        assert_eq!((c.user.as_deref(), c.proxy_jump.as_deref()), (Some("other"), None));
+    }
+
+    /// `Match exec` does not run once an earlier criterion of the line failed.
+    #[cfg(unix)]
+    #[test]
+    fn exec_after_failed_criterion() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("ran");
+        let c = cfg(&format!("Match host nope exec \"touch {}\"\n  User x\n", marker.display()), "h");
+        assert_eq!(c.user, None);
+        assert!(!marker.exists(), "Match exec ran for a line that cannot apply");
     }
 }

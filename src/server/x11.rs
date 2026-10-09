@@ -61,6 +61,22 @@ fn plausible(proto: &str, cookie: &str) -> bool {
         && cookie.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A listener for a display on `addr`: IPv6 only on IPv6 addresses, so `[::]`
+/// does not clash with the display's own `0.0.0.0`.
+fn listen(addr: SocketAddr, reuse: bool) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(true)?;
+    }
+    // Like sshd: only for loopback displays.
+    sock.set_reuse_address(reuse)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(128)?;
+    tokio::net::TcpListener::from_std(sock.into())
+}
+
 /// What a client asks for: the fake authentication and the screen.
 pub struct Request {
     pub proto: String,
@@ -84,16 +100,24 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
         vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()]
     };
     let mut found = None;
-    for n in cfg.x11_display_offset..cfg.x11_display_offset.saturating_add(DISPLAYS) {
+    'displays: for n in cfg.x11_display_offset..cfg.x11_display_offset.saturating_add(DISPLAYS) {
         let Ok(port) = u16::try_from(6000 + n) else { break };
-        // The display is taken if its IPv4 port is; IPv6 is a bonus.
-        let Ok(first) = tokio::net::TcpListener::bind(SocketAddr::new(ips[0], port)).await else { continue };
-        let mut listeners = vec![first];
-        if let Ok(l) = tokio::net::TcpListener::bind(SocketAddr::new(ips[1], port)).await {
-            listeners.push(l);
+        let mut listeners = Vec::new();
+        for ip in &ips {
+            match listen(SocketAddr::new(*ip, port), cfg.x11_use_localhost) {
+                Ok(l) => listeners.push(l),
+                // Someone holding the display on either address is taken: with
+                // half of it, they would get the connections (and cookies) of
+                // programs that reach the other address (CVE-2008-1483).
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue 'displays,
+                // No IPv6 (or IPv4) here.
+                Err(e) => debug!("X11 display {n} on {ip}: {e}"),
+            }
         }
-        found = Some((n, listeners));
-        break;
+        if !listeners.is_empty() {
+            found = Some((n, listeners));
+            break;
+        }
     }
     let Some((number, listeners)) = found else {
         return write_msg(&mut send, &Reply::Err("no free X11 display".into())).await;
@@ -157,6 +181,16 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
 
 #[cfg(test)]
 mod tests {
+    /// A display whose IPv6 port someone else holds is skipped as a whole.
+    #[tokio::test]
+    async fn half_taken_display_is_skipped() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let Ok(squat) = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else { return }; // no IPv6
+        let port = squat.local_addr().unwrap().port();
+        let err = super::listen(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port), true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
     #[test]
     fn auth_data_checks() {
         assert!(super::plausible("MIT-MAGIC-COOKIE-1", "00112233445566778899aabbccddeeff"));

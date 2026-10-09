@@ -2392,9 +2392,9 @@ fn server_policy() {
     let ssh_dir = s.home.path().join(".ssh");
     std::fs::create_dir_all(&ssh_dir).unwrap();
     std::fs::write(ssh_dir.join("rc"), "echo rc-ran > \"$HOME/rc-marker\"\n").unwrap();
-    let out = c.run(&["-p", &port, &dest(), "cat \"$HOME/rc-marker\""]);
-    assert_eq!(stdout(&out), "rc-ran\n", "{}", stderr(&out));
-    std::fs::remove_file(ssh_dir.join("rc")).unwrap();
+    let out = c.run(&["-p", &port, &dest(), "cat \"$HOME/rc-marker\"; echo $QSH_TEST_SET"]);
+    assert_eq!(stdout(&out), "rc-ran\nfrom-config\n", "{}", stderr(&out));
+    std::fs::remove_file(s.home.path().join("rc-marker")).unwrap();
 
     // `-t` checks a config, `-T` prints the settings for a login.
     let cfg_path = s.home.path().join(".config/qsh/qshd.toml");
@@ -2430,8 +2430,12 @@ fn server_policy() {
     std::fs::write(&cfg_path, format!("[[match]]\nuser = \"{me}\"\nforce_command = \"echo forced:$SSH_ORIGINAL_COMMAND\"\n")).unwrap();
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
     sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_file(s.home.path().join("rc-marker"));
     let out = c.run(&["-p", &port, &dest(), "uname"]);
     assert_eq!(stdout(&out), "forced:uname\n", "{}", stderr(&out));
+    // The user's rc file must not get around the server's forced command (as in sshd).
+    assert!(!s.home.path().join("rc-marker").exists(), "~/.ssh/rc ran under force_command");
+    std::fs::remove_file(ssh_dir.join("rc")).unwrap();
     let out = c.run(&["-p", &port, "cp", "/etc/hostname", &format!("{}:x", dest())]);
     assert!(!out.status.success(), "file transfer must be refused with a forced command");
 }
@@ -2445,6 +2449,10 @@ fn internal_sftp() {
     let s = Server::start_with("127.0.0.1", "[subsystems]\nsftp = \"internal-sftp\"\n");
     let c = Client::paired(&s);
     let port = s.port.to_string();
+    // A client's "internal-sftp" is a command like any other, for the user's
+    // shell (which may be nologin): only the server picks the built-in one.
+    let out = c.run(&["-p", &port, &dest(), "internal-sftp"]);
+    assert!(!out.status.success(), "internal-sftp ran as a client command: {}", stderr(&out));
     let sftp = |batch: &str| {
         let file = c.home.path().join("batch");
         std::fs::write(&file, batch).unwrap();

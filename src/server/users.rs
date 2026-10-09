@@ -69,7 +69,9 @@ fn group_list(_name: &str, _gid: Gid) -> Result<Vec<libc::gid_t>> {
 pub struct Prelude {
     /// Run an rc file: `~/.ssh/rc` (if `user_rc`) or `/etc/ssh/sshrc`.
     pub rc: bool,
-    pub user_rc: bool,
+    /// `~/.ssh/rc` may run, through this shell (the user's, like sshd's
+    /// `$SHELL -c '/bin/sh .ssh/rc'`, so restricted shells refuse it).
+    pub user_rc: Option<String>,
     /// X11 forwarding: the xauth display name, protocol and fake cookie,
     /// given to the rc file on stdin or added with xauth.
     pub x11: Option<(String, String, String)>,
@@ -95,8 +97,8 @@ impl Prelude {
         if self.rc {
             items.push("rc".to_string());
         }
-        if self.user_rc {
-            items.push("user_rc".to_string());
+        if let Some(shell) = &self.user_rc {
+            items.push(format!("user_rc={shell}"));
         }
         if let Some((display, proto, cookie)) = &self.x11 {
             items.push(format!("x11={display} {proto} {cookie}"));
@@ -124,7 +126,7 @@ impl Prelude {
         for item in decode_args(arg)? {
             match item.as_str() {
                 "rc" => p.rc = true,
-                "user_rc" => p.user_rc = true,
+                _ if item.starts_with("user_rc=") => p.user_rc = Some(item["user_rc=".len()..].to_string()),
                 _ if item.starts_with("x11=") => {
                     let mut f = item["x11=".len()..].split(' ').map(str::to_string);
                     p.x11 = Some((f.next()?, f.next()?, f.next()?));
@@ -261,16 +263,32 @@ impl User {
 
     /// A command that runs as this user with a clean environment in their home.
     pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-        self.command_as(program, None, &Prelude::default())
+        self.command_as(program, None, &Prelude::default(), self.env())
+    }
+
+    /// The environment of a launch: `env` itself, or, through
+    /// `internal-become`, only the base variables, with `env` handed over
+    /// in [`SESSION_ENV`] and set after the switch to the user. As root,
+    /// variables from the client (`accept_env`) must not reach the root
+    /// process: `LD_PRELOAD` and its like act at its exec.
+    fn launch_env(&self, wraps: bool, env: Vec<(String, String)>) -> Vec<(String, String)> {
+        if !wraps {
+            return env;
+        }
+        let pairs: Vec<String> = env.into_iter().filter(|(k, v)| !k.contains(['=', '\0']) && !v.contains('\0')).map(|(k, v)| format!("{k}={v}")).collect();
+        let mut base = self.env();
+        base.push((SESSION_ENV.into(), encode_args(&pairs)));
+        base
     }
 
     /// Like [`User::command`], with `arg0` as the program's argv[0], for a
-    /// session with `prelude`.
-    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, prelude: &Prelude) -> tokio::process::Command {
+    /// session with `prelude` and the environment `env`.
+    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, prelude: &Prelude, env: Vec<(String, String)>) -> tokio::process::Command {
         let (exe, args) = self.launch(program.as_ref(), arg0, false, prelude);
+        let wraps = self.wraps(program.as_ref(), prelude);
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(args).env_clear().envs(self.env()).kill_on_drop(true);
-        if self.wraps(program.as_ref(), prelude) {
+        cmd.args(args).env_clear().envs(self.launch_env(wraps, env)).kill_on_drop(true);
+        if wraps {
             name_self(&mut cmd);
         } else {
             cmd.current_dir(&self.home);
@@ -284,8 +302,9 @@ impl User {
     /// A command on a terminal, as this user (the terminal is handed to them).
     pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>, prelude: &Prelude) -> pty_process::Command {
         let (exe, args) = self.launch(program.as_ref(), arg0, true, prelude);
-        let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(env).kill_on_drop(true);
-        if self.wraps(program.as_ref(), prelude) {
+        let wraps = self.wraps(program.as_ref(), prelude);
+        let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(self.launch_env(wraps, env)).kill_on_drop(true);
+        if wraps {
             if let Ok(p) = exe_path() {
                 cmd = cmd.arg0(p);
             }
@@ -320,7 +339,7 @@ impl User {
         if let Some(root) = &self.chroot {
             let prelude = Prelude { chroot: Some(root.clone()), ..Default::default() };
             let argv = helper_argv(args);
-            let mut cmd = self.command_as(&argv[0], None, &prelude);
+            let mut cmd = self.command_as(&argv[0], None, &prelude, self.env());
             cmd.args(&argv[1..]);
             return Ok(cmd);
         }
@@ -372,6 +391,9 @@ pub const INTERNAL_SFTP: &str = "internal-sftp";
 
 /// Subcommand that switches to a user and runs a program (see `User::launch`).
 pub const BECOME: &str = "internal-become";
+/// Environment variable with the variables `internal-become` sets once it
+/// switched to the user (`NAME=value` items, encoded like [`HELPER_ARGS`]).
+pub const SESSION_ENV: &str = "QSHD_SESSION_ENV";
 /// Subcommand that takes its arguments from [`HELPER_ARGS`].
 pub const HELPER_FROM_ENV: &str = "internal-env";
 /// Environment variable with a helper's arguments, hex-encoded and NUL-separated.
@@ -397,6 +419,13 @@ pub fn decode_args(hex: &str) -> Option<Vec<String>> {
     let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
     let text = String::from_utf8(bytes?).ok()?;
     Some(text.split('\0').map(String::from).collect())
+}
+
+/// The command line that runs qshd's built-in SFTP server through the
+/// user's shell (`qshd internal-sftp`), so restricted shells refuse it.
+pub fn shell_sftp_command() -> Result<String> {
+    let exe = exe_path()?;
+    Ok(format!("{} {INTERNAL_SFTP}", shell_quote(exe.to_str().context("qshd path is not UTF-8")?)?))
 }
 
 /// Quotes a word for `sh -c` (and for fish and zsh, which read single quotes the

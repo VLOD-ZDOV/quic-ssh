@@ -125,6 +125,11 @@ impl SshArgs {
     }
 
     fn apply_value(&mut self, c: char, v: String) -> Result<(), String> {
+        // Several values become config lines (`-o`, `-J`, `-S`...): a line
+        // break would add lines of its own (ProxyCommand, Match exec).
+        if v.contains(['\n', '\r', '\0']) {
+            return Err(format!("bad value for -{c}: {v:?}"));
+        }
         // -p is re-added from the final port so `host:port` also reaches ssh;
         // -S and -O name qsh's sharing sockets, which ssh cannot use; ssh
         // refuses qsh's own -o keywords.
@@ -135,6 +140,7 @@ impl SshArgs {
                 let p = v.parse().map_err(|_| format!("bad port {v:?}"))?;
                 self.port = Some(p);
             }
+            'l' if !crate::proto::valid_user_name(&v) => return Err(format!("invalid user name {v:?}")),
             'l' => self.login = Some(v),
             'i' => self.identities.push(PathBuf::from(v)),
             'L' => self.local_forwards.push(v),
@@ -237,12 +243,10 @@ impl SshArgs {
         Ok(a)
     }
 
-    /// The `-o` options followed by `-l` as config lines (highest precedence).
+    /// The `-o` options and other switches as config lines (highest
+    /// precedence). `-l` goes to the configs as the command line's user.
     pub fn override_lines(&self) -> Vec<String> {
         let mut lines = self.options.clone();
-        if let Some(l) = &self.login {
-            lines.push(format!("User {l}"));
-        }
         if self.quiet {
             lines.push("LogLevel quiet".into());
         }
@@ -293,6 +297,10 @@ mod tests {
         assert_eq!(a.login.as_deref(), Some("bob"));
         assert_eq!(a.destination.as_deref(), Some("host"));
         assert_eq!(a.command, vec!["uname", "-a"]);
+        // Values that would become extra config lines, or odd user names.
+        for bad in [["-l", "bob\nProxyCommand evil"], ["-o", "User=x\nMatch exec evil"], ["-J", "gw\rProxyCommand x"], ["-l", "$(id)"]] {
+            assert!(SshArgs::parse(bad.iter().map(|s| s.to_string()).chain(["host".into()])).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

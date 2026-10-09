@@ -298,17 +298,24 @@ impl Target {
             bail!("invalid host {alias:?}");
         }
         let parsed_port = parsed_port.map(|p| p.parse::<u16>().context("invalid port")).transpose()?;
-        let cfg = home.map(|h| config::lookup(h, alias, sources)).unwrap_or_default();
+        // The command line's user (-l wins over user@, as in ssh), checked
+        // before the configs see it (`Match exec` runs commands with `%r`).
+        let ssh_dest = match &user {
+            Some(u) => format!("{u}@{alias}"),
+            None => alias.to_string(),
+        };
+        let cli_user = sources.user.clone().or(user);
+        if let Some(u) = cli_user.as_deref().filter(|u| !crate::proto::valid_user_name(u)) {
+            bail!("invalid user name {u:?}");
+        }
+        let lookup_sources = config::Sources { user: cli_user.clone(), ..sources.clone() };
+        let cfg = home.map(|h| config::lookup(h, alias, &lookup_sources)).unwrap_or_default();
 
         let host = cfg.hostname.clone().map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
         if !valid_host(&host) {
             bail!("invalid HostName {host:?} for {alias}");
         }
-        let ssh_dest = match &user {
-            Some(u) => format!("{u}@{alias}"),
-            None => alias.to_string(),
-        };
-        let user = match user.or(cfg.user.clone()) {
+        let user = match cli_user.or(cfg.user.clone()) {
             Some(u) => u,
             None => local_user()?,
         };
@@ -1067,7 +1074,7 @@ async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Co
     let mut hops: Vec<Arc<Conn>> = Vec::new();
     if let Some(jumps) = &target.proxy_jump {
         // Jump hosts use the config files, but not this host's -o options.
-        let sources = config::Sources { full: false, overrides: Vec::new(), ssh_config: target.sources.ssh_config.clone() };
+        let sources = config::Sources { ssh_config: target.sources.ssh_config.clone(), ..Default::default() };
         let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, share: false, ..opts.clone() };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let mut hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;

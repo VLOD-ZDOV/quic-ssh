@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
-pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV};
+pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV, SESSION_ENV};
 
 /// Copies `r` to `w` with plain reads and writes. Not `io::copy`: between a
 /// socket or file and a pipe it uses `splice()`, which keeps the pipe locked
@@ -259,11 +259,21 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     }
     #[cfg(not(target_vendor = "apple"))]
     let as_user = |_: &mut std::process::Command| {};
+    // The session's variables, now that they cannot act as root (see `User::launch_env`).
+    if let Ok(encoded) = std::env::var(SESSION_ENV) {
+        std::env::remove_var(SESSION_ENV);
+        for pair in decode_args(&encoded).context("bad session environment")? {
+            if let Some((k, v)) = pair.split_once('=').filter(|(k, _)| !k.is_empty()) {
+                std::env::set_var(k, v);
+            }
+        }
+    }
     let home = Path::new(home);
-    if std::env::set_current_dir(home).is_err() {
+    let in_home = std::env::set_current_dir(home).is_ok();
+    if !in_home {
         std::env::set_current_dir("/")?;
     }
-    run_prelude(&prelude, home, as_user);
+    run_prelude(&prelude, in_home, as_user);
     // qshd's own programs run right here: inside a chroot neither a shell
     // nor qshd's binary need to exist.
     #[cfg(not(target_vendor = "apple"))]
@@ -292,7 +302,11 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
 /// qshd's helpers that can run inside `internal-become` (sessions and
 /// file transfers of confined users); `args` as `helper_argv` makes them.
 pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
-    let args: Vec<&str> = args.iter().map(String::as_str).skip_while(|a| *a == "--").collect();
+    // Only the one "--" that `helper_argv` puts in front: a "--" after it is an argument.
+    let args: Vec<&str> = match args.split_first() {
+        Some((first, rest)) if first == "--" => rest.iter().map(String::as_str).collect(),
+        _ => args.iter().map(String::as_str).collect(),
+    };
     match (program, args.as_slice()) {
         (super::users::INTERNAL_SFTP, opts) => {
             let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
@@ -336,10 +350,11 @@ fn enter_chroot(root: &Path) -> Result<()> {
 
 /// What sshd does before a session's program: the last login and the
 /// message of the day for a login shell (both skipped with `~/.hushlogin`),
-/// then the user's `~/.ssh/rc`, or else the system's `/etc/ssh/sshrc`,
-/// through `/bin/sh` and with the session's output.
-fn run_prelude(prelude: &Prelude, home: &Path, as_user: impl Fn(&mut std::process::Command)) {
-    if (prelude.motd || prelude.last_login.is_some()) && !home.join(".hushlogin").exists() {
+/// then the user's `~/.ssh/rc` (through the user's shell, as `$SHELL -c
+/// '/bin/sh .ssh/rc'`), or else the system's `/etc/ssh/sshrc` (`/bin/sh`),
+/// with the session's output. Runs in the home directory if `in_home`.
+fn run_prelude(prelude: &Prelude, in_home: bool, as_user: impl Fn(&mut std::process::Command)) {
+    if (prelude.motd || prelude.last_login.is_some()) && !(in_home && Path::new(".hushlogin").exists()) {
         let mut out = io::stdout();
         if let Some(last) = &prelude.last_login {
             let _ = writeln!(out, "{last}");
@@ -353,13 +368,18 @@ fn run_prelude(prelude: &Prelude, home: &Path, as_user: impl Fn(&mut std::proces
     }
     // The X11 data goes to the rc file on stdin; without one, to xauth.
     let x11_line = prelude.x11.as_ref().map(|(_, proto, cookie)| format!("{proto} {cookie}\n"));
-    let user_rc = home.join(".ssh/rc");
     let rc = if !prelude.rc {
         None
-    } else if prelude.user_rc && user_rc.is_file() {
-        Some(user_rc)
+    } else if let Some(shell) = prelude.user_rc.as_ref().filter(|_| in_home && Path::new(".ssh/rc").is_file()) {
+        let mut cmd = std::process::Command::new(shell);
+        cmd.args(["-c", "/bin/sh .ssh/rc"]);
+        Some((cmd, ".ssh/rc"))
     } else {
-        Some(PathBuf::from("/etc/ssh/sshrc")).filter(|p| p.is_file())
+        Path::new("/etc/ssh/sshrc").is_file().then(|| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("/etc/ssh/sshrc");
+            (cmd, "/etc/ssh/sshrc")
+        })
     };
     let feed = |mut cmd: std::process::Command, input: Option<String>| {
         cmd.stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
@@ -370,11 +390,9 @@ fn run_prelude(prelude: &Prelude, home: &Path, as_user: impl Fn(&mut std::proces
         }
         child.wait()
     };
-    if let Some(rc) = rc {
-        let mut sh = std::process::Command::new("/bin/sh");
-        sh.arg(&rc);
-        if let Err(e) = feed(sh, x11_line) {
-            eprintln!("qshd: {}: {e}", rc.display());
+    if let Some((cmd, name)) = rc {
+        if let Err(e) = feed(cmd, x11_line) {
+            eprintln!("qshd: {name}: {e}");
         }
     } else if let (Some((display, proto, cookie)), Some(xauth)) = (&prelude.x11, &prelude.xauth) {
         let mut cmd = std::process::Command::new(xauth);

@@ -30,6 +30,10 @@ pub struct Session {
     pub remote: Option<std::net::IpAddr>,
     /// What runs first (motd, `~/.ssh/rc`...).
     pub prelude: Prelude,
+    /// Run qshd's built-in SFTP server with these options instead of a
+    /// shell: only for `internal-sftp` as a command the server chose (a
+    /// subsystem, `force_command`, a key's `command=`), never the client's.
+    pub sftp: Option<Vec<String>>,
 }
 
 impl Session {
@@ -48,14 +52,14 @@ impl Session {
 
 /// `internal-sftp [options]`: the built-in SFTP server, run without a
 /// shell (its options, if `command` is one).
-pub(super) fn internal_sftp(command: &Option<String>) -> Option<Vec<String>> {
-    let mut words = command.as_deref()?.split_whitespace();
+pub(super) fn internal_sftp(command: &str) -> Option<Vec<String>> {
+    let mut words = command.split_whitespace();
     (words.next()? == super::users::INTERNAL_SFTP).then(|| words.map(str::to_string).collect())
 }
 
 pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: Session, closed: watch::Receiver<bool>) -> Result<()> {
     // SFTP speaks a binary protocol: never on a terminal.
-    if internal_sftp(&session.command).is_some() {
+    if session.sftp.is_some() {
         session.pty = None;
     }
     let env = session.env(user);
@@ -65,7 +69,7 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
             record = login_record(user, &tty, &c, session.remote);
             (c, Io::Pty(p))
         }),
-        None => spawn_pipes(user, session.command, env, &session.prelude),
+        None => spawn_pipes(user, session.command, session.sftp, env, &session.prelude),
     };
     let (child, io) = match spawned {
         Ok(x) => x,
@@ -103,12 +107,17 @@ enum Io {
     Pty(pty_process::Pty),
 }
 
-fn spawn_pipes(user: &User, command: Option<String>, env: Vec<(String, String)>, prelude: &Prelude) -> Result<(tokio::process::Child, Io)> {
+fn spawn_pipes(
+    user: &User,
+    command: Option<String>,
+    sftp: Option<Vec<String>>,
+    env: Vec<(String, String)>,
+    prelude: &Prelude,
+) -> Result<(tokio::process::Child, Io)> {
     let arg0 = command.is_none().then(|| user.login_arg0());
-    let sftp = internal_sftp(&command);
     let program = if sftp.is_some() { std::path::PathBuf::from(super::users::INTERNAL_SFTP) } else { user.shell.clone() };
-    let mut cmd = user.command_as(&program, arg0.as_deref(), prelude);
-    cmd.envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = user.command_as(&program, arg0.as_deref(), prelude, env);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);
     match (sftp, command) {

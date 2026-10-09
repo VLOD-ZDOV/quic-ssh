@@ -607,55 +607,68 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     let display = x11.display();
     // A forced command (`command=`, a certificate's force-command) replaces
     // whatever the client asked to run, which is passed on like sshd does.
-    let session = |command: Option<String>, client_env: Vec<(String, String)>, pty: Option<PtySpec>| exec::Session {
-        prelude: users::Prelude {
-            // ~/.ssh/rc as allowed, else the system's /etc/ssh/sshrc.
-            rc: (user_rc && user.home.join(".ssh/rc").is_file()) || std::path::Path::new("/etc/ssh/sshrc").is_file(),
-            user_rc,
-            x11: display.as_ref().map(|d| (d.auth_display.clone(), d.proto.clone(), d.cookie.clone())),
-            xauth: display.as_ref().map(|_| cfg.xauth_location.to_string_lossy().into_owned()),
-            motd: cfg.print_motd
-                && login_shell(limits, &command, &pty)
-                && std::fs::metadata("/etc/motd").is_ok_and(|m| m.len() > 0),
-            last_login: None,
-            chroot: user.chroot.clone(),
-        },
-        command: limits.command.clone().or(command.clone()),
-        extra_env: cfg
-            .set_env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .chain(match (&limits.command, command) {
-                (Some(_), Some(original)) => Some(("SSH_ORIGINAL_COMMAND".into(), original)),
-                _ => None,
-            })
-            .chain(agent.path().map(|p| ("SSH_AUTH_SOCK".to_string(), p.to_string_lossy().into_owned())))
-            .chain(display.as_ref().map(|d| ("DISPLAY".to_string(), d.display.clone())))
-            .collect(),
-        client_env: client_env.into_iter().filter(|(k, _)| cfg.accepts_env(k)).collect(),
-        pty: pty.filter(|_| !limits.no_pty),
-        remote: Some(conn.remote_addr().ip().to_canonical()),
+    // `subsystem`: `command` is the server's (a subsystem's), not the client's.
+    let session = |command: Option<String>, client_env: Vec<(String, String)>, pty: Option<PtySpec>, subsystem: bool| {
+        let run = limits.command.clone().or(command.clone());
+        // qshd's own SFTP server only where the server chose the command.
+        let sftp = run.as_deref().filter(|_| subsystem || limits.command.is_some()).and_then(exec::internal_sftp);
+        // Like sshd: no ~/.ssh/rc for subsystems (internal-sftp is one) or
+        // under the server's force_command, which the user must not get around.
+        let user_rc = (user_rc && !subsystem && sftp.is_none() && cfg.force_command.is_none()).then(|| user.shell.to_string_lossy().into_owned());
+        exec::Session {
+            prelude: users::Prelude {
+                // ~/.ssh/rc as allowed, else the system's /etc/ssh/sshrc. As
+                // root, whether the user's exists is checked as the user (it
+                // may be in a chroot); `internal-become` runs as root anyway.
+                rc: (user_rc.is_some() && (user.switches() || user.home.join(".ssh/rc").is_file()))
+                    || std::path::Path::new("/etc/ssh/sshrc").is_file(),
+                user_rc,
+                x11: display.as_ref().map(|d| (d.auth_display.clone(), d.proto.clone(), d.cookie.clone())),
+                xauth: display.as_ref().map(|_| cfg.xauth_location.to_string_lossy().into_owned()),
+                motd: cfg.print_motd
+                    && login_shell(limits, &command, &pty)
+                    && std::fs::metadata("/etc/motd").is_ok_and(|m| m.len() > 0),
+                last_login: None,
+                chroot: user.chroot.clone(),
+            },
+            command: run,
+            sftp,
+            extra_env: cfg
+                .set_env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .chain(match (&limits.command, command) {
+                    (Some(_), Some(original)) => Some(("SSH_ORIGINAL_COMMAND".into(), original)),
+                    _ => None,
+                })
+                .chain(agent.path().map(|p| ("SSH_AUTH_SOCK".to_string(), p.to_string_lossy().into_owned())))
+                .chain(display.as_ref().map(|d| ("DISPLAY".to_string(), d.display.clone())))
+                .collect(),
+            client_env: client_env.into_iter().filter(|(k, _)| cfg.accepts_env(k)).collect(),
+            pty: pty.filter(|_| !limits.no_pty),
+            remote: Some(conn.remote_addr().ip().to_canonical()),
+        }
     };
     let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
     match request {
         Request::Exec { command, env, pty } => {
-            let mut spec = session(command, env, pty);
+            let mut spec = session(command, env, pty, false);
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
             exec::run(send, recv, user, spec, closed).await
         }
         Request::Persistent { command, env, pty } => {
-            let mut spec = session(command, env, Some(pty));
+            let mut spec = session(command, env, Some(pty), false);
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
             // Without a terminal (no-pty) or with sessions turned off: a plain session.
-            if spec.pty.is_none() || !state.sessions.enabled() || exec::internal_sftp(&spec.command).is_some() {
+            if spec.pty.is_none() || !state.sessions.enabled() || spec.sftp.is_some() {
                 return exec::run(send, recv, user, spec, closed).await;
             }
             state.sessions.start(send, recv, user, limits, spec, closed).await
         }
         Request::Resume { token, received } => state.sessions.resume(send, recv, user, limits, &token, received, closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
-        Request::Subsystem { name, env } => match subsystem_command(cfg, &name) {
-            Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None), closed).await,
+        Request::Subsystem { name, env } => match subsystem_command(cfg, user, &name) {
+            Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None, true), closed).await,
             None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
         },
         Request::RemoteForward { bind, port } => {
@@ -788,14 +801,21 @@ const SFTP_SERVERS: [&str; 5] = [
 ];
 
 /// Command line for a subsystem: from the config, or a detected sftp-server.
-fn subsystem_command(cfg: &ServerConfig, name: &str) -> Option<String> {
+fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<String> {
     if let Some(cmd) = cfg.subsystems.get(name) {
         return (!cmd.trim().is_empty()).then(|| cmd.clone());
     }
     if name == "sftp" {
-        // OpenSSH's sftp-server if installed, else the built-in one.
-        let installed = SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string());
-        return Some(installed.unwrap_or_else(|| users::INTERNAL_SFTP.to_string()));
+        // OpenSSH's sftp-server if installed, else the built-in one: in a
+        // chroot (set up for it) directly, otherwise through the user's
+        // shell like any other subsystem, so nologin and git-shell refuse it.
+        if let Some(installed) = SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()) {
+            return Some(installed.to_string());
+        }
+        if user.chroot.is_some() {
+            return Some(users::INTERNAL_SFTP.to_string());
+        }
+        return users::shell_sftp_command().ok();
     }
     None
 }

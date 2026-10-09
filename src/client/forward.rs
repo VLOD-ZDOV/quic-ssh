@@ -158,6 +158,13 @@ const SOCKS_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long repeated failures to reach the same target stay hidden.
 const QUIET_REPEATS: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Writes to stderr, which may be gone: a background forwarder (`-f`)
+/// outlives the terminal it started on, and `eprint!` would panic then.
+fn say(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
+}
+
 /// Reports that a forwarded connection could not be opened: once per target
 /// and minute, so that a browser trying dozens of connections to a port that
 /// does not answer does not flood the terminal. The line ends with `\r\n`,
@@ -171,8 +178,9 @@ fn report_failure(target: &str, e: &anyhow::Error) {
         shown.retain(|_, at| now.duration_since(*at) < QUIET_REPEATS);
         shown.insert(target.to_string(), now).is_none()
     };
-    if show {
-        eprint!("qsh: cannot forward to {target}: {e:#} (repeats are not shown for a minute)\r\n");
+    // Not with -q (LogLevel quiet/error).
+    if show && tracing::enabled!(tracing::Level::WARN) {
+        say(&format!("qsh: cannot forward to {target}: {e:#} (repeats are not shown for a minute)\r\n"));
     } else {
         debug!("forward to {target}: {e:#}");
     }
@@ -427,7 +435,7 @@ impl Forwarder {
     pub async fn agent(&self, path: PathBuf, quiet: bool) {
         if self.conn.server_version() < 4 {
             if !quiet {
-                eprintln!("qsh: warning: the server's qshd is too old for agent forwarding (-A)");
+                say("qsh: warning: the server's qshd is too old for agent forwarding (-A)\n");
             }
             return;
         }
@@ -444,7 +452,7 @@ impl Forwarder {
             Err(e) => {
                 self.routes.lock().unwrap().agent = None;
                 if !quiet {
-                    eprintln!("qsh: warning: agent forwarding refused: {e:#}");
+                    say(&format!("qsh: warning: agent forwarding refused: {e:#}\n"));
                 }
             }
         }
@@ -455,7 +463,7 @@ impl Forwarder {
     pub async fn x11(&self, auth: super::x11::X11Auth, quiet: bool) {
         if self.conn.server_version() < 6 {
             if !quiet {
-                eprintln!("qsh: warning: the server's qshd is too old for X11 forwarding");
+                say("qsh: warning: the server's qshd is too old for X11 forwarding\n");
             }
             return;
         }
@@ -473,7 +481,7 @@ impl Forwarder {
             Err(e) => {
                 self.routes.lock().unwrap().x11 = None;
                 if !quiet {
-                    eprintln!("qsh: warning: X11 forwarding refused: {e:#}");
+                    say(&format!("qsh: warning: X11 forwarding refused: {e:#}\n"));
                 }
             }
         }
