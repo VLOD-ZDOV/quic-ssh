@@ -227,7 +227,9 @@ async fn request_agent(conn: &Conn, quiet: bool) -> Option<(SendHalf, RecvHalf)>
 
 /// `-R`: asks the server to listen and serves the connections it hands back.
 /// With `agent` (`-A`), also forwards that ssh-agent socket.
-pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<PathBuf>, quiet: bool) -> Result<RemoteForwards> {
+/// `exit_on_failure`: a forward the server refuses ends qsh
+/// (ExitOnForwardFailure); otherwise it is a warning, as in ssh.
+pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<PathBuf>, quiet: bool, exit_on_failure: bool) -> Result<RemoteForwards> {
     let mut routes = HashMap::new();
     let mut requests = Vec::new();
     for f in forwards {
@@ -235,7 +237,15 @@ pub async fn start_remote(conn: &Arc<Conn>, forwards: &[Forward], agent: Option<
         // Like ssh: without an address, ask for loopback.
         let bind = f.bind.clone().unwrap_or_else(|| "localhost".into());
         write_msg(&mut send, &Request::RemoteForward { bind, port: f.port }).await?;
-        match expect_ok(&mut recv).await.with_context(|| format!("remote forward {}", f.describe()))? {
+        let reply = match expect_ok(&mut recv).await {
+            Ok(r) => r,
+            Err(e) if !exit_on_failure && e.is::<crate::proto::Refused>() => {
+                eprintln!("qsh: warning: remote port forwarding failed for listen port {}: {e:#}", f.port);
+                continue;
+            }
+            Err(e) => return Err(e.context(format!("remote forward {}", f.describe()))),
+        };
+        match reply {
             Reply::Bound { port } => {
                 if f.port == 0 && !quiet {
                     eprintln!("Allocated port {port} for remote forward to {}:{}", f.host, f.host_port);

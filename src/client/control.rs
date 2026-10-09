@@ -90,7 +90,7 @@ fn parse_time(t: &str) -> Option<Duration> {
 
 /// `%C`: a short hash of the connection, so socket names stay short and
 /// carry no host names.
-fn connection_hash(host: &str, port: u16, user: &str) -> String {
+pub fn connection_hash(host: &str, port: u16, user: &str) -> String {
     let digest = Sha256::digest(format!("{host}\0{port}\0{user}").as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }

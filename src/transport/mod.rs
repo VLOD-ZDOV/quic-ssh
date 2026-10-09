@@ -385,6 +385,60 @@ async fn udp_port_closed(addr: SocketAddr, local: Option<SocketAddr>) {
     }
 }
 
+/// A `ProxyCommand`: the program's stdin and stdout as one byte stream.
+/// The program is killed when the stream is dropped.
+pub struct ProxyCommand {
+    _child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stdin: tokio::process::ChildStdin,
+}
+
+impl ProxyCommand {
+    /// Starts `line` through the shell, as ssh does (`exec` saves a process).
+    pub fn spawn(line: &str) -> Result<ProxyCommand> {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new(std::env::var_os("SHELL").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into()));
+            c.arg("-c").arg(format!("exec {line}"));
+            c
+        };
+        #[cfg(not(unix))]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/C").arg(line);
+            c
+        };
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("cannot run ProxyCommand {line:?}"))?;
+        let stdout = child.stdout.take().context("ProxyCommand stdout")?;
+        let stdin = child.stdin.take().context("ProxyCommand stdin")?;
+        Ok(ProxyCommand { _child: child, stdout, stdin })
+    }
+}
+
+impl AsyncRead for ProxyCommand {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxyCommand {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
 /// How the server notices clients that went away (client_alive_interval):
 /// a probe every `interval`, given up after `count` unanswered ones.
 #[derive(Clone, Copy, Debug)]

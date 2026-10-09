@@ -8,8 +8,11 @@
 //! `ProxyJump`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`,
 //! `UserKnownHostsFile`, `ClearAllForwardings`, `EscapeChar`,
 //! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`,
-//! `ControlMaster`, `ControlPath`, `ControlPersist`, and qsh's own
-//! `PersistSession` and `PredictiveEcho`.
+//! `ControlMaster`, `ControlPath`, `ControlPersist`, `ProxyCommand`,
+//! `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`,
+//! `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand`,
+//! `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`,
+//! `ConnectionAttempts`, and qsh's own `PersistSession` and `PredictiveEcho`.
 //! `Match` blocks are evaluated for `all`, `host`, `originalhost`, `user` and
 //! `localuser`; a block whose conditions qsh cannot check (`exec`,
 //! `localnetwork`, `canonical`...) is not used, except that a proxy in it
@@ -83,6 +86,24 @@ pub struct HostConfig {
     /// `BindAddress` and `BindInterface` (`-b`, `-B`).
     pub bind_address: Option<String>,
     pub bind_interface: Option<String>,
+    /// `ProxyCommand` from qsh's config or `-o`: TLS over its stdin/stdout.
+    pub proxy_command: Option<String>,
+    /// `SendEnv` patterns (`-NAME` removes) and `SetEnv NAME=VALUE`s.
+    pub send_env: Vec<String>,
+    pub set_env: Vec<String>,
+    pub remote_command: Option<String>,
+    /// `SessionType` (`none`, `subsystem`, `default`).
+    pub session_type: Option<String>,
+    pub stdin_null: Option<bool>,
+    pub fork_after_authentication: Option<bool>,
+    pub exit_on_forward_failure: Option<bool>,
+    pub local_command: Option<String>,
+    pub permit_local_command: Option<bool>,
+    /// `HostKeyAlias`: the name to look the host key up under.
+    pub host_key_alias: Option<String>,
+    /// `ConnectTimeout` (seconds) and `ConnectionAttempts`.
+    pub connect_timeout: Option<u64>,
+    pub connection_attempts: Option<u32>,
     /// `-o` options for ssh/scp when `--full` hands the host over: what only
     /// qsh's config says (a name only `qsh ui` saved, say), so that ssh
     /// reaches the same host.
@@ -97,6 +118,12 @@ use crate::pattern::{host_matches, wildcard};
 
 /// Splits `Keyword value`, `Keyword=value` and `Keyword "quoted value"` lines.
 fn split_line(line: &str) -> Option<(String, Vec<String>)> {
+    split_line_raw(line).map(|(k, a, _)| (k, a))
+}
+
+/// Like [`split_line`], also returning the value as written (for commands,
+/// which ssh keeps verbatim).
+fn split_line_raw(line: &str) -> Option<(String, Vec<String>, String)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -107,6 +134,7 @@ fn split_line(line: &str) -> Option<(String, Vec<String>)> {
     if let Some(r) = rest.strip_prefix('=') {
         rest = r.trim_start();
     }
+    let raw = rest.trim_end().to_string();
     let mut args = Vec::new();
     let mut chars = rest.chars().peekable();
     while chars.peek().is_some() {
@@ -117,29 +145,27 @@ fn split_line(line: &str) -> Option<(String, Vec<String>)> {
         if chars.peek() == Some(&'#') {
             break;
         }
+        // Like OpenSSH's argv_split: quotes may start anywhere in a word,
+        // and a backslash escapes a quote, a backslash or a space.
         let mut arg = String::new();
-        if chars.peek() == Some(&'"') {
+        let mut quote: Option<char> = None;
+        while let Some(&c) = chars.peek() {
             chars.next();
-            for c in chars.by_ref() {
-                if c == '"' {
-                    break;
+            match (c, quote) {
+                ('\\', _) if chars.peek().is_some_and(|n| matches!(n, '"' | '\'' | '\\') || n.is_whitespace()) => {
+                    arg.push(chars.next().unwrap());
                 }
-                arg.push(c);
-            }
-        } else {
-            while let Some(&c) = chars.peek() {
-                if c.is_whitespace() {
-                    break;
-                }
-                arg.push(c);
-                chars.next();
+                ('"' | '\'', None) => quote = Some(c),
+                (q, Some(open)) if q == open => quote = None,
+                (w, None) if w.is_whitespace() => break,
+                (other, _) => arg.push(other),
             }
         }
         if !arg.is_empty() {
             args.push(arg);
         }
     }
-    Some((keyword, args))
+    Some((keyword, args, raw))
 }
 
 /// Whether a `Host`/`Match` block applies.
@@ -231,9 +257,9 @@ impl Parser<'_> {
         // Lines before the first Host/Match apply to every host.
         let mut active = Applies::Yes;
         for line in text.lines() {
-            let Some((keyword, args)) = split_line(line) else { continue };
+            let Some((keyword, args, raw)) = split_line_raw(line) else { continue };
             let first = args.first().cloned();
-            if is_proxy(&keyword, first.as_deref()) {
+            if is_proxy(&keyword, first.as_deref()) && !self.ours {
                 self.any_proxy = true;
                 // A proxy that may apply: do not connect around it.
                 if active == Applies::Maybe {
@@ -273,16 +299,50 @@ impl Parser<'_> {
                 "remoteforward" if self.full && args.len() == 2 => o.remote_forwards.push(format!("{}:{}", args[0], args[1])),
                 "dynamicforward" if self.full => o.dynamic_forwards.extend(first),
                 "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
+                // ProxyJump and ProxyCommand compete: the first one found wins (as in ssh).
                 "proxyjump" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
                     if self.ours {
-                        if o.proxy_jump.is_none() {
+                        if o.proxy_jump.is_none() && o.proxy_command.is_none() {
                             o.proxy_jump = first;
                         }
                     } else {
                         o.needs_proxy = true;
                     }
                 }
-                "proxycommand" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => o.needs_proxy = true,
+                "proxycommand" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                    if self.ours {
+                        if o.proxy_jump.is_none() && o.proxy_command.is_none() {
+                            o.proxy_command = Some(raw);
+                        }
+                    } else {
+                        o.needs_proxy = true;
+                    }
+                }
+                "sendenv" if self.full => o.send_env.extend(args.iter().cloned()),
+                "setenv" if self.full => {
+                    for a in &args {
+                        let name = a.split('=').next().unwrap_or("");
+                        if a.contains('=') && !o.set_env.iter().any(|e| e.split('=').next() == Some(name)) {
+                            o.set_env.push(a.clone());
+                        }
+                    }
+                }
+                "remotecommand" if self.full && o.remote_command.is_none() && !raw.is_empty() => {
+                    o.remote_command = (!raw.eq_ignore_ascii_case("none")).then_some(raw);
+                }
+                "sessiontype" if self.full && o.session_type.is_none() => o.session_type = first.map(|v| v.to_ascii_lowercase()),
+                "stdinnull" if self.full && o.stdin_null.is_none() => o.stdin_null = first.as_deref().map(yes),
+                "forkafterauthentication" if self.full && o.fork_after_authentication.is_none() => {
+                    o.fork_after_authentication = first.as_deref().map(yes);
+                }
+                "exitonforwardfailure" if self.full && o.exit_on_forward_failure.is_none() => {
+                    o.exit_on_forward_failure = first.as_deref().map(yes);
+                }
+                "localcommand" if self.full && o.local_command.is_none() && !raw.is_empty() => o.local_command = Some(raw),
+                "permitlocalcommand" if self.full && o.permit_local_command.is_none() => o.permit_local_command = first.as_deref().map(yes),
+                "hostkeyalias" if o.host_key_alias.is_none() => o.host_key_alias = first,
+                "connecttimeout" if o.connect_timeout.is_none() => o.connect_timeout = first.and_then(|v| v.parse().ok()),
+                "connectionattempts" if o.connection_attempts.is_none() => o.connection_attempts = first.and_then(|v| v.parse().ok()),
                 "batchmode" if o.batch_mode.is_none() => o.batch_mode = first.as_deref().map(yes),
                 "stricthostkeychecking" if o.strict_host_key_checking.is_none() => {
                     o.strict_host_key_checking = first.map(|v| v.to_ascii_lowercase());
@@ -502,7 +562,14 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         ssh.feed_file(&read(system), system.parent().unwrap_or(Path::new("/")));
     }
     let ssh = ssh.finish();
-    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && ours.proxy_jump.is_none());
+    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && ours.proxy_jump.is_none() && ours.proxy_command.is_none());
+    let mut set_env = ours.set_env.clone();
+    for e in &ssh.set_env {
+        let name = e.split('=').next();
+        if !set_env.iter().any(|o| o.split('=').next() == name) {
+            set_env.push(e.clone());
+        }
+    }
     let mut for_ssh = Vec::new();
     if let (Some(h), None) = (&ours.hostname, &ssh.hostname) {
         for_ssh.push(format!("HostName={h}"));
@@ -550,6 +617,19 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
         compression: ours.compression.or(ssh.compression),
         bind_address: ours.bind_address.or(ssh.bind_address),
         bind_interface: ours.bind_interface.or(ssh.bind_interface),
+        proxy_command: ours.proxy_command,
+        send_env: ours.send_env.into_iter().chain(ssh.send_env).collect(),
+        set_env,
+        remote_command: ours.remote_command.or(ssh.remote_command),
+        session_type: ours.session_type.or(ssh.session_type),
+        stdin_null: ours.stdin_null.or(ssh.stdin_null),
+        fork_after_authentication: ours.fork_after_authentication.or(ssh.fork_after_authentication),
+        exit_on_forward_failure: ours.exit_on_forward_failure.or(ssh.exit_on_forward_failure),
+        local_command: ours.local_command.or(ssh.local_command),
+        permit_local_command: ours.permit_local_command.or(ssh.permit_local_command),
+        host_key_alias: ours.host_key_alias.or(ssh.host_key_alias),
+        connect_timeout: ours.connect_timeout.or(ssh.connect_timeout),
+        connection_attempts: ours.connection_attempts.or(ssh.connection_attempts),
         for_ssh,
     }
 }
@@ -611,6 +691,29 @@ Host *
         assert!(parse(text, "b", Path::new("/x"), false).needs_proxy);
         assert_eq!(parse(text, "b", Path::new("/x"), true).proxy_jump.as_deref(), Some("bastion"));
         assert!(!parse(text, "c", Path::new("/x"), true).needs_proxy);
+    }
+
+    #[test]
+    fn commands_env_and_session_keywords() {
+        let text = "Host a\n ProxyCommand sh -c \"nc %h %p\"  # comment stays\n ProxyJump later\n SendEnv GIT_* -LC_*\n \
+                    SetEnv A=1 B=\"two words\"\n SetEnv A=ignored\n RemoteCommand tmux new -A -s main\n SessionType none\n \
+                    StdinNull yes\n ExitOnForwardFailure yes\n LocalCommand echo %n\n PermitLocalCommand yes\n \
+                    HostKeyAlias shared\n ConnectTimeout 7\n ConnectionAttempts 3\n";
+        let c = parse(text, "a", Path::new("/x"), true);
+        assert_eq!(c.proxy_command.as_deref(), Some("sh -c \"nc %h %p\"  # comment stays"));
+        assert_eq!(c.proxy_jump, None, "ProxyCommand came first");
+        assert_eq!(c.send_env, vec!["GIT_*", "-LC_*"]);
+        assert_eq!(c.set_env, vec!["A=1", "B=two words"]);
+        assert_eq!(c.remote_command.as_deref(), Some("tmux new -A -s main"));
+        assert_eq!(c.session_type.as_deref(), Some("none"));
+        assert_eq!((c.stdin_null, c.exit_on_forward_failure, c.permit_local_command), (Some(true), Some(true), Some(true)));
+        assert_eq!(c.local_command.as_deref(), Some("echo %n"));
+        assert_eq!(c.host_key_alias.as_deref(), Some("shared"));
+        assert_eq!((c.connect_timeout, c.connection_attempts), (Some(7), Some(3)));
+        // From ssh's config outside --full: the session settings are ssh's.
+        let c = parse(text, "a", Path::new("/x"), false);
+        assert!(c.proxy_command.is_none() && c.needs_proxy && c.remote_command.is_none() && c.send_env.is_empty());
+        assert_eq!(c.host_key_alias.as_deref(), Some("shared"));
     }
 
     #[test]
@@ -685,8 +788,9 @@ Host *
 mod match_tests {
     use super::*;
 
+    /// ssh's config, read in `--full` mode.
     fn cfg(text: &str, host: &str) -> HostConfig {
-        parse(text, host, Path::new("/nonexistent"), true)
+        Parser::new(host, Path::new("/nonexistent"), true, false).run(text)
     }
 
     #[test]

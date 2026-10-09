@@ -241,7 +241,7 @@ else
 fi
 
 # --- remote forwarding limits --------------------------------------------------------
-OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -N -R 80:127.0.0.1:9 qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
+OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -N -R 80:127.0.0.1:9 qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
 check "non-root user cannot listen on a privileged port (-R 80)" grep -q "only root may listen" <<<"$OUT"
 
 # --- PTY ------------------------------------------------------------------------------

@@ -13,13 +13,6 @@ use crate::client::predict::{Mode, Predictor};
 use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reader, Reply, Request, ServerMsg};
 use crate::transport::{Conn, RecvHalf, SendHalf};
 
-/// Local variables forwarded to the server (the server filters them again).
-fn forwarded_env() -> Vec<(String, String)> {
-    std::env::vars()
-        .filter(|(k, _)| k == "LANG" || k == "COLORTERM" || k.starts_with("LC_"))
-        .collect()
-}
-
 /// Puts the local terminal into raw mode and restores it on drop.
 struct RawMode;
 
@@ -161,6 +154,8 @@ pub struct SessionOptions {
     pub command: Option<String>,
     /// Run this subsystem (`-s`) instead of a command.
     pub subsystem: Option<String>,
+    /// Variables sent to the server (`Target::session_env`; it filters them again).
+    pub env: Vec<(String, String)>,
     pub pty: bool,
     /// Keystroke timing obfuscation interval for interactive sessions (`None` = off).
     pub keystroke_interval: Option<std::time::Duration>,
@@ -290,9 +285,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let (send, mut recv) = conn.open_bi().await?;
     let mut send = send;
     let request = match (opts.subsystem.clone(), &pty) {
-        (Some(name), _) => Request::Subsystem { name, env: forwarded_env() },
-        (None, Some(spec)) if persistent => Request::Persistent { command: opts.command.clone(), env: forwarded_env(), pty: spec.clone() },
-        (None, _) => Request::Exec { command: opts.command.clone(), env: forwarded_env(), pty: pty.clone() },
+        (Some(name), _) => Request::Subsystem { name, env: opts.env.clone() },
+        (None, Some(spec)) if persistent => Request::Persistent { command: opts.command.clone(), env: opts.env.clone(), pty: spec.clone() },
+        (None, _) => Request::Exec { command: opts.command.clone(), env: opts.env.clone(), pty: pty.clone() },
     };
     write_msg(&mut send, &request).await?;
     let token = match expect_ok(&mut recv).await? {

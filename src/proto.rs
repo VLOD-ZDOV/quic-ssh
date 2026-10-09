@@ -262,9 +262,22 @@ pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mu
 /// Fails with the peer's error text, made safe to print: no control
 /// characters (escape sequences could redraw the terminal), at most 500
 /// characters.
+/// The server answered a request with `Reply::Err` (as opposed to a
+/// broken connection).
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply> {
     match read_msg(r).await? {
-        Reply::Err(e) => bail!("{}", e.chars().filter(|c| !c.is_control()).take(500).collect::<String>()),
+        Reply::Err(e) => Err(Refused(e.chars().filter(|c| !c.is_control()).take(500).collect()).into()),
         other => Ok(other),
     }
 }

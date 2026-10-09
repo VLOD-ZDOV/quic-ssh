@@ -38,6 +38,30 @@ pub fn mode(meta: &std::fs::Metadata) -> u32 {
 }
 
 /// The local login name.
+/// This machine's host name (for `%l`/`%L`).
+pub fn hostname() -> String {
+    #[cfg(unix)]
+    {
+        nix::unistd::gethostname().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_default()
+    }
+}
+
+/// The real user id (`%i`); 0 where there is none (Windows).
+pub fn uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 pub fn local_user() -> anyhow::Result<String> {
     #[cfg(unix)]
     {

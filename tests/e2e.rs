@@ -977,12 +977,16 @@ fn nix_is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
-/// ProxyCommand cannot be followed by qsh itself: never connect around it.
+/// ssh's ProxyCommand leads to sshd, so qsh does not follow it, and never
+/// connects around it either.
 #[test]
 fn proxy_command_is_not_bypassed() {
     let s = Server::start();
     let c = Client::paired(&s);
-    let out = c.run(&["-p", &s.port.to_string(), "-o", "ProxyCommand=nc %h %p", &dest(), "true"]);
+    let ssh = c.home.path().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("config"), "Host 127.0.0.1\n  ProxyCommand nc %h %p\n").unwrap();
+    let out = c.run(&["-p", &s.port.to_string(), &dest(), "true"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("ProxyCommand"), "{}", stderr(&out));
 }
@@ -2533,4 +2537,45 @@ fn per_source_penalties() {
     }
     let out = paired.run(&["--transport", "tcp", "-p", &port, &dest(), "echo", "exempt"]);
     assert_eq!(stdout(&out), "exempt\n", "{}", stderr(&out));
+}
+
+/// ssh_config session keywords in qsh's own config: ProxyCommand (TLS over
+/// a program's stdio), SendEnv/SetEnv, RemoteCommand, SessionType,
+/// LocalCommand, HostKeyAlias, ExitOnForwardFailure.
+#[test]
+fn client_session_keywords() {
+    let s = Server::start_with("127.0.0.1", "accept_env = [\"LANG\", \"QSH_T_*\"]\n");
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let cfg_dir = c.home.path().join(".config/qsh");
+    let marker = c.home.path().join("local-ran");
+    let write_cfg = |text: &str| std::fs::write(cfg_dir.join("config"), text).unwrap();
+
+    // ProxyCommand: qsh -W through the server to its own TCP port.
+    write_cfg(&format!(
+        "Host viaproxy\n  HostName 127.0.0.1\n  Port {port}\n  ProxyCommand {QSH} -W %h:%p -p {port} {}\n  HostKeyAlias 127.0.0.1\n",
+        dest()
+    ));
+    let out = c.run(&["-l", &user(), "viaproxy", "echo", "proxied"]);
+    assert_eq!(stdout(&out), "proxied\n", "ProxyCommand: {}", stderr(&out));
+
+    // SendEnv / SetEnv (the server accepts QSH_T_*).
+    write_cfg(&format!(
+        "Host h\n  HostName 127.0.0.1\n  Port {port}\n  SendEnv QSH_T_SENT\n  SetEnv QSH_T_SET=\"set value\"\n  PermitLocalCommand yes\n  LocalCommand touch {}\n",
+        marker.display()
+    ));
+    let out = c.cmd(&["-l", &user(), "h", "echo $QSH_T_SENT/$QSH_T_SET"]).env("QSH_T_SENT", "sent").output().unwrap();
+    assert_eq!(stdout(&out), "sent/set value\n", "{}", stderr(&out));
+    assert!(marker.exists(), "LocalCommand did not run");
+
+    // RemoteCommand runs when the command line has none; both is an error.
+    write_cfg(&format!("Host h\n  HostName 127.0.0.1\n  Port {port}\n  RemoteCommand echo remote-%n\n"));
+    let out = c.run(&["-l", &user(), "h"]);
+    assert_eq!(stdout(&out), "remote-h\n", "{}", stderr(&out));
+    assert!(!c.run(&["-l", &user(), "h", "true"]).status.success());
+
+    // SessionType none: like -N, with ExitOnForwardFailure a refused -R ends qsh.
+    write_cfg(&format!("Host h\n  HostName 127.0.0.1\n  Port {port}\n  SessionType none\n  ExitOnForwardFailure yes\n"));
+    let out = c.run(&["-l", &user(), "-R", "1:127.0.0.1:9", "h"]);
+    assert!(!out.status.success() && stderr(&out).contains("only root"), "{}", stderr(&out));
 }

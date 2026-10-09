@@ -109,6 +109,30 @@ pub struct Target {
     pub compression: bool,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
+    /// The host as given, before `HostName` (`%n`).
+    pub alias: String,
+    /// `ProxyCommand` (qsh's config or `-o`): the connection runs over its
+    /// stdin and stdout.
+    pub proxy_command: Option<String>,
+    /// `SendEnv` patterns and `SetEnv` variables for sessions.
+    pub send_env: Vec<String>,
+    pub set_env: Vec<(String, String)>,
+    /// `RemoteCommand`, used when the command line has none.
+    pub remote_command: Option<String>,
+    /// `SessionType`: `none` (like -N), `subsystem` (like -s), `default`.
+    pub session_type: Option<String>,
+    /// `StdinNull` (like -n) and `ForkAfterAuthentication` (like -f).
+    pub stdin_null: bool,
+    pub fork_after_authentication: bool,
+    /// `ExitOnForwardFailure`: a forward that cannot be set up ends qsh.
+    pub exit_on_forward_failure: bool,
+    /// `LocalCommand`, when `PermitLocalCommand` allows it.
+    pub local_command: Option<String>,
+    /// `HostKeyAlias`: the name the host key is known under.
+    pub host_key_alias: Option<String>,
+    /// `ConnectTimeout` and `ConnectionAttempts`.
+    pub connect_timeout: Option<std::time::Duration>,
+    pub connection_attempts: u32,
 }
 
 /// The server refused the login (as opposed to a network problem).
@@ -141,6 +165,61 @@ pub fn parse_escape(v: Option<&str>) -> Option<u8> {
 }
 
 impl Target {
+    /// The name the host key is looked up and stored under (`HostKeyAlias`).
+    pub fn key_name(&self) -> &str {
+        self.host_key_alias.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Replaces ssh's tokens in commands: `%%`, `%C` (connection hash), `%d`
+    /// (home), `%h` (host), `%i` (uid), `%j` (ProxyJump), `%L`/`%l` (local
+    /// host name, short/full), `%n` (host as given), `%p` (port), `%r`
+    /// (remote user), `%u` (local user). Unknown tokens are an error, as in ssh.
+    pub fn expand_tokens(&self, text: &str) -> Result<String> {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('C') => out.push_str(&control::connection_hash(&self.host, self.port, &self.user)),
+                Some('d') => out.push_str(&home_dir().map(|h| h.display().to_string()).unwrap_or_default()),
+                Some('h') => out.push_str(&self.host),
+                Some('i') => out.push_str(&crate::platform::uid().to_string()),
+                Some('j') => out.push_str(self.proxy_jump.as_deref().unwrap_or("")),
+                Some('L') => out.push_str(crate::platform::hostname().split('.').next().unwrap_or("")),
+                Some('l') => out.push_str(&crate::platform::hostname()),
+                Some('n') => out.push_str(&self.alias),
+                Some('p') => out.push_str(&self.port.to_string()),
+                Some('r') => out.push_str(&self.user),
+                Some('u') => out.push_str(&local_user().unwrap_or_default()),
+                other => bail!("unknown token %{} in {text:?}", other.map(String::from).unwrap_or_default()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Variables a session sends: LANG, LC_* and COLORTERM (which qshd
+    /// accepts by default), what `SendEnv` adds or removes (`-PATTERN`),
+    /// then `SetEnv`.
+    pub fn session_env(&self) -> Vec<(String, String)> {
+        let mut patterns: Vec<String> = vec!["LANG".into(), "LC_*".into(), "COLORTERM".into()];
+        for p in &self.send_env {
+            match p.strip_prefix('-') {
+                Some(remove) => patterns.retain(|q| !crate::pattern::wildcard(remove, q)),
+                None => patterns.push(p.clone()),
+            }
+        }
+        let mut env: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| patterns.iter().any(|p| crate::pattern::wildcard(p, k)))
+            .filter(|(k, _)| !self.set_env.iter().any(|(s, _)| s == k))
+            .collect();
+        env.extend(self.set_env.iter().cloned());
+        env
+    }
+
     /// Parses a destination and applies the matching config entries.
     /// Precedence: `-p`/`user@`/`:port` on the command line, then `-o`, then
     /// `~/.config/qsh/config`, then `~/.ssh/config`. The latter's `Port` is
@@ -289,6 +368,19 @@ impl Target {
             predict: cfg.predictive_echo.as_deref().map(predict::parse_mode).unwrap_or_default(),
             compression: cfg.compression.unwrap_or(false),
             sources: sources.clone(),
+            alias: alias.to_string(),
+            proxy_command: cfg.proxy_command,
+            send_env: cfg.send_env,
+            set_env: cfg.set_env.iter().filter_map(|e| e.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            remote_command: cfg.remote_command,
+            session_type: cfg.session_type,
+            stdin_null: cfg.stdin_null.unwrap_or(false),
+            fork_after_authentication: cfg.fork_after_authentication.unwrap_or(false),
+            exit_on_forward_failure: cfg.exit_on_forward_failure.unwrap_or(false),
+            local_command: cfg.local_command.filter(|_| cfg.permit_local_command.unwrap_or(false)),
+            host_key_alias: cfg.host_key_alias,
+            connect_timeout: cfg.connect_timeout.filter(|&t| t > 0).map(std::time::Duration::from_secs),
+            connection_attempts: cfg.connection_attempts.unwrap_or(1).max(1),
             host,
             port,
         })
@@ -474,6 +566,19 @@ async fn open(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rustls:
 }
 
 async fn open_any(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rustls::ClientConfig>, rejected: &Rejection, via: Option<&Conn>) -> Result<Conn> {
+    if let (Some(command), None) = (&target.proxy_command, via) {
+        // TLS + yamux over the command's stdin and stdout (like `ssh -W` or nc).
+        let line = target.expand_tokens(command)?;
+        let stream = transport::ProxyCommand::spawn(&line)?;
+        let label = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), target.port);
+        let timeout = target.connect_timeout.unwrap_or(JUMP_HANDSHAKE_TIMEOUT);
+        let conn = tokio::time::timeout(timeout, transport::connect_stream(stream, tls[&target.port].clone(), label))
+            .await
+            .map_err(|_| anyhow::anyhow!("no TLS answer through ProxyCommand {line:?}"))?
+            .with_context(|| format!("no qshd through ProxyCommand {line:?}"))?;
+        tracing::info!("connected to {}:{} through ProxyCommand", target.host, target.port);
+        return Ok(conn);
+    }
     if let Some(via) = via {
         // Through a jump host: TLS + yamux over a stream forwarded to the qshd TCP port.
         // In --full mode the target port may be sshd's, so the other candidates are tried too.
@@ -513,7 +618,26 @@ async fn open_any(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rus
         cache.set(&hid, !refused && result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
         result?
     } else {
-        transport::connect(&target.host, target.port, opts.transport, target.family, &target.bind, tls[&target.port].clone()).await?
+        // ConnectionAttempts, one second apart, each within ConnectTimeout.
+        let mut attempt = 1;
+        loop {
+            let connect = transport::connect(&target.host, target.port, opts.transport, target.family, &target.bind, tls[&target.port].clone());
+            let result = match target.connect_timeout {
+                Some(t) => tokio::time::timeout(t, connect).await.unwrap_or_else(|_| {
+                    Err(transport::Unreachable(format!("{}:{}: connection timed out", target.host, target.port)).into())
+                }),
+                None => connect.await,
+            };
+            match result {
+                Ok(conn) => break conn,
+                Err(e) if attempt < target.connection_attempts && rejected.lock().unwrap().is_none() => {
+                    tracing::debug!("attempt {attempt}: {e:#}");
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     };
     tracing::info!("connected to {} over {}", conn.remote_addr(), conn.transport_name());
     Ok(conn)
@@ -556,7 +680,7 @@ fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, revoked: &[ssh_
         return CertVerdict::Invalid("its certificate authority is revoked".into());
     }
     if !cas.contains(cert.signature_key()) {
-        return CertVerdict::Unusable(format!("no @cert-authority for {} with the certificate's CA key", target.host));
+        return CertVerdict::Unusable(format!("no @cert-authority for {} with the certificate's CA key", target.key_name()));
     }
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
     if cert.cert_type() != CertType::Host || cert.public_key() != &own {
@@ -567,8 +691,8 @@ fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, revoked: &[ssh_
     if cert.validate_at(now, &fingerprints).is_err() {
         return CertVerdict::Invalid("its certificate has expired or its signature does not verify".into());
     }
-    if !cert.valid_principals().iter().any(|p| p.eq_ignore_ascii_case(&target.host)) {
-        return CertVerdict::Invalid(format!("its certificate is not valid for {} (principals {:?})", target.host, cert.valid_principals()));
+    if !cert.valid_principals().iter().any(|p| p.eq_ignore_ascii_case(target.key_name())) {
+        return CertVerdict::Invalid(format!("its certificate is not valid for {} (principals {:?})", target.key_name(), cert.valid_principals()));
     }
     CertVerdict::Valid(format!("certificate {:?} signed by {}", cert.key_id(), cert.signature_key().fingerprint(ssh_key::HashAlg::Sha256)))
 }
@@ -587,8 +711,8 @@ enum HostTrust {
 /// Revoked keys never pass.
 fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -> Result<HostTrust> {
     let (kh, kh_path) = known_hosts_for(target)?;
-    let hid = host_id(&target.host, port);
-    let names = if hid == target.host { vec![hid.clone()] } else { vec![hid.clone(), target.host.clone()] };
+    let hid = host_id(target.key_name(), port);
+    let names = if hid == target.key_name() { vec![hid.clone()] } else { vec![hid.clone(), target.key_name().to_string()] };
     let files = marker_files(target);
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
     let marked = |marker: &str| -> Result<Vec<_>> {
@@ -631,7 +755,7 @@ fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -
 /// whichever port answers first), which must not pass as a new host.
 fn other_ports(target: &Target, port: u16, key: PublicKey, kh: &KnownHosts) -> Result<HostTrust> {
     for other in target_ports(target).into_iter().filter(|&p| p != port) {
-        match kh.lookup(&host_id(&target.host, other))? {
+        match kh.lookup(&host_id(target.key_name(), other))? {
             Some(known) if known == key => return Ok(HostTrust::Trusted(format!("the key known for port {other}"))),
             Some(known) => {
                 return Ok(HostTrust::Refused(format!(
@@ -679,7 +803,7 @@ fn tls_configs(target: &Target, own: &Identity, throwaway: &Identity, rejected: 
     let (kh, _) = known_hosts_for(target)?;
     let (mut configs, mut hidden) = (HashMap::new(), Vec::new());
     for port in target_ports(target) {
-        let pinned = matches!(kh.lookup(&host_id(&target.host, port)), Ok(Some(_)));
+        let pinned = matches!(kh.lookup(&host_id(target.key_name(), port)), Ok(Some(_)));
         if !pinned {
             hidden.push(port);
         }
@@ -693,7 +817,7 @@ fn tls_configs(target: &Target, own: &Identity, throwaway: &Identity, rejected: 
 /// trusted CA, or known_hosts following the host key policy.
 async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) -> Result<()> {
     let port = conn.remote_addr().port();
-    let hid = host_id(&target.host, port);
+    let hid = host_id(target.key_name(), port);
     let key = conn.peer_key();
     match judge_host(target, port, key, conn.host_cert())? {
         HostTrust::Trusted(how) => {
@@ -730,8 +854,8 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
 fn refuse_proxy(target: &Target) -> Result<()> {
     if target.needs_proxy {
         bail!(
-            "the config for {} uses ProxyCommand or (in ssh's config) ProxyJump, which qsh cannot follow; \
-             use --full to connect with ssh instead, or set ProxyJump in ~/.config/qsh/config",
+            "ssh's config routes {} through ProxyCommand or ProxyJump, which lead to sshd; \
+             use --full to connect with ssh instead, or set ProxyJump or ProxyCommand in ~/.config/qsh/config",
             target.host
         );
     }
@@ -871,7 +995,7 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
 
     // The server proved knowledge of the code inside this TLS session, so its key is authentic.
     let (kh, _) = known_hosts_for(target)?;
-    let hid = host_id(&target.host, conn.remote_addr().port());
+    let hid = host_id(target.key_name(), conn.remote_addr().port());
     let key = conn.peer_key();
     match kh.lookup(&hid)? {
         Some(known) if known == key => {}

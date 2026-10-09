@@ -255,6 +255,18 @@ fn main() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         finish(rt.block_on(master_main(a)));
     }
+    // ForkAfterAuthentication in the config means -f.
+    #[cfg(unix)]
+    let master = std::env::var_os(MASTER_FD).is_some();
+    #[cfg(not(unix))]
+    let master = false;
+    if !a.background && !master && a.control_command.is_none() {
+        if let Some(dest) = &a.destination {
+            if Target::resolve(dest, a.port, &sources(&a)).is_ok_and(|t| t.fork_after_authentication) {
+                a.background = true;
+            }
+        }
+    }
     #[cfg(not(unix))]
     if a.background {
         finish(Err(anyhow!("-f (going to the background) is not supported on this system")));
@@ -544,7 +556,7 @@ fn print_config(t: &Target) {
     println!("batchmode {}", if t.batch_mode { "yes" } else { "no" });
 }
 
-async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
+async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let Some(dest) = a.destination.clone() else {
         // `ssh -Q kex` and the like.
         if a.full {
@@ -565,6 +577,20 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
     if let Some(cmd) = &a.control_command {
         return control_command(&target, cmd).await;
     }
+    // Session settings from the config, as if given on the command line.
+    if let Some(remote) = &target.remote_command {
+        if !a.command.is_empty() {
+            bail!("cannot execute both the command line and RemoteCommand");
+        }
+        a.command = vec![target.expand_tokens(remote)?];
+    }
+    match target.session_type.as_deref() {
+        None | Some("default") => {}
+        Some("none") => a.no_command = true,
+        Some("subsystem") => a.subsystem = true,
+        Some(other) => bail!("unknown SessionType {other:?} (none, subsystem, default)"),
+    }
+    a.stdin_null |= target.stdin_null;
     if a.background && !a.no_command && a.command.is_empty() && a.stdio_forward.is_none() {
         bail!("cannot go to the background (-f) without a command or -N");
     }
@@ -635,14 +661,14 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
         match forward::start_local(conn.clone(), f, a.gateway_ports).await {
             Ok(()) => {}
             // Like ssh: a forward from the config that cannot bind is only a warning.
-            Err(e) if !required => eprintln!("qsh: warning: LocalForward {spec}: {e:#}"),
+            Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: LocalForward {spec}: {e:#}"),
             Err(e) => return Err(e),
         }
     }
     for (spec, required) in dynamics {
         match forward::start_dynamic(conn.clone(), &spec, a.gateway_ports).await {
             Ok(()) => {}
-            Err(e) if !required => eprintln!("qsh: warning: DynamicForward {spec}: {e:#}"),
+            Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: DynamicForward {spec}: {e:#}"),
             Err(e) => return Err(e),
         }
     }
@@ -650,7 +676,10 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
     let uses_forwards = uses_forwards || agent.is_some();
-    let _remote = forward::start_remote(&conn, &remotes, agent, quiet).await?;
+    let _remote = forward::start_remote(&conn, &remotes, agent, quiet, target.exit_on_forward_failure).await?;
+    if let Some(command) = &target.local_command {
+        run_local_command(&target.expand_tokens(command)?);
+    }
     #[cfg(unix)]
     let master = start_master(&conn, &target, quiet);
     #[cfg(unix)]
@@ -719,6 +748,7 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
         SessionOptions {
             command,
             subsystem,
+            env: target.session_env(),
             pty,
             keystroke_interval: target.keystroke_interval,
             escape_char,
@@ -756,6 +786,21 @@ async fn session_main(a: SshArgs, args: &[String]) -> Result<i32> {
     }
     conn.close().await;
     Ok(code)
+}
+
+/// `LocalCommand` (with `PermitLocalCommand`): runs on this machine once
+/// connected, through the user's shell, as in ssh.
+fn run_local_command(line: &str) {
+    #[cfg(unix)]
+    let status = std::process::Command::new(std::env::var_os("SHELL").filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into()))
+        .arg("-c")
+        .arg(line)
+        .status();
+    #[cfg(not(unix))]
+    let status = std::process::Command::new("cmd").arg("/C").arg(line).status();
+    if let Err(e) = status {
+        eprintln!("qsh: LocalCommand {line:?}: {e}");
+    }
 }
 
 /// `ControlMaster`: offers this connection to later qsh runs.
