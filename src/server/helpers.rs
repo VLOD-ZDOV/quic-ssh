@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::keys::{create_private_dir, home_dir, parse_key_list, qsh_dir, PublicKey};
-pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV, SESSION_ENV};
+pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV, PRELUDE_ENV, SESSION_ENV};
 
 /// Copies `r` to `w` with plain reads and writes. Not `io::copy`: between a
 /// socket or file and a pipe it uses `splice()`, which keeps the pipe locked
@@ -182,8 +182,8 @@ pub fn tar(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// `qshd internal-become UID GID GROUPS HOME TTY ARG0 PRELUDE -- PROGRAM [ARGS...]`
-/// (see `User::launch`). As root: hands the terminal on stdin to the user
+/// `qshd internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]`
+/// (see `User::launch`), with the prelude in [`PRELUDE_ENV`]. As root: hands the terminal on stdin to the user
 /// if TTY is `tty` (group `tty`, mode 0620, like sshd), switches to the
 /// user's groups, group and user. Then changes to HOME (or `/`), does what
 /// PRELUDE asks for (see [`Prelude`]) and runs PROGRAM with ARG0 (if not
@@ -193,13 +193,15 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     use nix::sys::stat::{fchmod, Mode};
     use nix::unistd::{fchown, Gid, Group, Uid};
     use std::os::unix::process::CommandExt;
-    let [uid, gid, groups, home, tty, arg0, prelude, dashes, program, rest @ ..] = args else {
-        bail!("usage: internal-become UID GID GROUPS HOME TTY ARG0 PRELUDE -- PROGRAM [ARGS...]")
+    let [uid, gid, groups, home, tty, arg0, dashes, program, rest @ ..] = args else {
+        bail!("usage: internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]")
     };
     if dashes != "--" {
         bail!("bad arguments");
     }
-    let prelude = Prelude::decode(prelude).context("bad prelude")?;
+    let prelude = std::env::var(PRELUDE_ENV).unwrap_or_else(|_| "-".into());
+    std::env::remove_var(PRELUDE_ENV);
+    let prelude = Prelude::decode(&prelude).context("bad prelude")?;
     crate::platform::close_inherited_fds();
     let (uid, gid) = (Uid::from_raw(uid.parse()?), Gid::from_raw(gid.parse()?));
     // Without root, only for the user qshd runs as (sessions with a prelude).

@@ -228,11 +228,16 @@ pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
 /// must belong to the user.
 fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
     let real = fs::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
+    // A path named outside the home directory (`/etc/ssh/keys/%u`) is the
+    // administrator's: root may own its file, as with sshd.
+    let named_outside = !path.starts_with(top);
     let top = fs::canonicalize(top).unwrap_or_else(|_| top.to_path_buf());
-    // Outside the home directory only the user's own files count: root reads
-    // these, and a symlink must not make it read someone else's (such as
-    // root's authorized_keys) as the user's.
-    if uid != 0 && !real.starts_with(&top) && fs::metadata(&real)?.uid() != uid {
+    let named_outside = named_outside && !path.starts_with(&top);
+    // Reached from inside the home directory, outside it only the user's own
+    // files count: root reads these, and a symlink must not make it read
+    // someone else's (such as root's authorized_keys) as the user's.
+    let owner = fs::metadata(&real)?.uid();
+    if uid != 0 && !real.starts_with(&top) && owner != uid && !(named_outside && owner == 0) {
         bail!("{} leads outside the home directory to a file the user does not own", path.display());
     }
     for p in real.ancestors() {
@@ -389,6 +394,8 @@ mod tests {
         std::os::unix::fs::symlink("/etc", home.path().join(".ssh")).unwrap();
         let err = read_strict(&home.path().join(".ssh/passwd"), home.path(), me.max(1)).unwrap_err();
         assert!(format!("{err:#}").contains("does not own"), "{err:#}");
+        // Named outside the home directory, root's files count (`/etc/ssh/keys/%u`).
+        assert!(read_strict(Path::new("/etc/passwd"), home.path(), me.max(1)).is_ok());
     }
 
     #[cfg(unix)]

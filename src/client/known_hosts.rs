@@ -50,7 +50,8 @@ fn names_match(field: &str, id: &str) -> bool {
     let mut plain = Vec::new();
     for n in field.split(',') {
         match n.strip_prefix("|1|") {
-            Some(h) if hashed_matches(h, id) => return true,
+            // ssh hashes names in lower case; qsh before v1.0.1 as given.
+            Some(h) if hashed_matches(h, &id.to_ascii_lowercase()) || hashed_matches(h, id) => return true,
             Some(_) => {}
             None => plain.push(n),
         }
@@ -59,11 +60,11 @@ fn names_match(field: &str, id: &str) -> bool {
 }
 
 /// `host`, or `[host]:port` for a non-default port (same convention as
-/// OpenSSH), in lower case like ssh's names (hashed names must match exactly).
+/// OpenSSH). Names are matched ignoring case, and added in lower case like
+/// ssh's (hashed names must match exactly).
 pub fn host_id(host: &str, port: u16) -> String {
-    let host = host.to_ascii_lowercase();
     if port == crate::DEFAULT_PORT {
-        host
+        host.to_string()
     } else {
         format!("[{host}]:{port}")
     }
@@ -167,7 +168,8 @@ impl KnownHosts {
             create_private_dir(dir)?;
         }
         let mut f = OpenOptions::new().read(true).append(true).create(true).open(path)?;
-        let name = if self.hash { hash_name(id) } else { id.to_string() };
+        let id = id.to_ascii_lowercase();
+        let name = if self.hash { hash_name(&id) } else { id };
         let mut line = format!("{name} {}\n", key.to_openssh(""));
         if !ends_with_newline(&mut f)? {
             line.insert(0, '\n');
@@ -266,5 +268,10 @@ mod tests {
         assert!(!hashed_matches("jLzX8/hLVkOJ2dIUr06/FZ3KJrM=|PBvM/gMzzlJiXMqdTsQaWGCbOmU=", "example.org"));
         let h = hash_name("example.com");
         assert!(names_match(&h, "example.com") && !names_match(&h, "example.org"));
+        // Names are added in lower case, as by ssh; qsh before v1.0.1 hashed them as given.
+        kh.add("[Mixed.Example]:2222", a).unwrap();
+        assert_eq!(kh.lookup("[mixed.example]:2222").unwrap(), Some(a));
+        assert!(names_match(&hash_name("Old.Example"), "Old.Example"));
+        assert!(names_match(&h, "Example.COM"));
     }
 }

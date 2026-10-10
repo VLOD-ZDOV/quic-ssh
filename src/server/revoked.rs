@@ -177,9 +177,14 @@ fn parse_krl(data: &[u8]) -> Result<Revoked> {
     let _reserved = r.string()?;
     let _comment = r.string()?;
     let mut out = Revoked::default();
+    let mut signed = false;
     while !r.done() {
         let kind = r.u8()?;
         let mut s = Reader(r.string()?);
+        // Signatures come last (as in OpenSSH's krl.c).
+        if signed && kind != 4 {
+            bail!("KRL section {kind} after a signature");
+        }
         match kind {
             // Certificates.
             1 => {
@@ -245,8 +250,12 @@ fn parse_krl(data: &[u8]) -> Result<Revoked> {
                     out.sha1.insert(s.string()?.to_vec());
                 }
             }
-            // Signatures over the KRL: not needed to apply it.
-            4 => {}
+            // A signature over the KRL: the signing key (read above), then the
+            // signature itself as a string of its own. Not needed to apply it.
+            4 => {
+                r.string()?;
+                signed = true;
+            }
             5 => {
                 while !s.done() {
                     out.sha256.insert(s.string()?.to_vec());
@@ -317,6 +326,13 @@ mod tests {
             assert_eq!(serial(n), revoked, "serial {n}");
         }
         assert!(c.key_ids.contains("stolen laptop"));
+        // A signature: the signing key's section, then the signature as a string of its own.
+        let mut signed = krl.clone();
+        signed.extend(section(4, &blob(&key(8))));
+        signed.extend(string(b"signature"));
+        assert!(Revoked::parse(&signed).unwrap().revoked(&Offered::Key(key(1))));
+        signed.extend(section(2, &string(&blob(&key(4)))));
+        assert!(Revoked::parse(&signed).is_err(), "nothing but signatures after one");
         // Damaged files are refused (and then no key is accepted at all).
         assert!(Revoked::parse(&krl[..krl.len() - 3]).is_err());
         assert!(matches!(Revocation::load(Some(Path::new("/nonexistent/krl"))), Revocation::Broken));

@@ -378,6 +378,20 @@ fn ssh_authorized_keys_are_honored() {
 }
 
 #[test]
+fn qsh_authorized_keys_can_be_turned_off() {
+    let s = Server::start_with("127.0.0.1", "use_qsh_authorized_keys = false\n");
+    let c = Client::new();
+    assert!(c.run(&["keygen"]).status.success());
+    let pubkey = std::fs::read_to_string(c.home.path().join(".config/qsh/id_ed25519.pub")).unwrap();
+    let qsh_dir = s.home.path().join(".config/qsh");
+    std::fs::create_dir_all(&qsh_dir).unwrap();
+    std::fs::write(qsh_dir.join("authorized_keys"), &pubkey).unwrap();
+    let port = s.port.to_string();
+    let out = c.run(&["--accept-new-host", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "the qsh key file was read");
+}
+
+#[test]
 fn auto_falls_back_to_tcp() {
     let s = Server::start();
     let c = Client::paired(&s);

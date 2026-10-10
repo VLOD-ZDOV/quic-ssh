@@ -427,15 +427,24 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     };
     let left = || grace.saturating_sub(started.elapsed());
     if pairing {
+        // A paired key would go to a file this server does not read.
+        let user = user.filter(|_| cfg.use_qsh_authorized_keys);
         match user {
             // A pairing that does not add a key counts as a failed login,
             // for unknown users too (penalties must not tell them apart).
             Some(user) => {
-                if pair(conn, &state, &user, send, recv).await? {
-                    *outcome = Outcome::LoggedIn;
-                } else {
-                    *outcome = Outcome::AuthFailed;
-                }
+                *outcome = match tokio::time::timeout(left(), pair(conn, &state, &user, send, recv)).await {
+                    Ok(Ok(true)) => Outcome::LoggedIn,
+                    Ok(Ok(false)) => Outcome::AuthFailed,
+                    Ok(Err(e)) => {
+                        *outcome = Outcome::AuthFailed;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        *outcome = Outcome::GraceExceeded;
+                        bail!("pairing took too long");
+                    }
+                };
                 return Ok(());
             }
             // Same answer, after the same time, as for an existing user
@@ -981,21 +990,14 @@ async fn remote_forward(
 }
 
 /// A listening Unix socket at `path` that belongs to the user: bound by a
-/// helper running as them (system mode), which hands the socket over.
+/// helper running as them, which hands the socket over.
 async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<tokio::net::UnixListener> {
     use tokio::io::AsyncReadExt;
     let mask = format!("{:o}", cfg.bind_mask());
     let unlink = if cfg.stream_local_bind_unlink { "yes" } else { "no" };
-    if !user.switches() {
-        // The server is the user: bind here, then narrow the permissions.
-        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-        if cfg.stream_local_bind_unlink && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
-            let _ = std::fs::remove_file(path);
-        }
-        let l = tokio::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666 & !cfg.bind_mask()))?;
-        return Ok(l);
-    }
+    // Bound by a helper also when the server is the user: it sets the umask
+    // before binding (a process-wide setting), so the socket is never open
+    // to others for a moment.
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
     let mut child = user
         .confined_helper(&["internal-listen-unix", path, &mask, unlink])?

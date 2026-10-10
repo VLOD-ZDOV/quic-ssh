@@ -180,11 +180,13 @@ impl std::error::Error for LoginRefused {}
 /// characters or shell metacharacters. They reach ssh's argument list and
 /// `%h` in commands (ProxyCommand, Match exec...), and may come from
 /// elsewhere (a git submodule's URL): as ssh does since 9.6, such names are
-/// refused (compare CVE-2023-51385).
+/// refused (compare CVE-2023-51385). Nor can a name be a pattern list
+/// (`*?,!`): written to known_hosts as it is, `evil.example,github.com`
+/// would pin a key for another host.
 fn valid_host(host: &str) -> bool {
     !host.is_empty()
         && !host.starts_with('-')
-        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}".contains(c))
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}*?,!".contains(c))
 }
 
 /// `EscapeChar`: `none`, a single character, or `^X` for a control character.
@@ -1149,7 +1151,7 @@ mod tests {
 
     #[test]
     fn shell_metacharacters_in_host_names() {
-        for bad in ["a$(id)", "a;b", "a`id`", "a|b", "a&b", "a>b", "-oProxyCommand=x", "a b", "a'b", "{a,b}"] {
+        for bad in ["a$(id)", "a;b", "a`id`", "a|b", "a&b", "a>b", "-oProxyCommand=x", "a b", "a'b", "{a,b}", "evil.example,github.com", "*", "h?st", "!h"] {
             assert!(Target::parse_with(bad, None, None, false).is_err(), "{bad}");
         }
         for good in ["host.example.com", "192.0.2.1", "[2001:db8::1]:22", "fe80::1%eth0", "user@host_1"] {

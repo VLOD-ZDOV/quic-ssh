@@ -20,11 +20,14 @@ const MAX_QUERIES: u32 = 32;
 /// Smallest accepted RSA modulus.
 const MIN_RSA_BITS: usize = 2048;
 
-/// The user's authorized_keys entries (`~/.config/qsh/authorized_keys`, and
-/// `authorized_keys_file` if `use_ssh_authorized_keys`), read with
-/// StrictModes checks.
+/// The user's authorized_keys entries (`~/.config/qsh/authorized_keys` if
+/// `use_qsh_authorized_keys`, and `authorized_keys_file` if
+/// `use_ssh_authorized_keys`), read with StrictModes checks.
 pub fn authorized_entries(cfg: &ServerConfig, user: &User) -> Vec<AuthorizedKey> {
-    let mut files = vec![qsh_dir(&user.home).join("authorized_keys")];
+    let mut files = Vec::new();
+    if cfg.use_qsh_authorized_keys {
+        files.push(qsh_dir(&user.home).join("authorized_keys"));
+    }
     if cfg.use_ssh_authorized_keys {
         for f in cfg.authorized_keys_files(&user.name, user.uid, &user.home) {
             match f {
@@ -288,6 +291,8 @@ pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Optio
             return Ok(true);
         }
         warn!("{}: wrong password for {}", login.ip, login.user);
+        // Like a wrong one-time code: guessing takes time on every connection.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(false)
 }

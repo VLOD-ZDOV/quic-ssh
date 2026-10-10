@@ -813,9 +813,12 @@ fn lookup_pass(
     (canonical, final_pass): (bool, bool),
     (ours_seed, ssh_seed): (HostConfig, HostConfig),
 ) -> (HostConfig, HostConfig) {
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
+    // A file others could change is not read at all (as by ssh): its
+    // `Match exec` would run before the connection is refused.
+    let bad_file = [qsh_dir.join("config"), qsh_dir.join(UI_HOSTS), ssh_file.clone()].iter().find_map(|f| insecure_file(f));
+    let read = |p: &Path| if insecure_file(p).is_some() { String::new() } else { std::fs::read_to_string(p).unwrap_or_default() };
     // Relative Includes in the user's file are in ~/.ssh, even with -F (as in ssh).
     let ssh_dir = home.join(".ssh");
     // -o lines come first: before any `Host` they apply to every host and win.
@@ -830,8 +833,8 @@ fn lookup_pass(
     let mut ours = Parser::new(host, &qsh_dir, true, true);
     (ours.original, ours.canonical, ours.final_pass, ours.out) = (original.to_string(), canonical, final_pass, ours_seed);
     let mut ours = ours.run(&ours_text);
-    if ours.bad_file.is_none() {
-        ours.bad_file = [qsh_dir.join("config"), qsh_dir.join(UI_HOSTS), ssh_file.clone()].iter().find_map(|f| insecure_file(f));
+    if bad_file.is_some() {
+        ours.bad_file = bad_file;
     }
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
@@ -1202,6 +1205,15 @@ mod match_tests {
         assert!(c.bad_file.as_deref().is_some_and(|b| b.contains("extra")), "{c:?}");
         std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o620)).unwrap();
         assert!(lookup(home.path(), "x", &Sources::default()).bad_file.is_some());
+        // Such a file is not read at all: its `Match exec` does not run.
+        let marker = home.path().join("ran");
+        std::fs::write(dir.join("config"), format!("Match exec \"touch {}\"\n  User x\n", marker.display())).unwrap();
+        std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(lookup(home.path(), "x", &Sources::default()).bad_file.is_some());
+        assert!(!marker.exists(), "Match exec ran");
+        std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        lookup(home.path(), "x", &Sources::default());
+        assert!(marker.exists(), "the test's Match exec works");
     }
 
     /// `none` is a first value like any other: later ones do not count.

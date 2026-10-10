@@ -125,7 +125,7 @@ impl Prelude {
         *self == Prelude::default()
     }
 
-    /// One argument for `internal-become` (`-` for nothing).
+    /// The value of [`PRELUDE_ENV`] (`-` for nothing).
     fn encode(&self) -> String {
         if self.is_empty() {
             return "-".into();
@@ -285,7 +285,6 @@ impl User {
             self.home.clone().into_os_string(),
             if tty { "tty" } else { "-" }.into(),
             arg0.unwrap_or("").into(),
-            prelude.encode().into(),
             "--".into(),
         ];
         args.push(program.to_owned());
@@ -307,14 +306,17 @@ impl User {
     /// `internal-become`, only the base variables, with `env` handed over
     /// in [`SESSION_ENV`] and set after the switch to the user. As root,
     /// variables from the client (`accept_env`) must not reach the root
-    /// process: `LD_PRELOAD` and its like act at its exec.
-    fn launch_env(&self, wraps: bool, env: Vec<(String, String)>) -> Vec<(String, String)> {
+    /// process: `LD_PRELOAD` and its like act at its exec. The prelude goes
+    /// in [`PRELUDE_ENV`], not on the command line, which every local user
+    /// can read (`/proc/PID/cmdline`): it holds the X11 cookie.
+    fn launch_env(&self, wraps: bool, env: Vec<(String, String)>, prelude: &Prelude) -> Vec<(String, String)> {
         if !wraps {
             return env;
         }
         let pairs: Vec<String> = env.into_iter().filter(|(k, v)| !k.contains(['=', '\0']) && !v.contains('\0')).map(|(k, v)| format!("{k}={v}")).collect();
         let mut base = self.env();
         base.push((SESSION_ENV.into(), encode_args(&pairs)));
+        base.push((PRELUDE_ENV.into(), prelude.encode()));
         base
     }
 
@@ -324,7 +326,7 @@ impl User {
         let (exe, args) = self.launch(program.as_ref(), arg0, false, prelude);
         let wraps = self.wraps(program.as_ref(), prelude);
         let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(args).env_clear().envs(self.launch_env(wraps, env)).kill_on_drop(true);
+        cmd.args(args).env_clear().envs(self.launch_env(wraps, env, prelude)).kill_on_drop(true);
         if wraps {
             name_self(&mut cmd);
         } else {
@@ -340,7 +342,7 @@ impl User {
     pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>, prelude: &Prelude) -> pty_process::Command {
         let (exe, args) = self.launch(program.as_ref(), arg0, true, prelude);
         let wraps = self.wraps(program.as_ref(), prelude);
-        let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(self.launch_env(wraps, env)).kill_on_drop(true);
+        let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(self.launch_env(wraps, env, prelude)).kill_on_drop(true);
         if wraps {
             if let Ok(p) = exe_path() {
                 cmd = cmd.arg0(p);
@@ -438,6 +440,9 @@ pub const BECOME: &str = "internal-become";
 /// Environment variable with the variables `internal-become` sets once it
 /// switched to the user (`NAME=value` items, encoded like [`HELPER_ARGS`]).
 pub const SESSION_ENV: &str = "QSHD_SESSION_ENV";
+/// Environment variable with what `internal-become` does before the
+/// program (see [`Prelude`]).
+pub const PRELUDE_ENV: &str = "QSHD_PRELUDE";
 /// Subcommand that takes its arguments from [`HELPER_ARGS`].
 pub const HELPER_FROM_ENV: &str = "internal-env";
 /// Environment variable with a helper's arguments, hex-encoded and NUL-separated.
@@ -511,6 +516,20 @@ mod tests {
         assert_eq!(argv, ["internal-recv", "--", "-dir/a b", "$(x)", ""]);
         assert_eq!(decode_args(&encode_args(&argv)).unwrap(), argv);
         assert!(decode_args("zz").is_none() && decode_args("abc").is_none());
+    }
+
+    /// The prelude holds the X11 cookie: never on the command line, which
+    /// every local user can read.
+    #[test]
+    fn prelude_stays_off_the_command_line() {
+        let name = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
+        let Ok(user) = User::lookup(&name) else { return };
+        let prelude = Prelude { x11: Some(("unix:10.0".into(), "MIT-MAGIC-COOKIE-1".into(), "0f".repeat(16))), ..Default::default() };
+        let (_, args) = user.launch(std::ffi::OsStr::new("/bin/sh"), None, false, &prelude);
+        assert!(!args.is_empty() && !args.iter().any(|a| a.to_string_lossy().contains(&prelude.encode())), "{args:?}");
+        let env = user.launch_env(true, Vec::new(), &prelude);
+        let passed = env.iter().find(|(k, _)| k == PRELUDE_ENV).and_then(|(_, v)| Prelude::decode(v));
+        assert_eq!(passed, Some(prelude));
     }
 
     #[test]

@@ -28,9 +28,13 @@ pub struct ServerConfig {
     /// Also accept keys from `~/.ssh/authorized_keys` (the files in
     /// `authorized_keys_file`).
     pub use_ssh_authorized_keys: bool,
+    /// Accept keys from qsh's own `~/.config/qsh/authorized_keys` (where
+    /// `qsh pair` puts them). Off where keys are managed
+    /// centrally (`authorized_keys_file`, `authorized_keys_command`).
+    pub use_qsh_authorized_keys: bool,
     /// The OpenSSH key files read with `use_ssh_authorized_keys` (like
     /// AuthorizedKeysFile): relative to the home, `%h` home, `%u` user,
-    /// `%U` uid, `%%`. qsh's own `~/.config/qsh/authorized_keys` is always read.
+    /// `%U` uid, `%%`.
     #[serde(deserialize_with = "names")]
     pub authorized_keys_file: Vec<String>,
     /// Principals that certificates from `trusted_user_ca_keys` must name,
@@ -418,8 +422,9 @@ fn opt_names<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::
     names(d).map(Some)
 }
 
-/// `allow_users`/`deny_users`: like [`names`], but split at spaces only, as
-/// the address part of `user@address` may be a comma-separated list.
+/// `allow_users`/`deny_users`: like [`names`], but the address part of
+/// `user@address` may be a comma-separated list. Commas between users still
+/// separate them (`"alice,bob"`, `"alice,bob@192.0.2.0/24"`), as before v1.0.1.
 fn user_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -431,7 +436,19 @@ fn user_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error
         Raw::One(s) => vec![s],
         Raw::Many(v) => v,
     };
-    Ok(words.iter().flat_map(|w| w.split([' ', '\t'])).filter(|w| !w.is_empty()).map(str::to_string).collect())
+    let mut out = Vec::new();
+    for word in words.iter().flat_map(|w| w.split([' ', '\t'])) {
+        let (users, addresses) = match word.find('@') {
+            Some(at) => word.split_at(at),
+            None => (word, ""),
+        };
+        let mut users: Vec<&str> = users.split(',').collect();
+        let last = users.pop().unwrap_or_default();
+        out.extend(users.into_iter().map(str::to_string));
+        out.push(format!("{last}{addresses}"));
+    }
+    out.retain(|w| !w.is_empty());
+    Ok(out)
 }
 
 fn opt_user_entries<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
@@ -510,6 +527,7 @@ overrides! {
         refuse_connection: bool,
         set_env: BTreeMap<String, String>,
         totp: Totp,
+        use_qsh_authorized_keys: bool,
         use_ssh_authorized_keys: bool,
         x11_display_offset: u32,
         x11_forwarding: bool,
@@ -599,6 +617,7 @@ impl Default for ServerConfig {
             tcp: true,
             host_key: None,
             use_ssh_authorized_keys: true,
+            use_qsh_authorized_keys: true,
             authorized_keys_file: vec![".ssh/authorized_keys".into()],
             authorized_principals_file: None,
             allow_tcp_forwarding: Forwarding::All,
@@ -907,6 +926,14 @@ mod tests {
         assert!(cfg.login_refused(&who("dave", none, "192.0.2.1")).is_none());
         assert!(cfg.login_refused(&who("dave", none, "198.51.100.7")).is_none());
         assert!(cfg.login_refused(&who("dave", none, "192.0.2.9")).is_some(), "negated");
+        // Commas between users separate them, as before v1.0.1.
+        let cfg = parse("deny_users = \"alice,bob, carol,erin@192.0.2.0/24,!192.0.2.9\"\n");
+        for user in ["alice", "bob", "carol"] {
+            assert!(cfg.login_refused(&who(user, none, "203.0.113.1")).is_some(), "{user}");
+        }
+        assert!(cfg.login_refused(&who("erin", none, "192.0.2.1")).is_some());
+        assert!(cfg.login_refused(&who("erin", none, "192.0.2.9")).is_none(), "the address list stays one");
+        assert!(cfg.login_refused(&who("dave", none, "192.0.2.1")).is_none());
         // A broken range is an error, not an entry that never matches.
         let text = "deny_users = \"bob@192.0.2.0/99\"\n";
         let parsed: ServerConfig = toml::from_str(text).unwrap();

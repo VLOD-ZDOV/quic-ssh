@@ -251,8 +251,20 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     let tmp = path.with_extension(format!("{:08x}", rand::random::<u32>()));
     // Two qsh replacing the same stale socket at once must take turns.
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-    // Not through a symlink someone put there (in a shared ControlPath directory).
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&lock_path)?;
+    // Not through a symlink, a FIFO or someone else's file put there (in a
+    // shared ControlPath directory), which would leave us waiting.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .with_context(|| format!("cannot open {}", lock_path.display()))?;
+    let meta = lock.metadata()?;
+    if !meta.is_file() || meta.uid() != nix::unistd::geteuid().as_raw() {
+        bail!("{} is not a file of ours", lock_path.display());
+    }
     lock.lock()?;
     let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
     let result = (|| {
