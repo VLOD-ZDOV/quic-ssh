@@ -48,7 +48,7 @@ irm https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.ps1 |
 
 It installs `qsh.exe` to `%LOCALAPPDATA%\Programs\qsh` and adds that folder to your `PATH`.
 
-To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. `qsh update v1.0.2` installs a given release. The script is taken from the latest release, not from the main branch.
+To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. The restart closes the qsh sessions open on that server, so it asks first when run in a terminal; tmux, screen and `nohup` jobs keep running with the unit files from `contrib/` (`KillMode=process`, as for sshd). `qsh update v1.0.2` installs a given release. The script is taken from the latest release, not from the main branch.
 
 ### Prebuilt binaries
 

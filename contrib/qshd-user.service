@@ -12,6 +12,9 @@ ExecStart=/usr/local/bin/qshd serve
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+# Like sshd: a restart closes qsh sessions, but tmux, screen and nohup jobs
+# started from them keep running.
+KillMode=process
 
 [Install]
 WantedBy=default.target

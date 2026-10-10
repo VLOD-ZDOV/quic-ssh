@@ -252,24 +252,41 @@ service_android() {
 
 # On an update, restart a running service so it uses the new qshd.
 restart_running() {
+    running=
     case $plat in
         linux)
             if [ -d /run/systemd/system ]; then
                 if systemctl is-active --quiet qshd 2>/dev/null; then
-                    as_root systemctl restart qshd && say "Restarted the qshd service"
+                    running=system
                 elif systemctl --user is-active --quiet qshd 2>/dev/null; then
-                    systemctl --user restart qshd && say "Restarted the qshd user service"
+                    running=user
                 fi
             fi ;;
         macos)
             if [ "$root" != none ] && $root launchctl print system/qshd >/dev/null 2>&1; then
-                as_root launchctl kickstart -k system/qshd && say "Restarted the qshd service"
+                running=launchd
             fi ;;
         android)
             if command -v sv >/dev/null 2>&1 && sv status qshd 2>/dev/null | grep -q '^run'; then
-                sv restart qshd >/dev/null && say "Restarted the qshd service"
+                running=runit
             fi ;;
     esac
+    [ -n "$running" ] || return 0
+    say "Restarting qshd closes the qsh sessions open on this machine."
+    if has_tty; then
+        ask "Restart the qshd service now? [Y/n]: "
+        case $REPLY in
+            "" | [Yy]*) ;;
+            *) say "Restart it later to use the new qshd."; return 0 ;;
+        esac
+    fi
+    case $running in
+        system) as_root systemctl restart qshd ;;
+        user) systemctl --user restart qshd ;;
+        launchd) as_root launchctl kickstart -k system/qshd ;;
+        runit) sv restart qshd >/dev/null ;;
+    esac
+    say "Restarted the qshd service"
 }
 
 if [ "$what" = server ]; then
