@@ -187,7 +187,7 @@ qsh входит теми же ключами, что и ssh, в таком по
 
 Аппаратные ключи (`sk-ssh-ed25519`, `sk-ecdsa`) работают через ssh-agent (`ssh-add ~/.ssh/id_ed25519_sk`). Зашифрованный ключ спросит пароль. `SSH_ASKPASS` и `SSH_ASKPASS_REQUIRE` работают как в OpenSSH.
 
-`-A` (или `ForwardAgent yes`) делает твой агент доступным на сервере через `SSH_AUTH_SOCK`. Сокет лежит в закрытом каталоге, который принадлежит тебе.
+`-A` (или `ForwardAgent yes`) делает твой агент доступным на сервере через `SSH_AUTH_SOCK`. Сокет лежит в закрытом каталоге, который принадлежит тебе. Как и с ssh, root на сервере может пользоваться ключами агента, пока идёт сессия, поэтому пробрасывай его только на хосты, которым доверяешь (или используй `ProxyJump`). qsh не может привязать проброшенный агент к хостам (`session-bind` в OpenSSH требует SSH-сессии), поэтому ключи, добавленные через `ssh-add -h`, через него не работают: ssh-agent отказывает им в непривязанном соединении.
 
 ### Сессии, переживающие обрыв
 
@@ -364,6 +364,7 @@ upload        70.1 Mbit/s  (41.8 MiB in 5.0 s)
 listen = "[::]:4422"            # UDP и TCP; если IPv6 выключен, используется 0.0.0.0
 # host_key = "/etc/qsh/host_ed25519"
 use_ssh_authorized_keys = true  # принимать и ~/.ssh/authorized_keys
+use_qsh_authorized_keys = true  # ~/.config/qsh/authorized_keys (false: только файлы ниже)
 allow_tcp_forwarding = true     # или "no", "local" (только -L/-D/-W), "remote" (только -R)
 max_connections = 256
 max_startups = 64               # одновременно неаутентифицированных подключений (как MaxStartups у sshd)
@@ -443,7 +444,7 @@ per_source_penalties = true     # отбрасывать адреса, с кот
 
 Пользователи, которых не пускают `deny_users`/`allow_users`/`deny_groups`/`allow_groups` или `permit_root_login = "no"`, обрабатываются как несуществующие: они получают тот же ответ «access denied», так что по нему не узнать, какие аккаунты есть.
 
-Ключи пользователя хранятся в `~/.config/qsh/authorized_keys` и (если включено) в `~/.ssh/authorized_keys`. Подходят все типы ключей, кроме DSA и RSA короче 2048 бит. Соблюдаются такие опции:
+Ключи пользователя хранятся в `~/.config/qsh/authorized_keys` (если не задано `use_qsh_authorized_keys = false`) и (если включено) в `~/.ssh/authorized_keys`. Подходят все типы ключей, кроме DSA и RSA короче 2048 бит. Соблюдаются такие опции:
 
 - `command=` (исходная команда попадает в `SSH_ORIGINAL_COMMAND`; передача файлов запрещается);
 - `from=` (адреса и CIDR);

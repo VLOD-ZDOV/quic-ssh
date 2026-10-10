@@ -187,7 +187,7 @@ qsh logs in with the same keys as ssh, in this order:
 
 Security keys (`sk-ssh-ed25519`, `sk-ecdsa`) work through ssh-agent (`ssh-add ~/.ssh/id_ed25519_sk`). Encrypted keys prompt for their passphrase. `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE` work as in OpenSSH.
 
-`-A` (or `ForwardAgent yes`) makes your agent available on the server through `SSH_AUTH_SOCK`. The socket sits in a private directory owned by you.
+`-A` (or `ForwardAgent yes`) makes your agent available on the server through `SSH_AUTH_SOCK`. The socket sits in a private directory owned by you. As with ssh, root on the server can use the keys in your agent while the session lasts, so forward it only to hosts you trust (or use `ProxyJump`). qsh cannot bind the forwarded agent to hosts (OpenSSH's `session-bind` needs an SSH session), so keys added with `ssh-add -h` cannot be used through it: ssh-agent refuses them on an unbound connection.
 
 ### Sessions that survive disconnects
 
@@ -364,6 +364,7 @@ The config file is optional. Defaults:
 listen = "[::]:4422"            # UDP and TCP; falls back to 0.0.0.0 if IPv6 is disabled
 # host_key = "/etc/qsh/host_ed25519"
 use_ssh_authorized_keys = true  # also accept ~/.ssh/authorized_keys
+use_qsh_authorized_keys = true  # ~/.config/qsh/authorized_keys (false: only the files below)
 allow_tcp_forwarding = true     # or "no", "local" (-L/-D/-W only), "remote" (-R only)
 max_connections = 256
 max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
@@ -443,7 +444,7 @@ Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than
 
 Users that `deny_users`/`allow_users`/`deny_groups`/`allow_groups` or `permit_root_login = "no"` keep out are treated like unknown users: they get the same "access denied", so the answer does not tell which accounts exist.
 
-User keys live in `~/.config/qsh/authorized_keys` and, if enabled, `~/.ssh/authorized_keys`. All key types work, except DSA and RSA below 2048 bits. These options are enforced:
+User keys live in `~/.config/qsh/authorized_keys` (unless `use_qsh_authorized_keys = false`) and, if enabled, `~/.ssh/authorized_keys`. All key types work, except DSA and RSA below 2048 bits. These options are enforced:
 
 - `command=` (the original command goes to `SSH_ORIGINAL_COMMAND`; file transfer is refused);
 - `from=` (addresses and CIDR);
