@@ -1221,6 +1221,8 @@ fn enter() -> std::io::Result<DefaultTerminal> {
 fn leave() {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+    // ratatui hides the cursor while drawing; a session started from the menu needs it back.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
 }
 
 fn wait_for_enter() {
