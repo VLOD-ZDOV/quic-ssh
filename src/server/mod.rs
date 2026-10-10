@@ -56,6 +56,8 @@ struct State {
     penalties: penalty::Penalties,
     totp_used: auth::UsedCodes,
     sessions: Arc<persist::Sessions>,
+    /// The port qshd listens on (UDP and TCP share it).
+    port: u16,
 }
 
 impl State {
@@ -282,6 +284,7 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
         penalties,
         totp_used: Default::default(),
         sessions,
+        port: listener.local_addr()?.port(),
     });
     #[cfg(unix)]
     if let Some(reload) = reload {
@@ -621,6 +624,18 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     Ok(())
 }
 
+/// `SSH_CLIENT` and `SSH_CONNECTION` as sshd sets them: programs (shell
+/// prompts among them) use these to tell a remote login.
+fn ssh_connection(conn: &Conn, cfg: &ServerConfig, server_port: u16) -> [(String, String); 2] {
+    let remote = conn.remote_addr();
+    let (ip, port) = (remote.ip().to_canonical(), remote.port());
+    let local = conn.local_ip().map(|l| l.to_canonical()).unwrap_or(cfg.listen.ip());
+    [
+        ("SSH_CLIENT".into(), format!("{ip} {port} {server_port}")),
+        ("SSH_CONNECTION".into(), format!("{ip} {port} {local} {server_port}")),
+    ]
+}
+
 /// What a stream of a logged-in connection works with.
 struct StreamCtx<'a> {
     conn: &'a Arc<Conn>,
@@ -711,6 +726,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                     (Some(_), Some(original)) => Some(("SSH_ORIGINAL_COMMAND".into(), original)),
                     _ => None,
                 })
+                .chain(ssh_connection(conn, cfg, state.port))
                 .chain(agent.path().map(|p| ("SSH_AUTH_SOCK".to_string(), p.to_string_lossy().into_owned())))
                 .chain(display.as_ref().map(|d| ("DISPLAY".to_string(), d.display.clone())))
                 .collect(),

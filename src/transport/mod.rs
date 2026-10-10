@@ -52,6 +52,8 @@ pub struct Conn {
     peer_key: PublicKey,
     exporter: [u8; 32],
     remote: SocketAddr,
+    /// The address the peer reached us at (server side), if known.
+    local_ip: Option<std::net::IpAddr>,
     /// Jump-host connections this one is tunnelled through (kept alive with it).
     hops: Vec<Arc<Conn>>,
     /// The peer's protocol version once logged in (3 for servers that do not say).
@@ -93,6 +95,11 @@ impl Conn {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    /// Our address that the peer connected to (server side), if known.
+    pub fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.local_ip
     }
 
     /// The server's host certificate in SSH wire format, unverified.

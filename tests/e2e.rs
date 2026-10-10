@@ -202,6 +202,29 @@ fn exec_over_both_transports() {
     }
 }
 
+/// SSH_CLIENT, SSH_CONNECTION and, with a terminal, SSH_TTY, as sshd sets them
+/// (shell prompts use them to show a remote login).
+#[test]
+fn ssh_connection_variables() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    for t in ["quic", "tcp"] {
+        let out = exec(&c, &s, t, "echo \"$SSH_CLIENT|$SSH_CONNECTION|${SSH_TTY-unset}\"");
+        let line = stdout(&out);
+        let parts: Vec<&str> = line.trim().split('|').collect();
+        assert_eq!(parts.len(), 3, "{t}: {line} {}", stderr(&out));
+        let client: Vec<&str> = parts[0].split(' ').collect();
+        assert!(client.len() == 3 && client[0] == "127.0.0.1" && client[2] == port, "{t}: {line}");
+        assert_eq!(parts[1], format!("127.0.0.1 {} 127.0.0.1 {port}", client[1]), "{t}");
+        assert_eq!(parts[2], "unset", "{t}: SSH_TTY without a terminal");
+        let out = c.run(&["-tt", "--transport", t, "-p", &port, &dest(), "sh", "-c", "'echo \"$SSH_TTY\"; tty'"]);
+        let text = stdout(&out);
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        assert!(lines.len() == 2 && lines[0].starts_with("/dev/") && lines[0] == lines[1], "{t}: {lines:?}");
+    }
+}
+
 #[test]
 fn stdin_is_forwarded() {
     let s = Server::start();

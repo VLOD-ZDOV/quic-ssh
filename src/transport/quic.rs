@@ -58,7 +58,8 @@ fn finish(endpoint: Option<Endpoint>, conn: quinn::Connection) -> Result<Conn> {
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|_| anyhow::anyhow!("TLS exporter failed"))?;
     let remote = conn.remote_address();
-    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, hops: Vec::new(), server_version: 3, host_cert })
+    let local_ip = conn.local_ip();
+    Ok(Conn { inner: Inner::Quic(QuicConn { endpoint, conn }), peer_key, exporter, remote, local_ip, hops: Vec::new(), server_version: 3, host_cert })
 }
 
 /// `local`: the address to send from (`-b`/`-B`); any if `None`.

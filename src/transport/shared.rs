@@ -144,6 +144,7 @@ async fn try_attach(path: &Path) -> Result<Conn> {
         peer_key: PublicKey(peer_key),
         exporter: [0; 32],
         remote,
+        local_ip: None,
         hops: Vec::new(),
         server_version,
         host_cert: None,

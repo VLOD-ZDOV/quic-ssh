@@ -113,7 +113,7 @@ fn tls_info<D>(c: &rustls::ConnectionCommon<D>) -> Result<TlsInfo> {
     Ok((peer_key, host_cert, exporter))
 }
 
-fn finish<T>(socket: T, mode: Mode, info: TlsInfo, remote: SocketAddr) -> Conn
+fn finish<T>(socket: T, mode: Mode, info: TlsInfo, remote: SocketAddr, local_ip: Option<std::net::IpAddr>) -> Conn
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -126,6 +126,7 @@ where
         peer_key,
         exporter,
         remote,
+        local_ip,
         hops: Vec::new(),
         server_version: 3,
         host_cert,
@@ -171,7 +172,7 @@ pub async fn connect(tls: Arc<rustls::ClientConfig>, addr: SocketAddr, local: Op
     let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
     let stream = tokio_rustls::TlsConnector::from(tls).connect(name, sock).await?;
     let info = tls_info(stream.get_ref().1)?;
-    Ok(finish(stream, Mode::Client, info, addr))
+    Ok(finish(stream, Mode::Client, info, addr, None))
 }
 
 /// TLS + yamux over an already open byte stream (e.g. a stream forwarded
@@ -183,15 +184,16 @@ where
     let name = ServerName::try_from(crate::tls::SERVER_NAME)?;
     let stream = tokio_rustls::TlsConnector::from(tls).connect(name, stream).await?;
     let info = tls_info(stream.get_ref().1)?;
-    Ok(finish(stream, Mode::Client, info, remote))
+    Ok(finish(stream, Mode::Client, info, remote, None))
 }
 
 pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: SocketAddr, alive: Option<super::Alive>) -> Result<Conn> {
     sock.set_nodelay(true)?;
     keep_alive(&sock, alive);
+    let local_ip = sock.local_addr().ok().map(|a| a.ip());
     let stream = tokio_rustls::TlsAcceptor::from(tls).accept(sock).await?;
     let info = tls_info(stream.get_ref().1)?;
-    Ok(finish(stream, Mode::Server, info, addr))
+    Ok(finish(stream, Mode::Server, info, addr, local_ip))
 }
 
 impl TcpConn {

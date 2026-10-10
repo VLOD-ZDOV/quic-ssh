@@ -149,6 +149,8 @@ pub(super) fn spawn_pty(
     pty.resize(pty_process::Size::new(spec.rows, spec.cols))?;
     let tty = nix::unistd::ttyname(&pts).ok().map(|p| p.to_string_lossy().into_owned());
     let arg0 = command.is_none().then(|| user.login_arg0());
+    let mut env = env;
+    env.extend(tty.clone().map(|t| ("SSH_TTY".to_string(), t)));
     let mut cmd = user.pty_command(&user.shell, arg0.as_deref(), env, prelude);
     if let Some(c) = command {
         cmd = cmd.arg("-c").arg(c);
