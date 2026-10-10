@@ -121,6 +121,9 @@ jobs:
     needs: [build, android, macos, windows]
     runs-on: ubuntu-latest
     steps:
+      # install.sh and install.ps1 ship with each release, so `qsh update` and the
+      # README's curl line run the released script, not whatever is on main.
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -129,16 +132,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS
           cat > notes.md <<NOTES
           Static Linux binaries (musl) for x86_64 and aarch64, macOS (Apple Silicon and Intel), Windows (the qsh client), and a native Android build for Termux (qsh-aarch64-android).
 
           \`\`\`sh
-          ARCH=\$(uname -m)   # x86_64 or aarch64
-          curl -fsSL https://github.com/${{ github.repository }}/releases/download/$TAG/qsh-\$ARCH-linux.tar.gz | tar xz
-          sudo install -m755 qsh-\$ARCH-linux/qsh qsh-\$ARCH-linux/qshd /usr/local/bin/
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
           \`\`\`
+
+          Already installed: \`qsh update\`.
 
           See the README for setup.
           NOTES
-          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz *.zip SHA256SUMS
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz *.zip install.sh install.ps1 SHA256SUMS

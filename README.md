@@ -30,9 +30,29 @@ Features:
 
 ## Installation
 
+### Install script
+
+Linux, macOS and Termux:
+
+```sh
+curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.sh | sh
+```
+
+It asks whether to install only the client (`qsh`) or the client and the server (`qsh` + `qshd`), and, for the server, whether to run qshd as a service that starts at boot (systemd, launchd, or termux-services). It puts the programs in `/usr/local/bin` (asking for sudo), or in `~/.local/bin` when there is no sudo, and checks the download against `SHA256SUMS`. A service file that is already there is kept as it is. To skip the questions: `... | sh -s -- --server --service` (or `--client`, `--no-service`).
+
+Windows (client only), in PowerShell:
+
+```powershell
+irm https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.ps1 | iex
+```
+
+It installs `qsh.exe` to `%LOCALAPPDATA%\Programs\qsh` and adds that folder to your `PATH`.
+
+To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. `qsh update v1.0.2` installs a given release. The script is taken from the latest release, not from the main branch.
+
 ### Prebuilt binaries
 
-Static Linux builds for x86_64 and aarch64 are on the [Releases](https://github.com/VLOD-ZDOV/quic-ssh/releases) page:
+To install by hand instead: static Linux builds for x86_64 and aarch64 are on the [Releases](https://github.com/VLOD-ZDOV/quic-ssh/releases) page:
 
 ```sh
 ARCH=$(uname -m)   # x86_64 or aarch64
@@ -122,6 +142,8 @@ Pairing is optional: if your key is already in `~/.ssh/authorized_keys` on the s
 
 ### Running as a service
 
+The install script sets this up when you answer yes. By hand:
+
 ```sh
 # system mode
 sudo cp contrib/qshd.service /etc/systemd/system/
@@ -167,6 +189,7 @@ qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
 qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
+qsh update                             # install the latest release (qshd too, if it is next to qsh)
 ```
 
 Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`, `-b` and `-B` (the local address or interface connections leave from). Other ssh flags are accepted and ignored (`-v` lists them). `-C` on a session is ignored too; for compressed copies use `qsh cp -C`.
@@ -546,6 +569,8 @@ This is still a young project and has not had an external audit. For critical sy
 - qshd runs on Linux, macOS and other Unix systems; on Windows there is only the client.
 
 ### Upgrading
+
+`qsh update` installs the latest release. Update qshd first when the notes say so.
 
 What v1.0 added on the protocol (banner, passwords, Unix sockets, X11, tunnels) needs qshd 1.0 on the server; with an older qshd, qsh reports that the feature is not supported and the rest works. qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
 

@@ -27,7 +27,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 7] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor"];
+const TOOLS: [&str; 8] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -136,6 +136,11 @@ enum Cmd {
         /// The command (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Update qsh, and qshd next to it, to the latest release; restarts a running qshd service
+    Update {
+        /// Release tag instead of the latest, for example v1.0.2
+        version: Option<String>,
     },
 }
 
@@ -570,7 +575,41 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             let dests = multi::destinations(&all, &groups, &hosts)?;
             multi::run(&dests, &command, parallel, &cli.conn.as_args()).await
         }
+        Cmd::Update { version } => update(version.as_deref()),
     }
+}
+
+const INSTALLER: &str = "https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install";
+
+/// Runs the release's installer in update mode on the directory this qsh is in.
+/// The installer of the latest release also installs older tags.
+fn update(version: Option<&str>) -> Result<i32> {
+    if let Some(v) = version {
+        if !v.starts_with('v') || !v[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            bail!("not a release tag: {v} (for example v1.0.2)");
+        }
+    }
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).context("cannot find this qsh")?;
+    let dir = exe.parent().context("cannot find this qsh")?;
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-Command", &format!("irm {INSTALLER}.ps1 | iex")]);
+        c
+    } else {
+        // Without the script (no network), sh must fail instead of running nothing.
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &format!(
+            "if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL {INSTALLER}.sh); else s=$(wget -qO- {INSTALLER}.sh); fi || exit 1; sh -c \"$s\" install.sh --update"
+        )]);
+        c
+    };
+    cmd.env("QSH_BIN_DIR", dir);
+    match version {
+        Some(v) => cmd.env("QSH_VERSION", v),
+        None => cmd.env_remove("QSH_VERSION"),
+    };
+    let status = cmd.status().context("cannot run the installer")?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// `-G`: prints the resolved settings, like ssh. Tools (e.g. git) also use it
@@ -1130,6 +1169,7 @@ mod tests {
         assert!(tool("-v keygen"));
         assert!(tool("--full cp a host:b"));
         assert!(tool("-oPort=1 speed h"));
+        assert!(tool("update"));
         assert!(!tool("-f host"));
         assert!(!tool("host cp a b"));
         assert!(!tool("-p 22 host"));

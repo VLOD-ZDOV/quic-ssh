@@ -1,0 +1,61 @@
+name: Installer
+
+# install.sh and install.ps1 against the latest release, as users run them.
+on:
+  push:
+    branches: [main]
+    paths: [install.sh, install.ps1, .github/workflows/installer.yml]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck install.sh
+      - name: Client into a user directory (dash, no terminal)
+        run: |
+          QSH_BIN_DIR=$HOME/qbin sh install.sh </dev/null
+          test -x ~/qbin/qsh && test ! -e ~/qbin/qshd
+      - name: Server with a system service
+        run: |
+          sudo sh install.sh --server --service
+          sleep 2
+          systemctl is-active qshd
+          /usr/local/bin/qsh --version
+      - name: Update keeps the service running
+        run: |
+          sh install.sh --update | tee out
+          grep -q "up to date" out
+          QSH_VERSION=v1.0.1 sh install.sh --update
+          systemctl is-active qshd
+          /usr/local/bin/qshd --version | grep 1.0.1
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Server with a launchd service
+        run: |
+          sudo sh install.sh --server --service
+          sleep 2
+          sudo launchctl print system/qshd | grep -q "state = running"
+          sh install.sh --update | grep "up to date"
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Windows PowerShell
+        shell: powershell
+        run: |
+          .\install.ps1
+          & "$env:LOCALAPPDATA\Programs\qsh\qsh.exe" --version
+          if (-not ((.\install.ps1 6>&1 | Out-String) -match 'up to date')) { exit 1 }
+      - name: PowerShell 7 through iex, pinned version
+        shell: pwsh
+        run: |
+          $env:QSH_VERSION = 'v1.0.1'
+          Get-Content install.ps1 -Raw | Invoke-Expression
+          if (-not ((& "$env:LOCALAPPDATA\Programs\qsh\qsh.exe" --version 2>&1) -match '1\.0\.1')) { exit 1 }
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\qsh\qsh.exe.old")) { exit 1 }

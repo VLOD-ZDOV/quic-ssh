@@ -1,6 +1,6 @@
 [package]
 name = "qsh"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Secure shell over QUIC with automatic TCP fallback"
 license = "GPL-3.0-only"
