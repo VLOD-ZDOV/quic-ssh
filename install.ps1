@@ -15,12 +15,25 @@
         $tag = $env:QSH_VERSION
         $url = "https://github.com/$repo/releases/download/$tag"
     } else {
-        $tag = try { (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name } catch { $null }
+        # releases/latest redirects to .../tag/<latest tag>.
+        $tag = try {
+            $req = [Net.WebRequest]::Create("https://github.com/$repo/releases/latest")
+            $req.Method = 'HEAD'
+            $resp = $req.GetResponse()
+            $resp.ResponseUri.Segments[-1]
+            $resp.Close()
+        } catch { $null }
         $url = "https://github.com/$repo/releases/latest/download"
     }
     if ($tag -and (Test-Path $exe)) {
-        # qsh prints its version on stderr, like ssh -V.
-        $out = & { $ErrorActionPreference = 'Continue'; & $exe --version 2>&1 } | Out-String
+        # qsh prints its version on stderr, like ssh -V, which Windows PowerShell turns into errors.
+        $psi = New-Object Diagnostics.ProcessStartInfo $exe, '--version'
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $p = [Diagnostics.Process]::Start($psi)
+        $out = $p.StandardError.ReadToEnd() + $p.StandardOutput.ReadToEnd()
+        $p.WaitForExit()
         $have = if ($out -match 'qsh (\d[\w.-]*)') { $Matches[1] } else { $null }
         if ($have -and "v$have" -eq $tag) {
             Write-Host "qsh $have is up to date"
