@@ -175,12 +175,32 @@ impl PtyInput {
     }
 
     pub(super) async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+        let mut pause = Duration::from_millis(1);
         while !data.is_empty() {
-            let mut ready = self.0.writable().await?;
+            // The kernel may wake writers before the room is there, and then
+            // not again: so try again after a while even without a wakeup.
+            let mut ready = match tokio::time::timeout(pause, self.0.writable()).await {
+                Ok(ready) => ready?,
+                Err(_) => {
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                    match nix::unistd::write(self.0.get_ref(), data) {
+                        Ok(n) => {
+                            data = &data[n..];
+                            pause = Duration::from_millis(1);
+                        }
+                        Err(nix::errno::Errno::EAGAIN) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    continue;
+                }
+            };
             // Read before trying: a failed try clears it.
             let hung_up = ready.ready().is_write_closed();
             match ready.try_io(|fd| nix::unistd::write(fd.get_ref(), data).map_err(std::io::Error::from)) {
-                Ok(Ok(n)) => data = &data[n..],
+                Ok(Ok(n)) => {
+                    data = &data[n..];
+                    pause = Duration::from_millis(1);
+                }
                 Ok(Err(e)) => return Err(e),
                 // Nobody has the terminal open any more: the input has no reader.
                 Err(_) if hung_up => return Err(std::io::ErrorKind::BrokenPipe.into()),
