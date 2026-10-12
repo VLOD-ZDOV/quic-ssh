@@ -21,6 +21,8 @@ fn spawn(user: &User, args: &[&str], stdin: bool) -> Result<Child> {
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // A helper can wait forever (a FIFO nobody writes): it goes with the transfer.
+        .kill_on_drop(true)
         .spawn()?)
 }
 

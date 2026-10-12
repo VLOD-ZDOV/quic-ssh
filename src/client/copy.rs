@@ -113,13 +113,42 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -
     let (send, mut recv, compressed) = open(conn, req, compressed).await?;
     expect_ok(&mut recv).await?;
     let mut send = if compressed { compress(send) } else { send };
-    let sent = transfer(&mut file, &mut send, size, &name).await?;
-    send.shutdown().await?;
-    if sent != size {
-        bail!("{} changed size during the copy", local.display());
+    let mut answer = answer(recv);
+    let sending = async {
+        let sent = transfer(&mut file, &mut send, size, &name).await?;
+        send.shutdown().await?;
+        anyhow::Ok(sent)
+    };
+    tokio::pin!(sending);
+    let changed = || anyhow::anyhow!("{} changed size during the copy", local.display());
+    tokio::select! {
+        sent = &mut sending => match sent {
+            Ok(n) if n != size => Err(changed()),
+            Ok(_) => answer.await?,
+            Err(e) => Err(server_reason(&mut answer, e).await),
+        },
+        // The server took it all; only our end of the stream was left to send.
+        early = &mut answer => {
+            early??;
+            if sending.await? != size { Err(changed()) } else { Ok(()) }
+        }
     }
-    expect_ok(&mut recv).await?;
-    Ok(())
+}
+
+/// The server's final answer to an upload, read while we send: a server
+/// that gives up half-way (a full disk) answers without reading the rest,
+/// and over TCP our writes would then wait forever for flow-control credit.
+fn answer(mut recv: RecvHalf) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move { expect_ok(&mut recv).await.map(drop) })
+}
+
+/// Why sending failed: the server's reason if it gave one, which says more
+/// than our write error ("stopped by peer").
+async fn server_reason(answer: &mut tokio::task::JoinHandle<Result<()>>, write: anyhow::Error) -> anyhow::Error {
+    match tokio::time::timeout(Duration::from_secs(2), answer).await {
+        Ok(Ok(Err(server))) => server,
+        _ => write,
+    }
 }
 
 pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool) -> Result<()> {
@@ -160,25 +189,30 @@ pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str, compressed: bo
     expect_ok(&mut recv).await?;
     let send = if compressed { compress(send) } else { send };
     let root = local.to_path_buf();
-    let sent = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
+    let mut answer = answer(recv);
+    let mut sending = tokio::task::spawn_blocking(move || -> Result<(crate::tree::Stats, SendHalf)> {
         let mut w = tokio_util::io::SyncIoBridge::new(send);
         let stats = crate::tree::write_tree(&root, &mut w)?;
         w.shutdown()?;
         Ok((stats, w.into_inner()))
-    })
-    .await?;
-    match sent {
-        Ok((stats, _send)) => {
-            expect_ok(&mut recv).await?;
-            report(&stats);
-            Ok(())
-        }
-        // If the server gave up, its reason is more useful than our write error.
-        Err(e) => match tokio::time::timeout(std::time::Duration::from_secs(2), expect_ok(&mut recv)).await {
-            Ok(Err(server)) => Err(server),
-            _ => Err(e),
+    });
+    let stats = tokio::select! {
+        sent = &mut sending => match sent? {
+            Ok((stats, _send)) => {
+                answer.await??;
+                stats
+            }
+            Err(e) => return Err(server_reason(&mut answer, e).await),
         },
-    }
+        // An error stops us here (a blocked writer stays behind until the
+        // connection closes); success means only the end was left to send.
+        early = &mut answer => {
+            early??;
+            sending.await??.0
+        }
+    };
+    report(&stats);
+    Ok(())
 }
 
 /// `qsh cp -r` download: receives the contents of remote directory `remote`.

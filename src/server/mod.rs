@@ -638,6 +638,15 @@ fn ssh_connection(conn: &Conn, cfg: &ServerConfig, server_port: u16) -> [(String
     ]
 }
 
+/// Runs a transfer until it ends or the connection closes; dropping it
+/// kills its helper.
+async fn until_closed(mut closed: watch::Receiver<bool>, transfer: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    tokio::select! {
+        res = transfer => res,
+        _ = closed.wait_for(|c| *c) => Ok(()),
+    }
+}
+
 /// What a stream of a logged-in connection works with.
 struct StreamCtx<'a> {
     conn: &'a Arc<Conn>,
@@ -784,8 +793,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         {
             write_msg(&mut send, &files_denied()).await
         }
-        Request::UploadTree { path, name } => files::upload_tree(send, recv, user, &path, &name, compressed).await,
-        Request::DownloadTree { path } => files::download_tree(send, user, &path, compressed).await,
+        Request::UploadTree { path, name } => until_closed(closed, files::upload_tree(send, recv, user, &path, &name, compressed)).await,
+        Request::DownloadTree { path } => until_closed(closed, files::download_tree(send, user, &path, compressed)).await,
         Request::DirectTcp { host, port } => {
             if !cfg.local_forwarding() {
                 return write_msg(&mut send, &Reply::Err("port forwarding is disabled".into())).await;
@@ -819,9 +828,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
         }
         Request::Upload { path, name, size, mode } => {
-            files::upload(send, recv, user, &path, &name, (size, mode), compressed).await
+            until_closed(closed, files::upload(send, recv, user, &path, &name, (size, mode), compressed)).await
         }
-        Request::Download { path } => files::download(send, user, &path, compressed).await,
+        Request::Download { path } => until_closed(closed, files::download(send, user, &path, compressed)).await,
         Request::AgentForward => {
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
