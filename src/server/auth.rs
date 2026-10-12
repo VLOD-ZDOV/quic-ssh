@@ -446,7 +446,11 @@ pub async fn second_factor(
             let mut state = used.lock().unwrap();
             // Another qshd of the user's (another port, a user-mode one) may
             // have taken a code: the lock makes check and mark one step.
-            let _ = file.lock();
+            // Without the lock (a file system without locks), this qshd
+            // still takes each code once; tell why others might not.
+            if let Err(e) = file.lock() {
+                warn!("{}: cannot lock the one-time code file ({e}); another qshd of the user could take the same code", user.name);
+            }
             let last = state.last_used(user.uid).max(step_taken(&file));
             if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
                 state.used.insert(user.uid, step);
