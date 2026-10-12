@@ -502,6 +502,10 @@ impl Sessions {
         let producer = produce(sess, generation, out_tx.clone());
         tokio::pin!(producer);
         let (mut producing, mut exited) = (true, false);
+        // A client that reports what it showed (1.0.5 and newer) also says it
+        // got the end with a hangup. Without one, the end of its stream is no
+        // proof: over TCP a dead connection ends its streams like a close.
+        let mut hangs_up = false;
         loop {
             tokio::select! {
                 end = &mut producer, if producing => {
@@ -529,13 +533,16 @@ impl Sessions {
                     Ok(Some(ClientMsg::Typed { data, .. })) => sess.send_input(Input::Data(data)),
                     Ok(Some(ClientMsg::Resize { cols, rows })) => sess.send_input(Input::Resize { cols, rows }),
                     Ok(Some(ClientMsg::StdinEof)) => {}
-                    Ok(Some(ClientMsg::Shown(n))) => sess.pacing.shown(n),
+                    Ok(Some(ClientMsg::Shown(n))) => {
+                        hangs_up = true;
+                        sess.pacing.shown(n);
+                    }
                     Ok(Some(ClientMsg::Hangup)) if exited => return Ok(Detach::Done),
                     // Hang up, then report the exit like any other end, so the
                     // client knows the hangup arrived before it disconnects.
                     Ok(Some(ClientMsg::Hangup)) => self.hang_up(&token, sess).await,
                     Err(e) if e.is::<crate::proto::Malformed>() => {}
-                    Ok(None) if exited => return Ok(Detach::Done),
+                    Ok(None) if exited && !hangs_up => return Ok(Detach::Done),
                     // The stream ended without a hangup: the client is gone.
                     Ok(None) | Err(_) => return Ok(Detach::Lost("client gone")),
                 },
