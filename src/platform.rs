@@ -169,3 +169,25 @@ pub fn raise_fd_limit() {
         }
     }
 }
+
+/// The program's arguments. They go into a protocol of UTF-8 strings, and a
+/// lossy conversion could name another file: one that is not UTF-8 is
+/// refused with a message (std would panic).
+pub fn args_or_exit(program: &str) -> Vec<String> {
+    match std::env::args_os().map(std::ffi::OsString::into_string).collect() {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!("{program}: argument {:?} is not valid UTF-8", bad);
+            std::process::exit(255);
+        }
+    }
+}
+
+/// Whether a panic is std's for printing to a closed pipe (`qshd pair |
+/// head -1`), which should end the program quietly, as it does C tools.
+pub fn is_broken_pipe_print(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    let payload = info.payload();
+    let msg = payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("");
+    // EPIPE is 32 on every Unix qsh runs on; the text is not localized.
+    msg.starts_with("failed printing to std") && msg.contains("os error 32")
+}

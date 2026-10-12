@@ -201,7 +201,8 @@ fn finish(result: Result<i32>) -> ! {
     let code = match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("qsh: {e:#}");
+            // Not eprintln: a closed stderr must not turn the code into a panic's.
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("qsh: {e:#}\n"));
             255
         }
     };
@@ -215,11 +216,14 @@ fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::terminal::disable_raw_mode();
+        if qsh::platform::is_broken_pipe_print(info) {
+            std::process::exit(141);
+        }
         default_hook(info);
         std::process::exit(101);
     }));
     qsh::platform::blocking_stdio();
-    let args: Vec<String> = std::env::args().collect();
+    let args = qsh::platform::args_or_exit("qsh");
     let as_ssh = invoked_as_ssh(&args[0]);
     // As `ssh`, every word is ssh's: `ssh cp` connects to a host named cp.
     if !as_ssh && is_tool_invocation(&args) {

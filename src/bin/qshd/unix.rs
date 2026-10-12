@@ -115,8 +115,15 @@ fn host_key(path: &std::path::Path) -> Result<Identity> {
 }
 
 pub fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if qsh::platform::is_broken_pipe_print(info) {
+            std::process::exit(141);
+        }
+        default_hook(info);
+    }));
     // Switching to a user before running their program (see `User::launch`).
-    let argv: Vec<String> = std::env::args().collect();
+    let argv = qsh::platform::args_or_exit("qshd");
     if argv.get(1).map(String::as_str) == Some(helpers::BECOME) {
         let Err(e) = helpers::become_user(&argv[2..]);
         eprintln!("qshd: {e:#}");
@@ -130,7 +137,7 @@ pub fn main() {
         }
         return;
     }
-    let cli = match std::env::args().nth(1).as_deref() {
+    let cli = match argv.get(1).map(String::as_str) {
         // A helper started through the user's shell: the real arguments are in the environment.
         Some(helpers::HELPER_FROM_ENV) => {
             let args = std::env::var(helpers::HELPER_ARGS).ok().and_then(|a| helpers::decode_args(&a));
