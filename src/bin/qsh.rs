@@ -981,7 +981,8 @@ fn with_doctor_hint(e: anyhow::Error, target: &Target) -> anyhow::Error {
 }
 
 /// Arguments for OpenSSH's ssh: everything ssh understands, as given.
-/// The command line for ssh, without qsh's own long options.
+/// The command line for ssh, without qsh's own long options, and with the
+/// long ones ssh has short (`--port`) spelled as ssh knows them.
 fn without_qsh_options(args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut it = args.iter();
@@ -991,12 +992,27 @@ fn without_qsh_options(args: &[String]) -> Vec<String> {
             out.extend(it.cloned());
             break;
         }
-        match arg.as_str() {
+        let (name, value) = match arg.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let short = match name {
+            "--port" => "-p",
+            "--identity" => "-i",
+            "--login" => "-l",
+            _ => "",
+        };
+        match name {
             "--full" | "--accept-new-host" | "--verbose" => {}
             "--transport" => {
-                it.next();
+                if value.is_none() {
+                    it.next();
+                }
             }
-            _ if arg.starts_with("--transport=") => {}
+            _ if !short.is_empty() => {
+                out.push(short.to_string());
+                out.extend(value.or_else(|| it.next().cloned()));
+            }
             _ => out.push(arg.clone()),
         }
     }
@@ -1165,6 +1181,15 @@ mod tests {
     fn tool(args: &str) -> bool {
         let v: Vec<String> = std::iter::once("qsh").chain(args.split_whitespace()).map(String::from).collect();
         is_tool_invocation(&v)
+    }
+
+    #[test]
+    fn long_options_for_ssh() {
+        let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_qsh_options(&args("--full --port 2222 --login=bob --identity k --transport tcp --transport=quic -v host -- --port")),
+            args("-p 2222 -l bob -i k -v host -- --port")
+        );
     }
 
     #[test]
