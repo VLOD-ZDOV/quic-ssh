@@ -35,6 +35,24 @@ async fn stderr_text(child: &mut Child) -> String {
     if text.is_empty() { "helper failed".into() } else { text }
 }
 
+/// Why a helper that exited with `status` failed: its stderr, or the status
+/// (a signal says nothing on stderr, e.g. SIGXFSZ for a file size limit).
+async fn failure(child: &mut Child, status: std::process::ExitStatus) -> String {
+    match stderr_text(child).await {
+        text if text != "helper failed" => text,
+        // Through the user's shell, a signal shows as 128 + its number.
+        _ => {
+            use std::os::unix::process::ExitStatusExt;
+            let signal = status.signal().or(status.code().filter(|c| *c > 128).map(|c| c - 128));
+            match signal.map(nix::sys::signal::Signal::try_from) {
+                Some(Ok(nix::sys::signal::Signal::SIGXFSZ)) => "file too large (the server's file size limit)".into(),
+                Some(Ok(sig)) => format!("helper killed by {sig}"),
+                _ => format!("helper failed ({status})"),
+            }
+        }
+    }
+}
+
 /// Waits for the helper's "ok" line. Otherwise returns what went wrong: its
 /// stderr, or what it printed instead (e.g. nologin's "account not available").
 async fn ready(child: &mut Child) -> Result<BufReader<ChildStdout>, String> {
@@ -92,7 +110,7 @@ pub async fn upload(
     let reply = match copied {
         Ok(n) if n == size && status.success() => Reply::Ok,
         Ok(n) if n != size => Reply::Err(format!("transfer interrupted after {n} of {size} bytes")),
-        _ => Reply::Err(stderr_text(&mut child).await),
+        _ => Reply::Err(failure(&mut child, status).await),
     };
     write_msg(&mut send, &reply).await?;
     send.shutdown().await?;
@@ -138,7 +156,7 @@ pub async fn upload_tree(mut send: SendHalf, recv: RecvHalf, user: &User, path: 
         let _ = tokio::io::copy(&mut recv, &mut tokio::io::sink()).await;
         Reply::Ok
     } else {
-        Reply::Err(stderr_text(&mut child).await)
+        Reply::Err(failure(&mut child, status).await)
     };
     write_msg(&mut send, &reply).await?;
     send.shutdown().await?;
@@ -163,7 +181,7 @@ pub async fn download_tree(mut send: SendHalf, user: &User, path: &str, compress
         send.write_all(&buf[..n]).await?;
     }
     let status = child.wait().await?;
-    let reply = if status.success() { Reply::Ok } else { Reply::Err(stderr_text(&mut child).await) };
+    let reply = if status.success() { Reply::Ok } else { Reply::Err(failure(&mut child, status).await) };
     write_msg(&mut send, &reply).await?;
     send.shutdown().await?;
     Ok(())
