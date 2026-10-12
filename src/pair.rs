@@ -8,7 +8,8 @@
 //!
 //! `T` = TLS exporter || client key || server key, so the proof is bound to
 //! this exact TLS session and both certificates; a man in the middle cannot
-//! relay it. The code is deleted after the first attempt, so it allows one guess.
+//! relay it. A code allows [`TRIES`] guesses (a typo does not waste it), and
+//! a pairing that succeeds deletes it.
 
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -37,10 +38,14 @@ use crate::keys::PublicKey;
 use crate::proto::{read_msg, write_msg, Reply};
 
 pub const CODE_TTL: Duration = Duration::from_secs(600);
+/// Attempts one code allows: a mistyped code still works, and someone who
+/// only knows the user name must make this many (penalized) failed logins
+/// to waste it.
+pub const TRIES: u32 = 3;
 const ALPHABET: &[u8] = b"23456789abcdefghjkmnpqrstuvwxyz";
 const SPAKE_ID: &[u8] = b"qsh-pair-v1";
 
-/// Random code like `k7f3-9qxm` (~40 bits; one guess per code).
+/// Random code like `k7f3-9qxm` (~40 bits; [`TRIES`] guesses per code).
 pub fn generate_code() -> String {
     let mut rng = rand::rngs::OsRng;
     let chars: String = (0..8)
@@ -74,18 +79,34 @@ pub fn create_pending(home: &Path) -> Result<String> {
     let path = pending_path(home);
     create_private_dir(path.parent().unwrap())?;
     let _ = std::fs::remove_file(&path);
+    write_pending(&path, &normalize(&code), now() + CODE_TTL.as_secs(), TRIES)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    Ok(code)
+}
+
+#[cfg(unix)]
+fn write_pending(path: &Path, code: &str, expires: u64, tries: u32) -> std::io::Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .with_context(|| format!("cannot create {}", path.display()))?;
-    writeln!(f, "{} {}", normalize(&code), now() + CODE_TTL.as_secs())?;
-    Ok(code)
+        .open(path)?;
+    writeln!(f, "{code} {expires} {tries}")
 }
 
-/// Reads and deletes the pending code. Runs as the target user.
+/// Deletes what is left of a code a pairing used (not a fresh one from a
+/// later `qshd pair`).
+#[cfg(unix)]
+pub fn discard_used(home: &Path) {
+    let path = pending_path(home);
+    let fresh = std::fs::read_to_string(&path).is_ok_and(|t| t.split_whitespace().nth(2) == Some(&TRIES.to_string()));
+    if !fresh {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Reads the pending code, using up one of its tries. Runs as the target user.
 #[cfg(unix)]
 pub fn take_pending(home: &Path) -> Result<String> {
     let path = pending_path(home);
@@ -100,7 +121,7 @@ pub fn take_pending(home: &Path) -> Result<String> {
         }
         Err(e) => return Err(e).context("cannot open pairing file"),
     };
-    // Single use: remove before anything else can fail.
+    // Taken before anything else can fail: two tries at once cannot both have it.
     std::fs::remove_file(&path).context("cannot remove pairing file")?;
     let meta = f.metadata()?;
     if !meta.is_file() || meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
@@ -113,6 +134,12 @@ pub fn take_pending(home: &Path) -> Result<String> {
     let expires: u64 = parts.next().and_then(|s| s.parse().ok()).context("malformed pairing file")?;
     if now() > expires {
         bail!("pairing code expired; run `qshd pair` again");
+    }
+    // Older files have no count: one try.
+    let tries: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if tries > 1 {
+        // Put back for the next try, unless `qshd pair` made a new code meanwhile.
+        let _ = write_pending(&path, &code, expires, tries - 1);
     }
     Ok(code)
 }
@@ -251,10 +278,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pending_file_single_use() {
+    fn pending_file_tries() {
         let home = tempfile::tempdir().unwrap();
         let code = create_pending(home.path()).unwrap();
-        assert_eq!(take_pending(home.path()).unwrap(), normalize(&code));
+        for _ in 0..TRIES {
+            assert_eq!(take_pending(home.path()).unwrap(), normalize(&code));
+        }
         assert!(take_pending(home.path()).is_err());
+        // A pairing uses up what is left of its code, but not a newer one.
+        create_pending(home.path()).unwrap();
+        take_pending(home.path()).unwrap();
+        discard_used(home.path());
+        assert!(take_pending(home.path()).is_err());
+        let newer = create_pending(home.path()).unwrap();
+        discard_used(home.path());
+        assert_eq!(take_pending(home.path()).unwrap(), normalize(&newer));
     }
 }

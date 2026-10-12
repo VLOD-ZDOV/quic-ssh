@@ -465,10 +465,13 @@ pub fn pair_take() -> Result<()> {
     Ok(())
 }
 
-/// Appends a key to `~/.config/qsh/authorized_keys` unless already present.
+/// Appends a key to `~/.config/qsh/authorized_keys` unless already present
+/// (after a pairing, whose code is then used up).
 pub fn add_key(line: &str) -> Result<()> {
     let key = PublicKey::parse_openssh(line).context("invalid public key")?;
-    let dir = qsh_dir(&home_dir()?);
+    let home = home_dir()?;
+    crate::pair::discard_used(&home);
+    let dir = qsh_dir(&home);
     create_private_dir(&dir)?;
     let path = dir.join("authorized_keys");
     let existing = match fs::read_to_string(&path) {

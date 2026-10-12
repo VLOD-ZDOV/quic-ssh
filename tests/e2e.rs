@@ -399,15 +399,29 @@ fn unknown_key_is_denied() {
 fn wrong_pair_code_is_rejected_and_burned() {
     let s = Server::start();
     let c = Client::new();
-    let code = s.pair_code();
     let port = s.port.to_string();
-    let out = c.run(&["pair", "-p", &port, &dest(), "zzzz-zzzz"]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("wrong pairing code"), "{}", stderr(&out));
-    // The real code no longer works either: one guess per code.
+    let wrong = |c: &Client| {
+        let out = c.run(&["pair", "-p", &port, &dest(), "zzzz-zzzz"]);
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("wrong pairing code"), "{}", stderr(&out));
+    };
+    let pending = s.home.path().join(".config/qsh/pending_pair");
+    // A typo does not waste the code, and a pairing uses it up.
+    let code = s.pair_code();
+    wrong(&c);
     let out = c.run(&["pair", "-p", &port, &dest(), &code]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!pending.exists(), "a code that paired is gone");
+    // After pairing::TRIES wrong guesses, the real code no longer works either.
+    let other = Client::new();
+    let code = s.pair_code();
+    for _ in 0..3 {
+        wrong(&other);
+    }
+    let out = other.run(&["pair", "-p", &port, &dest(), &code]);
     assert!(!out.status.success());
-    assert!(!s.authorized_keys().exists() || std::fs::read_to_string(s.authorized_keys()).unwrap().is_empty());
+    assert!(stderr(&out).contains("no active pairing code"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(s.authorized_keys()).unwrap().lines().count(), 1);
 }
 
 #[test]
