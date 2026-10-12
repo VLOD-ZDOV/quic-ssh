@@ -541,6 +541,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     } else {
         let disconnect = disconnect.clone();
         let forwarder = opts.forwarder.clone();
+        #[cfg(unix)]
         let (answered, suspended) = (answered.clone(), suspended.clone());
         let mut input = Input::new(raw.is_some(), cursor_keys.clone());
         tokio::spawn(async move {
