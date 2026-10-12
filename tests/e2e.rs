@@ -2528,6 +2528,14 @@ fn keys_from_a_command() {
     std::fs::set_permissions(&prog, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
     let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
     assert!(!out.status.success(), "an unsafe command was used");
+    // Too much output: refused at once, not after the command's time is up.
+    std::fs::write(&prog, format!("#!/bin/sh\nhead -c 3000000 /dev/zero | tr '\\0' '#'\ncat {}\n", keys.display())).unwrap();
+    std::fs::set_permissions(&prog, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let started = Instant::now();
+    let out = c.run(&["-o", "BatchMode=yes", "-p", &port, &dest(), "true"]);
+    assert!(!out.status.success(), "a command printing too much was used");
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!(s.log().contains("printed more than"), "{}", s.log());
 }
 
 /// A host without an open port: it keeps `qsh -N -R` to a public qshd, and

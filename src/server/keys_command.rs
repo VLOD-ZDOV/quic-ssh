@@ -212,15 +212,35 @@ impl<'a> KeysCommand<'a> {
         let mut stderr = child.stderr.take().expect("piped");
         let finished = tokio::time::timeout(TIMEOUT, async {
             // Both at once, so a chatty stderr cannot block the program.
-            let (mut o, mut e) = ((&mut stdout).take(MAX_OUTPUT), (&mut stderr).take(MAX_OUTPUT));
-            let (a, b) = tokio::join!(o.read_to_end(&mut out), e.read_to_end(&mut err));
-            a?;
-            b?;
-            child.wait().await
+            let (mut out_done, mut err_done) = (false, false);
+            let (mut a, mut b) = ([0u8; 8192], [0u8; 8192]);
+            while !(out_done && err_done) {
+                // Past the limit the program may still be writing, and would
+                // wait for us forever: not waited for.
+                if out.len() as u64 > MAX_OUTPUT || err.len() as u64 > MAX_OUTPUT {
+                    return Ok(None);
+                }
+                tokio::select! {
+                    n = stdout.read(&mut a), if !out_done => match n? {
+                        0 => out_done = true,
+                        n => out.extend_from_slice(&a[..n]),
+                    },
+                    n = stderr.read(&mut b), if !err_done => match n? {
+                        0 => err_done = true,
+                        n => err.extend_from_slice(&b[..n]),
+                    },
+                }
+            }
+            child.wait().await.map(Some)
         })
         .await;
         let status = match finished {
-            Ok(s) => s?,
+            Ok(Ok(Some(s))) => s,
+            Ok(Ok(None)) => {
+                let _ = child.kill().await;
+                bail!("printed more than {MAX_OUTPUT} bytes");
+            }
+            Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
                 let _ = child.kill().await;
                 bail!("timed out after {TIMEOUT:?}");
