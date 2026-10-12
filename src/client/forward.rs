@@ -628,7 +628,7 @@ impl Forwarder {
             write_msg(&mut send, &Request::Tunnel { ethernet, unit: units.1 }).await?;
             expect_ok(&mut recv).await?;
             let task = tokio::spawn(async move {
-                if let Err(e) = crate::tunnel::relay(dev, send, recv).await {
+                if let Err(e) = crate::tunnel::relay(crate::tunnel::Device::Own(dev), send, recv).await {
                     debug!("tunnel: {e:#}");
                 }
             });

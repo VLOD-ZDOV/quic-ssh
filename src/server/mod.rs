@@ -1186,16 +1186,15 @@ async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<
 /// `-w`: a tunnel device here, its packets to and from the client.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn tunnel(mut send: SendHalf, recv: RecvHalf, conn: &Arc<Conn>, user: &User, ethernet: bool, unit: Option<u32>) -> Result<()> {
-    // qshd opens devices as root: other users get new ones only, not one
-    // that exists (another user's persistent device, say).
-    if user.uid != 0 {
-        if let Some(name) = unit.map(|u| crate::tunnel::device_name(ethernet, u)) {
-            if nix::net::if_::if_nametoindex(name.as_str()).is_ok() {
-                return write_msg(&mut send, &Reply::Err(format!("tunnel device {name} exists already"))).await;
-            }
-        }
-    }
-    let (dev, name) = match crate::tunnel::open(ethernet, unit) {
+    // Like sshd: a user other than root opens the device with their own
+    // rights (a helper hands it over), so the kernel lets them use only a
+    // device made for them, and not create one with qshd's.
+    let opened = if user.uid == 0 {
+        crate::tunnel::open(ethernet, unit).map(|(d, name)| (crate::tunnel::Device::Own(d), name))
+    } else {
+        tunnel_as_user(user, ethernet, unit).await
+    };
+    let (dev, name) = match opened {
         Ok(d) => d,
         Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
     };
@@ -1204,6 +1203,19 @@ async fn tunnel(mut send: SendHalf, recv: RecvHalf, conn: &Arc<Conn>, user: &Use
     let result = crate::tunnel::relay(dev, send, recv).await;
     info!("{}: tunnel device {name} closed", conn.remote_addr());
     result
+}
+
+#[cfg(target_os = "linux")]
+async fn tunnel_as_user(user: &User, ethernet: bool, unit: Option<u32>) -> Result<(crate::tunnel::Device, String)> {
+    // A new device needs rights a user does not have: only a named one can be theirs.
+    let Some(unit) = unit else { bail!("name the tunnel device (-w any:N): a user other than root can only use one made for them") };
+    let fd = socket_from_helper(user.helper(&["internal-tun-fd", if ethernet { "tap" } else { "tun" }, &unit.to_string()])?).await?;
+    Ok((crate::tunnel::Device::handed(fd)?, crate::tunnel::device_name(ethernet, unit)))
+}
+
+#[cfg(target_os = "macos")]
+async fn tunnel_as_user(_user: &User, _ethernet: bool, _unit: Option<u32>) -> Result<(crate::tunnel::Device, String)> {
+    bail!("only root may use tunnel devices on this system")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

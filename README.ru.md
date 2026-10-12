@@ -175,6 +175,7 @@ qsh -f -N -L 5432:db:5432 host         # войти и уйти в фон
 qsh -A host                            # пробросить ssh-agent
 qsh -Y host xterm                      # проброс X11 (-X: недоверенный, как в ssh)
 sudo qsh -w 0:0 -N root@host           # туннельные устройства tun0 <-> tun0 (root с обеих сторон)
+sudo qsh -w any:3 -N alice@host        # не root: только созданное для него устройство (ip tuntap add tun3 mode tun user alice)
 qsh cp file.txt user@host:dir/         # загрузить
 qsh cp user@host:logs/app.log .        # скачать
 qsh cp -r project/ user@host:src/      # скопировать каталог (в любую сторону)
@@ -441,7 +442,7 @@ x11_forwarding = false          # разрешить qsh -X/-Y (DISPLAY=localhos
 x11_display_offset = 10
 x11_use_localhost = true
 xauth_location = "/usr/bin/xauth"
-permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; существующие устройства — только root
+permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; как в sshd, не root — только созданное для него устройство (Linux)
 client_alive_interval = 0       # секунд между проверками молчащего клиента; 0 = встроенная (~60 с)
 client_alive_count_max = 3
 per_source_penalties = true     # отбрасывать адреса, с которых раз за разом не входят; или "authfail:5s noauth:1s min:15s max:10m"

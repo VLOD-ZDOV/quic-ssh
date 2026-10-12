@@ -105,6 +105,27 @@ pub fn connect_unix_fd(path: &str) -> Result<()> {
     hand_over(std::os::unix::net::UnixStream::connect(path).with_context(|| format!("connect {path}"))?)
 }
 
+/// Opens tunnel device `kind` (`tun`, `tap`) number `unit` (or `any`) as
+/// the user and hands it to qshd (`-w` for a user other than root).
+pub fn tun_fd(kind: &str, unit: &str) -> Result<()> {
+    let ethernet = match kind {
+        "tun" => false,
+        "tap" => true,
+        _ => bail!("unknown tunnel device kind {kind}"),
+    };
+    let unit = match unit {
+        "any" => None,
+        n => Some(n.parse::<u32>().context("bad tunnel device number")?),
+    };
+    #[cfg(target_os = "linux")]
+    return hand_over(crate::tunnel::open_as_user(ethernet, unit)?);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ethernet, unit);
+        bail!("tunnel devices are not supported on this system")
+    }
+}
+
 /// Sends `fd` to qshd over stdout, which is a Unix socket.
 fn hand_over(fd: impl std::os::fd::AsFd) -> Result<()> {
     use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};

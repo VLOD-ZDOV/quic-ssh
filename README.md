@@ -175,6 +175,7 @@ qsh -f -N -L 5432:db:5432 host         # log in, then go to the background
 qsh -A host                            # forward your ssh-agent
 qsh -Y host xterm                      # X11 forwarding (-X: untrusted, as in ssh)
 sudo qsh -w 0:0 -N root@host           # tunnel devices tun0 <-> tun0 (root on both sides)
+sudo qsh -w any:3 -N alice@host        # a non-root user: only a device made for them (ip tuntap add tun3 mode tun user alice)
 qsh cp file.txt user@host:dir/         # upload
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
@@ -440,7 +441,7 @@ x11_forwarding = false          # allow qsh -X/-Y (DISPLAY=localhost:10 and up)
 x11_display_offset = 10
 x11_use_localhost = true
 xauth_location = "/usr/bin/xauth"
-permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; only root may use existing devices
+permit_tunnel = "no"            # qsh -w: "yes", "point-to-point" (TUN), "ethernet" (TAP); Linux, macOS; as in sshd, other users only a device made for them (Linux)
 client_alive_interval = 0       # seconds between probes of a silent client; 0 = built-in (~60 s)
 client_alive_count_max = 3
 per_source_penalties = true     # drop addresses that keep failing; or "authfail:5s noauth:1s min:15s max:10m"

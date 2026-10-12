@@ -77,6 +77,8 @@ enum Cmd {
     #[command(hide = true)]
     InternalConnectUnixFd { path: String },
     #[command(hide = true)]
+    InternalTunFd { kind: String, unit: String },
+    #[command(hide = true)]
     InternalListenUnix { path: String, mask: String, unlink: String },
     #[command(hide = true)]
     InternalUntar { path: String, name: String },
@@ -166,6 +168,7 @@ pub fn main() {
         Some(Cmd::InternalConnectUnix { path }) => helpers::connect_unix(&path),
         Some(Cmd::InternalConnectFd { host, port }) => helpers::connect_fd(&host, port),
         Some(Cmd::InternalConnectUnixFd { path }) => helpers::connect_unix_fd(&path),
+        Some(Cmd::InternalTunFd { kind, unit }) => helpers::tun_fd(&kind, &unit),
         Some(Cmd::InternalListenUnix { path, mask, unlink }) => helpers::listen_unix(&path, &mask, &unlink),
         Some(Cmd::InternalUntar { path, name }) => helpers::untar(&path, &name),
         Some(Cmd::InternalTar { path }) => helpers::tar(&path),

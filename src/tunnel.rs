@@ -1,14 +1,14 @@
 //! Tunnel devices (`qsh -w`), like ssh's: a TUN (point-to-point, IP
 //! packets) or TAP (ethernet frames) device on each side, and the packets
 //! between them on one stream, each with a 4-byte length in front. Both
-//! sides need the right to create network devices (root). The devices are
-//! created up but without addresses; configuring them is left to the user,
-//! as with ssh.
+//! sides need the right to create network devices (root), or a device made
+//! for the user on the server. New devices are created up but without
+//! addresses; configuring them is left to the user, as with ssh.
 
 use anyhow::{Context, Result};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use device::{device_name, open, relay};
+pub use device::{device_name, open, open_as_user, relay, Device};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod device {
@@ -49,9 +49,56 @@ mod device {
         Ok((dev, name))
     }
 
+    /// Opens the device with the rights of whoever runs this, and leaves it
+    /// as it is: as with sshd, a user may only take a device made for them
+    /// (`ip tuntap add tun0 mode tun user NAME`), not create or change one.
+    pub fn open_as_user(ethernet: bool, unit: Option<u32>) -> Result<tun_rs::SyncDevice> {
+        let mut b = tun_rs::DeviceBuilder::new()
+            .layer(if ethernet { tun_rs::Layer::L2 } else { tun_rs::Layer::L3 })
+            .inherit_enable_state();
+        if let Some(u) = unit {
+            b = b.name(device_name(ethernet, u));
+        }
+        b.build_sync().context("cannot open the tunnel device (only one made for this user may be used)")
+    }
+
+    /// A device qsh opened itself, or (Linux) one [`open_as_user`] opened
+    /// for qshd in a helper: each read and write of it is one packet.
+    pub enum Device {
+        Own(tun_rs::AsyncDevice),
+        #[cfg(target_os = "linux")]
+        Handed(tokio::io::unix::AsyncFd<std::fs::File>),
+    }
+
+    impl Device {
+        #[cfg(target_os = "linux")]
+        pub fn handed(fd: std::os::fd::OwnedFd) -> Result<Self> {
+            use nix::fcntl::{fcntl, FcntlArg, OFlag};
+            let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+            fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+            Ok(Device::Handed(tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))?))
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self {
+                Device::Own(d) => d.recv(buf).await,
+                #[cfg(target_os = "linux")]
+                Device::Handed(f) => f.async_io(tokio::io::Interest::READABLE, |mut f| std::io::Read::read(&mut f, buf)).await,
+            }
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+            match self {
+                Device::Own(d) => d.send(buf).await,
+                #[cfg(target_os = "linux")]
+                Device::Handed(f) => f.async_io(tokio::io::Interest::WRITABLE, |mut f| std::io::Write::write(&mut f, buf)).await,
+            }
+        }
+    }
+
     /// Carries packets between `dev` and the stream until either ends.
     pub async fn relay(
-        dev: tun_rs::AsyncDevice,
+        dev: Device,
         mut send: SendHalf,
         mut recv: RecvHalf,
     ) -> Result<()> {

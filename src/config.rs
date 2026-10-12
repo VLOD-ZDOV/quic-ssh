@@ -64,7 +64,8 @@ pub struct ServerConfig {
     /// The xauth program (like XAuthLocation).
     pub xauth_location: PathBuf,
     /// Tunnel devices (`qsh -w`, like PermitTunnel): `no`, `yes`,
-    /// `point-to-point` (TUN only) or `ethernet` (TAP only). Root only.
+    /// `point-to-point` (TUN only) or `ethernet` (TAP only). Other users than
+    /// root only get a device made for them, as in sshd.
     pub permit_tunnel: PermitTunnel,
     /// Destinations `-L`/`-D`/`-W` may connect to: `host:port` patterns with
     /// `*` (like PermitOpen). Empty or `["any"]`: any; `["none"]`: none.
