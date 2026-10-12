@@ -938,7 +938,7 @@ fn ui_lists_hosts_and_quits() {
     .unwrap();
     let pty = nix::pty::openpty(Some(&nix::pty::Winsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }), None).unwrap();
     let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
-    let mut child = Command::new(QSH)
+    let child = Command::new(QSH)
         .arg("ui")
         .env("HOME", c.home.path())
         .env("TERM", "xterm-256color")
@@ -947,6 +947,15 @@ fn ui_lists_hosts_and_quits() {
         .stderr(slave())
         .spawn()
         .unwrap();
+    // A failed check must not leave the ui running.
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Killed(child);
     let mut master = std::fs::File::from(pty.master);
     nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
     let mut screen = Vec::new();
@@ -968,7 +977,7 @@ fn ui_lists_hosts_and_quits() {
     master.write_all(b"q").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success());
             break;
         }
