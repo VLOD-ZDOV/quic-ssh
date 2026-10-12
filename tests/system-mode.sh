@@ -219,12 +219,48 @@ sleep 0.5
 TARGET_HEX=$(printf '%04X' "$FWD_TARGET")
 FWD_UID=$(awk -v p=":$TARGET_HEX" '$3 ~ p"$" && $4 == "01" {print $8; exit}' /proc/net/tcp)
 check "forwarded connection is made as alice, not root" test "$FWD_UID" = "$ALICE_UID"
+# The helper hands the connected socket to qshd and ends.
+check "no helper stays for a forwarded connection" bash -c "! pgrep -u $ALICE_UID -f internal-connect >/dev/null"
 # A quiet forwarded connection must not stall the server (the helper once
 # copied with splice(), which kept the pipe that qshd reads locked).
 check "server answers while a forwarded connection is quiet" \
     timeout 10 env HOME="$T/client" "$QSH" -p "$PORT" qsh-alice@127.0.0.1 true < /dev/null
 exec 3>&-
 kill "$FWD_PID" "$LISTENER_PID" 2>/dev/null || true
+
+# The end of the client's data reaches the target (it once stayed in the
+# helper's stdin, and the target waited for it forever).
+python3 - "$T/echo_port" <<'PY' &
+import socket, sys
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+while True:
+    c, _ = s.accept()
+    try:
+        data = b""
+        while chunk := c.recv(65536):
+            data += chunk
+        c.sendall(b"echo:" + data)
+    except OSError:
+        pass  # the readiness probe, gone already
+    c.close()
+PY
+ECHO_PID=$!
+for _ in $(seq 50); do [[ -s "$T/echo_port" ]] && break; sleep 0.1; done
+ECHO_LOCAL=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+HOME="$T/client" "$QSH" -p "$PORT" -N -L "$ECHO_LOCAL:127.0.0.1:$(cat "$T/echo_port")" qsh-alice@127.0.0.1 < /dev/null 2>/dev/null &
+FWD_PID=$!
+for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$ECHO_LOCAL) 2>/dev/null && break; sleep 0.1; done
+REPLY=$(timeout 10 python3 -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+s.sendall(b"half-close")
+s.shutdown(socket.SHUT_WR)
+print(s.makefile("rb").read().decode())' "$ECHO_LOCAL" 2>/dev/null)
+check "the end of the data reaches the target through -L" test "$REPLY" = "echo:half-close"
+kill "$FWD_PID" "$ECHO_PID" 2>/dev/null || true
 
 # --- agent forwarding ------------------------------------------------------------------
 if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then

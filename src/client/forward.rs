@@ -113,18 +113,28 @@ impl Forward {
     }
 
     pub fn describe(&self) -> String {
+        match self.config_args() {
+            (listen, Some(dest)) => format!("{listen}:{dest}"),
+            (listen, None) => listen,
+        }
+    }
+
+    /// Where it listens and where it goes, as `LocalForward`/`RemoteForward`
+    /// take them (no destination for SOCKS).
+    pub fn config_args(&self) -> (String, Option<String>) {
         let listen = match &self.listen {
             Listen::Tcp { bind: Some(b), port } if b.contains(':') => format!("[{b}]:{port}"),
             Listen::Tcp { bind: Some(b), port } => format!("{b}:{port}"),
             Listen::Tcp { bind: None, port } => port.to_string(),
             Listen::Unix(p) => p.clone(),
         };
-        match &self.dest {
-            Dest::Tcp { host, port } if host.contains(':') => format!("{listen}:[{host}]:{port}"),
-            Dest::Tcp { host, port } => format!("{listen}:{host}:{port}"),
-            Dest::Unix(p) => format!("{listen}:{p}"),
-            Dest::Socks => listen,
-        }
+        let dest = match &self.dest {
+            Dest::Tcp { host, port } if host.contains(':') => Some(format!("[{host}]:{port}")),
+            Dest::Tcp { host, port } => Some(format!("{host}:{port}")),
+            Dest::Unix(p) => Some(p.clone()),
+            Dest::Socks => None,
+        };
+        (listen, dest)
     }
 }
 
@@ -426,9 +436,14 @@ impl Forwarder {
                     let (conn, dest) = (self.conn(), fwd.dest.clone());
                     tasks.push(
                         tokio::spawn(async move {
-                            while let Ok((tcp, peer)) = listener.accept().await {
-                                let _ = tcp.set_nodelay(true);
-                                tokio::spawn(serve_local(conn.clone(), dest.clone(), tcp, peer.to_string()));
+                            loop {
+                                match listener.accept().await {
+                                    Ok((tcp, peer)) => {
+                                        let _ = tcp.set_nodelay(true);
+                                        tokio::spawn(serve_local(conn.clone(), dest.clone(), tcp, peer.to_string()));
+                                    }
+                                    Err(e) => crate::transport::accept_failed(&e).await,
+                                }
                             }
                         })
                         .abort_handle(),
@@ -442,8 +457,11 @@ impl Forwarder {
                 let (conn, dest, path) = (self.conn(), fwd.dest.clone(), path.clone());
                 tasks.push(
                     tokio::spawn(async move {
-                        while let Ok((sock, _)) = listener.accept().await {
-                            tokio::spawn(serve_local(conn.clone(), dest.clone(), sock, path.clone()));
+                        loop {
+                            match listener.accept().await {
+                                Ok((sock, _)) => drop(tokio::spawn(serve_local(conn.clone(), dest.clone(), sock, path.clone()))),
+                                Err(e) => crate::transport::accept_failed(&e).await,
+                            }
                         }
                     })
                     .abort_handle(),

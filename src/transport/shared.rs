@@ -314,7 +314,10 @@ impl Master {
                     let sock = tokio::select! {
                         s = listener.accept() => match s {
                             Ok((s, _)) => s,
-                            Err(_) => break,
+                            Err(e) => {
+                                super::accept_failed(&e).await;
+                                continue;
+                            }
                         },
                         () = conn.closed() => break,
                     };

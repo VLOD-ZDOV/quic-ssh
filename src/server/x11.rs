@@ -155,9 +155,14 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
         .map(|l| {
             let tx = tx.clone();
             tokio::spawn(async move {
-                while let Ok(accepted) = l.accept().await {
-                    if tx.send(accepted).await.is_err() {
-                        break;
+                loop {
+                    match l.accept().await {
+                        Ok(accepted) => {
+                            if tx.send(accepted).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => crate::transport::accept_failed(&e).await,
                     }
                 }
             })

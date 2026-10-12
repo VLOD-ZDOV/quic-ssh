@@ -19,6 +19,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Load tests, one at a time: beside the others they slow handshakes down.
+      - run: cargo test --locked --test e2e -- --ignored --test-threads=1
 
   # Client and server on macOS (Apple Silicon), with the end-to-end tests.
   macos:
@@ -31,6 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Load tests, one at a time: beside the others they slow handshakes down.
+      - run: cargo test --locked --test e2e -- --ignored --test-threads=1
 
   # The client on Windows (qshd is Unix-only).
   windows:

@@ -120,7 +120,13 @@ async fn serve(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, user: &U
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((sock, _)) = accepted else { break };
+                let (sock, _) = match accepted {
+                    Ok(a) => a,
+                    Err(e) => {
+                        crate::transport::accept_failed(&e).await;
+                        continue;
+                    }
+                };
                 // Only the user (and root) may use the agent, whatever the file modes say.
                 match sock.peer_cred() {
                     Ok(c) if c.uid() == uid || c.uid() == 0 => {}

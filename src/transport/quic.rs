@@ -14,8 +14,12 @@ pub struct QuicConn {
     conn: quinn::Connection,
 }
 
-/// Connection-wide receive window once logged in.
-const RECEIVE_WINDOW: u32 = 32 << 20;
+/// The client's connection-wide receive window (the server's is
+/// `connection_buffer_mb`). Data waiting in a stream whose reader is stuck
+/// (a forward nobody reads) counts against it until read, and when it is
+/// full every stream stops, the session too; at 32 streams' worth (see
+/// `stream_receive_window`) a few stuck forwards cannot do that.
+const RECEIVE_WINDOW: u32 = 256 << 20;
 
 /// `server`: start with the limits for a client that has not logged in
 /// yet (see [`QuicConn::logged_in`]). `alive`: the server's probe
@@ -103,7 +107,7 @@ impl QuicConn {
     }
 
     pub fn logged_in(&self) {
-        self.conn.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
+        self.conn.set_receive_window(VarInt::from_u32(super::server_buffer()));
         self.conn.set_max_concurrent_bi_streams(VarInt::from_u32(super::MAX_STREAMS));
     }
 

@@ -28,8 +28,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Server-side limit for completing the TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum concurrent streams (sessions, forwards, copies) per connection.
-const MAX_STREAMS: u32 = 128;
+/// Maximum concurrent streams (sessions, forwards, copies) each side opens
+/// per connection; more wait. A browser behind `-D` keeps many open.
+const MAX_STREAMS: u32 = 512;
+/// What the server buffers per logged-in connection (`connection_buffer_mb`).
+static SERVER_BUFFER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32 << 20);
+
+/// Sets what the server buffers per connection, for connections from now on.
+pub fn set_server_buffer(mb: u32) {
+    SERVER_BUFFER.store(mb.saturating_mul(1 << 20), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn server_buffer() -> u32 {
+    SERVER_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Before the client has logged in, the server only reads the login stream:
 /// it accepts few streams and buffers little, so that connections that
 /// never log in cannot take much memory.
@@ -109,6 +122,14 @@ impl Conn {
 
     pub fn set_server_version(&mut self, version: u32) {
         self.server_version = version;
+        self.peer_version(version);
+    }
+
+    /// Lets the transport use what a peer of this protocol version allows.
+    fn peer_version(&self, version: u32) {
+        if let Inner::Tcp(c) = &self.inner {
+            c.peer_version(version);
+        }
     }
 
     /// The server's protocol version (client side, after login).
@@ -142,9 +163,10 @@ impl Conn {
         }
     }
 
-    /// Server side: the client has logged in, lift the limits for clients
-    /// that have not (see [`PREAUTH_STREAMS`]).
-    pub fn logged_in(&self) {
+    /// Server side: the client (speaking protocol `version`) has logged in,
+    /// lift the limits for clients that have not (see [`PREAUTH_STREAMS`]).
+    pub fn logged_in(&self, version: u32) {
+        self.peer_version(version);
         match &self.inner {
             Inner::Quic(c) => c.logged_in(),
             Inner::Tcp(c) => c.logged_in(),
@@ -585,6 +607,28 @@ pub async fn splice(tcp: tokio::net::TcpStream, send: SendHalf, recv: RecvHalf) 
     bridge(tr, tw, send, recv).await
 }
 
+/// After a failed `accept`: out of descriptors (EMFILE) and the like pass,
+/// so a listener waits a little and goes on instead of closing for good.
+pub async fn accept_failed(e: &std::io::Error) {
+    // Once a minute: it may go on for a while, and qsh shows it in the terminal.
+    static SHOWN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let show = {
+        let mut shown = SHOWN.lock().unwrap();
+        let now = std::time::Instant::now();
+        let show = shown.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(60));
+        if show {
+            *shown = Some(now);
+        }
+        show
+    };
+    if show {
+        tracing::warn!("cannot accept a connection: {e}");
+    } else {
+        tracing::debug!("cannot accept a connection: {e}");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 /// Copies `r` → `send` and `recv` → `w` concurrently, shutting each writer down at EOF.
 pub async fn bridge<R, W>(mut r: R, mut w: W, mut send: SendHalf, mut recv: RecvHalf) -> Result<()>
 where
@@ -592,11 +636,14 @@ where
     W: AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;
-    let up = async {
+    // Each direction owns its writer, so it is closed as soon as that
+    // direction ends: shutdown() does not close a pipe (a helper's stdin in
+    // system mode), only dropping it does.
+    let up = async move {
         tokio::io::copy(&mut r, &mut send).await?;
         send.shutdown().await
     };
-    let down = async {
+    let down = async move {
         tokio::io::copy(&mut recv, &mut w).await?;
         w.shutdown().await
     };

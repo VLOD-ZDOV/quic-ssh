@@ -133,6 +133,8 @@ struct Form {
     user: String,
     port: String,
     key: String,
+    /// More of ssh's options, as its flags (`-L 8080:localhost:80 -A`).
+    options: String,
     /// Space-separated group names (a menu setting, kept in `groups`).
     groups: String,
     transport: usize,
@@ -144,13 +146,15 @@ struct Form {
     locked: bool,
 }
 
-const FORM_FIELDS: [&str; 8] = ["name", "host", "user", "port", "key file", "groups", "transport", "no qshd"];
+const FORM_FIELDS: [&str; 9] = ["name", "host", "user", "port", "key file", "ssh opts", "groups", "transport", "no qshd"];
 /// Form fields that are text.
-const TEXT_FIELDS: usize = 6;
+const TEXT_FIELDS: usize = 7;
+const PORT_FIELD: usize = 3;
+const OPTIONS_FIELD: usize = 5;
 /// The first field of a locked form (the menu's own settings).
-const FIRST_MENU_FIELD: usize = 5;
-const TRANSPORT_FIELD: usize = 6;
-const FALLBACK_FIELD: usize = 7;
+const FIRST_MENU_FIELD: usize = 6;
+const TRANSPORT_FIELD: usize = 7;
+const FALLBACK_FIELD: usize = 8;
 
 impl Form {
     fn new() -> Form {
@@ -161,6 +165,7 @@ impl Form {
             user: String::new(),
             port: String::new(),
             key: String::new(),
+            options: String::new(),
             groups: String::new(),
             transport: 0,
             fallback: true,
@@ -215,6 +220,7 @@ impl Form {
             f.user = s.user.unwrap_or_default();
             f.port = s.port.map(|p| p.to_string()).unwrap_or_default();
             f.key = s.identity.unwrap_or_default();
+            f.options = saved::flags_from_options(&s.options);
         } else if let Some(t) = &h.target {
             f.host = t.host.clone();
             f.user = t.user.clone();
@@ -222,6 +228,10 @@ impl Form {
                 f.port = t.port.to_string();
             }
             f.key = t.identity_files.first().map(|p| p.display().to_string()).unwrap_or_default();
+            // Shown only: they come from the config file (maybe from `Host *`).
+            if f.locked {
+                f.options = forward_flags(t);
+            }
         }
         f
     }
@@ -231,7 +241,8 @@ impl Form {
             return None;
         }
         match self.focus {
-            5 => Some(&mut self.groups),
+            6 => Some(&mut self.groups),
+            5 => Some(&mut self.options),
             0 => Some(&mut self.name),
             1 => Some(&mut self.host),
             2 => Some(&mut self.user),
@@ -258,7 +269,8 @@ impl Form {
             None => None,
             Some(p) => Some(p.parse::<u16>().ok().filter(|&p| p > 0).ok_or("port: a number from 1 to 65535")?),
         };
-        let saved = Saved { name: self.name.trim().to_string(), host: self.host.trim().to_string(), user: opt(&self.user), port, identity: opt(&self.key) };
+        let options = saved::options_from_flags(&self.options).map_err(|e| format!("ssh opts: {e:#}"))?;
+        let saved = Saved { name: self.name.trim().to_string(), host: self.host.trim().to_string(), user: opt(&self.user), port, identity: opt(&self.key), options };
         saved.validate().map_err(|e| e.to_string())?;
         Ok((saved, Prefs { transport: TRANSPORTS[self.transport].to_string(), ssh_fallback: self.fallback }))
     }
@@ -820,6 +832,9 @@ impl App {
             };
             lines.push(field("host key", Span::styled(text, Style::new().fg(color))));
         }
+        if let Some(flags) = h.target.as_ref().map(forward_flags).filter(|f| !f.is_empty()) {
+            lines.push(field("forwards", Span::styled(flags, Style::new().fg(Color::Cyan))));
+        }
         let prefs = self.state.prefs(&h.alias);
         let via = match (prefs.transport.as_str(), prefs.ssh_fallback) {
             (t, true) => format!("{t}, ssh if no qshd"),
@@ -906,6 +921,12 @@ impl App {
     }
 }
 
+/// A host's forwards from the configs, as ssh's flags.
+fn forward_flags(t: &Target) -> String {
+    let specs = [('L', &t.local_forwards), ('R', &t.remote_forwards), ('D', &t.dynamic_forwards)];
+    specs.iter().flat_map(|(c, list)| list.iter().map(move |s| format!("-{c} {s}"))).collect::<Vec<_>>().join(" ")
+}
+
 /// The new/edit form as a centered popup.
 fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
     let width = area.width.min(64);
@@ -921,8 +942,9 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
         form.name.clone(),
         form.host.clone(),
         form.user.clone(),
-        if form.port.is_empty() && form.focus != 3 { "4422 (default)".into() } else { form.port.clone() },
+        form.port.clone(),
         form.key.clone(),
+        form.options.clone(),
         form.groups.clone(),
         format!("‹ {} ›", TRANSPORTS[form.transport]),
         if form.fallback { "[x] use plain ssh".into() } else { "[ ] fail".into() },
@@ -940,11 +962,28 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
                 (true, false) => Style::new().bold().bg(Color::Rgb(40, 60, 90)),
                 (false, false) => Style::new(),
             };
-            Line::from(vec![label, Span::styled(format!("{value}{cursor}"), style)])
+            let placeholder = match i {
+                PORT_FIELD => "4422 (default)",
+                OPTIONS_FIELD => "-L 8080:localhost:80 -D 1080 -A …",
+                _ => "",
+            };
+            if value.is_empty() && !focused && !placeholder.is_empty() {
+                return Line::from(vec![label, Span::styled(placeholder, Style::new().fg(Color::DarkGray))]);
+            }
+            // Room inside the borders after the label and the cursor.
+            let room = (width as usize).saturating_sub(2 + 11 + 1).max(2);
+            let chars: Vec<char> = value.chars().collect();
+            let shown: String = match (chars.len() > room, focused) {
+                (false, _) => value,
+                // Typing: the end, where the cursor is.
+                (true, true) => std::iter::once('…').chain(chars[chars.len() - (room - 1)..].iter().copied()).collect(),
+                (true, false) => chars[..room - 1].iter().copied().chain(std::iter::once('…')).collect(),
+            };
+            Line::from(vec![label, Span::styled(format!("{shown}{cursor}"), style)])
         })
         .collect();
     lines.push(if form.locked {
-        Line::styled("address, user, port, key: change them in your config file", Style::new().fg(Color::DarkGray))
+        Line::styled("address … ssh opts: change them in your config file", Style::new().fg(Color::DarkGray))
     } else {
         Line::raw("")
     });
@@ -1624,6 +1663,14 @@ mod tests {
         typing(&mut app, "2222");
         app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Tab));
+        typing(&mut app, "-L 8080:localhost:80 -p 1");
+        app.on_event(key(KeyCode::Enter));
+        assert!(render(&mut app, 100, 30).contains("use the port"), "a port in the options");
+        for _ in 0..5 {
+            app.on_event(key(KeyCode::Backspace));
+        }
+        typing(&mut app, " -A");
+        app.on_event(key(KeyCode::Tab));
         typing(&mut app, "web prod!");
         assert_eq!(app.on_event(key(KeyCode::Enter)), Action::None, "bad group name");
         app.on_event(key(KeyCode::Backspace));
@@ -1634,7 +1681,7 @@ mod tests {
         let Action::Save(form) = app.on_event(key(KeyCode::Enter)) else { panic!("not saved") };
         assert_eq!(form.group_list().unwrap(), ["web", "prod"]);
         let (saved, prefs) = form.result().unwrap();
-        assert_eq!(saved, Saved { name: "box".into(), host: "192.0.2.5".into(), user: Some("admin".into()), port: Some(2222), identity: None });
+        assert_eq!(saved, Saved { name: "box".into(), host: "192.0.2.5".into(), user: Some("admin".into()), port: Some(2222), identity: None, options: vec!["LocalForward 8080 localhost:80".into(), "ForwardAgent yes".into()] });
         assert_eq!(prefs, Prefs { transport: "quic".into(), ssh_fallback: false });
     }
 

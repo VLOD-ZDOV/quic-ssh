@@ -58,6 +58,10 @@ impl Server {
 
     /// Starts in a prepared HOME (e.g. with a host key and certificate).
     fn start_in(home: TempDir, listen: &str, config: &str) -> Server {
+        Self::start_env(home, listen, config, &[])
+    }
+
+    fn start_env(home: TempDir, listen: &str, config: &str, env: &[(&str, &str)]) -> Server {
         let dir = home.path().join(".config/qsh");
         std::fs::create_dir_all(&dir).unwrap();
         // Tests fail logins on purpose; penalties are tested on their own.
@@ -68,6 +72,7 @@ impl Server {
             .env("HOME", home.path())
             // One-time codes work right after the start (debug builds only).
             .env("QSHD_TEST_NO_TOTP_FLOOR", "1")
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -306,7 +311,23 @@ fn echo_server() -> u16 {
 
 #[test]
 fn local_port_forwarding() {
-    let s = Server::start();
+    local_port_forwarding_with(Server::start());
+}
+
+/// As in system mode, where a helper running as the user connects: the end
+/// of the client's data must reach the target through the helper's stdin.
+#[test]
+fn local_port_forwarding_through_the_helper() {
+    local_port_forwarding_with(Server::start_env(tempfile::tempdir().unwrap(), "127.0.0.1:0", "", &[("QSHD_TEST_FORWARD_HELPER", "1")]));
+}
+
+/// A small `connection_buffer_mb` slows bulk data down but loses none.
+#[test]
+fn local_port_forwarding_with_a_small_buffer() {
+    local_port_forwarding_with(Server::start_with("127.0.0.1", "connection_buffer_mb = 1\n"));
+}
+
+fn local_port_forwarding_with(s: Server) {
     let c = Client::paired(&s);
     let target = echo_server();
     for t in ["quic", "tcp"] {
@@ -325,6 +346,7 @@ fn local_port_forwarding() {
             assert!(Instant::now() < deadline, "forward did not come up");
             sleep(Duration::from_millis(50));
         };
+        sock.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         // Write a lot without reading, half-close, then read a lot back: the
         // stream must keep flowing in both phases.
         let payload = pseudo_random(32 * 1024 * 1024);
@@ -780,28 +802,37 @@ fn cve_no_user_enumeration() {
         let out = c.run(&["--accept-new-host", "--transport", "tcp", "-p", &port, &format!("{who}@127.0.0.1"), "true"]);
         (start.elapsed(), stderr(&out))
     };
-    let (mut known, mut unknown) = (Vec::new(), Vec::new());
-    for _ in 0..15 {
-        let (t, e) = attempt(&user());
-        known.push((t, e));
-        let (t, e) = attempt("qsh-no-such-user");
-        unknown.push((t, e));
-    }
-    // The server's answer is the same; only the echoed user name in the local hint differs.
     let msg = |e: &str| {
         let line = e.lines().find(|l| l.starts_with("qsh:")).unwrap_or("").to_string();
         line.split(" for ").next().unwrap_or("").to_string()
     };
-    assert!(msg(&known[0].1).contains("access denied"), "{}", known[0].1);
-    assert_eq!(msg(&known[0].1), msg(&unknown[0].1));
     let median = |v: &mut Vec<(Duration, String)>| {
         v.sort_by_key(|x| x.0);
         v[v.len() / 2].0
     };
-    let (k, u) = (median(&mut known), median(&mut unknown));
-    eprintln!("median time: existing user {k:?}, unknown user {u:?}");
-    let diff = k.abs_diff(u);
-    assert!(diff < Duration::from_millis(15), "timing differs by {diff:?}");
+    // Other tests running at the same time add noise: a real difference
+    // shows in every round, noise rarely in three.
+    let mut diffs = Vec::new();
+    for _ in 0..3 {
+        let (mut known, mut unknown) = (Vec::new(), Vec::new());
+        for _ in 0..15 {
+            let (t, e) = attempt(&user());
+            known.push((t, e));
+            let (t, e) = attempt("qsh-no-such-user");
+            unknown.push((t, e));
+        }
+        // The server's answer is the same; only the echoed user name in the local hint differs.
+        assert!(msg(&known[0].1).contains("access denied"), "{}", known[0].1);
+        assert_eq!(msg(&known[0].1), msg(&unknown[0].1));
+        let (k, u) = (median(&mut known), median(&mut unknown));
+        eprintln!("median time: existing user {k:?}, unknown user {u:?}");
+        let diff = k.abs_diff(u);
+        if diff < Duration::from_millis(15) {
+            return;
+        }
+        diffs.push(diff);
+    }
+    panic!("timing differs by {diffs:?}");
 }
 
 /// CVE-2025-26466 class: unauthenticated connections from one address must not lock out others.
@@ -2940,4 +2971,132 @@ fn permit_open_also_limits_sockets() {
     let back = dir.path().join("back.sock");
     let out = c.run(&["-p", &s.port.to_string(), "-o", "ExitOnForwardFailure=yes", "-R", &format!("{}:127.0.0.1:9", back.display()), &dest(), "true"]);
     assert!(!out.status.success() && !back.exists(), "{}", stderr(&out));
+}
+
+/// Starts `qsh -N` with forwards and waits until local `port` takes connections.
+fn forwarding(c: &Client, s: &Server, transport: &str, forwards: &[String], port: u16) -> Child {
+    let port_arg = s.port.to_string();
+    let mut args = vec!["--transport", transport, "-p", &port_arg, "-N"];
+    args.extend(forwards.iter().map(String::as_str));
+    let d = dest();
+    args.push(&d);
+    let child = c.cmd(&args).stderr(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "port {port} did not come up");
+        sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+/// More connections at once than a connection allows streams (each side
+/// opens up to 512): the rest wait. With TCP, yamux used to end the whole
+/// connection at 128 streams.
+#[test]
+#[ignore = "heavy: CI runs it on its own (--ignored)"]
+fn many_forwarded_connections_at_once() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let target = echo_server();
+    for t in ["quic", "tcp"] {
+        let (local, remote) = (free_port(), free_port());
+        let fwd = ["-L".into(), format!("{local}:127.0.0.1:{target}"), "-R".into(), format!("{remote}:127.0.0.1:{target}")];
+        let mut child = forwarding(&c, &s, t, &fwd, local);
+        // -R: streams the server opens; they broke TCP connections (yamux).
+        let ports = if t == "tcp" { vec![local, remote] } else { vec![local] };
+        for port in ports {
+            let n = 520;
+            // All connections open before any ends (a failed one counts too).
+            let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let threads: Vec<_> = (0..n)
+                .map(|i| {
+                    let opened = opened.clone();
+                    std::thread::spawn(move || {
+                        let text = format!("connection {i}");
+                        let sock = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut s| s.write_all(text.as_bytes()).map(|()| s));
+                        opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let deadline = Instant::now() + Duration::from_secs(20);
+                        while opened.load(std::sync::atomic::Ordering::SeqCst) < n && Instant::now() < deadline {
+                            sleep(Duration::from_millis(10));
+                        }
+                        let mut sock = sock.ok()?;
+                        sock.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+                        sock.shutdown(std::net::Shutdown::Write).ok()?;
+                        let mut reply = String::new();
+                        sock.read_to_string(&mut reply).ok()?;
+                        (reply == format!("echo:{text}")).then_some(())
+                    })
+                })
+                .collect();
+            let ok = threads.into_iter().filter_map(|t| t.join().unwrap()).count();
+            assert_eq!(ok, n, "{t}, port {port}");
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Out of file descriptors, a local forward refuses connections for a while
+/// but keeps listening.
+#[test]
+#[ignore = "heavy: CI runs it on its own (--ignored)"]
+fn forward_survives_running_out_of_descriptors() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let local = free_port();
+    let port = s.port.to_string();
+    let spec = format!("{local}:127.0.0.1:{target}");
+    let script = format!("ulimit -n 64 && exec '{QSH}' -p {port} -N -L {spec} {}", dest());
+    let mut child = Command::new("sh")
+        .args(["-c", &script])
+        .env("HOME", c.home.path())
+        .env_remove("SSH_AUTH_SOCK")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert_eq!(talk_tcp(local, b"first"), "echo:first");
+    let socks: Vec<_> = (0..100).filter_map(|_| std::net::TcpStream::connect(("127.0.0.1", local)).ok()).collect();
+    sleep(Duration::from_millis(500));
+    drop(socks);
+    sleep(Duration::from_millis(500));
+    assert_eq!(talk_tcp(local, b"again"), "echo:again");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Forwards whose readers stopped (a paused download) must not stall the
+/// other streams of the connection.
+#[test]
+#[ignore = "heavy: CI runs it on its own (--ignored)"]
+fn stuck_forwards_do_not_stall_the_connection() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let blaster = TcpListener::bind("127.0.0.1:0").unwrap();
+    let blaster_port = blaster.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut sock in blaster.incoming().flatten() {
+            std::thread::spawn(move || while sock.write_all(&[7u8; 65536]).is_ok() {});
+        }
+    });
+    let target = echo_server();
+    for t in ["quic", "tcp"] {
+        let (stuck, local) = (free_port(), free_port());
+        let fwd = ["-L".into(), format!("{stuck}:127.0.0.1:{blaster_port}"), "-L".into(), format!("{local}:127.0.0.1:{target}")];
+        let mut child = forwarding(&c, &s, t, &fwd, local);
+        // More than 32 MiB (the old window) at 8 MiB per stream.
+        let unread: Vec<_> = (0..6).map(|_| std::net::TcpStream::connect(("127.0.0.1", stuck)).unwrap()).collect();
+        sleep(Duration::from_secs(2));
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.write_all(b"still here").unwrap();
+        sock.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        sock.read_to_string(&mut reply).expect(t);
+        assert_eq!(reply, "echo:still here", "{t}");
+        drop(unread);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }

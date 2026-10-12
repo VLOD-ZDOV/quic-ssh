@@ -79,6 +79,12 @@ pub struct ServerConfig {
     pub max_startups: usize,
     /// Maximum unauthenticated connections from one IP address.
     pub max_startups_per_ip: usize,
+    /// Data from a client that qshd may hold before the program it is for
+    /// reads it, per connection, in MiB. Normally little is held; it fills
+    /// when forwards stop reading (a stuck service), and then the whole
+    /// connection waits. Each stuck stream takes up to 8 MiB, so 32 lets 4
+    /// stuck forwards be. Worst case RAM: `max_connections` times this.
+    pub connection_buffer_mb: u32,
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).
     pub gateway_ports: GatewayPorts,
@@ -633,6 +639,7 @@ impl Default for ServerConfig {
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
             max_connections: 256,
+            connection_buffer_mb: 32,
             max_startups: 64,
             max_startups_per_ip: 8,
             gateway_ports: GatewayPorts::No,
@@ -693,10 +700,14 @@ impl ServerConfig {
             ("max_startups", self.max_startups),
             ("max_startups_per_ip", self.max_startups_per_ip),
             ("max_auth_tries", self.max_auth_tries as usize),
+            ("connection_buffer_mb", self.connection_buffer_mb as usize),
         ] {
             if value == 0 {
                 bail!("{name} must be at least 1");
             }
+        }
+        if self.connection_buffer_mb > 4000 {
+            bail!("connection_buffer_mb must be at most 4000");
         }
         for mask in std::iter::once(&self.stream_local_bind_mask).chain(self.matches.iter().flat_map(|m| &m.stream_local_bind_mask)) {
             if u32::from_str_radix(mask, 8).map_or(true, |m| m > 0o777) {

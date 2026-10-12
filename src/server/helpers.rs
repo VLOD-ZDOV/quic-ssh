@@ -76,27 +76,52 @@ pub fn send(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Connects to `host:port` and relays stdin/stdout to the socket (port
-/// forwarding as the user). Prints "ok" first, or an error on stderr.
-pub fn connect(host: &str, port: u16) -> Result<()> {
+/// Connects to `host:port` (as the user the helper runs as).
+fn connect_tcp(host: &str, port: u16) -> Result<std::net::TcpStream> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
     let mut last = None;
-    let mut sock = None;
     for addr in (host, port).to_socket_addrs().with_context(|| format!("connect {host}:{port}"))? {
         match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
-            Ok(s) => {
-                sock = Some(s);
-                break;
-            }
+            Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
     }
-    let sock = match (sock, last) {
-        (Some(s), _) => s,
-        (None, Some(e)) => bail!("connect {host}:{port}: {e}"),
-        (None, None) => bail!("connect {host}:{port}: no addresses"),
-    };
+    match last {
+        Some(e) => bail!("connect {host}:{port}: {e}"),
+        None => bail!("connect {host}:{port}: no addresses"),
+    }
+}
+
+/// Connects to `host:port` as the user and hands the socket to qshd (`-L`
+/// in system mode): uid-based firewall rules apply to it, and no process
+/// stays to relay the data.
+pub fn connect_fd(host: &str, port: u16) -> Result<()> {
+    hand_over(connect_tcp(host, port)?)
+}
+
+/// Like [`connect_fd`], to the Unix socket `path`.
+pub fn connect_unix_fd(path: &str) -> Result<()> {
+    hand_over(std::os::unix::net::UnixStream::connect(path).with_context(|| format!("connect {path}"))?)
+}
+
+/// Sends `fd` to qshd over stdout, which is a Unix socket.
+fn hand_over(fd: impl std::os::fd::AsFd) -> Result<()> {
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use std::os::fd::AsFd;
+    let fds = [fd.as_fd()];
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    control.push(SendAncillaryMessage::ScmRights(&fds));
+    sendmsg(io::stdout().as_fd(), &[io::IoSlice::new(b"S")], &mut control, SendFlags::empty()).context("cannot hand the socket to qshd")?;
+    Ok(())
+}
+
+/// Connects to `host:port` and relays stdin/stdout to the socket. Prints
+/// "ok" first, or an error on stderr. Kept for a qshd started before an
+/// update, which may run this binary's helpers (see [`connect_fd`]).
+pub fn connect(host: &str, port: u16) -> Result<()> {
+    let sock = connect_tcp(host, port)?;
     let _ = sock.set_nodelay(true);
     let mut out = io::stdout();
     writeln!(out, "ok")?;
@@ -112,8 +137,8 @@ pub fn connect(host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Connects to the Unix socket `path` and relays stdin/stdout to it (`-L`
-/// to a socket, as the user). Prints "ok" first, or an error on stderr.
+/// Connects to the Unix socket `path` and relays stdin/stdout to it. Prints
+/// "ok" first, or an error on stderr. Kept like [`connect`].
 pub fn connect_unix(path: &str) -> Result<()> {
     use std::os::unix::net::UnixStream;
     let sock = UnixStream::connect(path).with_context(|| format!("connect {path}"))?;
@@ -137,8 +162,6 @@ pub fn connect_unix(path: &str) -> Result<()> {
 /// is taken away from the socket's permissions; with `unlink` = "yes", a
 /// stale socket file is removed first.
 pub fn listen_unix(path: &str, mask: &str, unlink: &str) -> Result<()> {
-    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
-    use std::os::fd::AsFd;
     use std::os::unix::fs::FileTypeExt;
     let mask = u32::from_str_radix(mask, 8).context("bad mask")? & 0o777;
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask as libc::mode_t));
@@ -146,12 +169,7 @@ pub fn listen_unix(path: &str, mask: &str, unlink: &str) -> Result<()> {
         let _ = fs::remove_file(path);
     }
     let listener = std::os::unix::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
-    let fds = [listener.as_fd()];
-    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut control = SendAncillaryBuffer::new(&mut space);
-    control.push(SendAncillaryMessage::ScmRights(&fds));
-    sendmsg(io::stdout().as_fd(), &[io::IoSlice::new(b"L")], &mut control, SendFlags::empty()).context("cannot hand the socket to qshd")?;
-    Ok(())
+    hand_over(listener)
 }
 
 /// Receives a tar stream on stdin into `path` (or `path/name` if `path` is a
@@ -321,6 +339,7 @@ pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
         ("internal-untar", [path, name]) => untar(path, name),
         ("internal-tar", [path]) => tar(path),
         ("internal-connect-unix", [path]) => connect_unix(path),
+        ("internal-connect-unix-fd", [path]) => connect_unix_fd(path),
         ("internal-listen-unix", [path, mask, unlink]) => listen_unix(path, mask, unlink),
         _ => bail!("{program} cannot run here"),
     }

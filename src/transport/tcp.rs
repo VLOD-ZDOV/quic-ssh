@@ -2,15 +2,15 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
@@ -29,19 +29,63 @@ pub struct TcpConn {
     /// How many streams opened by the peer may wait to be accepted; more are
     /// reset (few before login, see [`super::PREAUTH_STREAMS`]).
     queue: Arc<AtomicUsize>,
+    /// Streams we may still open. yamux ends the whole connection when the
+    /// peer has more streams than it allows, so opens beyond this wait, as
+    /// in QUIC.
+    opens: Arc<Semaphore>,
+    raised: AtomicBool,
 }
 
-fn yamux_config() -> Config {
+/// What yamux allows, counting streams both ways: room for [`MAX_STREAMS`]
+/// from each side and for closed streams that are not gone yet.
+///
+/// [`MAX_STREAMS`]: super::MAX_STREAMS
+const YAMUX_STREAMS: usize = 4 * super::MAX_STREAMS as usize;
+/// Streams we open to a peer older than protocol version 7, whose yamux
+/// allowed 128 for both sides together.
+const OLD_PEER_STREAMS: usize = 96;
+
+fn yamux_config(mode: Mode) -> Config {
     let mut cfg = Config::default();
-    cfg.set_max_num_streams(super::MAX_STREAMS as usize);
-    // Per-stream windows auto-tune up to this total.
-    cfg.set_max_connection_receive_window(Some(128 << 20));
+    cfg.set_max_num_streams(YAMUX_STREAMS);
+    // yamux gives every stream a 256 KiB window it cannot take back; beyond
+    // that, per-stream windows auto-tune up to this much more in total.
+    let more = if matches!(mode, Mode::Server) { super::server_buffer() as usize } else { 128 << 20 };
+    cfg.set_max_connection_receive_window(Some(YAMUX_STREAMS * (256 << 10) + more));
     cfg
 }
 
 fn split(s: yamux::Stream) -> (SendHalf, RecvHalf) {
-    let (r, w) = tokio::io::split(s.compat());
+    split_io(s.compat())
+}
+
+fn split_io<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> (SendHalf, RecvHalf) {
+    let (r, w) = tokio::io::split(s);
     (Box::new(w), Box::new(r))
+}
+
+/// A stream we opened; its permit goes back when both halves are dropped.
+struct Opened {
+    stream: tokio_util::compat::Compat<yamux::Stream>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsyncRead for Opened {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Opened {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 /// Runs the yamux connection in a background task. All stream I/O (including
@@ -51,7 +95,7 @@ fn start<T>(socket: T, mode: Mode, queue: Arc<AtomicUsize>) -> (mpsc::Sender<Cmd
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut conn = Connection::new(socket.compat(), yamux_config(), mode);
+    let mut conn = Connection::new(socket.compat(), yamux_config(mode), mode);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(32);
     let (in_tx, in_rx) = mpsc::channel(super::MAX_STREAMS as usize);
     let (alive_tx, alive_rx) = watch::channel(true);
@@ -122,7 +166,14 @@ where
     let queue = Arc::new(AtomicUsize::new(limit as usize));
     let (cmds, incoming, alive) = start(socket, mode, queue.clone());
     Conn {
-        inner: Inner::Tcp(TcpConn { cmds, incoming: Mutex::new(incoming), alive, queue }),
+        inner: Inner::Tcp(TcpConn {
+            cmds,
+            incoming: Mutex::new(incoming),
+            alive,
+            queue,
+            opens: Arc::new(Semaphore::new(OLD_PEER_STREAMS)),
+            raised: AtomicBool::new(false),
+        }),
         peer_key,
         exporter,
         remote,
@@ -198,10 +249,22 @@ pub async fn accept(tls: Arc<rustls::ServerConfig>, sock: TcpStream, addr: Socke
 
 impl TcpConn {
     pub async fn open_bi(&self) -> Result<(SendHalf, RecvHalf)> {
+        let permit = tokio::select! {
+            p = self.opens.clone().acquire_owned() => p.map_err(|_| anyhow!("connection closed"))?,
+            () = self.closed() => bail!("connection closed"),
+        };
         let (tx, rx) = oneshot::channel();
         self.cmds.send(Cmd::Open(tx)).await.map_err(|_| anyhow!("connection closed"))?;
         let stream = rx.await.map_err(|_| anyhow!("connection closed"))??;
-        Ok(split(stream))
+        Ok(split_io(Opened { stream: stream.compat(), _permit: permit }))
+    }
+
+    /// The peer's protocol version is known: from 7 on, its yamux allows
+    /// [`YAMUX_STREAMS`], so we may open [`super::MAX_STREAMS`].
+    pub fn peer_version(&self, version: u32) {
+        if version >= 7 && !self.raised.swap(true, Ordering::Relaxed) {
+            self.opens.add_permits(super::MAX_STREAMS as usize - OLD_PEER_STREAMS);
+        }
     }
 
     pub async fn accept_bi(&self) -> Option<(SendHalf, RecvHalf)> {

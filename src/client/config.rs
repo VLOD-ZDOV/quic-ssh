@@ -165,6 +165,7 @@ fn yes(v: &str) -> bool {
 }
 
 use crate::pattern::{host_matches, wildcard};
+use super::forward::Forward;
 
 /// Splits `Keyword value`, `Keyword=value` and `Keyword "quoted value"` lines.
 fn split_line(line: &str) -> Option<(String, Vec<String>)> {
@@ -874,6 +875,32 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
     }
     for f in &ours.identity_files {
         for_ssh.push(format!("IdentityFile={f}"));
+    }
+    // Forwards and the like from qsh's own files (`qsh ui` writes them) are
+    // wanted when ssh takes over too.
+    for (key, specs) in [("LocalForward", &ours.local_forwards), ("RemoteForward", &ours.remote_forwards)] {
+        for spec in specs {
+            let parsed = if key == "LocalForward" { Forward::parse(spec) } else { Forward::parse_remote(spec) };
+            match parsed.map(|f| f.config_args()) {
+                Ok((listen, Some(dest))) => for_ssh.push(format!("{key}={listen} {dest}")),
+                Ok((listen, None)) => for_ssh.push(format!("{key}={listen}")),
+                Err(_) => {}
+            }
+        }
+    }
+    for d in &ours.dynamic_forwards {
+        for_ssh.push(format!("DynamicForward={d}"));
+    }
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    match (ours.forward_agent, &ours.forward_agent_socket) {
+        (Some(true), Some(socket)) => for_ssh.push(format!("ForwardAgent={socket}")),
+        (Some(on), _) => for_ssh.push(format!("ForwardAgent={}", yes_no(on))),
+        (None, _) => {}
+    }
+    for (key, value) in [("ForwardX11", ours.forward_x11), ("ForwardX11Trusted", ours.forward_x11_trusted), ("Compression", ours.compression)] {
+        if let Some(v) = value {
+            for_ssh.push(format!("{key}={}", yes_no(v)));
+        }
     }
     HostConfig {
         hostname: ours.hostname.or(ssh.hostname),

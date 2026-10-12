@@ -110,6 +110,7 @@ fn reload_on_hangup(state: Arc<State>, reload: Reload) {
                     } else {
                         info!("config reloaded");
                     }
+                    crate::transport::set_server_buffer(new.connection_buffer_mb);
                     *state.cfg.write().unwrap() = Arc::new(new);
                 }
                 Err(e) => warn!("config not reloaded, keeping the old one: {e:#}"),
@@ -252,6 +253,7 @@ fn host_certificate(cfg: &ServerConfig, host: &Identity) -> Option<Vec<u8>> {
 /// Binds the configured address on UDP and TCP. If the default dual-stack
 /// address is unavailable (IPv6 disabled), falls back to IPv4.
 pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
+    crate::transport::set_server_buffer(cfg.connection_buffer_mb);
     let tls = crate::tls::server_config(host, host_certificate(cfg, host))?;
     let alive = (cfg.client_alive_interval > 0)
         .then(|| crate::transport::Alive { interval: Duration::from_secs(cfg.client_alive_interval), count: cfg.client_alive_count_max });
@@ -568,7 +570,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     };
     info!("{addr}: {name} logged in with {how} over {}", conn.transport_name());
     *outcome = Outcome::LoggedIn;
-    conn.logged_in();
+    conn.logged_in(version);
     let welcome = if version >= 4 { Reply::Welcome { version: VERSION } } else { Reply::Ok };
     write_msg(&mut send, &welcome).await?;
     drop(startup);
@@ -794,10 +796,16 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.may_open(&host, port) {
                 return write_msg(&mut send, &Reply::Err(format!("forwarding to {host}:{port} is not permitted (permit_open)"))).await;
             }
-            if user.switches() {
-                // Connect as the user, not as root, so uid-based firewall rules
-                // (iptables --uid-owner) apply (compare CVE-2016-10010).
-                return forward_as_user(send, recv, user, &["internal-connect", &host, &port.to_string()]).await;
+            // Tests reach the system-mode path without root (debug builds only).
+            let testing = cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_FORWARD_HELPER").is_some();
+            if user.switches() || testing {
+                return match connect_as(user, &host, port).await {
+                    Ok(tcp) => {
+                        write_msg(&mut send, &Reply::Ok).await?;
+                        crate::transport::splice(tcp, send, recv).await
+                    }
+                    Err(e) => write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
+                };
             }
             let connect = tokio::net::TcpStream::connect((host.as_str(), port));
             match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
@@ -828,7 +836,14 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed with permit_open/permitopen".into())).await;
             }
             if user.switches() {
-                return forward_as_user(send, recv, user, &["internal-connect-unix", &path]).await;
+                return match connect_unix_as(user, &path).await {
+                    Ok(sock) => {
+                        write_msg(&mut send, &Reply::Ok).await?;
+                        let (r, w) = sock.into_split();
+                        crate::transport::bridge(r, w, send, recv).await
+                    }
+                    Err(e) => write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
+                };
             }
             match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(&path)).await {
                 Ok(Ok(sock)) => {
@@ -969,9 +984,14 @@ async fn remote_forward(
         .map(|l| {
             let tx = tx.clone();
             tokio::spawn(async move {
-                while let Ok(accepted) = l.accept().await {
-                    if tx.send(accepted).await.is_err() {
-                        break;
+                loop {
+                    match l.accept().await {
+                        Ok(accepted) => {
+                            if tx.send(accepted).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => crate::transport::accept_failed(&e).await,
                     }
                 }
             })
@@ -1008,19 +1028,50 @@ async fn remote_forward(
 /// A listening Unix socket at `path` that belongs to the user: bound by a
 /// helper running as them, which hands the socket over.
 async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<tokio::net::UnixListener> {
-    use tokio::io::AsyncReadExt;
     let mask = format!("{:o}", cfg.bind_mask());
     let unlink = if cfg.stream_local_bind_unlink { "yes" } else { "no" };
     // Bound by a helper also when the server is the user: it sets the umask
     // before binding (a process-wide setting), so the socket is never open
     // to others for a moment.
+    let fd = socket_from_helper(user.confined_helper(&["internal-listen-unix", path, &mask, unlink])?).await?;
+    let std = std::os::unix::net::UnixListener::from(fd);
+    std.set_nonblocking(true)?;
+    Ok(tokio::net::UnixListener::from_std(std)?)
+}
+
+/// `-L` in system mode: a socket connected by a helper running as the user,
+/// so uid-based firewall rules (iptables --uid-owner) apply, as in sshd
+/// (compare CVE-2016-10010). The helper ends once it has handed it over.
+async fn connect_as(user: &User, host: &str, port: u16) -> Result<tokio::net::TcpStream> {
+    let fd = socket_from_helper(user.helper(&["internal-connect-fd", host, &port.to_string()])?).await?;
+    let std = std::net::TcpStream::from(fd);
+    std.set_nonblocking(true)?;
+    let tcp = tokio::net::TcpStream::from_std(std)?;
+    let _ = tcp.set_nodelay(true);
+    Ok(tcp)
+}
+
+/// Like [`connect_as`], to a Unix socket (inside the user's chroot, if any).
+async fn connect_unix_as(user: &User, path: &str) -> Result<tokio::net::UnixStream> {
+    let fd = socket_from_helper(user.confined_helper(&["internal-connect-unix-fd", path])?).await?;
+    let std = std::os::unix::net::UnixStream::from(fd);
+    std.set_nonblocking(true)?;
+    Ok(tokio::net::UnixStream::from_std(std)?)
+}
+
+/// Runs a helper that hands a socket over its stdout (see
+/// `helpers::hand_over`); its stderr is the error otherwise.
+async fn socket_from_helper(mut helper: tokio::process::Command) -> Result<std::os::fd::OwnedFd> {
+    use tokio::io::AsyncReadExt;
     let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
-    let mut child = user
-        .confined_helper(&["internal-listen-unix", path, &mask, unlink])?
+    let mut child = helper
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stderr(Stdio::piped())
         .spawn()?;
+    // The command holds the helper's end of the pair: closed, a helper that
+    // ends without a socket is noticed at once.
+    drop(helper);
     // Waited for without a thread of its own, and not forever: the helper
     // runs as the user, who can stop it.
     ours.set_nonblocking(true)?;
@@ -1043,11 +1094,7 @@ async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<t
     };
     let status = child.wait().await?;
     match received {
-        Ok(fd) => {
-            let std = std::os::unix::net::UnixListener::from(fd);
-            std.set_nonblocking(true)?;
-            Ok(tokio::net::UnixListener::from_std(std)?)
-        }
+        Ok(fd) => Ok(fd),
         Err(e) => {
             let mut err = String::new();
             if let Some(mut stderr) = child.stderr.take() {
@@ -1096,7 +1143,13 @@ async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((sock, _)) = accepted else { break };
+                let (sock, _) = match accepted {
+                    Ok(a) => a,
+                    Err(e) => {
+                        crate::transport::accept_failed(&e).await;
+                        continue;
+                    }
+                };
                 let (conn, path) = (conn.clone(), path.to_string());
                 tokio::spawn(async move {
                     let result = async {
@@ -1171,35 +1224,6 @@ async fn speed_up(mut send: SendHalf, mut recv: RecvHalf, bytes: u64) -> Result<
     write_msg(&mut send, &Reply::File { size: received, mode: 0 }).await?;
     send.shutdown().await?;
     Ok(())
-}
-
-/// Forwarding through `qshd internal-connect` (or `internal-connect-unix`,
-/// in the user's chroot), which runs as the user; `args` is the helper and
-/// its arguments.
-async fn forward_as_user(mut send: SendHalf, recv: RecvHalf, user: &User, args: &[&str]) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-    let mut helper = if args.first() == Some(&"internal-connect-unix") { user.confined_helper(args)? } else { user.helper(args)? };
-    let mut child = helper
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    // The helper prints "ok" once connected; the rest of stdout is the socket's data.
-    let mut out = BufReader::new(child.stdout.take().expect("piped"));
-    let mut status = String::new();
-    (&mut out).take(64).read_line(&mut status).await?;
-    if status.trim() != "ok" {
-        let mut err = String::new();
-        if let Some(e) = child.stderr.take() {
-            let _ = e.take(4096).read_to_string(&mut err).await;
-        }
-        return write_msg(&mut send, &Reply::Err(err.trim().to_string())).await;
-    }
-    write_msg(&mut send, &Reply::Ok).await?;
-    let stdin = child.stdin.take().expect("piped");
-    let result = crate::transport::bridge(out, stdin, send, recv).await;
-    let _ = child.kill().await;
-    result
 }
 
 /// Runs a helper as the user and returns its trimmed stdout, or its stderr
