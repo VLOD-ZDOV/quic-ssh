@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use anyhow::{bail, Context, Result};
 use ssh_key::certificate::CertType;
 use ssh_key::public::KeyData;
-use ssh_key::{Algorithm, Certificate, HashAlg};
+use ssh_key::{Algorithm, HashAlg};
 
 use crate::pattern::{address_allowed, source_address_allowed};
 
@@ -200,7 +200,8 @@ pub fn parse_line(line: &str) -> Result<Option<AuthorizedKey>> {
             }
             "principals" => {
                 once(entry.principals.is_some())?;
-                entry.principals = Some(need(value)?.split(',').map(|s| s.trim().to_string()).collect());
+                // `principals=""` allows none, not an empty name.
+                entry.principals = Some(need(value)?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
             }
             "cert-authority" => entry.cert_authority = true,
             "restrict" => {
@@ -245,7 +246,7 @@ pub fn parse_list(text: &str, mut skip: impl FnMut(usize, anyhow::Error)) -> Vec
 #[derive(Clone, Debug)]
 pub enum Offered {
     Key(KeyData),
-    Cert(Box<Certificate>),
+    Cert(Box<crate::keys::Cert>),
 }
 
 impl Offered {
@@ -253,7 +254,7 @@ impl Offered {
     pub fn from_bytes(bytes: &[u8]) -> Result<Offered> {
         match ssh_key::PublicKey::from_bytes(bytes) {
             Ok(k) => Ok(Offered::Key(k.key_data().clone())),
-            Err(_) => Ok(Offered::Cert(Box::new(Certificate::from_bytes(bytes).context("unknown key format")?))),
+            Err(_) => Ok(Offered::Cert(Box::new(crate::keys::Cert::from_bytes(bytes).context("unknown key format")?))),
         }
     }
 
@@ -377,12 +378,13 @@ pub fn check(offered: &Offered, entries: &[AuthorizedKey], trusted_cas: &[KeyDat
     }
 }
 
-fn check_cert(cert: &Certificate, entries: &[AuthorizedKey], trusted_cas: &[KeyData], login: &Login) -> Result<Grant, String> {
+fn check_cert(cert: &crate::keys::Cert, entries: &[AuthorizedKey], trusted_cas: &[KeyData], login: &Login) -> Result<Grant, String> {
     if cert.cert_type() != CertType::User {
         return Err("not a user certificate".into());
     }
     let ca = cert.signature_key();
-    let principals = cert.valid_principals();
+    // An empty name is no principal (`ssh-keygen -n ""`).
+    let principals: Vec<String> = cert.valid_principals().iter().filter(|p| !p.is_empty()).cloned().collect();
     // Either the server trusts the CA for everyone (principal = user name), or
     // the user trusts it in authorized_keys (principals= or the user name).
     let mut grant = None;
