@@ -2104,6 +2104,33 @@ fn one_time_code_is_taken_once_across_servers() {
     assert_eq!(ok, 1, "one code let {ok} logins in: {:?}", outs.iter().map(stderr).collect::<Vec<_>>());
 }
 
+/// Through a master, a command that ends without reading all its input
+/// still gives its output and exit status, while more input is on the way.
+#[test]
+fn shared_session_keeps_output_after_input_is_refused() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let sock = c.home.path().join("master.sock");
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host *\n    ControlMaster auto\n    ControlPersist 30\n    ControlPath {}\n", sock.display())).unwrap();
+    let port = s.port.to_string();
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    for i in 0..10 {
+        let mut child = c.cmd(&["-v", "-p", &port, &dest(), "head -c 3; exit 7"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Input keeps coming after the command is gone.
+        let feeder = std::thread::spawn(move || {
+            let chunk = [b'x'; 65536];
+            while stdin.write_all(&chunk).is_ok() {}
+        });
+        let out = child.wait_with_output().unwrap();
+        feeder.join().unwrap();
+        assert_eq!((stdout(&out).as_str(), out.status.code()), ("xxx", Some(7)), "run {i}: {}", stderr(&out));
+        assert!(stderr(&out).contains("shared connection"), "{}", stderr(&out));
+    }
+    let _ = c.run(&["-O", "exit", "-p", &port, &dest()]);
+}
+
 /// `ControlMaster auto` + `ControlPersist` in qsh's config: the first run
 /// leaves a master in the background, later runs (sessions, copies) go
 /// through it without a login of their own, and `-O check|exit` talk to it.
