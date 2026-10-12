@@ -529,11 +529,16 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // predictions are taken off the screen.
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<String>();
     let stdin_tx = tx.clone();
+    // When the server was last heard from by a ping; and whether qsh is
+    // stopped (`~^Z`), which is no silence of the server's.
+    let answered: Heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let suspended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if opts.stdin_null {
         let _ = stdin_tx.send(ClientMsg::StdinEof).await;
     } else {
         let disconnect = disconnect.clone();
         let forwarder = opts.forwarder.clone();
+        let (answered, suspended) = (answered.clone(), suspended.clone());
         let mut input = Input::new(raw.is_some(), cursor_keys.clone());
         tokio::spawn(async move {
             loop {
@@ -583,7 +588,11 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                                 EscapeAction::Suspend => {
                                     #[cfg(unix)]
                                     {
+                                        use std::sync::atomic::Ordering;
+                                        suspended.store(true, Ordering::SeqCst);
                                         suspend();
+                                        *answered.lock().unwrap() = std::time::Instant::now();
+                                        suspended.store(false, Ordering::SeqCst);
                                         // The window may have changed meanwhile (no SIGWINCH reached us).
                                         if let Ok((cols, rows)) = crossterm::terminal::size() {
                                             let _ = stdin_tx.send(ClientMsg::Resize { cols, rows }).await;
@@ -663,7 +672,6 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             }
         }))
     }
-    let answered: Heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let mut received: u64 = 0;
     // Output shown on the current stream, and how much of it was reported.
     let (mut shown, mut reported) = (0u64, 0u64);
@@ -784,7 +792,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 // When a message last arrived (not when the loop got to it), or
                 // a ping was answered.
                 let heard = incoming.last_received().max(*answered.lock().unwrap());
-                heard.elapsed() >= alive_interval * alive_max
+                !suspended.load(std::sync::atomic::Ordering::SeqCst) && heard.elapsed() >= alive_interval * alive_max
             }
         };
         if !lost {
