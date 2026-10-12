@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tracing::{debug, info};
 
@@ -316,7 +315,7 @@ impl Sessions {
                         sess.output_taken.notified().await;
                     }
                     // EIO is how a PTY master reports that the slave side was closed.
-                    let Ok(n @ 1..) = reader.read(&mut buf).await else { break };
+                    let Ok(n @ 1..) = exec::read_ready(&mut reader, &mut buf).await else { break };
                     let dropped = {
                         let mut out = sess.out.lock().unwrap();
                         out.buf.extend(&buf[..n]);

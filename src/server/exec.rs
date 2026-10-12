@@ -239,11 +239,26 @@ impl Pacing {
     }
 }
 
+/// Reads what is there, at least one byte (0 at the end), then whatever
+/// else is ready without waiting: a terminal hands output over in pieces of
+/// a line or so, and a message for each costs more than the bytes.
+pub(super) async fn read_ready<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    use futures::FutureExt;
+    let mut n = r.read(buf).await?;
+    while n > 0 && n < buf.len() {
+        match r.read(&mut buf[n..]).now_or_never() {
+            Some(Ok(more @ 1..)) => n += more,
+            _ => break,
+        }
+    }
+    Ok(n)
+}
+
 /// Forwards a child output stream as `ServerMsg`s until EOF.
 async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap: fn(Vec<u8>) -> ServerMsg) {
     let mut buf = vec![0u8; 32 * 1024];
     loop {
-        match r.read(&mut buf).await {
+        match read_ready(&mut r, &mut buf).await {
             // EIO is how a PTY master reports that the slave side was closed.
             Ok(0) | Err(_) => break,
             Ok(n) => {
