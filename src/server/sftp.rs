@@ -141,7 +141,7 @@ pub fn serve(opts: Options) -> Result<()> {
     }
     let mut input = BufReader::with_capacity(MAX_PACKET as usize, io::stdin().lock());
     let mut output = BufWriter::with_capacity(MAX_PACKET as usize, io::stdout().lock());
-    let mut server = Server { opts, handles: HashMap::new(), next_handle: 0 };
+    let mut server = Server { opts, handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
     loop {
         let mut len = [0u8; 4];
         match input.read_exact(&mut len) {
@@ -171,6 +171,31 @@ struct Server {
     opts: Options,
     handles: HashMap<u32, Handle>,
     next_handle: u32,
+    owners: Owners,
+}
+
+/// User and group names by ID, each looked up once: a lookup can go to NSS
+/// (LDAP and the like), and a listing has an entry per file.
+#[derive(Default)]
+struct Owners {
+    users: HashMap<u32, String>,
+    groups: HashMap<u32, String>,
+}
+
+impl Owners {
+    fn user(&mut self, uid: u32) -> &str {
+        self.users.entry(uid).or_insert_with(|| {
+            let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok().flatten();
+            user.map(|u| u.name).unwrap_or_else(|| uid.to_string())
+        })
+    }
+
+    fn group(&mut self, gid: u32) -> &str {
+        self.groups.entry(gid).or_insert_with(|| {
+            let group = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid)).ok().flatten();
+            group.map(|g| g.name).unwrap_or_else(|| gid.to_string())
+        })
+    }
 }
 
 /// Reads fields of a request.
@@ -293,7 +318,8 @@ fn ok(id: u32) -> Vec<u8> {
 }
 
 /// `-rw-r--r--    1 alice    staff        1234 Oct  9 12:00 name`, as `ls -l` (for sftp's `ls`).
-fn long_name(name: &str, m: &fs::Metadata) -> String {
+/// Names are bytes: not every file name is UTF-8.
+fn long_name(name: &[u8], m: &fs::Metadata, owners: &mut Owners) -> Vec<u8> {
     use std::os::unix::fs::FileTypeExt;
     let mode = m.mode();
     let t = m.file_type();
@@ -317,8 +343,6 @@ fn long_name(name: &str, m: &fs::Metadata) -> String {
         let bit = 0o400 >> i;
         perms.push(if mode & bit != 0 { c } else { '-' });
     }
-    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(m.uid())).ok().flatten().map(|u| u.name);
-    let group = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(m.gid())).ok().flatten().map(|g| g.name);
     let when = jiff::Timestamp::from_second(m.mtime())
         .map(|t| t.to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)))
         .map(|z| {
@@ -326,13 +350,10 @@ fn long_name(name: &str, m: &fs::Metadata) -> String {
             z.strftime(if recent { "%b %e %H:%M" } else { "%b %e  %Y" }).to_string()
         })
         .unwrap_or_default();
-    format!(
-        "{perms} {:>4} {:<8} {:<8} {:>8} {when} {name}",
-        m.nlink(),
-        user.unwrap_or_else(|| m.uid().to_string()),
-        group.unwrap_or_else(|| m.gid().to_string()),
-        m.size()
-    )
+    let user = owners.user(m.uid()).to_string();
+    let mut line = format!("{perms} {:>4} {user:<8} {:<8} {:>8} {when} ", m.nlink(), owners.group(m.gid()), m.size()).into_bytes();
+    line.extend_from_slice(name);
+    line
 }
 
 fn apply_attrs(path: &Path, a: &Attrs, follow: bool) -> io::Result<()> {
@@ -341,14 +362,15 @@ fn apply_attrs(path: &Path, a: &Attrs, follow: bool) -> io::Result<()> {
     if let Some(size) = a.size {
         OpenOptions::new().write(true).open(path)?.set_len(size)?;
     }
+    // Owner before mode: a chown clears setuid and setgid bits.
+    if let Some((uid, gid)) = a.ids {
+        let chown = if follow { std::os::unix::fs::chown } else { std::os::unix::fs::lchown };
+        chown(path, Some(uid), Some(gid))?;
+    }
     if let Some(perm) = a.perm {
         if follow || !fs::symlink_metadata(path)?.file_type().is_symlink() {
             fs::set_permissions(path, fs::Permissions::from_mode(perm & 0o7777))?;
         }
-    }
-    if let Some((uid, gid)) = a.ids {
-        let chown = if follow { std::os::unix::fs::chown } else { std::os::unix::fs::lchown };
-        chown(path, Some(uid), Some(gid))?;
     }
     if let Some((atime, mtime)) = a.times {
         let flag = if follow { UtimensatFlags::FollowSymlink } else { UtimensatFlags::NoFollowSymlink };
@@ -440,6 +462,11 @@ impl Server {
             CLOSE => {
                 let h = Self::handle_id(m)?;
                 match self.handles.remove(&h) {
+                    // A failed close can be the first word of a failed write (NFS, quotas).
+                    Some(Handle::File(f)) => match nix::unistd::close(f) {
+                        Ok(()) => ok(id),
+                        Err(e) => io_status(id, &e.into()),
+                    },
                     Some(_) => ok(id),
                     None => status(id, FAILURE, "invalid handle"),
                 }
@@ -541,20 +568,23 @@ impl Server {
                 let Some(Handle::Dir { path, entries, dots }) = self.handles.get_mut(&h) else {
                     return Some(status(id, FAILURE, "invalid handle"));
                 };
-                let mut names: Vec<(String, String, fs::Metadata)> = Vec::new();
+                use std::os::unix::ffi::OsStrExt;
+                let owners = &mut self.owners;
+                let mut names: Vec<(Vec<u8>, Vec<u8>, fs::Metadata)> = Vec::new();
                 if std::mem::take(dots) {
                     for dot in [".", ".."] {
                         if let Ok(md) = fs::symlink_metadata(path.join(dot)) {
-                            names.push((dot.into(), long_name(dot, &md), md));
+                            names.push((dot.into(), long_name(dot.as_bytes(), &md, owners), md));
                         }
                     }
                 }
                 if let Some(it) = entries {
                     for entry in it.by_ref() {
                         let Ok(entry) = entry else { continue };
-                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let name = entry.file_name().as_bytes().to_vec();
                         if let Ok(md) = fs::symlink_metadata(entry.path()) {
-                            names.push((name.clone(), long_name(&name, &md), md));
+                            let long = long_name(&name, &md, owners);
+                            names.push((name, long, md));
                         }
                         if names.len() >= DIR_BATCH {
                             break;
@@ -569,7 +599,7 @@ impl Server {
                 }
                 let mut out = Out::new(R_NAME, id).u32(names.len() as u32);
                 for (name, long, md) in &names {
-                    out = out.str(name).str(long).attrs(md);
+                    out = out.bytes(name).bytes(long).attrs(md);
                 }
                 out.0
             }
@@ -606,7 +636,7 @@ impl Server {
             }
             REALPATH => {
                 let path = m.path()?;
-                match fs::canonicalize(&path) {
+                match realpath(&path) {
                     Ok(p) => name_reply(id, &p),
                     Err(e) => io_status(id, &e),
                 }
@@ -762,11 +792,11 @@ fn fsetstat(f: &File, a: &Attrs) -> io::Result<()> {
     if let Some(size) = a.size {
         f.set_len(size)?;
     }
-    if let Some(perm) = a.perm {
-        f.set_permissions(fs::Permissions::from_mode(perm & 0o7777))?;
-    }
     if let Some((uid, gid)) = a.ids {
         std::os::unix::fs::fchown(f, Some(uid), Some(gid))?;
+    }
+    if let Some(perm) = a.perm {
+        f.set_permissions(fs::Permissions::from_mode(perm & 0o7777))?;
     }
     if let Some((atime, mtime)) = a.times {
         let t = |s: u32| TimeSpec::new(s as i64, 0);
@@ -785,6 +815,21 @@ fn expand_tilde(path: &str) -> Option<PathBuf> {
         nix::unistd::User::from_name(user).ok().flatten()?.dir
     };
     Some(home.join(tail))
+}
+
+/// Like OpenBSD's realpath, which sftp-server uses: the last component
+/// need not exist (`scp -r` and `put -r` ask about a directory before they
+/// create it), and an empty path is the current directory.
+fn realpath(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.as_os_str().is_empty() { Path::new(".") } else { path };
+    match fs::canonicalize(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err(e) };
+            let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        other => other,
+    }
 }
 
 fn name_reply(id: u32, path: &Path) -> Vec<u8> {
@@ -848,7 +893,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
         let p = path.to_str().unwrap();
-        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0 };
+        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
         let flags = (FXF_WRITE | FXF_CREAT | FXF_TRUNC).to_be_bytes();
         let reply = srv.handle(&packet(OPEN, 1, &[&s(p), &flags, &0u32.to_be_bytes()]));
         assert_eq!(reply[0], R_HANDLE);
@@ -873,9 +918,33 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// `scp -r` asks for the real path of a directory it is about to create;
+    /// listings keep names that are not UTF-8.
+    #[test]
+    fn realpath_of_a_new_name_and_raw_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
+        let new = root.join("new");
+        let reply = srv.handle(&packet(REALPATH, 1, &[&s(new.to_str().unwrap())]));
+        assert_eq!(reply[0], R_NAME);
+        assert!(reply.windows(new.as_os_str().len()).any(|w| w == new.as_os_str().as_bytes()));
+        let missing = root.join("no/such");
+        assert_eq!(code(&srv.handle(&packet(REALPATH, 2, &[&s(missing.to_str().unwrap())]))), NO_SUCH_FILE);
+
+        let raw = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        std::fs::write(root.join(raw), b"x").unwrap();
+        let reply = srv.handle(&packet(OPENDIR, 3, &[&s(root.to_str().unwrap())]));
+        let handle = reply[5..].to_vec();
+        let reply = srv.handle(&packet(READDIR, 4, &[&handle]));
+        assert_eq!(reply[0], R_NAME);
+        assert!(reply.windows(4).any(|w| w == b"caf\xe9"), "the name's bytes as they are");
+    }
+
     #[test]
     fn malformed_requests_get_an_error() {
-        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0 };
+        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
         assert_eq!(code(&srv.handle(&packet(OPEN, 1, &[&[0, 0, 0, 9, b'x']]))), BAD_MESSAGE);
         assert_eq!(code(&srv.handle(&packet(STAT, 2, &[&s("a\0b")]))), BAD_MESSAGE);
         assert_eq!(code(&srv.handle(&packet(99, 3, &[]))), OP_UNSUPPORTED);
