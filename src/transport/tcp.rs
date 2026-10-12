@@ -245,7 +245,7 @@ where
 
 /// TCP keepalive (QUIC has its own): a peer that vanished without a word
 /// (sleep, a changed network, a NAT that forgot the connection) is noticed
-/// after about a minute instead of never, on both sides.
+/// after about a minute instead of never (or a quarter of an hour), on both sides.
 /// `alive`: the server's own probe interval and count instead.
 fn keep_alive(sock: &TcpStream, alive: Option<super::Alive>) {
     use std::time::Duration;
@@ -264,6 +264,13 @@ fn keep_alive(sock: &TcpStream, alive: Option<super::Alive>) {
     let _ = interval;
     if let Err(e) = socket2::SockRef::from(sock).set_tcp_keepalive(&ka) {
         tracing::debug!("TCP keepalive: {e}");
+    }
+    // Keepalive probes only an idle connection: with data waiting for an
+    // acknowledgement (output to a client that vanished), only this ends it
+    // before the retransmissions give up, which takes some 15 minutes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) = socket2::SockRef::from(sock).set_tcp_user_timeout(Some(time + interval * retries)) {
+        tracing::debug!("TCP user timeout: {e}");
     }
 }
 
