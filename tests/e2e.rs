@@ -1818,6 +1818,46 @@ fn session_survives_network_outage() {
     assert_eq!(status.code(), Some(7), "{seen}");
 }
 
+/// A persistent session drops nothing: output for a client that reads
+/// slowly (it used to keep only the last MiB), and a paste larger than a
+/// MiB (it used to be cut).
+#[test]
+fn persistent_session_loses_nothing() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let mut child = c.cmd(&["-tt", "-p", &port, &dest(), "seq 1 300000"]).stdin(Stdio::null()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 16384];
+    while let Ok(n @ 1..) = out.read(&mut buf) {
+        got.extend_from_slice(&buf[..n]);
+        sleep(Duration::from_millis(2));
+    }
+    assert!(child.wait().unwrap().success());
+    let text = String::from_utf8_lossy(&got);
+    let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 300000, "output lost (last line {:?})", lines.last());
+    assert_eq!(lines.last(), Some(&"300000"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("pasted");
+    let data: Vec<u8> = (0..3_000_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let script = format!("stty raw -echo; echo READY; sleep 1; head -c {} > {}", data.len(), file.display());
+    let mut child = c.cmd(&["-tt", "-p", &port, &dest(), &script]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("READY") {
+        let n = out.read(&mut buf).unwrap();
+        assert!(n > 0, "no READY");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    std::thread::spawn(move || while let Ok(1..) = out.read(&mut [0u8; 4096]) {});
+    child.stdin.as_mut().unwrap().write_all(&data).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(std::fs::read(&file).unwrap() == data, "the paste was cut or changed");
+}
+
 #[test]
 fn hangup_ends_a_persistent_session() {
     let s = Server::start();
