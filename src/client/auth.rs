@@ -276,7 +276,9 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
     let mut keyring: Option<Keyring> = None;
     let mut passwords = 0u32;
     let mut reply: Reply = read_msg(recv).await?;
-    loop {
+    // A real login takes a few steps; a server that goes on and on (banners,
+    // questions) is not let keep us forever.
+    for _ in 0..MAX_LOGIN_STEPS {
         reply = match reply {
             Reply::Ok => return Ok(Outcome::Welcome(3)),
             Reply::Welcome { version } => return Ok(Outcome::Welcome(version)),
@@ -324,7 +326,11 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             other => bail!("unexpected reply {other:?} while logging in"),
         };
     }
+    bail!("the server does not finish the login")
 }
+
+/// Messages a login may take (see [`login`]).
+const MAX_LOGIN_STEPS: usize = 64;
 
 /// Offers keys until the server accepts one, then proves it. Returns the
 /// server's answer to the proof, or to `Auth::Done` if nothing was accepted.
