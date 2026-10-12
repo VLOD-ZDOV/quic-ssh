@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ssh_key::{Algorithm, Certificate, PrivateKey};
+use ssh_key::{Algorithm, PrivateKey};
 use tracing::debug;
 
 use super::Target;
@@ -44,9 +44,9 @@ fn cert_path(key: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-fn read_cert(path: &Path) -> Option<Certificate> {
+fn read_cert(path: &Path) -> Option<crate::keys::Cert> {
     let text = std::fs::read_to_string(path).ok()?;
-    match Certificate::from_openssh(text.trim()) {
+    match crate::keys::Cert::from_openssh(text.trim()) {
         Ok(c) => Some(c),
         Err(e) => {
             debug!("ignoring certificate {}: {e}", path.display());
@@ -129,7 +129,7 @@ impl Keyring {
         let wanted: HashSet<Vec<u8>> = file_keys.iter().filter_map(|(_, k)| ssh_key::PublicKey::from(k.clone()).to_bytes().ok()).collect();
 
         // Certificates: next to each key file, and from CertificateFile.
-        let mut certs: Vec<(PathBuf, Certificate)> = Vec::new();
+        let mut certs: Vec<(PathBuf, crate::keys::Cert)> = Vec::new();
         for (path, _) in &file_keys {
             if let Some(c) = read_cert(&cert_path(path)) {
                 certs.push((path.clone(), c));
@@ -228,7 +228,7 @@ fn sign_with(key: &PrivateKey, data: &[u8]) -> Result<ssh_key::Signature> {
 
 /// The key inside a certificate blob, as a key blob.
 fn cert_key_blob(blob: &[u8]) -> Option<Vec<u8>> {
-    let cert = Certificate::from_bytes(blob).ok()?;
+    let cert = crate::keys::Cert::from_bytes(blob).ok()?;
     ssh_key::PublicKey::from(cert.public_key().clone()).to_bytes().ok()
 }
 

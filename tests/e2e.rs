@@ -1479,6 +1479,14 @@ fn user_certificates() {
     sign(&ec, &["-n", &user(), "-O", "force-command=echo from-cert"]);
     let wrong = keygen(keys.path(), "wrong", "ecdsa");
     sign(&wrong, &["-n", "somebody-else"]);
+    // Without -V: valid forever (an end of 2^64-1).
+    let forever = keygen(keys.path(), "forever", "ecdsa");
+    let out = Command::new("ssh-keygen")
+        .args(["-q", "-s", ca.to_str().unwrap(), "-I", "forever-cert", "-n", &user()])
+        .arg(format!("{}.pub", forever.display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ssh-keygen -s: {}", stderr(&out));
 
     // Trusted by the server for everyone.
     let ca_file = keys.path().join("user_ca.pub");
@@ -1492,6 +1500,8 @@ fn user_certificates() {
     let out = q(&ec, "id");
     assert_eq!(stdout(&out), "from-cert\n", "force-command: {}", stderr(&out));
     assert!(!q(&wrong, "true").status.success(), "certificate for another principal accepted");
+    let out = q(&forever, "echo forever");
+    assert_eq!(stdout(&out), "forever\n", "a certificate valid forever: {}", stderr(&out));
 
     // Trusted by the user through a cert-authority line.
     let (s, c) = server_with_keys("", &[format!("cert-authority,principals=\"somebody-else\" {}", public(&ca))]);

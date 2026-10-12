@@ -783,7 +783,7 @@ enum CertVerdict {
 /// `@revoked` keys for this host.
 fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, revoked: &[ssh_key::public::KeyData], cas: &[ssh_key::public::KeyData]) -> CertVerdict {
     use ssh_key::certificate::CertType;
-    let cert = match ssh_key::Certificate::from_bytes(cert) {
+    let cert = match crate::keys::Cert::from_bytes(cert) {
         Ok(c) => c,
         Err(e) => return CertVerdict::Unusable(format!("cannot parse the host certificate: {e}")),
     };

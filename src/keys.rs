@@ -207,6 +207,78 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// An SSH certificate. `ssh-keygen` without `-V` makes one valid forever,
+/// ending at 2^64-1, which ssh-key refuses (it wants a 63-bit time): such a
+/// one is read with the latest end ssh-key takes, and its signature is
+/// checked over the bytes as signed.
+#[derive(Clone, Debug)]
+pub struct Cert {
+    cert: ssh_key::Certificate,
+    /// For a certificate valid forever: what the CA signed.
+    forever_signed: Option<Vec<u8>>,
+    /// As it was read (encoding `cert` again would change a forever one).
+    raw: Vec<u8>,
+}
+
+impl std::ops::Deref for Cert {
+    type Target = ssh_key::Certificate;
+    fn deref(&self) -> &ssh_key::Certificate {
+        &self.cert
+    }
+}
+
+impl Cert {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Cert> {
+        let err = match ssh_key::Certificate::from_bytes(bytes) {
+            Ok(cert) => return Ok(Cert { cert, forever_signed: None, raw: bytes.to_vec() }),
+            Err(e) => e,
+        };
+        // Which eight 0xff bytes are the end of validity is up to the parse.
+        const LATEST: u64 = i64::MAX as u64;
+        for at in (0..bytes.len().saturating_sub(7)).filter(|&i| bytes[i..i + 8] == [0xff; 8]) {
+            let mut patched = bytes.to_vec();
+            patched[at..at + 8].copy_from_slice(&LATEST.to_be_bytes());
+            let Ok(cert) = ssh_key::Certificate::from_bytes(&patched) else { continue };
+            if cert.valid_before() != LATEST {
+                continue;
+            }
+            // The signature is the last field: everything before it was signed.
+            let signature = 4 + ssh_encoding::Encode::encoded_len(cert.signature())?;
+            let signed = bytes[..bytes.len().saturating_sub(signature)].to_vec();
+            return Ok(Cert { cert, forever_signed: Some(signed), raw: bytes.to_vec() });
+        }
+        Err(err.into())
+    }
+
+    /// The certificate as it was read.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(self.raw.clone())
+    }
+
+    /// The `type base64 [comment]` text of a `-cert.pub` file.
+    pub fn from_openssh(text: &str) -> Result<Cert> {
+        use base64::Engine;
+        let data = text.split_whitespace().nth(1).context("not a certificate line")?;
+        Cert::from_bytes(&base64::engine::general_purpose::STANDARD.decode(data)?)
+    }
+
+    /// Like [`ssh_key::Certificate::validate_at`].
+    pub fn validate_at<'a>(&self, now: u64, ca_fingerprints: impl IntoIterator<Item = &'a ssh_key::Fingerprint>) -> Result<()> {
+        let Some(signed) = &self.forever_signed else {
+            return Ok(self.cert.validate_at(now, ca_fingerprints)?);
+        };
+        signature::Verifier::verify(self.cert.signature_key(), signed, self.cert.signature()).context("certificate signature")?;
+        let ca = self.cert.signature_key().fingerprint(HashAlg::Sha256);
+        if !ca_fingerprints.into_iter().any(|f| f == &ca) {
+            bail!("certificate authority is not trusted");
+        }
+        if now < self.cert.valid_after() {
+            bail!("certificate is not valid yet");
+        }
+        Ok(())
+    }
+}
+
 /// Parses an authorized_keys-style text and returns all ed25519 keys in it.
 pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
     text.lines()
