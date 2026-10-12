@@ -604,13 +604,19 @@ fn user_entry_matches(entry: &str, who: &Login) -> bool {
         })
 }
 
+/// Whether `cidr` is a range of either family (an IPv6 one is only checked
+/// against an IPv6 address).
+fn cidr_valid(cidr: &str) -> bool {
+    cidr_contains(cidr, IpAddr::from([0u8; 4])).is_some() && cidr_contains(cidr, IpAddr::from([0u16; 8])).is_some()
+}
+
 /// Checks the address ranges of AllowUsers/DenyUsers entries: a broken one
 /// would never match, which for deny_users means letting users in.
 fn check_user_entries(what: &str, entries: &[String]) -> Result<()> {
     for entry in entries {
         let Some((_, host)) = entry.rsplit_once('@') else { continue };
         for cidr in host.split(',').map(|p| p.trim_start_matches('!')).filter(|p| p.contains('/')) {
-            if cidr_contains(cidr, IpAddr::from([0u8; 4])).is_none() {
+            if !cidr_valid(cidr) {
                 bail!("{what}: bad address range {cidr:?} in {entry:?}");
             }
         }
@@ -725,7 +731,7 @@ impl ServerConfig {
                 bail!("match block {}: max_auth_tries must be at least 1", i + 1);
             }
             for cidr in m.address.iter().map(|a| a.trim_start_matches('!')).filter(|a| a.contains('/')) {
-                if cidr_contains(cidr, IpAddr::from([0u8; 4])).is_none() {
+                if !cidr_valid(cidr) {
                     bail!("match block {}: bad address range {cidr:?}", i + 1);
                 }
             }
@@ -1002,6 +1008,8 @@ mod tests {
             "permit_root_login = \"maybe\"",
             "[[match]]\nuser = \"x\"\nlisten = \"0.0.0.0:1\"",
             "[[match]]\naddress = \"10.0.0.0/40\"",
+            "[[match]]\naddress = \"2001:db8::/200\"",
+            "deny_users = [\"*@2001:db8::/129\"]",
             "[set_env]\n\"A=B\" = \"x\"",
         ] {
             let parsed = toml::from_str::<ServerConfig>(bad).map_err(anyhow::Error::from).and_then(|c| c.validate().map(|_| c));
