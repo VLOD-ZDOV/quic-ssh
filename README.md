@@ -219,8 +219,11 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - qsh notices the loss within about 15 s, reconnects by itself, and shows the output you missed. Full-screen programs redraw.
 - Wi-Fi to mobile switches, laptop sleep and short outages no longer kill your shell. Over QUIC, a change of address (NAT rebinding) usually needs no reconnect at all.
 - Keys typed during an outage are dropped, and `~.` gives up waiting.
+- Nothing is dropped while you are connected: a program that writes faster than your terminal shows waits for it, as over ssh, and a paste of any size arrives whole. While you are away, the last 1 MiB of output is kept; programs go on running, but one that floods its terminal is slowed down instead of keeping a core busy.
+- Up to 16 such sessions per user. At the limit, a new one closes the session that has been detached the longest (one left behind by a killed client, say).
 - Quitting normally (exit, `~.`, closing the terminal) ends the session on the server as usual.
 - Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Sessions with port, agent or X11 forwarding are not kept; forwards added later with `~C` end when the connection is lost (qsh says which).
+- After `^C`, at most about 1 MiB of output that was already on its way scrolls by (ssh: about 2 MiB), in every terminal session with qshd 1.0.5 or newer.
 - `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
 
 ### Connection sharing (`ControlMaster`)
@@ -235,10 +238,10 @@ Host *
 ```
 
 - `ControlMaster auto`: use a running master, or become one. `yes` (or `-M`) always becomes one. The default `no` uses a master only if `ControlPath` is set.
-- `ControlPersist 10m` keeps the master in the background for 10 minutes after the last session (`yes` until `-O exit`). Without it the first qsh is the master and, when its own session ends, waits for the others.
+- `ControlPersist 10m` keeps the master in the background for 10 minutes after the last session (`yes` until `-O exit`); connections through the master's own forwards count as sessions. Without it the first qsh is the master and, when its own session ends, waits for the others.
 - The socket is in `~/.config/qsh/ctl/` by default (`ControlPath`, or `-S path`; tokens `%h %p %r %C`). ssh's `ControlPath` is not used: those sockets speak ssh's protocol.
 - `qsh -O check host`, `-O exit`, `-O stop`, `-O forward -L ...` and `-O cancel -L ...` as in ssh.
-- Runs with `-R` or `-A` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it.
+- Runs with `-R` or `-A` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it. A master whose own terminal session reconnects keeps sharing the new connection.
 - Not on Windows.
 
 ### Host aliases (`~/.ssh/config`)
@@ -414,7 +417,7 @@ session_timeout = 3600          # seconds a disconnected terminal session is kep
 # allow_users = ["alice", "bob@192.0.2.0/24,!192.0.2.9"]
 # deny_groups = ["nossh"]
 # allow_groups = ["staff"]
-permit_root_login = "prohibit-password"   # root with keys only; "yes", "no", "forced-commands-only"
+permit_root_login = "prohibit-password"   # root with keys only; "yes", "no", "forced-commands-only" (keys with command=)
 password_authentication = false # accept /etc/shadow passwords when no key works (system mode, Linux; not expired ones)
 permit_empty_passwords = false
 login_grace_time = 120          # seconds to log in; 0 = no limit
@@ -482,13 +485,13 @@ User keys live in `~/.config/qsh/authorized_keys` (unless `use_qsh_authorized_ke
 
 A line with any other option is **not used at all**: a restriction qsh cannot enforce never turns into access.
 
-**Certificates.** Sign keys with `ssh-keygen -s ca -I id -n USER key.pub`, then trust the CA either server-wide (`trusted_user_ca_keys`) or per user with a `cert-authority` line. `force-command`, `source-address` and the `permit-*` extensions are enforced. For host certificates, sign the host key (`ssh-keygen -s ca -I host -h -n host.example.com /etc/qsh/host_ed25519.pub`) and add `@cert-authority *.example.com <CA key>` to `~/.config/qsh/known_hosts` or `~/.ssh/known_hosts` on clients: hosts with a valid certificate are trusted without the first-connection question. `@revoked` lines are honoured. As with OpenSSH, a host whose certificate comes from a revoked CA, or from a trusted CA but is expired or made for another name, is refused even if its key is in known_hosts.
+**Certificates.** Sign keys with `ssh-keygen -s ca -I id -n USER key.pub`, then trust the CA either server-wide (`trusted_user_ca_keys`) or per user with a `cert-authority` line. `force-command`, `source-address` and the `permit-*` extensions are enforced. For host certificates, sign the host key (`ssh-keygen -s ca -I host -h -n host.example.com /etc/qsh/host_ed25519.pub`) and add `@cert-authority *.example.com <CA key>` to `~/.config/qsh/known_hosts` or `~/.ssh/known_hosts` on clients: hosts with a valid certificate are trusted without the first-connection question. `@revoked` lines are honoured. Certificates without an expiry date (`ssh-keygen` without `-V`) work too. As with OpenSSH, a host whose certificate comes from a revoked CA, or from a trusted CA but is expired or made for another name, is refused even if its key is in known_hosts.
 
 **Keys from a program.** `authorized_keys_command` works like sshd's `AuthorizedKeysCommand`: its output is read like an authorized_keys file, in addition to the files. Tokens: `%u` user, `%h` home, `%U` uid, and for the offered key `%f` (fingerprint), `%k` (base64), `%t` (type). With a key token it runs once per offered key. The program needs an absolute path that only root can change (in user mode: root or the server's user), runs with a 10 s limit, and as root only as `authorized_keys_command_user`.
 
 **Revoking keys.** `revoked_keys` names a file with public keys (one per line) or a KRL made with `ssh-keygen -k`, which can also revoke certificates by serial number or key ID, and whole CAs. It is read at every login, so changes apply at once. If the file is set but cannot be read, no key is accepted.
 
-**One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once. `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again. Right after qshd starts, codes that the previous process might have accepted are refused (up to a minute and a half), so a code seen before a restart cannot be replayed.
+**One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once, also across several qshd of the same user (another port, a user-mode qshd next to the system one). `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again. Right after qshd starts, codes that the previous process might have accepted are refused (up to a minute and a half), so a code seen before a restart cannot be replayed.
 
 Logs go to stderr (journald). Set the level with `QSHD_LOG`, for example `QSHD_LOG=qsh=debug`.
 
@@ -551,7 +554,7 @@ python3 bench/bench.py
 - **The client** logs in with mutual TLS using its Ed25519 key, or after the handshake with a signature by any SSH key or certificate over data bound to the TLS session. Either way, the login cannot be relayed to another connection. To a host it does not know yet, the client shows its key only after the host is accepted (the handshake uses a throwaway key). Private key files that other users can read are refused, as by OpenSSH. Passwords are off unless the server sets `password_authentication` (system mode on Linux; yescrypt and SHA-crypt hashes from /etc/shadow, checked after the host key is verified, with the same work for unknown users). A second factor (TOTP) can be added.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code is single-use (burned after the first attempt, even a failed one) and expires after 10 minutes.
 - **Privileges:** in system mode, user processes run with the user's uid, gid and groups. File operations (`cp`, writing authorized_keys during pairing) are done by a `qshd` helper process running as the user, so root never opens paths the user controls. Forwarded connections (`-L`, `-D`) are opened by such a helper too and handed to qshd, so firewall rules by user (`iptables --uid-owner`) apply. Like sshd, file transfers and subsystems (sftp) start through the user's login shell, so `nologin` or `git-shell` also block them. authorized_keys and the directories leading to it are checked following sshd's StrictModes rules, along the real path (a symlinked `~/.ssh` is checked where it really is).
-- **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout (TCP keepalive on the TCP fallback). Before login a connection may open few streams and the server buffers at most about 1 MiB for it. User lookups and key files are read off the threads that drive the network, and helpers never hold a pipe that qshd reads locked.
+- **Resource limits:** handshake and hello timeouts, a limit on unauthenticated connections in total and per IP (like MaxStartups), connection and stream limits, 60 s idle timeout (on the TCP fallback, TCP keepalive, and a minute's limit on unacknowledged data). Before login a connection may open few streams and the server buffers at most about 1 MiB for it. User lookups and key files are read off the threads that drive the network, and helpers never hold a pipe that qshd reads locked.
 - **No inherited descriptors:** like sshd's `closefrom`, a user's program gets nothing from qshd but stdin, stdout and stderr (no other session's terminal, even for a moment).
 - **Directory copy** (`cp -r`) unpacks only regular files and directories. Absolute paths, `..`, links and device files are refused, and setuid/setgid bits are dropped, so a malicious server cannot write outside the target directory. Long-name and PAX headers over 64 KiB are refused before they are read, so it cannot fill the client's memory either.
 - **Port forwarding** in system mode connects as the user, not as root, so firewall rules based on uid apply. Accounts whose expiry date has passed (`chage -E`, `usermod -e`) are refused.
@@ -575,6 +578,8 @@ This is still a young project and has not had an external audit. For critical sy
 ### Upgrading
 
 `qsh update` installs the latest release. Update qshd first when the notes say so.
+
+qsh and qshd 1.0.5 work with older versions of each other. With both at 1.0.5, a connection over TCP may have up to 512 streams each way (96 before), and `^C` takes effect on the screen quickly (see above).
 
 What v1.0 added on the protocol (banner, passwords, Unix sockets, X11, tunnels) needs qshd 1.0 on the server; with an older qshd, qsh reports that the feature is not supported and the rest works. qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
 
