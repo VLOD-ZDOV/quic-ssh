@@ -360,7 +360,9 @@ fn apply_attrs(path: &Path, a: &Attrs, follow: bool) -> io::Result<()> {
     use nix::sys::stat::{utimensat, UtimensatFlags};
     use nix::sys::time::TimeSpec;
     if let Some(size) = a.size {
-        OpenOptions::new().write(true).open(path)?.set_len(size)?;
+        // By name, as sftp-server does: opening a FIFO would wait for a reader.
+        let size = i64::try_from(size).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        nix::unistd::truncate(path, size)?;
     }
     // Owner before mode: a chown clears setuid and setgid bits.
     if let Some((uid, gid)) = a.ids {
@@ -866,6 +868,20 @@ fn statvfs_reply(id: u32, v: &nix::sys::statvfs::Statvfs) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn size_of_a_fifo_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let a = super::Attrs { size: Some(0), ids: None, perm: None, times: None };
+        assert!(super::apply_attrs(&fifo, &a, true).is_err());
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"12345").unwrap();
+        let a = super::Attrs { size: Some(2), ..a };
+        super::apply_attrs(&file, &a, true).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"12");
+    }
+
     use super::*;
 
     fn packet(kind: u8, id: u32, fields: &[&[u8]]) -> Vec<u8> {
