@@ -354,7 +354,12 @@ fn local_port_forwarding_with(s: Server) {
         sock.shutdown(std::net::Shutdown::Write).unwrap();
         let mut reply = Vec::new();
         sock.read_to_end(&mut reply).unwrap();
-        assert_eq!(&reply[..5], b"echo:", "{t}");
+        if !reply.starts_with(b"echo:") {
+            let _ = child.kill();
+            let mut err = String::new();
+            let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+            panic!("{t}: {} bytes back; qsh said: {err}", reply.len());
+        }
         assert!(reply[5..] == payload[..], "{t}: payload mismatch ({} bytes)", reply.len());
         child.kill().unwrap();
         child.wait().unwrap();
