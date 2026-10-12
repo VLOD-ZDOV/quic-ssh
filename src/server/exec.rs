@@ -423,8 +423,12 @@ async fn supervise(
     feeder.abort();
     pacing.reset(); // nobody takes reports now: let the rest of the output go
 
+    // Whatever still holds the output open (a background job) gets a hangup
+    // once the readers, and with them the terminal's master, are gone.
+    let stop: Vec<_> = readers.iter().map(|r| r.abort_handle()).collect();
     let drain = futures::future::join_all(readers);
     let _ = tokio::time::timeout(DRAIN_GRACE, drain).await;
+    stop.iter().for_each(tokio::task::AbortHandle::abort);
     if let Some(status) = status {
         let _ = tx.send(ServerMsg::Exit { code: status.code(), signal: status.signal() }).await;
     }

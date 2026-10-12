@@ -60,9 +60,7 @@ struct Output {
     /// A resuming client says how many bytes it got, which is behind our
     /// offsets by what was dropped while it was away.
     skew: u64,
-    /// When output was last read, and whether reading waits for the client
-    /// (see [`drain`]).
-    last_read: Instant,
+    /// Whether reading waits for the client (see [`drain`]).
     waiting: bool,
     /// Since when nobody is attached (see [`Sessions::evict`]).
     detached_at: Instant,
@@ -262,7 +260,6 @@ impl Sessions {
                 attached: false,
                 sent: 0,
                 skew: 0,
-                last_read: now,
                 waiting: false,
                 detached_at: now,
             }),
@@ -325,7 +322,6 @@ impl Sessions {
                         }
                         out.buf.drain(..excess);
                         out.start += excess as u64;
-                        out.last_read = Instant::now();
                         excess > 0 && !out.attached
                     };
                     sess.changed.send_replace(());
@@ -594,8 +590,8 @@ async fn produce(sess: &Detachable, generation: u64, out: mpsc::Sender<ServerMsg
 }
 
 /// Waits for the rest of the program's output: until the terminal is closed,
-/// or nothing came for [`exec::DRAIN_GRACE`] while not waiting for the
-/// client (a background job may hold the terminal open forever), and for
+/// for [`exec::DRAIN_GRACE`] otherwise (a background job may hold it open
+/// forever), not counting time spent waiting for a slow client, and for
 /// [`DRAIN_LIMIT`] at most.
 async fn drain(sess: &Detachable, collector: &mut tokio::task::JoinHandle<()>) {
     let deadline = Instant::now() + DRAIN_LIMIT;
@@ -603,8 +599,7 @@ async fn drain(sess: &Detachable, collector: &mut tokio::task::JoinHandle<()>) {
         if tokio::time::timeout(exec::DRAIN_GRACE, &mut *collector).await.is_ok() {
             return;
         }
-        let out = sess.out.lock().unwrap();
-        if (!out.waiting && out.last_read.elapsed() >= exec::DRAIN_GRACE) || Instant::now() >= deadline {
+        if !sess.out.lock().unwrap().waiting || Instant::now() >= deadline {
             return;
         }
     }
