@@ -298,11 +298,17 @@ pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
 /// Like [`read_strict`] for secrets: the file must also be private (no
 /// permissions for group or others). `Ok(None)` if it does not exist.
 pub fn read_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<String>> {
+    Ok(open_strict_private(path, home, uid)?.map(|(text, _)| text))
+}
+
+#[cfg(unix)]
+/// Like [`read_strict_private`], also returning the open file.
+pub fn open_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<(String, fs::File)>> {
     let Some(f) = open_strict(path, home, uid)? else { return Ok(None) };
     if f.metadata()?.mode() & 0o077 != 0 {
         bail!("{} must be private (chmod 600)", path.display());
     }
-    read_limited(f).map(Some)
+    Ok(Some((read_limited(f.try_clone()?)?, f)))
 }
 
 #[cfg(unix)]

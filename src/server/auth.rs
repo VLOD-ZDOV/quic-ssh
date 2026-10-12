@@ -11,7 +11,7 @@ use tracing::warn;
 use super::users::User;
 use crate::authkeys::{self, AuthorizedKey, Grant, Login, Offered};
 use crate::config::{ServerConfig, Totp};
-use crate::keys::{qsh_dir, read_strict, read_strict_private, PublicKey};
+use crate::keys::{qsh_dir, read_strict, open_strict_private, PublicKey};
 use crate::proto::{auth_data, read_msg, write_msg, Auth, Reply};
 use crate::transport::{RecvHalf, SendHalf};
 
@@ -351,6 +351,25 @@ impl TotpState {
 
 pub type UsedCodes = std::sync::Mutex<TotpState>;
 
+/// The last code step taken by any qshd, kept as the secret file's
+/// modification time on a step boundary (a file written by hand is not on
+/// one, to the nanosecond).
+fn step_taken(file: &std::fs::File) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    match file.metadata() {
+        Ok(m) if m.mtime_nsec() == 0 && m.mtime() > 0 && m.mtime() as u64 % crate::totp::STEP == 0 => m.mtime() as u64 / crate::totp::STEP,
+        _ => 0,
+    }
+}
+
+fn take_step(file: &std::fs::File, step: u64) {
+    use nix::sys::time::TimeSpec;
+    let mtime = TimeSpec::new((step * crate::totp::STEP) as i64, 0);
+    if let Err(e) = nix::sys::stat::futimens(file, &TimeSpec::UTIME_OMIT, &mtime) {
+        warn!("cannot mark the one-time code as used for other qshd instances: {e}");
+    }
+}
+
 /// Second factor after a key: asks for a one-time code if the user has set
 /// one up (or if the server requires it). `Err(message)` = deny with that answer.
 pub async fn second_factor(
@@ -367,11 +386,11 @@ pub async fn second_factor(
     let path = crate::totp::secret_path(&user.home);
     let read = {
         let (path, home, uid) = (path.clone(), user.home.clone(), user.uid);
-        tokio::task::spawn_blocking(move || read_strict_private(&path, &home, uid)).await?
+        tokio::task::spawn_blocking(move || open_strict_private(&path, &home, uid)).await?
     };
-    let secret = match read {
-        Ok(Some(text)) => match crate::totp::base32_decode(text.trim()) {
-            Ok(s) if s.len() >= 10 => s,
+    let (secret, file) = match read {
+        Ok(Some((text, file))) => match crate::totp::base32_decode(text.trim()) {
+            Ok(s) if s.len() >= 10 => (s, file),
             _ => {
                 warn!("{}: unusable secret, login refused", path.display());
                 return Ok(Err("access denied".into()));
@@ -425,12 +444,17 @@ pub async fn second_factor(
         };
         {
             let mut state = used.lock().unwrap();
-            let last = state.last_used(user.uid);
+            // Another qshd of the user's (another port, a user-mode one) may
+            // have taken a code: the lock makes check and mark one step.
+            let _ = file.lock();
+            let last = state.last_used(user.uid).max(step_taken(&file));
             if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
                 state.used.insert(user.uid, step);
                 state.failures.remove(&user.uid);
+                take_step(&file, step);
                 return Ok(Ok(()));
             }
+            let _ = file.unlock();
             state.failures.entry(user.uid).or_default().push_back(std::time::Instant::now());
         }
         warn!("{}: wrong one-time code", user.name);
@@ -441,6 +465,18 @@ pub async fn second_factor(
 
 #[cfg(test)]
 mod tests {
+    /// The step taken is kept in the secret file for other qshd instances.
+    #[test]
+    fn taken_step_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "x").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(super::step_taken(&file), 0, "a file written normally marks nothing");
+        super::take_step(&file, 59_000_000);
+        assert_eq!(super::step_taken(&std::fs::File::open(&path).unwrap()), 59_000_000);
+    }
+
     #[test]
     fn password_hashes() {
         use super::password_matches;
