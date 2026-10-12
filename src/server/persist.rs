@@ -5,11 +5,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tracing::{debug, info};
 
 use super::exec::{self, Session};
@@ -23,11 +23,24 @@ const BUFFER: usize = 1 << 20;
 /// Persistent sessions per user and in total, attached or not.
 const MAX_PER_USER: usize = 16;
 const MAX_TOTAL: usize = 256;
-/// Input waiting for a program that does not read it; more is dropped.
+/// Input waiting for a program that does not read it; beyond this, the
+/// client's messages wait (flow control then holds the client back).
 const MAX_PENDING_INPUT: usize = 1 << 20;
+/// What a resize counts as input, so those cannot pile up without limit.
+const RESIZE_COST: usize = 64;
+/// While detached, output beyond the buffer is still taken so the program
+/// goes on, dropping the oldest, but one chunk per this at most: a program
+/// like `yes` must not keep a core busy for nobody.
+const DETACHED_PACE: Duration = Duration::from_millis(20);
+/// The longest wait for the rest of the output after the program exited
+/// (see [`drain`]).
+const DRAIN_LIMIT: Duration = Duration::from_secs(60);
 /// How long a finished session waits for its client to fetch the end.
 const KEEP_FINISHED: Duration = Duration::from_secs(300);
 const CHUNK: usize = 32 * 1024;
+/// Output read ahead of an attached client; the rest of the buffer is what
+/// it already got, for a reconnect. More would scroll by after a ^C.
+const READ_AHEAD: u64 = 2 * CHUNK as u64;
 
 type Token = [u8; 16];
 
@@ -42,6 +55,18 @@ struct Output {
     /// Bumped on every attach, so an older attachment knows it was replaced.
     generation: u64,
     attached: bool,
+    /// Output up to here went to the attached client. The program waits
+    /// while [`READ_AHEAD`] bytes have not, so nothing is dropped meanwhile.
+    sent: u64,
+    /// A resuming client says how many bytes it got, which is behind our
+    /// offsets by what was dropped while it was away.
+    skew: u64,
+    /// When output was last read, and whether reading waits for the client
+    /// (see [`drain`]).
+    last_read: Instant,
+    waiting: bool,
+    /// Since when nobody is attached (see [`Sessions::evict`]).
+    detached_at: Instant,
 }
 
 impl Output {
@@ -61,7 +86,12 @@ struct Detachable {
     /// What the key that started the session was allowed; resuming needs the same.
     restrictions: Restrictions,
     input: mpsc::UnboundedSender<Input>,
-    pending_input: Arc<AtomicUsize>,
+    pending_input: AtomicUsize,
+    /// Signals that input was written, or output sent to the client.
+    input_taken: Notify,
+    output_taken: Notify,
+    /// For the attached client.
+    pacing: exec::Pacing,
     /// Asks the task that owns the child to hang up the session.
     kill: Mutex<Option<oneshot::Sender<()>>>,
     out: Mutex<Output>,
@@ -69,18 +99,28 @@ struct Detachable {
     changed: watch::Sender<()>,
 }
 
+impl Input {
+    fn cost(&self) -> usize {
+        match self {
+            Input::Data(d) => d.len(),
+            Input::Resize { .. } => RESIZE_COST,
+        }
+    }
+}
+
 impl Detachable {
     fn send_input(&self, input: Input) {
-        let len = match &input {
-            Input::Data(d) => d.len(),
-            Input::Resize { .. } => 0,
-        };
-        // A program that does not read its terminal must not make us buffer without limit.
-        if self.pending_input.fetch_add(len, Ordering::SeqCst) + len > MAX_PENDING_INPUT {
-            self.pending_input.fetch_sub(len, Ordering::SeqCst);
-            return;
+        let cost = input.cost();
+        self.pending_input.fetch_add(cost, Ordering::SeqCst);
+        if self.input.send(input).is_err() {
+            self.pending_input.fetch_sub(cost, Ordering::SeqCst);
         }
-        let _ = self.input.send(input);
+    }
+
+    /// Whether more input may be taken from the client: a program that does
+    /// not read its terminal must not make us buffer without limit.
+    fn input_room(&self) -> bool {
+        self.pending_input.load(Ordering::SeqCst) < MAX_PENDING_INPUT
     }
 }
 
@@ -112,8 +152,10 @@ impl Map {
 
 /// Why an attachment stopped.
 enum Detach {
-    /// The session is over (or another attachment took over): nothing to keep.
+    /// The client has the end of the session: nothing to keep.
     Done,
+    /// Another attachment took over.
+    Replaced,
     /// The client is gone: keep the session for a reconnect.
     Lost(&'static str),
 }
@@ -142,6 +184,37 @@ impl Sessions {
         }
     }
 
+    /// Takes a session slot for user `uid`. At the user's limit, the session
+    /// detached the longest goes (a client killed while reconnecting leaves
+    /// one behind, which would otherwise lock the user out for the timeout).
+    async fn reserve(&self, uid: u32) -> bool {
+        for _ in 0..2 {
+            let oldest = {
+                let mut map = self.map.lock().unwrap();
+                if map.total >= MAX_TOTAL {
+                    return false;
+                }
+                if map.per_user.get(&uid).copied().unwrap_or(0) < MAX_PER_USER {
+                    *map.per_user.entry(uid).or_default() += 1;
+                    map.total += 1;
+                    return true;
+                }
+                map.sessions
+                    .iter()
+                    .filter(|(_, s)| s.uid == uid)
+                    .filter_map(|(t, s)| {
+                        let out = s.out.lock().unwrap();
+                        (!out.attached).then_some((out.detached_at, *t, s.clone()))
+                    })
+                    .min_by_key(|(at, ..)| *at)
+            };
+            let Some((_, token, sess)) = oldest else { return false };
+            info!("too many sessions: closing the one detached the longest");
+            self.hang_up(&token, &sess).await;
+        }
+        false
+    }
+
     /// Starts a terminal session that can be resumed, and attaches `send`/`recv` to it.
     pub async fn start(
         self: &Arc<Self>,
@@ -153,23 +226,14 @@ impl Sessions {
         closed: watch::Receiver<bool>,
     ) -> Result<()> {
         // Reserve a slot first, so concurrent requests cannot all pass the check.
-        let reserved = {
-            let mut map = self.map.lock().unwrap();
-            let mine = map.per_user.get(&user.uid).copied().unwrap_or(0);
-            if mine >= MAX_PER_USER || map.total >= MAX_TOTAL {
-                false
-            } else {
-                *map.per_user.entry(user.uid).or_default() += 1;
-                map.total += 1;
-                true
-            }
-        };
-        if !reserved {
+        if !self.reserve(user.uid).await {
             return write_msg(&mut send, &Reply::Err(format!("too many sessions (at most {MAX_PER_USER} per user)"))).await;
         }
         let env = session.env(user);
         let spec = session.pty.clone().expect("persistent sessions have a terminal");
-        let (mut child, pty, tty) = match exec::spawn_pty(user, session.command.take(), env, &spec, &session.prelude) {
+        let spawned = exec::spawn_pty(user, session.command.take(), env, &spec, &session.prelude)
+            .and_then(|(child, pty, tty)| Ok((child, exec::PtyInput::new(&pty)?, pty, tty)));
+        let (mut child, pty_input, pty, tty) = match spawned {
             Ok(x) => x,
             Err(e) => {
                 self.map.lock().unwrap().release(user.uid);
@@ -177,18 +241,32 @@ impl Sessions {
             }
         };
         let record = exec::login_record(user, &tty, &child, session.remote);
-        let (mut reader, mut writer) = pty.into_split();
+        let (mut reader, resizer) = pty.into_split();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = oneshot::channel();
         let (changed, _) = watch::channel(());
-        let pending_input = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
         let sess = Arc::new(Detachable {
             uid: user.uid,
             restrictions: restrictions.clone(),
             input: input_tx,
-            pending_input: pending_input.clone(),
+            pending_input: AtomicUsize::new(0),
+            input_taken: Notify::new(),
+            output_taken: Notify::new(),
+            pacing: exec::Pacing::default(),
             kill: Mutex::new(Some(kill_tx)),
-            out: Mutex::new(Output { buf: VecDeque::new(), start: 0, exit: None, generation: 0, attached: false }),
+            out: Mutex::new(Output {
+                buf: VecDeque::new(),
+                start: 0,
+                exit: None,
+                generation: 0,
+                attached: false,
+                sent: 0,
+                skew: 0,
+                last_read: now,
+                waiting: false,
+                detached_at: now,
+            }),
             changed,
         });
         let mut token = Token::default();
@@ -198,33 +276,63 @@ impl Sessions {
 
         // Input: written by its own task, so a program that stops reading
         // cannot block the attachment (output, pings, detaching).
-        tokio::spawn(async move {
-            while let Some(input) = input_rx.recv().await {
-                match input {
-                    Input::Data(data) => {
-                        let _ = writer.write_all(&data).await;
-                        pending_input.fetch_sub(data.len(), Ordering::SeqCst);
+        let input = {
+            let sess = sess.clone();
+            tokio::spawn(async move {
+                while let Some(input) = input_rx.recv().await {
+                    let cost = input.cost();
+                    match input {
+                        Input::Data(data) => {
+                            sess.pacing.input_waits(true);
+                            let _ = pty_input.write_all(&data).await;
+                            sess.pacing.input_waits(false);
+                        }
+                        Input::Resize { cols, rows } => {
+                            let _ = resizer.resize(pty_process::Size::new(rows, cols));
+                        }
                     }
-                    Input::Resize { cols, rows } => {
-                        let _ = writer.resize(pty_process::Size::new(rows, cols));
-                    }
+                    sess.pending_input.fetch_sub(cost, Ordering::SeqCst);
+                    sess.input_taken.notify_one();
                 }
-            }
-        });
+            })
+        };
         // Output collector: everything the program writes goes into the buffer.
-        let collector = {
+        let mut collector = {
             let sess = sess.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; CHUNK];
-                // EIO is how a PTY master reports that the slave side was closed.
-                while let Ok(n @ 1..) = reader.read(&mut buf).await {
-                    let mut out = sess.out.lock().unwrap();
-                    out.buf.extend(&buf[..n]);
-                    let excess = out.buf.len().saturating_sub(BUFFER);
-                    out.buf.drain(..excess);
-                    out.start += excess as u64;
-                    drop(out);
+                loop {
+                    // An attached client gets everything: the program waits for
+                    // it, as it would for a slow connection over ssh.
+                    loop {
+                        let wait = {
+                            let mut out = sess.out.lock().unwrap();
+                            out.waiting = out.attached && out.end() - out.sent >= READ_AHEAD;
+                            out.waiting
+                        };
+                        if !wait {
+                            break;
+                        }
+                        sess.output_taken.notified().await;
+                    }
+                    // EIO is how a PTY master reports that the slave side was closed.
+                    let Ok(n @ 1..) = reader.read(&mut buf).await else { break };
+                    let dropped = {
+                        let mut out = sess.out.lock().unwrap();
+                        out.buf.extend(&buf[..n]);
+                        let mut excess = out.buf.len().saturating_sub(BUFFER);
+                        if out.attached {
+                            excess = excess.min(out.sent.saturating_sub(out.start) as usize);
+                        }
+                        out.buf.drain(..excess);
+                        out.start += excess as u64;
+                        out.last_read = Instant::now();
+                        excess > 0 && !out.attached
+                    };
                     sess.changed.send_replace(());
+                    if dropped {
+                        tokio::time::sleep(DETACHED_PACE).await;
+                    }
                 }
             })
         };
@@ -243,7 +351,11 @@ impl Sessions {
                     }
                 };
                 drop(record); // the logout
-                let _ = tokio::time::timeout(exec::DRAIN_GRACE, collector).await;
+                drain(&sess, &mut collector).await;
+                // Whatever still holds the terminal (a background job) gets a
+                // hangup once the master is closed.
+                collector.abort();
+                input.abort();
                 let attached = {
                     let mut out = sess.out.lock().unwrap();
                     out.exit = Some(status.map(|s| (s.code(), s.signal())).unwrap_or((None, None)));
@@ -295,46 +407,61 @@ impl Sessions {
         }
     }
 
-    /// Streams the session to the client from byte `from` on, and applies its
-    /// input, until the session ends, the client leaves, or another attach
-    /// takes over. Whatever happens, a lost client leaves the session detached
-    /// with its timeout running.
+    /// Streams the session to the client from the `received`th byte on, and
+    /// applies its input, until the session ends, the client leaves, or
+    /// another attach takes over. Whatever happens, a lost client leaves the
+    /// session detached with its timeout running.
     async fn attach(
         self: &Arc<Self>,
         send: SendHalf,
         recv: RecvHalf,
         token: Token,
         sess: Arc<Detachable>,
-        from: u64,
+        received: u64,
         closed: watch::Receiver<bool>,
     ) -> Result<()> {
-        let generation = {
+        let (generation, lost) = {
             let mut out = sess.out.lock().unwrap();
             out.generation += 1;
             out.attached = true;
-            out.generation
+            let from = received.saturating_add(out.skew).min(out.end());
+            let lost = from < out.start;
+            if lost {
+                out.skew += out.start - from;
+            }
+            out.sent = from.max(out.start);
+            (out.generation, lost)
         };
+        sess.pacing.reset();
         // Wake an older attachment so it notices it has been replaced.
         sess.changed.send_replace(());
-        let outcome = self.serve(send, recv, token, &sess, generation, from, closed).await;
+        sess.output_taken.notify_one();
+        let outcome = self.serve(send, recv, token, &sess, generation, lost, closed).await;
         let reason = match outcome {
-            Ok(Detach::Done) => return Ok(()),
+            Ok(Detach::Done) => {
+                self.remove(&token);
+                return Ok(());
+            }
+            Ok(Detach::Replaced) => return Ok(()),
             Ok(Detach::Lost(reason)) => reason.to_string(),
             Err(e) => format!("{e:#}"),
         };
-        let still_ours = {
+        let (still_ours, finished) = {
             let mut out = sess.out.lock().unwrap();
             let ours = out.generation == generation;
             if ours {
                 out.attached = false;
+                out.detached_at = Instant::now();
             }
-            ours
+            (ours, out.exit.is_some())
         };
+        sess.output_taken.notify_one();
         if still_ours {
-            debug!("persistent session detached ({reason}), kept for {:?}", self.timeout);
+            let keep = if finished { KEEP_FINISHED.min(self.timeout) } else { self.timeout };
+            debug!("persistent session detached ({reason}), kept for {keep:?}");
             let sessions = self.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(sessions.timeout).await;
+                tokio::time::sleep(keep).await;
                 let abandoned = {
                     let out = sess.out.lock().unwrap();
                     out.generation == generation && !out.attached
@@ -356,64 +483,140 @@ impl Sessions {
         token: Token,
         sess: &Detachable,
         generation: u64,
-        from: u64,
+        lost: bool,
         mut closed: watch::Receiver<bool>,
     ) -> Result<Detach> {
-        // Output wakes the loop below all the time: client messages are read
-        // in a task, so a frame is never cut short (see `Reader`).
+        // Client messages are read in a task, so waiting for one can be
+        // given up without cutting a frame short (see `Reader`).
         let mut incoming = Reader::<ClientMsg>::spawn(recv);
-        let mut changed = sess.changed.subscribe();
-        changed.mark_changed();
         write_msg(&mut send, &Reply::Session { token: token.to_vec() }).await?;
-        let mut sent = from;
+        if lost {
+            write_msg(&mut send, &ServerMsg::Stderr(b"\r\n[qsh: some output was lost while disconnected]\r\n".to_vec())).await?;
+        }
+        // Output and replies are written by a task of their own, so input
+        // (a ^C among it) is taken while a slow client holds output up.
+        let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(4);
+        // After the exit status, the stream stays open until the client
+        // answers (see below), so its answer is not cut off.
+        let mut writer = Abort(tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                write_msg(&mut send, &msg).await?;
+            }
+            std::future::pending::<Result<()>>().await
+        }));
+        let producer = produce(sess, generation, out_tx.clone());
+        tokio::pin!(producer);
+        let (mut producing, mut exited) = (true, false);
         loop {
             tokio::select! {
-                res = changed.changed() => {
-                    if res.is_err() {
-                        return Ok(Detach::Done);
-                    }
-                    let (data, exit, lost) = {
-                        let out = sess.out.lock().unwrap();
-                        if out.generation != generation {
-                            return Ok(Detach::Done); // replaced by a newer attachment
-                        }
-                        let lost = sent < out.start;
-                        sent = sent.max(out.start);
-                        let skip = (sent - out.start) as usize;
-                        let data: Vec<u8> = out.buf.iter().skip(skip).copied().collect();
-                        sent = out.end();
-                        (data, out.exit, lost)
-                    };
-                    if lost {
-                        write_msg(&mut send, &ServerMsg::Stderr(b"\r\n[qsh: some output was lost while disconnected]\r\n".to_vec())).await?;
-                    }
-                    for chunk in data.chunks(CHUNK) {
-                        write_msg(&mut send, &ServerMsg::Stdout(chunk.to_vec())).await?;
-                    }
-                    if let Some((code, signal)) = exit {
-                        write_msg(&mut send, &ServerMsg::Exit { code, signal }).await?;
-                        let _ = send.shutdown().await;
-                        self.remove(&token);
-                        return Ok(Detach::Done);
+                end = &mut producer, if producing => {
+                    producing = false;
+                    match end {
+                        Produced::Exit => exited = true,
+                        Produced::Replaced => return Ok(Detach::Replaced),
+                        // The writer's error comes next.
+                        Produced::WriterGone => {}
                     }
                 }
-                msg = incoming.next() => match msg {
+                res = &mut writer.0 => match res {
+                    Ok(Err(e)) => return Err(e),
+                    _ => return Ok(Detach::Lost("cannot write")),
+                },
+                // After the end, the client's hangup (or its end of the stream)
+                // says it got it; until then it may resume to fetch it.
+                msg = incoming.next(), if exited || sess.input_room() => match msg {
                     Ok(Some(ClientMsg::Stdin(data))) => sess.send_input(Input::Data(data)),
-                    // Chaff gets an echo-sized reply, like in other sessions.
-                    Ok(Some(ClientMsg::Typed { data, .. })) if data.is_empty() => write_msg(&mut send, &ServerMsg::Pong(vec![0])).await?,
+                    // Chaff gets an echo-sized reply, like in other sessions,
+                    // when there is room: it must not hold up real input.
+                    Ok(Some(ClientMsg::Typed { data, .. })) if data.is_empty() => {
+                        let _ = out_tx.try_send(ServerMsg::Pong(vec![0]));
+                    }
                     Ok(Some(ClientMsg::Typed { data, .. })) => sess.send_input(Input::Data(data)),
                     Ok(Some(ClientMsg::Resize { cols, rows })) => sess.send_input(Input::Resize { cols, rows }),
                     Ok(Some(ClientMsg::StdinEof)) => {}
+                    Ok(Some(ClientMsg::Shown(n))) => sess.pacing.shown(n),
+                    Ok(Some(ClientMsg::Hangup)) if exited => return Ok(Detach::Done),
                     // Hang up, then report the exit like any other end, so the
                     // client knows the hangup arrived before it disconnects.
                     Ok(Some(ClientMsg::Hangup)) => self.hang_up(&token, sess).await,
                     Err(e) if e.is::<crate::proto::Malformed>() => {}
+                    Ok(None) if exited => return Ok(Detach::Done),
                     // The stream ended without a hangup: the client is gone.
                     Ok(None) | Err(_) => return Ok(Detach::Lost("client gone")),
                 },
+                () = sess.input_taken.notified(), if !exited && !sess.input_room() => {}
                 _ = async { closed.wait_for(|c| *c).await.is_ok() } => return Ok(Detach::Lost("connection closed")),
             }
         }
+    }
+}
+
+/// Why an attachment's output stopped.
+enum Produced {
+    Exit,
+    Replaced,
+    WriterGone,
+}
+
+/// Hands the session's output to the writer from where the client is, then
+/// the exit status once the program is done and all of it went out.
+async fn produce(sess: &Detachable, generation: u64, out: mpsc::Sender<ServerMsg>) -> Produced {
+    let mut changed = sess.changed.subscribe();
+    let mut on_stream = 0u64;
+    loop {
+        let (data, exit) = {
+            let mut out = sess.out.lock().unwrap();
+            if out.generation != generation {
+                return Produced::Replaced;
+            }
+            let from = (out.sent - out.start) as usize;
+            let to = out.buf.len().min(from + CHUNK);
+            let data: Vec<u8> = out.buf.range(from..to).copied().collect();
+            out.sent += data.len() as u64;
+            (data, out.exit)
+        };
+        if !data.is_empty() {
+            sess.output_taken.notify_one();
+            on_stream += data.len() as u64;
+            sess.pacing.wait(on_stream).await;
+            if out.send(ServerMsg::Stdout(data)).await.is_err() {
+                return Produced::WriterGone;
+            }
+            continue;
+        }
+        if let Some((code, signal)) = exit {
+            let _ = out.send(ServerMsg::Exit { code, signal }).await;
+            return Produced::Exit;
+        }
+        if changed.changed().await.is_err() {
+            return Produced::Replaced;
+        }
+    }
+}
+
+/// Waits for the rest of the program's output: until the terminal is closed,
+/// or nothing came for [`exec::DRAIN_GRACE`] while not waiting for the
+/// client (a background job may hold the terminal open forever), and for
+/// [`DRAIN_LIMIT`] at most.
+async fn drain(sess: &Detachable, collector: &mut tokio::task::JoinHandle<()>) {
+    let deadline = Instant::now() + DRAIN_LIMIT;
+    loop {
+        if tokio::time::timeout(exec::DRAIN_GRACE, &mut *collector).await.is_ok() {
+            return;
+        }
+        let out = sess.out.lock().unwrap();
+        if (!out.waiting && out.last_read.elapsed() >= exec::DRAIN_GRACE) || Instant::now() >= deadline {
+            return;
+        }
+    }
+}
+
+/// Aborts the task when dropped.
+struct Abort<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Abort<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

@@ -2,6 +2,8 @@
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::users::{Prelude, User};
-use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg};
+use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg, SHOWN_WINDOW};
 use crate::transport::{RecvHalf, SendHalf};
 
 /// How long to keep draining output after the process exited (background
@@ -159,6 +161,84 @@ pub(super) fn spawn_pty(
     Ok((child, pty, tty))
 }
 
+/// Writes to a PTY master. pty-process's writer spins when the terminal's
+/// other side is closed: a hangup keeps the master "writable" while writes
+/// fail with EAGAIN, so a paste into a program that exited without reading
+/// it would take a whole core forever.
+pub(super) struct PtyInput(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
+
+impl PtyInput {
+    pub(super) fn new(pty: &pty_process::Pty) -> std::io::Result<PtyInput> {
+        use std::os::fd::AsFd;
+        let fd = pty.as_fd().try_clone_to_owned()?;
+        Ok(PtyInput(tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::WRITABLE)?))
+    }
+
+    pub(super) async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+        while !data.is_empty() {
+            let mut ready = self.0.writable().await?;
+            // Read before trying: a failed try clears it.
+            let hung_up = ready.ready().is_write_closed();
+            match ready.try_io(|fd| nix::unistd::write(fd.get_ref(), data).map_err(std::io::Error::from)) {
+                Ok(Ok(n)) => data = &data[n..],
+                Ok(Err(e)) => return Err(e),
+                // Nobody has the terminal open any more: the input has no reader.
+                Err(_) if hung_up => return Err(std::io::ErrorKind::BrokenPipe.into()),
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Holds terminal output back while more than [`SHOWN_WINDOW`] of it has
+/// not been shown (see [`ClientMsg::Shown`]), so a ^C takes effect on the
+/// screen soon. Only for a client that reports, and never while input
+/// waits for the program: it may be waiting for its output to go first.
+#[derive(Default)]
+pub(super) struct Pacing {
+    shown: AtomicU64,
+    reports: AtomicBool,
+    input_waits: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl Pacing {
+    /// Forgets the reports, for a new stream.
+    pub(super) fn reset(&self) {
+        self.shown.store(0, Ordering::SeqCst);
+        self.reports.store(false, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    pub(super) fn shown(&self, n: u64) {
+        self.shown.fetch_max(n, Ordering::SeqCst);
+        self.reports.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    pub(super) fn input_waits(&self, waits: bool) {
+        self.input_waits.store(waits, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    /// Waits until `sent` bytes of output in total may be on the way.
+    pub(super) async fn wait(&self, sent: u64) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.reports.load(Ordering::SeqCst)
+                || self.input_waits.load(Ordering::SeqCst)
+                || sent <= self.shown.load(Ordering::SeqCst) + SHOWN_WINDOW
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 /// Forwards a child output stream as `ServerMsg`s until EOF.
 async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap: fn(Vec<u8>) -> ServerMsg) {
     let mut buf = vec![0u8; 32 * 1024];
@@ -200,7 +280,8 @@ pub(super) async fn hang_up_group<F: std::future::Future>(group: nix::unistd::Pi
 /// Where client input goes.
 enum Input {
     Pipe(Option<tokio::process::ChildStdin>),
-    Pty(pty_process::OwnedWritePty),
+    /// The writer only resizes; data goes through [`PtyInput`].
+    Pty(pty_process::OwnedWritePty, PtyInput),
 }
 
 /// Applies client input to the child. Sends on `gone` when the stream ends:
@@ -208,13 +289,14 @@ enum Input {
 /// of input is `StdinEof`), so an end, clean or not, means the client is
 /// gone. A clean one is how a client that was killed looks through a shared
 /// connection (its master just passes the closed socket on).
-async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>) {
+async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>, pacing: Arc<Pacing>) {
     loop {
         let msg = match read_msg_opt::<_, ClientMsg>(&mut recv).await {
             Ok(Some(msg)) => msg,
             // Unknown message type from a newer client: skip it.
             Err(e) if e.is::<crate::proto::Malformed>() => continue,
             Ok(None) | Err(_) => {
+                pacing.reset(); // no more reports
                 let _ = gone.send(());
                 return;
             }
@@ -222,13 +304,19 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
         // Obfuscated keystrokes: chaff gets an echo-sized reply so that, on the
         // wire, it looks like a real keystroke and its echo.
         let msg = match msg {
+            // Only when there is room: chaff must not hold up real input.
             ClientMsg::Typed { data, .. } if data.is_empty() => {
-                let _ = tx.send(ServerMsg::Pong(vec![0])).await;
+                let _ = tx.try_send(ServerMsg::Pong(vec![0]));
                 continue;
             }
             ClientMsg::Typed { data, .. } => ClientMsg::Stdin(data),
+            ClientMsg::Shown(n) => {
+                pacing.shown(n);
+                continue;
+            }
             other => other,
         };
+        pacing.input_waits(true);
         match (msg, &mut input) {
             (ClientMsg::Stdin(data), Input::Pipe(stdin)) => {
                 if let Some(w) = stdin {
@@ -237,7 +325,7 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
                     }
                 }
             }
-            (ClientMsg::Stdin(data), Input::Pty(w)) => {
+            (ClientMsg::Stdin(data), Input::Pty(_, w)) => {
                 let _ = w.write_all(&data).await;
             }
             (ClientMsg::StdinEof, Input::Pipe(stdin)) => {
@@ -245,15 +333,16 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
                     let _ = w.shutdown().await;
                 }
             }
-            (ClientMsg::Resize { cols, rows }, Input::Pty(w)) => {
+            (ClientMsg::Resize { cols, rows }, Input::Pty(w, _)) => {
                 let _ = w.resize(pty_process::Size::new(rows, cols));
             }
             // EOF on a terminal is the user's ^D; resize without a PTY is meaningless.
-            (ClientMsg::StdinEof, Input::Pty(_)) | (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
-            (ClientMsg::Typed { .. }, _) => unreachable!("converted above"),
+            (ClientMsg::StdinEof, Input::Pty(..)) | (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
+            (ClientMsg::Typed { .. } | ClientMsg::Shown(_), _) => unreachable!("handled above"),
             // Only persistent sessions outlive the stream; this one ends with it anyway.
             (ClientMsg::Hangup, _) => {}
         }
+        pacing.input_waits(false);
     }
 }
 
@@ -268,21 +357,31 @@ async fn supervise(
     let (gone_tx, mut gone_rx) = oneshot::channel();
 
     let mut readers = Vec::new();
+    let pacing = Arc::new(Pacing::default());
+    let terminal = matches!(io, Io::Pty(_));
     let feeder = match io {
         Io::Pipes { stdin, stdout, stderr } => {
             readers.push(tokio::spawn(pump(stdout, tx.clone(), ServerMsg::Stdout)));
             readers.push(tokio::spawn(pump(stderr, tx.clone(), ServerMsg::Stderr)));
-            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone()))
+            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone(), pacing.clone()))
         }
         Io::Pty(pty) => {
+            let input = PtyInput::new(&pty)?;
             let (r, w) = pty.into_split();
             readers.push(tokio::spawn(pump(r, tx.clone(), ServerMsg::Stdout)));
-            tokio::spawn(feed(recv, Input::Pty(w), gone_tx, tx.clone()))
+            tokio::spawn(feed(recv, Input::Pty(w, input), gone_tx, tx.clone(), pacing.clone()))
         }
     };
 
+    let writer_pacing = pacing.clone();
     let writer = tokio::spawn(async move {
+        let pacing = writer_pacing;
+        let mut sent = 0u64;
         while let Some(msg) = rx.recv().await {
+            if let (ServerMsg::Stdout(data), true) = (&msg, terminal) {
+                sent += data.len() as u64;
+                pacing.wait(sent).await;
+            }
             let last = matches!(msg, ServerMsg::Exit { .. });
             if write_msg(&mut send, &msg).await.is_err() {
                 return;
@@ -307,6 +406,7 @@ async fn supervise(
         }
     };
     feeder.abort();
+    pacing.reset(); // nobody takes reports now: let the rest of the output go
 
     let drain = futures::future::join_all(readers);
     let _ = tokio::time::timeout(DRAIN_GRACE, drain).await;

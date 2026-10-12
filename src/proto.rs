@@ -215,7 +215,18 @@ pub enum ClientMsg {
     /// End a persistent session now (the user quit), instead of keeping it
     /// for a reconnect.
     Hangup,
+    /// Terminal output shown so far on this stream, in bytes: the server
+    /// then keeps at most [`SHOWN_WINDOW`] more on the way. Older servers
+    /// skip it.
+    Shown(u64),
 }
+
+/// Terminal output a server lets be on the way before the client showed it
+/// (see [`ClientMsg::Shown`]): what still scrolls by after a ^C. A stream's
+/// own flow-control window is much larger, for fast transfers.
+pub const SHOWN_WINDOW: u64 = 1 << 20;
+/// How often a client reports [`ClientMsg::Shown`].
+pub const SHOWN_EVERY: u64 = 64 << 10;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum ServerMsg {

@@ -395,7 +395,18 @@ enum ResumeError {
     Retry(anyhow::Error),
 }
 
+/// One reconnect attempt at most this long: a handshake into a path that
+/// went dead would otherwise wait for the idle timeout.
+const RESUME_WAIT: Duration = Duration::from_secs(15);
+
 async fn resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Result<(Arc<Conn>, SendHalf, RecvHalf), ResumeError> {
+    match tokio::time::timeout(RESUME_WAIT, try_resume(reconnect, token, received)).await {
+        Ok(res) => res,
+        Err(_) => Err(ResumeError::Retry(anyhow::anyhow!("timed out"))),
+    }
+}
+
+async fn try_resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Result<(Arc<Conn>, SendHalf, RecvHalf), ResumeError> {
     // A refused login (the session expired, or a question that cannot be
     // asked now) will not get better by retrying.
     let conn = reconnect(token.to_vec()).await.map_err(|e| match e.downcast_ref::<super::LoginRefused>() {
@@ -450,6 +461,11 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     };
 
     let (tx, mut rx) = mpsc::channel::<ClientMsg>(32);
+    // A terminal's output is reported as shown (see `ClientMsg::Shown`).
+    let report_shown = pty.is_some();
+    if report_shown {
+        let _ = tx.send(ClientMsg::Shown(0)).await;
+    }
     // Where messages go; replaced after a reconnect. Messages sent while there
     // is no working stream are dropped (typing during an outage is lost).
     let (sink_tx, mut sink_rx) = mpsc::channel::<SendHalf>(1);
@@ -649,6 +665,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     }
     let answered: Heard = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let mut received: u64 = 0;
+    // Output shown on the current stream, and how much of it was reported.
+    let (mut shown, mut reported) = (0u64, 0u64);
     let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
     let (alive_interval, alive_max) = alive.unwrap_or(DEFAULT_ALIVE);
     let mut heartbeat = tokio::time::interval(alive_interval);
@@ -718,9 +736,21 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                                 cursor_keys.lock().unwrap().feed(&d);
                             }
                             show(&mut stdout, &mut predictor, &d).await?;
+                            shown += d.len() as u64;
+                            // Not waiting: a later report covers this one.
+                            if report_shown && shown - reported >= crate::proto::SHOWN_EVERY && tx.try_send(ClientMsg::Shown(shown)).is_ok() {
+                                reported = shown;
+                            }
                         }
                         ServerMsg::Stderr(d) => show(&mut stderr, &mut predictor, &d).await?,
-                        ServerMsg::Exit { code, signal } => break code.or(signal.map(|s| s.saturating_add(128))).unwrap_or(255),
+                        ServerMsg::Exit { code, signal } => {
+                            // Tells the server we have the end; until then it keeps the
+                            // session for a resume, in case the exit got lost on the way.
+                            if token.is_some() {
+                                hang_up(&tx, &mut incoming).await;
+                            }
+                            break code.or(signal.map(|s| s.saturating_add(128))).unwrap_or(255);
+                        }
                         ServerMsg::Pong(_) => {}
                     }
                     false
@@ -804,6 +834,10 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             pings = Some(pinger(conn.clone(), incoming.heard(), answered.clone(), alive_interval));
         }
         let _ = sink_tx.send(new_send).await;
+        (shown, reported) = (0, 0);
+        if report_shown {
+            let _ = tx.send(ClientMsg::Shown(0)).await;
+        }
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
         // Forwards added on the way were the old connection's.
         if let Some(f) = &opts.forwarder {
