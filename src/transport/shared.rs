@@ -433,12 +433,25 @@ impl Drop for Master {
 /// the server must see the end of the input, and the stream must not wait
 /// for output nobody reads.
 async fn relay(sock: UnixStream, mut send: SendHalf, mut recv: RecvHalf) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut r, mut w) = sock.into_split();
     let up = async {
-        let copied = tokio::io::copy(&mut r, &mut send).await;
+        let mut buf = vec![0u8; 64 << 10];
+        let client_gone = loop {
+            match r.read(&mut buf).await {
+                Ok(0) => break false,
+                Ok(n) => {
+                    // The server takes no more input (the command ended):
+                    // its output and exit status are still to come.
+                    if send.write_all(&buf[..n]).await.is_err() {
+                        break false;
+                    }
+                }
+                Err(_) => break true,
+            }
+        };
         let _ = send.shutdown().await;
-        copied.is_ok()
+        !client_gone
     };
     let down = async {
         tokio::io::copy(&mut recv, &mut w).await?;
