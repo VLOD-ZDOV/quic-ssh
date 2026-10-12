@@ -393,7 +393,7 @@ max_connections = 256
 max_startups = 64               # unauthenticated connections at once (like sshd's MaxStartups)
 max_startups_per_ip = 8         # ... from one IP address
 connection_buffer_mb = 32       # per connection: data held for programs that have not read it yet. Usually
-                                # near 0; it fills when forwards stop reading (up to 8 MiB each), and when full
+                                # near 0; it fills when forwards stop reading (up to 1/8 of it each), and when full
                                 # the whole connection waits. RAM at worst: max_connections × this (256 × 32 MiB
                                 # = 8 GiB), plus up to 256 KiB per open stream over TCP. Small VM: 8-16; busy proxy: 64-256
 tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`

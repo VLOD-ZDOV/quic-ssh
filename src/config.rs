@@ -82,8 +82,9 @@ pub struct ServerConfig {
     /// Data from a client that qshd may hold before the program it is for
     /// reads it, per connection, in MiB. Normally little is held; it fills
     /// when forwards stop reading (a stuck service), and then the whole
-    /// connection waits. Each stuck stream takes up to 8 MiB, so 32 lets 4
-    /// stuck forwards be. Worst case RAM: `max_connections` times this.
+    /// connection waits. A stream may hold an eighth of it (8 MiB at most),
+    /// so 7 stuck forwards cannot fill it. Worst case RAM: `max_connections`
+    /// times this.
     pub connection_buffer_mb: u32,
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).

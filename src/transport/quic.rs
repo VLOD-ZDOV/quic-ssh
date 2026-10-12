@@ -36,8 +36,11 @@ fn transport_config(server: bool, alive: Option<super::Alive>) -> Arc<TransportC
     t.keep_alive_interval(Some(keepalive));
     // QUIC allows idle timeouts up to 2^62 ms; ours are far below.
     t.max_idle_timeout(idle.try_into().ok());
-    // Larger windows than the defaults so bulk copies are not window-limited on long links.
-    t.stream_receive_window(VarInt::from_u32(8 << 20));
+    // Larger windows than the defaults so bulk copies are not window-limited
+    // on long links. A server's is an eighth of its connection buffer, so
+    // fewer than 8 stuck streams cannot fill it and stop the connection.
+    let stream_window = if server { (super::server_buffer() / 8).clamp(256 << 10, 8 << 20) } else { 8 << 20 };
+    t.stream_receive_window(VarInt::from_u32(stream_window));
     t.receive_window(VarInt::from_u32(window));
     t.send_window(32 << 20);
     // BBR instead of the default Cubic: it does not treat random loss (Wi-Fi,

@@ -39,7 +39,7 @@ pub fn set_server_buffer(mb: u32) {
     SERVER_BUFFER.store(mb.saturating_mul(1 << 20), std::sync::atomic::Ordering::Relaxed);
 }
 
-fn server_buffer() -> u32 {
+pub(crate) fn server_buffer() -> u32 {
     SERVER_BUFFER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
