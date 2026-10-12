@@ -1853,9 +1853,24 @@ fn persistent_session_loses_nothing() {
         seen.extend_from_slice(&buf[..n]);
     }
     std::thread::spawn(move || while let Ok(1..) = out.read(&mut [0u8; 4096]) {});
-    child.stdin.as_mut().unwrap().write_all(&data).unwrap();
-    assert!(child.wait().unwrap().success());
-    assert!(std::fs::read(&file).unwrap() == data, "the paste was cut or changed");
+    let mut stdin = child.stdin.take().unwrap();
+    std::thread::spawn(move || stdin.write_all(&data).map(|()| data));
+    // A stall fails the test instead of hanging it.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let got = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            panic!("the paste stalled after {got} bytes");
+        }
+        sleep(Duration::from_millis(100));
+    };
+    assert!(status.success());
+    let expected: Vec<u8> = (0..3_000_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    assert!(std::fs::read(&file).unwrap() == expected, "the paste was cut or changed");
 }
 
 #[test]
