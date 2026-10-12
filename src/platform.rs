@@ -119,7 +119,12 @@ pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = file.with_file_name(format!(".{name}.{}.{}.{nanos}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
-    let written = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, &file));
+    // The file keeps its permissions (a private one stays private).
+    let keep = |()| match std::fs::metadata(&file) {
+        Ok(m) => std::fs::set_permissions(&tmp, m.permissions()),
+        Err(_) => Ok(()),
+    };
+    let written = std::fs::write(&tmp, contents).and_then(keep).and_then(|()| std::fs::rename(&tmp, &file));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -208,4 +213,19 @@ pub fn is_broken_pipe_print(info: &std::panic::PanicHookInfo<'_>) -> bool {
     let msg = payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("");
     // EPIPE is 32 on every Unix qsh runs on; the text is not localized.
     msg.starts_with("failed printing to std") && msg.contains("os error 32")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn replaced_file_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("private");
+        std::fs::write(&file, b"old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        super::replace_file(&file, b"new").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 }
