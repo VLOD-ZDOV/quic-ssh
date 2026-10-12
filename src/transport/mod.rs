@@ -233,7 +233,9 @@ impl Bind {
     fn allows(&self, remote: &SocketAddr) -> bool {
         match self {
             Bind::Address(ip) => ip.is_ipv4() == remote.is_ipv4(),
-            _ => true,
+            // An interface with IPv4 only cannot reach the host's IPv6 addresses.
+            Bind::Interface(name) => interface_address(name, remote.is_ipv4()).is_ok(),
+            Bind::Any => true,
         }
     }
 
@@ -304,8 +306,13 @@ where
 }
 
 pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, bind: &Bind, tls: rustls::ClientConfig) -> Result<Conn> {
-    let addrs: Vec<SocketAddr> = resolve(host, port, family).await?.into_iter().filter(|a| bind.allows(a)).collect();
+    let resolved = resolve(host, port, family).await?;
+    let addrs: Vec<SocketAddr> = resolved.iter().copied().filter(|a| bind.allows(a)).collect();
     if addrs.is_empty() {
+        // Why the bind address does not fit, if that is it.
+        if let Some(a) = resolved.first() {
+            bind.local_for(a)?;
+        }
         bail!("{host} has no addresses");
     }
     let tls = Arc::new(tls);
