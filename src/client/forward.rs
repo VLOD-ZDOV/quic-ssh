@@ -151,7 +151,7 @@ async fn bind_local(bind: Option<&str>, port: u16, gateway: bool) -> Result<Vec<
     let mut listeners = Vec::new();
     let mut last_err = None;
     for addr in addrs {
-        match TcpListener::bind(addr).await {
+        match crate::platform::listen_tcp(addr) {
             Ok(l) => listeners.push(l),
             Err(e) => last_err = Some(e),
         }

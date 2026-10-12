@@ -89,6 +89,24 @@ pub fn terminal() -> io::Result<(File, File)> {
     }
 }
 
+/// Listens on `addr` like `TcpListener::bind`, but an IPv6 address listens
+/// for IPv6 only: `[::]` next to `0.0.0.0` on the same port would otherwise
+/// clash with it (Linux makes `[::]` take IPv4 too) and be left out.
+pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(true)?;
+    }
+    // As tokio's bind does: a port in TIME_WAIT can be listened on again.
+    #[cfg(unix)]
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    tokio::net::TcpListener::from_std(sock.into())
+}
+
 /// Replaces `path` with `contents` in one step: written to a temporary file
 /// of a unique name next to it, then renamed over it, so a reader never sees
 /// half a file and two writers never write into the same temporary file.

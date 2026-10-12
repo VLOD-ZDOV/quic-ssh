@@ -974,7 +974,7 @@ async fn remote_forward(
     for mut addr in remote_listen_addrs(gateway, bind, port) {
         // With port 0, the first listener picks a port and the others reuse it.
         addr.set_port(bound_port);
-        match tokio::net::TcpListener::bind(addr).await {
+        match crate::platform::listen_tcp(addr) {
             Ok(l) => {
                 bound_port = l.local_addr()?.port();
                 listeners.push(l);

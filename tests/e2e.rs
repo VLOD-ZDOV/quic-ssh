@@ -384,6 +384,45 @@ fn local_port_forwarding_with(s: Server) {
     }
 }
 
+/// A forward on every address (`-L *:...`, and `-R` with `gateway_ports`)
+/// takes IPv6 connections too: `[::]` must not lose to `0.0.0.0`.
+#[test]
+fn forwards_on_every_address_take_ipv6_too() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return eprintln!("skipped: no IPv6 loopback");
+    }
+    let s = Server::start_with("127.0.0.1", "gateway_ports = \"yes\"\n");
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let (local, remote) = (free_port(), free_port());
+    let mut child = c
+        .cmd(&["-p", &s.port.to_string(), "-N", "-L", &format!("*:{local}:127.0.0.1:{target}"), "-R", &format!("{remote}:127.0.0.1:{target}"), &dest()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let echo = |addr: &str, port: u16| -> Option<Vec<u8>> {
+        let mut sock = std::net::TcpStream::connect((addr, port)).ok()?;
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.write_all(b"hi").ok()?;
+        sock.shutdown(std::net::Shutdown::Write).ok()?;
+        let mut reply = Vec::new();
+        sock.read_to_end(&mut reply).ok()?;
+        Some(reply)
+    };
+    for port in [local, remote] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while echo("127.0.0.1", port).is_none() {
+            assert!(Instant::now() < deadline, "forward on port {port} did not come up");
+            sleep(Duration::from_millis(50));
+        }
+        for addr in ["127.0.0.1", "::1"] {
+            assert_eq!(echo(addr, port).as_deref(), Some(&b"echo:hi"[..]), "{addr} port {port}");
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn unknown_key_is_denied() {
     let s = Server::start();
