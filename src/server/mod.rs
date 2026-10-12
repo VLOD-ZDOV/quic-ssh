@@ -1103,6 +1103,8 @@ async fn socket_from_helper(mut helper: tokio::process::Command) -> Result<std::
             Err(anyhow::anyhow!("the helper did not answer"))
         }
     };
+    // Lets the helper go: it waits until we have the socket.
+    drop(ours);
     let status = child.wait().await?;
     match received {
         Ok(fd) => Ok(fd),

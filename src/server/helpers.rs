@@ -113,7 +113,14 @@ fn hand_over(fd: impl std::os::fd::AsFd) -> Result<()> {
     let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     control.push(SendAncillaryMessage::ScmRights(&fds));
-    sendmsg(io::stdout().as_fd(), &[io::IoSlice::new(b"S")], &mut control, SendFlags::empty()).context("cannot hand the socket to qshd")?;
+    let out = io::stdout();
+    sendmsg(out.as_fd(), &[io::IoSlice::new(b"S")], &mut control, SendFlags::empty()).context("cannot hand the socket to qshd")?;
+    // Stay until qshd has it (it closes its end then): on macOS, a socket
+    // still on its way when the sender exits was sometimes lost. Not long,
+    // for a qshd from before this change, which waits for us first.
+    let sock = std::os::unix::net::UnixStream::from(out.as_fd().try_clone_to_owned()?);
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+    let _ = io::Read::read(&mut &sock, &mut [0u8; 1]);
     Ok(())
 }
 
