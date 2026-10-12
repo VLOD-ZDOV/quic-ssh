@@ -99,8 +99,15 @@ impl Revoked {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let key = ssh_key::PublicKey::from_openssh(line).with_context(|| format!("line {}: not a public key", n + 1))?;
-            out.keys.insert(blob(key.key_data()));
+            // A certificate line (`id-cert.pub`) revokes the key in it, as in sshd.
+            let key = match ssh_key::PublicKey::from_openssh(line) {
+                Ok(key) => key.key_data().clone(),
+                Err(e) => match crate::keys::Cert::from_openssh(line) {
+                    Ok(cert) => cert.public_key().clone(),
+                    Err(_) => return Err(e).with_context(|| format!("line {}: not a public key", n + 1)),
+                },
+            };
+            out.keys.insert(blob(&key));
         }
         Ok(out)
     }

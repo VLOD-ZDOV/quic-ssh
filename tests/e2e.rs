@@ -2357,6 +2357,11 @@ fn revoked_keys_and_krl() {
     assert!(works(&certified), "another serial");
     krl(&[], &public(&ca));
     assert!(!works(&certified), "the CA itself revoked");
+    // A certificate in the text list revokes its key, and only that.
+    let cert_line = std::fs::read_to_string(format!("{}-cert.pub", certified.display())).unwrap();
+    std::fs::write(&list, cert_line).unwrap();
+    assert!(!works(&certified), "revoked by its certificate line");
+    assert!(works(&ec) && works(&ed), "a certificate line must not break the list");
     std::fs::write(&list, "garbage\n").unwrap();
     assert!(!works(&ec) && !works(&ed), "a damaged list must refuse everyone");
 }
