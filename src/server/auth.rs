@@ -357,7 +357,7 @@ pub type UsedCodes = std::sync::Mutex<TotpState>;
 fn step_taken(file: &std::fs::File) -> u64 {
     use std::os::unix::fs::MetadataExt;
     match file.metadata() {
-        Ok(m) if m.mtime_nsec() == 0 && m.mtime() > 0 && m.mtime() as u64 % crate::totp::STEP == 0 => m.mtime() as u64 / crate::totp::STEP,
+        Ok(m) if m.mtime_nsec() == 0 && m.mtime() > 0 && (m.mtime() as u64).is_multiple_of(crate::totp::STEP) => m.mtime() as u64 / crate::totp::STEP,
         _ => 0,
     }
 }
