@@ -177,6 +177,7 @@ qsh -Y host xterm                      # X11 forwarding (-X: untrusted, as in ss
 sudo qsh -w 0:0 -N root@host           # tunnel devices tun0 <-> tun0 (root on both sides)
 sudo qsh -w any:3 -N alice@host        # a non-root user: only a device made for them (ip tuntap add tun3 mode tun user alice)
 qsh cp file.txt user@host:dir/         # upload
+qsh cp a.txt b.txt user@host:~/inbox   # several files into a directory (~ is the home directory)
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
 qsh cp -C logs.txt host:               # compressed (zstd), for text on slow links

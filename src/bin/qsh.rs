@@ -93,8 +93,9 @@ enum Cmd {
         /// Compress the data (zstd); worth it for text on slow links
         #[arg(short = 'C')]
         compress: bool,
-        src: String,
-        dst: String,
+        /// The sources, then the destination (a directory if there are several sources)
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Pair with a server using a code from `qshd pair` (adds your key there, pins its key here)
     Pair {
@@ -566,7 +567,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             client::pair(&target, &opts, &code).await.map_err(|e| with_doctor_hint(e, &target))?;
             Ok(0)
         }
-        Cmd::Cp { recursive, compress, src, dst } => cp(&src, &dst, (recursive, compress), &cli.conn).await,
+        Cmd::Cp { recursive, compress, paths } => cp(&paths, (recursive, compress), &cli.conn).await,
         Cmd::Speed { destination, seconds } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
@@ -1116,17 +1117,41 @@ fn keygen(file: Option<PathBuf>) -> Result<i32> {
     Ok(0)
 }
 
-async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &ConnArgs) -> Result<i32> {
+async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnArgs) -> Result<i32> {
     enum Direction {
         Upload { local: PathBuf, remote: String },
         Download { remote: String, local: PathBuf },
     }
-    let (dest, direction) = match (Location::parse(src), Location::parse(dst)) {
-        (Location::Local(local), Location::Remote { dest, path }) => (dest, Direction::Upload { local, remote: path }),
-        (Location::Remote { dest, path }, Location::Local(local)) => (dest, Direction::Download { remote: path, local }),
-        (Location::Local(_), Location::Local(_)) => bail!("one of SRC/DST must be remote ([user@]host:path)"),
-        (Location::Remote { .. }, Location::Remote { .. }) => bail!("remote-to-remote copies are not supported"),
-    };
+    let (srcs, dst) = paths.split_at(paths.len() - 1);
+    let dst = &dst[0];
+    let several = srcs.len() > 1;
+    let mut host: Option<String> = None;
+    let mut jobs = Vec::new();
+    for src in srcs {
+        let (dest, job) = match (Location::parse(src), Location::parse(dst)) {
+            (Location::Local(local), Location::Remote { dest, mut path }) => {
+                // Into the directory, never one file over another.
+                if several && !path.is_empty() && !path.ends_with('/') {
+                    path.push('/');
+                }
+                (dest, Direction::Upload { local, remote: path })
+            }
+            (Location::Remote { dest, path }, Location::Local(local)) => {
+                if several && !local.is_dir() {
+                    bail!("{}: not a directory (several sources need one)", local.display());
+                }
+                (dest, Direction::Download { remote: path, local })
+            }
+            (Location::Local(_), Location::Local(_)) => bail!("one of SRC/DST must be remote ([user@]host:path)"),
+            (Location::Remote { .. }, Location::Remote { .. }) => bail!("remote-to-remote copies are not supported"),
+        };
+        if host.as_ref().is_some_and(|h| *h != dest) {
+            bail!("all remote paths must be on one host");
+        }
+        host = Some(dest);
+        jobs.push(job);
+    }
+    let dest = host.expect("at least one source");
     let target = Target::parse(&dest, args.port, args.full)?;
     let scp_args = || {
         let mut v = Vec::new();
@@ -1148,7 +1173,8 @@ async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &Co
         for o in &target.ssh_options {
             v.extend(["-o".to_string(), o.clone()]);
         }
-        v.extend(["--".to_string(), src.to_string(), dst.to_string()]);
+        v.push("--".to_string());
+        v.extend(paths.iter().cloned());
         v
     };
     if args.full && target.needs_proxy {
@@ -1164,14 +1190,28 @@ async fn cp(src: &str, dst: &str, (recursive, compress): (bool, bool), args: &Co
         eprintln!("qsh: the server's qshd is too old for compression (-C); copying without it");
     }
     let compress = compress || target.compression;
-    let result = match (direction, recursive) {
-        (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote, compress).await,
-        (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote, compress).await,
-        (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local, compress).await,
-        (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local, compress).await,
-    };
+    // Like scp: a source that fails does not stop the others.
+    let mut failed = None;
+    for job in jobs {
+        let result = match (job, recursive) {
+            (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote, compress).await,
+            (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote, compress).await,
+            (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local, compress).await,
+            (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local, compress).await,
+        };
+        if let Err(e) = result {
+            if several {
+                eprintln!("qsh: {e:#}");
+            }
+            failed = Some(e);
+        }
+    }
     conn.close().await;
-    result.map(|()| 0)
+    match failed {
+        None => Ok(0),
+        Some(_) if several => Ok(1),
+        Some(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

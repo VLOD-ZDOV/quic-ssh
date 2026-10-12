@@ -309,6 +309,34 @@ fn copy_roundtrip() {
     assert!(stderr(&out).contains("does-not-exist"), "{}", stderr(&out));
 }
 
+/// Like scp: several sources into a directory (one that fails does not stop
+/// the others), and `~` on the remote side is the home directory.
+#[test]
+fn copy_several_sources_and_home() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let (a, b) = (c.home.path().join("a.txt"), c.home.path().join("b.txt"));
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    std::fs::create_dir(s.home.path().join("box")).unwrap();
+    let missing = c.home.path().join("missing.txt");
+    let out = c.run(&["cp", "-p", &port, a.to_str().unwrap(), missing.to_str().unwrap(), b.to_str().unwrap(), &format!("{}:~/box", dest())]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("missing.txt"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(s.home.path().join("box/a.txt")).unwrap(), "a");
+    assert_eq!(std::fs::read_to_string(s.home.path().join("box/b.txt")).unwrap(), "b");
+    let back = c.home.path().join("back");
+    std::fs::create_dir(&back).unwrap();
+    let out = c.run(&["cp", "-p", &port, &format!("{}:~/box/a.txt", dest()), &format!("{}:box/b.txt", dest()), back.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(back.join("b.txt")).unwrap(), "b");
+    // Several sources onto a file: refused.
+    let out = c.run(&["cp", "-p", &port, &format!("{}:box/a.txt", dest()), &format!("{}:box/b.txt", dest()), a.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+}
+
 /// Echo server that answers each connection with "echo:" + what it received.
 fn echo_server() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();

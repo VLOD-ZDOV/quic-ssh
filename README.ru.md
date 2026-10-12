@@ -177,6 +177,7 @@ qsh -Y host xterm                      # проброс X11 (-X: недовер�
 sudo qsh -w 0:0 -N root@host           # туннельные устройства tun0 <-> tun0 (root с обеих сторон)
 sudo qsh -w any:3 -N alice@host        # не root: только созданное для него устройство (ip tuntap add tun3 mode tun user alice)
 qsh cp file.txt user@host:dir/         # загрузить
+qsh cp a.txt b.txt user@host:~/inbox   # несколько файлов в каталог (~ — домашний каталог)
 qsh cp user@host:logs/app.log .        # скачать
 qsh cp -r project/ user@host:src/      # скопировать каталог (в любую сторону)
 qsh cp -C logs.txt host:               # со сжатием (zstd), для текста на медленном канале
