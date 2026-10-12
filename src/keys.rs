@@ -344,10 +344,16 @@ fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
     };
-    if !f.metadata()?.is_file() {
+    let opened = f.metadata()?;
+    if !opened.is_file() {
         bail!("{} is not a regular file", path.display());
     }
     check_owner_chain(path, home, uid)?;
+    // The checks went by name: the file open must be the one they saw.
+    let checked = fs::metadata(path)?;
+    if (checked.dev(), checked.ino()) != (opened.dev(), opened.ino()) {
+        bail!("{} was replaced while being checked", path.display());
+    }
     Ok(Some(f))
 }
 
