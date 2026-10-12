@@ -519,7 +519,10 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         Predictor::new(opts.predict, rows, cols)
     });
-    let (typed_tx, mut typed_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Not bounded: a keystroke dropped here (the main loop stuck on a slow
+    // terminal) could be the Enter before a password prompt, and the
+    // predictor would then draw the password. Only typed input goes here.
+    let (typed_tx, mut typed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Whether the remote program wants application cursor keys (followed on
     // Windows, where qsh encodes the keys itself).
     let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::CursorKeys::default()));
@@ -554,7 +557,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                         };
                         if !data.is_empty() {
                             if let Some(t) = &typed_tx {
-                                let _ = t.try_send(data.clone());
+                                let _ = t.send(data.clone());
                             }
                             if stdin_tx.send(ClientMsg::Stdin(data)).await.is_err() {
                                 break;
