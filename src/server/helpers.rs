@@ -195,9 +195,9 @@ pub fn tar(path: &str) -> Result<()> {
     }
     let mut out = io::stdout().lock();
     writeln!(out, "ok")?;
-    crate::tree::write_tree(dir, &mut out)?;
+    let stats = crate::tree::write_tree(dir, &mut out)?;
     out.flush()?;
-    Ok(())
+    stats.check()
 }
 
 /// `qshd internal-become UID GID GROUPS HOME TTY ARG0 -- PROGRAM [ARGS...]`

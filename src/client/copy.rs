@@ -212,7 +212,7 @@ pub async fn upload_tree(conn: &Conn, local: &Path, remote: &str, compressed: bo
         }
     };
     report(&stats);
-    Ok(())
+    stats.check()
 }
 
 /// `qsh cp -r` download: receives the contents of remote directory `remote`.

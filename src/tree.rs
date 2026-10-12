@@ -21,6 +21,33 @@ pub struct Stats {
     pub bytes: u64,
     /// Symlinks, devices, sockets and the like (not transferred).
     pub skipped: u64,
+    /// Files that shrank while being read: sent padded with zeros, to keep
+    /// the stream in step, so their copies are wrong.
+    pub shrunk: u64,
+}
+
+impl Stats {
+    /// An error if a file shrank while being sent.
+    pub fn check(&self) -> Result<()> {
+        if self.shrunk > 0 {
+            bail!("{} files shrank while being copied; their copies are incomplete", self.shrunk);
+        }
+        Ok(())
+    }
+}
+
+/// Counts what a reader gave.
+struct Counted<R> {
+    inner: R,
+    n: u64,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.n += n as u64;
+        Ok(n)
+    }
 }
 
 /// Writes the contents of `root` (not `root` itself) as a tar stream.
@@ -54,8 +81,12 @@ pub fn write_tree(root: &Path, out: impl Write) -> Result<Stats> {
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_size(meta.len());
                 // A file that shrinks while being read must not desync the stream.
-                let mut data = file.take(meta.len()).chain(io::repeat(0).take(meta.len()));
+                let mut read = Counted { inner: file.take(meta.len()), n: 0 };
+                let mut data = (&mut read).chain(io::repeat(0).take(meta.len()));
                 tar.append_data(&mut header, &path, (&mut data).take(meta.len()))?;
+                if read.n < meta.len() {
+                    stats.shrunk += 1;
+                }
                 stats.files += 1;
                 stats.bytes += meta.len();
             } else {
@@ -357,7 +388,7 @@ mod tests {
         sample(src.path());
         let mut buf = Vec::new();
         let sent = write_tree(src.path(), &mut buf).unwrap();
-        assert_eq!(sent, Stats { files: 3, dirs: 2, bytes: 100_005, skipped: 1 });
+        assert_eq!(sent, Stats { files: 3, dirs: 2, bytes: 100_005, skipped: 1, shrunk: 0 });
         let got = extract_tree(&buf[..], dst.path()).unwrap();
         assert_eq!((got.files, got.dirs, got.bytes), (3, 2, 100_005));
         assert_eq!(fs::read(dst.path().join("sub/b.bin")).unwrap().len(), 100_000);
