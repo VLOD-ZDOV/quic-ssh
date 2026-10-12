@@ -33,6 +33,8 @@ struct Server {
     child: Child,
     home: TempDir,
     port: u16,
+    /// The last lines qshd logged, for failure messages.
+    log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl Drop for Server {
@@ -86,8 +88,23 @@ impl Server {
                 break addr.rsplit(':').next().unwrap().parse().unwrap();
             }
         };
-        std::thread::spawn(move || lines.for_each(drop));
-        Server { child, home, port }
+        let log = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let keep = log.clone();
+        std::thread::spawn(move || {
+            for line in lines.map_while(Result::ok) {
+                let mut log = keep.lock().unwrap();
+                if log.len() == 200 {
+                    log.pop_front();
+                }
+                log.push_back(line);
+            }
+        });
+        Server { child, home, port, log }
+    }
+
+    /// What qshd logged lately.
+    fn log(&self) -> String {
+        self.log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
     }
 
     fn pair_code(&self) -> String {
@@ -318,7 +335,8 @@ fn local_port_forwarding() {
 /// of the client's data must reach the target through the helper's stdin.
 #[test]
 fn local_port_forwarding_through_the_helper() {
-    local_port_forwarding_with(Server::start_env(tempfile::tempdir().unwrap(), "127.0.0.1:0", "", &[("QSHD_TEST_FORWARD_HELPER", "1")]));
+    let env = [("QSHD_TEST_FORWARD_HELPER", "1"), ("QSHD_LOG", "qsh=debug")];
+    local_port_forwarding_with(Server::start_env(tempfile::tempdir().unwrap(), "127.0.0.1:0", "", &env));
 }
 
 /// A small `connection_buffer_mb` slows bulk data down but loses none.
@@ -358,7 +376,7 @@ fn local_port_forwarding_with(s: Server) {
             let _ = child.kill();
             let mut err = String::new();
             let _ = child.stderr.take().unwrap().read_to_string(&mut err);
-            panic!("{t}: {} bytes back; qsh said: {err}", reply.len());
+            panic!("{t}: {} bytes back; qsh said: {err}\nqshd said:\n{}", reply.len(), s.log());
         }
         assert!(reply[5..] == payload[..], "{t}: payload mismatch ({} bytes)", reply.len());
         child.kill().unwrap();
