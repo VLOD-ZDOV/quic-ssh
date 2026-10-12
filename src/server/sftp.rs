@@ -934,7 +934,10 @@ mod tests {
         assert_eq!(code(&srv.handle(&packet(REALPATH, 2, &[&s(missing.to_str().unwrap())]))), NO_SUCH_FILE);
 
         let raw = std::ffi::OsStr::from_bytes(b"caf\xe9");
-        std::fs::write(root.join(raw), b"x").unwrap();
+        // macOS (APFS) does not allow such names at all.
+        if std::fs::write(root.join(raw), b"x").is_err() && cfg!(target_os = "macos") {
+            return;
+        }
         let reply = srv.handle(&packet(OPENDIR, 3, &[&s(root.to_str().unwrap())]));
         let handle = reply[5..].to_vec();
         let reply = srv.handle(&packet(READDIR, 4, &[&handle]));
