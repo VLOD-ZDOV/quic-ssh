@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/VLOD-ZDOV/quic-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/VLOD-ZDOV/quic-ssh/actions/workflows/ci.yml)
 
-`qsh` is an `ssh` replacement that runs over **QUIC (UDP)**. If UDP is blocked, it falls back to **TLS over TCP** on its own. The server, `qshd`, listens on the same port (**4422** by default) over both UDP and TCP.
+`qsh` is an `ssh` replacement that runs over **QUIC (UDP)**. If UDP is blocked, it falls back to **TLS over TCP** on its own: when QUIC has not answered within 0.7 s, TCP is tried too, and the first to connect is used. The server, `qshd`, listens on the same port (**4422** by default) over both UDP and TCP.
 
 Why QUIC:
 
