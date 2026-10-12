@@ -28,6 +28,8 @@ use crate::proto::{read_msg, write_msg};
 const MUX_VERSION: u32 = 1;
 /// How long a client waits for a master's answer before connecting on its own.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long opening a stream through a master may take.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `-O forward` waits for the master and the server.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -82,7 +84,9 @@ impl SharedConn {
     pub async fn open_bi(&self) -> Result<(SendHalf, RecvHalf)> {
         let mut sock = connect(&self.path).await.context("connection master is gone")?;
         write_msg(&mut sock, &MuxRequest::Open).await?;
-        match tokio::time::timeout(ANSWER_TIMEOUT, read_msg(&mut sock)).await.context("connection master does not answer")?? {
+        // The master may wait for a free stream, as a connection of our own
+        // would; only a master that is stuck (stopped with ^Z) takes this long.
+        match tokio::time::timeout(OPEN_TIMEOUT, read_msg(&mut sock)).await.context("connection master does not answer")?? {
             MuxReply::Opened => {}
             MuxReply::Err(e) => bail!("{e}"),
             other => bail!("unexpected answer from the connection master: {other:?}"),
@@ -229,6 +233,8 @@ pub struct Master {
     /// `-O stop`: no new clients; end once the current ones are done.
     stopped: Arc<std::sync::atomic::AtomicBool>,
     accepting: tokio::task::JoinHandle<()>,
+    /// The master's own forwarded connections, which count as activity too.
+    forwards: Arc<super::Activity>,
 }
 
 /// Another master already listens at the path.
@@ -298,8 +304,12 @@ impl Master {
     /// Starts sharing `conn` at `path`. Fails with [`InUse`] if another
     /// master is there.
     /// `hook` serves `-O forward` and `-O cancel`.
-    pub fn start(conn: Arc<Conn>, path: &Path, hook: Option<ForwardHook>) -> Result<Master> {
+    /// `conns` gives the connection, and a new one when a persistent session
+    /// reconnects: sharing goes on with that.
+    pub fn start(mut conns: watch::Receiver<Arc<Conn>>, path: &Path, hook: Option<ForwardHook>, forwards: Arc<super::Activity>) -> Result<Master> {
         let (listener, file) = bind(path)?;
+        // Every client and stream it serves holds a descriptor.
+        crate::platform::raise_fd_limit();
         let file = Arc::new(file);
         let active = Arc::new(AtomicUsize::new(0));
         let changed = Arc::new(Notify::new());
@@ -311,6 +321,7 @@ impl Master {
             tokio::spawn(async move {
                 let me = nix::unistd::geteuid().as_raw();
                 loop {
+                    let conn = conns.borrow_and_update().clone();
                     let sock = tokio::select! {
                         s = listener.accept() => match s {
                             Ok((s, _)) => s,
@@ -319,7 +330,14 @@ impl Master {
                                 continue;
                             }
                         },
-                        () = conn.closed() => break,
+                        () = conn.closed() => {
+                            // Wake whoever waits for the end; a reconnect brings a new connection.
+                            changed.notify_waiters();
+                            match conns.changed().await {
+                                Ok(()) => continue,
+                                Err(_) => break,
+                            }
+                        }
                     };
                     // The socket's directory is private; this is a second check.
                     match sock.peer_cred() {
@@ -339,7 +357,7 @@ impl Master {
                 changed.notify_waiters();
             })
         };
-        Ok(Master { file, active, changed, exit, stopped, accepting })
+        Ok(Master { file, active, changed, exit, stopped, accepting, forwards })
     }
 
     /// Stops accepting new clients (streams already open keep working).
@@ -362,7 +380,10 @@ impl Master {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let idle = self.active.load(Ordering::SeqCst) == 0;
+            let forward_ended = self.forwards.changed().notified();
+            tokio::pin!(forward_ended);
+            forward_ended.as_mut().enable();
+            let idle = self.active() == 0;
             let wait_for_quiet = async {
                 match (idle, linger) {
                     (true, None) => {}
@@ -373,11 +394,12 @@ impl Master {
             let mut exit = exit.clone();
             tokio::select! {
                 () = wait_for_quiet => {
-                    if self.active.load(Ordering::SeqCst) == 0 {
+                    if self.active() == 0 {
                         break;
                     }
                 }
                 () = notified => {}
+                () = forward_ended => {}
                 () = conn.closed() => break,
                 _ = exit.wait_for(|e| *e) => break,
             }
@@ -390,9 +412,10 @@ impl Master {
         let _ = exit.wait_for(|e| *e).await;
     }
 
-    /// Clients attached, and streams open for them, right now.
+    /// Clients attached, streams open for them, and the master's own
+    /// forwarded connections, right now.
     pub fn active(&self) -> usize {
-        self.active.load(Ordering::SeqCst)
+        self.active.load(Ordering::SeqCst) + self.forwards.count()
     }
 }
 

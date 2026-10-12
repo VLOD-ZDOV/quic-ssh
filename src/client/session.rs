@@ -860,7 +860,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     drop(tx);
     writer.abort();
     drop(raw);
-    conn.close().await;
+    // The caller closes the connection: a master may still share it.
+    drop(conn);
     Ok(code)
 }
 

@@ -217,7 +217,7 @@ async fn open_direct_local(conn: &Conn, path: &str) -> Result<(SendHalf, RecvHal
 }
 
 /// Serves one local connection of a `-L`/`-D` forward through the server.
-async fn serve_local<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(conn: Arc<Conn>, dest: Dest, mut sock: S, peer: String) {
+async fn serve_local<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(conn: Arc<Conn>, dest: Dest, mut sock: S, peer: String, _busy: crate::transport::Busy) {
     let result = match &dest {
         Dest::Tcp { host, port } => match open_direct(&conn, host, *port).await {
             Ok((send, recv)) => bridge_stream(sock, send, recv).await,
@@ -370,7 +370,7 @@ impl Drop for SocketFile {
 /// The forwards of one connection.
 pub struct Forwarder {
     /// The connection; a persistent session replaces it when it reconnects.
-    conn: Mutex<Arc<Conn>>,
+    conn: tokio::sync::watch::Sender<Arc<Conn>>,
     /// `-g`: local forwards listen on all addresses by default.
     gateway: bool,
     active: Mutex<Vec<Active>>,
@@ -379,6 +379,8 @@ pub struct Forwarder {
     /// Agent and X11 forwarding requested (their streams are kept here).
     agent_request: Mutex<Option<(SendHalf, RecvHalf)>>,
     x11_request: Mutex<Option<(SendHalf, RecvHalf)>>,
+    /// Forwarded connections open now.
+    activity: Arc<crate::transport::Activity>,
 }
 
 impl Drop for Forwarder {
@@ -392,18 +394,30 @@ impl Drop for Forwarder {
 impl Forwarder {
     pub fn new(conn: Arc<Conn>, gateway: bool) -> Arc<Forwarder> {
         Arc::new(Forwarder {
-            conn: Mutex::new(conn),
+            conn: tokio::sync::watch::Sender::new(conn),
             gateway,
             active: Mutex::default(),
             routes: Arc::default(),
             dispatcher: Mutex::default(),
             agent_request: Mutex::default(),
             x11_request: Mutex::default(),
+            activity: Arc::default(),
         })
     }
 
-    fn conn(&self) -> Arc<Conn> {
-        self.conn.lock().unwrap().clone()
+    /// The connection now (a persistent session may have replaced it).
+    pub fn conn(&self) -> Arc<Conn> {
+        self.conn.borrow().clone()
+    }
+
+    /// The connection now and after each reconnect.
+    pub fn connections(&self) -> tokio::sync::watch::Receiver<Arc<Conn>> {
+        self.conn.subscribe()
+    }
+
+    /// Forwarded connections open now, which keep a master from ending.
+    pub fn activity(&self) -> Arc<crate::transport::Activity> {
+        self.activity.clone()
     }
 
     /// A persistent session got a new connection: the forwards of the old
@@ -412,7 +426,7 @@ impl Forwarder {
     /// them, as `~#` shows them, so they can be added again.
     pub fn reconnected(&self, conn: Arc<Conn>) -> Vec<String> {
         let gone = self.list();
-        *self.conn.lock().unwrap() = conn;
+        self.conn.send_replace(conn);
         self.active.lock().unwrap().clear();
         {
             let mut routes = self.routes.lock().unwrap();
@@ -433,14 +447,15 @@ impl Forwarder {
         match &fwd.listen {
             Listen::Tcp { bind, port } => {
                 for listener in bind_local(bind.as_deref(), *port, self.gateway).await? {
-                    let (conn, dest) = (self.conn(), fwd.dest.clone());
+                    let (conn, dest, activity) = (self.conn(), fwd.dest.clone(), self.activity.clone());
                     tasks.push(
                         tokio::spawn(async move {
                             loop {
                                 match listener.accept().await {
                                     Ok((tcp, peer)) => {
                                         let _ = tcp.set_nodelay(true);
-                                        tokio::spawn(serve_local(conn.clone(), dest.clone(), tcp, peer.to_string()));
+                                        let busy = activity.hold();
+                                        tokio::spawn(serve_local(conn.clone(), dest.clone(), tcp, peer.to_string(), busy));
                                     }
                                     Err(e) => crate::transport::accept_failed(&e).await,
                                 }
@@ -454,12 +469,12 @@ impl Forwarder {
             Listen::Unix(path) => {
                 let (listener, file) = bind_local_unix(path)?;
                 socket = Some(file);
-                let (conn, dest, path) = (self.conn(), fwd.dest.clone(), path.clone());
+                let (conn, dest, path, activity) = (self.conn(), fwd.dest.clone(), path.clone(), self.activity.clone());
                 tasks.push(
                     tokio::spawn(async move {
                         loop {
                             match listener.accept().await {
-                                Ok((sock, _)) => drop(tokio::spawn(serve_local(conn.clone(), dest.clone(), sock, path.clone()))),
+                                Ok((sock, _)) => drop(tokio::spawn(serve_local(conn.clone(), dest.clone(), sock, path.clone(), activity.hold()))),
                                 Err(e) => crate::transport::accept_failed(&e).await,
                             }
                         }
@@ -479,22 +494,38 @@ impl Forwarder {
         if self.conn().is_shared() {
             bail!("remote forwards need a connection of their own (this one is shared)");
         }
-        // The server tells connections apart by port only.
+        // The server tells connections apart by port only. Checked and taken
+        // at once: two requests for one port at a time must not both pass,
+        // and the one that fails must not remove the other's route.
         if let Listen::Tcp { port, .. } = &fwd.listen {
-            if *port != 0 && self.routes.lock().unwrap().ports.contains_key(port) {
-                bail!("there is a remote forward on port {port} already");
+            if *port != 0 {
+                let mut routes = self.routes.lock().unwrap();
+                if routes.ports.contains_key(port) {
+                    bail!("there is a remote forward on port {port} already");
+                }
+                // Routes first: a connection may arrive right after the server listens.
+                routes.ports.insert(*port, fwd.dest.clone());
             }
         }
-        // Routes first: a connection may arrive right after the server listens.
         self.dispatch();
-        let (mut send, mut recv) = self.conn().open_bi().await?;
+        let release = |port: &u16| {
+            if *port != 0 {
+                self.routes.lock().unwrap().ports.remove(port);
+            }
+        };
+        let opened = self.conn().open_bi().await;
+        let (mut send, mut recv) = match (opened, &fwd.listen) {
+            (Ok(x), _) => x,
+            (Err(e), Listen::Tcp { port, .. }) => {
+                release(port);
+                return Err(e);
+            }
+            (Err(e), _) => return Err(e),
+        };
         let bound = match &fwd.listen {
             Listen::Tcp { bind, port } => {
                 // Like ssh: without an address, ask for loopback.
                 let bind = bind.clone().unwrap_or_else(|| "localhost".into());
-                if *port != 0 {
-                    self.routes.lock().unwrap().ports.insert(*port, fwd.dest.clone());
-                }
                 let reply = async {
                     write_msg(&mut send, &Request::RemoteForward { bind, port: *port }).await?;
                     expect_ok(&mut recv).await
@@ -505,7 +536,7 @@ impl Forwarder {
                         Some(port)
                     }
                     result => {
-                        self.routes.lock().unwrap().ports.remove(port);
+                        release(port);
                         match result {
                             Err(e) => return Err(e),
                             Ok(other) => bail!("unexpected reply {other:?}"),
@@ -698,11 +729,12 @@ impl Forwarder {
         if slot.is_some() {
             return;
         }
-        let (conn, routes) = (self.conn(), self.routes.clone());
+        let (conn, routes, activity) = (self.conn(), self.routes.clone(), self.activity.clone());
         let task = tokio::spawn(async move {
             while let Some((send, mut recv)) = conn.accept_bi().await {
-                let routes = routes.clone();
+                let (routes, busy) = (routes.clone(), activity.hold());
                 tokio::spawn(async move {
+                    let _busy = busy;
                     let opened = match read_msg(&mut recv).await {
                         Ok(o) => o,
                         Err(_) => return,

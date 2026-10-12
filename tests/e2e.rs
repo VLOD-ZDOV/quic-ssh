@@ -2431,6 +2431,26 @@ fn connection_sharing_edge_cases() {
     }
 }
 
+/// A master whose own session ends waits for the sessions that share its
+/// connection (it used to close the connection under them).
+#[test]
+fn master_waits_for_shared_sessions() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPath /tmp/qsh-test-%C\n").unwrap();
+    let port = s.port.to_string();
+    let mut master = c.cmd(&["-p", &port, &dest(), "sleep 2"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !c.run(&["-O", "check", "-p", &port, &dest()]).status.success() {
+        assert!(Instant::now() < deadline, "no master");
+        sleep(Duration::from_millis(100));
+    }
+    let out = c.run(&["-p", &port, &dest(), "sleep 4; echo still-here"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "still-here");
+    assert!(master.wait().unwrap().success());
+}
+
 /// sshd-style server settings: allow/deny lists, `[[match]]`, forced
 /// commands, environment, banner, limits, `~/.ssh/rc`, `-t`/`-T` and SIGHUP.
 #[test]

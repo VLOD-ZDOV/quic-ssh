@@ -152,3 +152,20 @@ pub fn blocking_stdio() {
         }
     }
 }
+
+/// Lifts the soft limit on open files (often 1024) towards the hard one:
+/// every connection, forwarded connection and helper holds descriptors.
+/// Capped so that programs started from here, which inherit it, see a usual value.
+pub fn raise_fd_limit() {
+    #[cfg(unix)]
+    {
+        use nix::sys::resource::{getrlimit, setrlimit, Resource};
+        const WANT: u64 = 8192;
+        if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+            let new = hard.min(WANT);
+            if soft < new {
+                let _ = setrlimit(Resource::RLIMIT_NOFILE, new, hard);
+            }
+        }
+    }
+}

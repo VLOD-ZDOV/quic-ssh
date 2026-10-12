@@ -432,7 +432,7 @@ async fn master_main(a: SshArgs) -> Result<i32> {
         Err(e) => return Err(e),
     };
     let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports);
-    let master = match Master::start(conn.clone(), &path, Some(forward_hook(&forwarder))) {
+    let master = match Master::start(forwarder.connections(), &path, Some(forward_hook(&forwarder)), forwarder.activity()) {
         Ok(m) => m,
         // Another qsh got there first: use that one.
         Err(e) if e.is::<InUse>() => {
@@ -901,6 +901,8 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     };
     #[cfg(not(unix))]
     let code = session.await?;
+    // A persistent session may have logged in again on the way.
+    let conn = forwarder.conn();
     #[cfg(unix)]
     if let Some(m) = master {
         wait_for_shared(m, &conn, quiet).await;
@@ -932,7 +934,7 @@ fn start_master(conn: &Arc<qsh::transport::Conn>, target: &Target, quiet: bool, 
     if conn.is_shared() || target.sharing.master == ControlMaster::No {
         return None;
     }
-    let started = prepare_control_dir(path).and_then(|()| qsh::transport::shared::Master::start(conn.clone(), path, Some(forward_hook(forwarder))));
+    let started = prepare_control_dir(path).and_then(|()| qsh::transport::shared::Master::start(forwarder.connections(), path, Some(forward_hook(forwarder)), forwarder.activity()));
     match started {
         Ok(m) => {
             tracing::debug!("sharing the connection at {}", path.display());

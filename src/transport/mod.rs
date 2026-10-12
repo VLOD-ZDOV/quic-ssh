@@ -607,6 +607,40 @@ pub async fn splice(tcp: tokio::net::TcpStream, send: SendHalf, recv: RecvHalf) 
     bridge(tr, tw, send, recv).await
 }
 
+/// Streams in use that keep a shared connection's master (ControlPersist)
+/// from ending: those of its own forwards.
+#[derive(Default)]
+pub struct Activity {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl Activity {
+    pub fn hold(self: &Arc<Self>) -> Busy {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy(self.clone())
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Signalled whenever a stream ends.
+    pub fn changed(&self) -> &tokio::sync::Notify {
+        &self.changed
+    }
+}
+
+/// A stream counted in an [`Activity`] while this lives.
+pub struct Busy(Arc<Activity>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
 /// After a failed `accept`: out of descriptors (EMFILE) and the like pass,
 /// so a listener waits a little and goes on instead of closing for good.
 pub async fn accept_failed(e: &std::io::Error) {
