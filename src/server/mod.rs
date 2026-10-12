@@ -513,9 +513,11 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
             }
         }
     }
-    // Root with forced-commands-only: only keys with a forced command.
+    // Root with forced-commands-only: only keys with a forced command of
+    // their own (as in sshd, the server's force_command does not count: it
+    // is not a statement about which keys may log in as root).
     let granted = granted.filter(|(grant, _)| {
-        let forced = grant.restrictions.command.is_some() || cfg.force_command.is_some();
+        let forced = grant.restrictions.command.is_some();
         let ok = user.as_ref().is_none_or(|u| u.uid != 0) || cfg.permit_root_login != PermitRootLogin::ForcedCommandsOnly || forced;
         if !ok {
             warn!("{addr}: root login refused: the key has no forced command (permit_root_login = forced-commands-only)");
