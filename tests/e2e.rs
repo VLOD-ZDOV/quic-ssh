@@ -2040,6 +2040,70 @@ fn one_time_code_guessing_is_limited_across_connections() {
     assert!(stderr(&out).contains("too many wrong one-time codes"), "{}", stderr(&out));
 }
 
+/// Two qshd of one user (another port, a user-mode one next to the system
+/// one) share the secret: logins with one code at the same time on both
+/// get in once.
+#[test]
+fn one_time_code_is_taken_once_across_servers() {
+    use qsh::totp;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let secret = b"a secret both share!";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    // The second qshd, on the same home.
+    let mut second = Command::new(QSHD)
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .env("HOME", s.home.path())
+        .env("QSHD_TEST_NO_TOTP_FLOOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(second.stderr.take().unwrap()).lines();
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _second = Killed(second);
+    let other_port = loop {
+        let line = lines.next().expect("qshd exited before listening").unwrap();
+        if let Some(rest) = line.split("listening on ").nth(1) {
+            break rest.split_whitespace().next().unwrap().rsplit(':').next().unwrap().to_string();
+        }
+    };
+    std::thread::spawn(move || lines.for_each(drop));
+    // Not at the end of a step, so that every login gets the same code.
+    while std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() % totp::STEP > totp::STEP - 8 {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let code = format!("{:06}", totp::code(secret, step));
+    let ports = [s.port.to_string(), other_port];
+    let logins: Vec<_> = (0..6)
+        .map(|i| {
+            let dir = tempfile::tempdir().unwrap();
+            let script = askpass_script(dir.path(), std::slice::from_ref(&code));
+            let child = c
+                .cmd(&["--accept-new-host", "-p", &ports[i % 2], &dest(), "true"])
+                .env("SSH_ASKPASS", &script)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            (dir, child)
+        })
+        .collect();
+    let outs: Vec<_> = logins.into_iter().map(|(_dir, child)| child.wait_with_output().unwrap()).collect();
+    let ok = outs.iter().filter(|o| o.status.success()).count();
+    assert_eq!(ok, 1, "one code let {ok} logins in: {:?}", outs.iter().map(stderr).collect::<Vec<_>>());
+}
+
 /// `ControlMaster auto` + `ControlPersist` in qsh's config: the first run
 /// leaves a master in the background, later runs (sessions, copies) go
 /// through it without a login of their own, and `-O check|exit` talk to it.
