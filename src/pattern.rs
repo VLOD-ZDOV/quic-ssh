@@ -68,7 +68,11 @@ pub fn endpoint_matches(pattern: &str, host: &str, port: u16, listen: bool) -> b
         None => return false,
     };
     let port_ok = p_port == "*" || p_port.parse::<u16>().ok() == Some(port);
-    let host_ok = p_host == "*" || p_host.eq_ignore_ascii_case(host) || (listen && p_host.is_empty() && matches!(host, "" | "localhost"));
+    let same_address = matches!((p_host.parse::<IpAddr>(), host.parse::<IpAddr>()), (Ok(a), Ok(b)) if a.to_canonical() == b.to_canonical());
+    let host_ok = p_host == "*"
+        || p_host.eq_ignore_ascii_case(host)
+        || same_address
+        || (listen && p_host.is_empty() && matches!(host, "" | "localhost"));
     port_ok && host_ok
 }
 
@@ -101,12 +105,22 @@ pub fn cidr_contains(cidr: &str, ip: IpAddr) -> Option<bool> {
     }
 }
 
+/// One address pattern without a CIDR: a plain address is compared as an
+/// address, so any spelling of it matches (`2001:DB8:0::1`, a v4-mapped
+/// one); a wildcard is matched against the canonical text.
+pub fn address_matches(pattern: &str, ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    match pattern.parse::<IpAddr>() {
+        Ok(a) => a.to_canonical() == ip,
+        Err(_) => wildcard(&pattern.to_ascii_lowercase(), &ip.to_string()),
+    }
+}
+
 /// `from=` in authorized_keys: comma-separated address patterns (wildcards or
 /// CIDR, `!` to exclude). Like sshd, a negated match denies, then any positive
 /// match allows. Host name patterns cannot match, since qshd does no reverse DNS.
 /// A malformed CIDR denies, as in sshd (a typo must not open an exclusion).
 pub fn address_allowed(list: &str, ip: IpAddr) -> bool {
-    let text = ip.to_canonical().to_string();
     let mut allowed = false;
     for p in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         let (neg, p) = match p.strip_prefix('!') {
@@ -119,7 +133,7 @@ pub fn address_allowed(list: &str, ip: IpAddr) -> bool {
                 None => return false,
             }
         } else {
-            wildcard(p, &text)
+            address_matches(p, ip)
         };
         if hit && neg {
             return false;
@@ -182,6 +196,11 @@ mod tests {
         assert!(address_allowed("2001:db8::/32", ip("2001:db8::1")));
         assert!(address_allowed("127.0.0.1", ip("::ffff:127.0.0.1")), "mapped addresses count as IPv4");
         assert!(!address_allowed("example.com", ip("192.0.2.7")));
+        assert!(endpoint_matches("[::1]:22", "0:0::1", 22, false));
+        // Any spelling of an address is that address, an exclusion included.
+        assert!(!address_allowed("*,!2001:DB8:0:0::1", ip("2001:db8::1")));
+        assert!(!address_allowed("*,!::ffff:192.0.2.7", ip("192.0.2.7")));
+        assert!(address_allowed("2001:DB8::*", ip("2001:db8::5")));
         assert!(!address_allowed("!10.0.0.0/33,*", ip("10.0.0.1")), "a malformed exclusion denies");
         assert!(source_address_allowed("192.0.2.0/24", ip("192.0.2.9")));
         assert!(!source_address_allowed("192.0.2.0/24,bogus", ip("192.0.2.9")));

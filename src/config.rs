@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::pattern::{address_allowed, cidr_contains, name_matches, wildcard};
+use crate::pattern::{address_allowed, address_matches, cidr_contains, name_matches, wildcard};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -588,7 +588,7 @@ fn user_entry_matches(entry: &str, who: &Login) -> bool {
         None => (entry, None),
     };
     let addr = who.addr.to_canonical();
-    let one = |p: &str| if p.contains('/') { cidr_contains(p, addr).unwrap_or(false) } else { wildcard(p, &addr.to_string()) };
+    let one = |p: &str| if p.contains('/') { cidr_contains(p, addr).unwrap_or(false) } else { address_matches(p, addr) };
     wildcard(user, who.user)
         && host.is_none_or(|h| {
             let mut found = false;
