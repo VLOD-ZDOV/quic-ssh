@@ -59,9 +59,68 @@ fn split(s: yamux::Stream) -> (SendHalf, RecvHalf) {
     split_io(s.compat())
 }
 
-fn split_io<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> (SendHalf, RecvHalf) {
-    let (r, w) = tokio::io::split(s);
-    (Box::new(w), Box::new(r))
+fn split_io<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(s: S) -> (SendHalf, RecvHalf) {
+    let shared = Arc::new(Halves { stream: std::sync::Mutex::new(s), wakers: Arc::default() });
+    (Box::new(Half { shared: shared.clone(), reads: false }), Box::new(Half { shared, reads: true }))
+}
+
+/// A yamux stream shared by its read and write halves. Both poll the same
+/// channel to the connection (reads for window updates), which wakes only
+/// whoever polled it last: with `tokio::io::split`, a write could take the
+/// wakeup a pending window update needed, and the stream stalled for good
+/// once both sides sent at the same time. So every wakeup wakes both halves.
+struct Halves<S> {
+    stream: std::sync::Mutex<S>,
+    wakers: Arc<Wakers>,
+}
+
+#[derive(Default)]
+struct Wakers {
+    read: futures::task::AtomicWaker,
+    write: futures::task::AtomicWaker,
+}
+
+impl std::task::Wake for Wakers {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.read.wake();
+        self.write.wake();
+    }
+}
+
+struct Half<S> {
+    shared: Arc<Halves<S>>,
+    reads: bool,
+}
+
+impl<S: Unpin> Half<S> {
+    fn poll<T>(&self, cx: &mut std::task::Context<'_>, f: impl FnOnce(std::pin::Pin<&mut S>, &mut std::task::Context<'_>) -> T) -> T {
+        let wakers = &self.shared.wakers;
+        if self.reads { &wakers.read } else { &wakers.write }.register(cx.waker());
+        let waker = std::task::Waker::from(wakers.clone());
+        let mut stream = self.shared.stream.lock().unwrap();
+        f(std::pin::Pin::new(&mut *stream), &mut std::task::Context::from_waker(&waker))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Half<S> {
+    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.poll(cx, |s, cx| s.poll_read(cx, buf))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Half<S> {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.poll(cx, |s, cx| s.poll_write(cx, buf))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll(cx, |s, cx| s.poll_flush(cx))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll(cx, |s, cx| s.poll_shutdown(cx))
+    }
 }
 
 /// A stream we opened; its permit goes back when both halves are dropped.
