@@ -40,7 +40,13 @@ impl Location {
         };
         match colon {
             Some(i) if i > 0 && !s[..i].contains('/') => {
-                Location::Remote { dest: s[..i].to_string(), path: s[i + 1..].to_string() }
+                // Remote paths start in the home directory: `~` and `~/` mean
+                // it, as with scp (whose remote shell expands them).
+                let path = match &s[i + 1..] {
+                    "~" => "",
+                    p => p.strip_prefix("~/").unwrap_or(p),
+                };
+                Location::Remote { dest: s[..i].to_string(), path: path.to_string() }
             }
             _ => Location::Local(PathBuf::from(s)),
         }
