@@ -234,18 +234,21 @@ impl Cert {
             Err(e) => e,
         };
         // Which eight 0xff bytes are the end of validity is up to the parse.
+        // A few tries at most: a client sends this before logging in.
         const LATEST: u64 = i64::MAX as u64;
-        for at in (0..bytes.len().saturating_sub(7)).filter(|&i| bytes[i..i + 8] == [0xff; 8]) {
-            let mut patched = bytes.to_vec();
+        let mut patched = bytes.to_vec();
+        for at in (0..bytes.len().saturating_sub(7)).filter(|&i| bytes[i..i + 8] == [0xff; 8]).take(64) {
             patched[at..at + 8].copy_from_slice(&LATEST.to_be_bytes());
-            let Ok(cert) = ssh_key::Certificate::from_bytes(&patched) else { continue };
+            let parsed = ssh_key::Certificate::from_bytes(&patched);
+            patched[at..at + 8].copy_from_slice(&[0xff; 8]);
+            let Ok(cert) = parsed else { continue };
             if cert.valid_before() != LATEST {
                 continue;
             }
             // The signature is the last field: everything before it was signed.
             let signature = 4 + ssh_encoding::Encode::encoded_len(cert.signature())?;
             let signed = bytes[..bytes.len().saturating_sub(signature)].to_vec();
-            return Ok(Cert { cert, forever_signed: Some(signed), raw: bytes.to_vec() });
+            return Ok(Cert { cert, forever_signed: Some(signed), raw: patched });
         }
         Err(err.into())
     }
@@ -392,6 +395,15 @@ pub fn read_key_list_strict(path: &Path, home: &Path, uid: u32) -> Result<Vec<Pu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blob of 0xff bytes (each 8 of them could be a forever end) is
+    /// turned down quickly.
+    #[test]
+    fn hostile_certificate_blob_is_cheap() {
+        let started = std::time::Instant::now();
+        assert!(Cert::from_bytes(&vec![0xff; 1 << 20]).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 
     #[test]
     fn openssh_roundtrip() {
