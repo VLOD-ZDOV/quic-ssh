@@ -359,6 +359,10 @@ permit_tunnel = "point-to-point"
 EOF
     kill -HUP "$SERVER_PID"
     sleep 0.5
+    # As with sshd, a user other than root gets only a device made for them.
+    OUT=$(HOME="$T/client" timeout 10 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -w 101:102 -N qsh-alice@127.0.0.1 </dev/null 2>&1 || true)
+    check "a user cannot create a tunnel device" grep -q "only one made for this user" <<<"$OUT"
+    ip tuntap add tun102 mode tun user qsh-alice
     HOME="$T/client" timeout 30 "$QSH" -p "$PORT" -o ExitOnForwardFailure=yes -w 101:102 -N qsh-alice@127.0.0.1 </dev/null >/dev/null 2>"$T/tun.err" &
     TUN_CLIENT=$!
     for _ in $(seq 100); do [[ -e /sys/class/net/tun101 && -e /sys/class/net/tun102 ]] && break; sleep 0.1; done
@@ -374,6 +378,7 @@ EOF
     check "an ethernet tunnel is refused by point-to-point" grep -q "not allowed" <<<"$OUT"
     kill "$TUN_CLIENT" 2>/dev/null || true
     wait "$TUN_CLIENT" 2>/dev/null || true
+    ip tuntap del tun102 mode tun 2>/dev/null || true
     [[ -n ${QSH_DEBUG:-} ]] && cat "$T/tun.err"
 fi
 
