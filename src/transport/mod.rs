@@ -21,8 +21,13 @@ pub type RecvHalf = Box<dyn AsyncRead + Send + Unpin>;
 /// TLS exporter label used to bind pairing to this exact connection.
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-qsh-pair-v1";
 
-/// How long the client waits for QUIC before falling back to TCP.
+/// How long the client waits for QUIC on one address.
 const QUIC_TIMEOUT: Duration = Duration::from_millis(2500);
+/// QUIC still connecting after this: TCP starts too, and the first one
+/// connected is used (UDP blocked costs this, not every QUIC timeout).
+/// A QUIC handshake takes one round trip, so it wins unless the path is
+/// very slow, where TCP would be no faster.
+const TCP_AFTER: Duration = Duration::from_millis(700);
 /// How long `--full` waits for qshd before handing over to ssh.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -316,30 +321,73 @@ pub async fn connect(host: &str, port: u16, mode: Mode, family: Family, bind: &B
         bail!("{host} has no addresses");
     }
     let tls = Arc::new(tls);
-    let mut errors = Vec::new();
-
-    if mode != Mode::Tcp {
-        for &addr in &addrs {
-            let timeout = if mode == Mode::Quic { TCP_TIMEOUT } else { QUIC_TIMEOUT };
-            match tokio::time::timeout(timeout, quic::connect(tls.clone(), addr, bind.local_for(&addr)?)).await {
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => errors.push(format!("quic {addr}: {e:#}")),
-                Err(_) => errors.push(format!("quic {addr}: timed out")),
+    let quic = quic_all(&tls, &addrs, bind, if mode == Mode::Quic { TCP_TIMEOUT } else { QUIC_TIMEOUT });
+    let tcp = tcp_all(&tls, &addrs, bind);
+    let result = match mode {
+        Mode::Quic => quic.await,
+        Mode::Tcp => tcp.await,
+        Mode::Auto => {
+            tokio::pin!(quic, tcp);
+            let first = tokio::select! {
+                r = &mut quic => Some(r),
+                () = tokio::time::sleep(TCP_AFTER) => None,
+            };
+            match first {
+                // QUIC failed: TCP now.
+                Some(Err(q)) => tcp.await.map_err(|t| [q, t].concat()),
+                Some(ok) => ok,
+                // QUIC is slow: TCP joins in, and the first to connect is used.
+                None => {
+                    debug!("no QUIC answer yet: trying TCP too");
+                    tokio::select! {
+                        r = &mut quic => match r {
+                            Err(q) => tcp.await.map_err(|t| [q, t].concat()),
+                            ok => ok,
+                        },
+                        r = &mut tcp => match r {
+                            Err(t) => quic.await.map_err(|q| [q, t].concat()),
+                            ok => ok,
+                        },
+                    }
+                }
             }
-            debug!("{}", errors.last().unwrap());
         }
-    }
-    if mode != Mode::Quic {
-        for &addr in &addrs {
-            match tokio::time::timeout(TCP_TIMEOUT, tcp::connect(tls.clone(), addr, bind.local_for(&addr)?)).await {
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => errors.push(format!("tcp {addr}: {e:#}")),
-                Err(_) => errors.push(format!("tcp {addr}: timed out")),
-            }
-            debug!("{}", errors.last().unwrap());
-        }
-    }
+    };
+    let errors = match result {
+        Ok(conn) => return Ok(conn),
+        Err(e) => e,
+    };
     Err(Unreachable(format!("cannot connect to {host}:{port}\n  {}", errors.join("\n  "))).into())
+}
+
+/// QUIC to each address in turn; the reasons if none answered.
+async fn quic_all(tls: &Arc<rustls::ClientConfig>, addrs: &[SocketAddr], bind: &Bind, timeout: Duration) -> std::result::Result<Conn, Vec<String>> {
+    let mut errors = Vec::new();
+    for &addr in addrs {
+        let local = bind.local_for(&addr).map_err(|e| vec![format!("quic {addr}: {e:#}")])?;
+        match tokio::time::timeout(timeout, quic::connect(tls.clone(), addr, local)).await {
+            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Err(e)) => errors.push(format!("quic {addr}: {e:#}")),
+            Err(_) => errors.push(format!("quic {addr}: timed out")),
+        }
+        debug!("{}", errors.last().unwrap());
+    }
+    Err(errors)
+}
+
+/// TCP to each address in turn; the reasons if none answered.
+async fn tcp_all(tls: &Arc<rustls::ClientConfig>, addrs: &[SocketAddr], bind: &Bind) -> std::result::Result<Conn, Vec<String>> {
+    let mut errors = Vec::new();
+    for &addr in addrs {
+        let local = bind.local_for(&addr).map_err(|e| vec![format!("tcp {addr}: {e:#}")])?;
+        match tokio::time::timeout(TCP_TIMEOUT, tcp::connect(tls.clone(), addr, local)).await {
+            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Err(e)) => errors.push(format!("tcp {addr}: {e:#}")),
+            Err(_) => errors.push(format!("tcp {addr}: timed out")),
+        }
+        debug!("{}", errors.last().unwrap());
+    }
+    Err(errors)
 }
 
 /// No qshd answered (as opposed to an authentication or host key failure).
