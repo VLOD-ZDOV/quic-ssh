@@ -497,30 +497,40 @@ impl Forwarder {
         // The server tells connections apart by port only. Checked and taken
         // at once: two requests for one port at a time must not both pass,
         // and the one that fails must not remove the other's route.
-        if let Listen::Tcp { port, .. } = &fwd.listen {
-            if *port != 0 {
+        // Routes first: a connection may arrive right after the server listens.
+        match &fwd.listen {
+            Listen::Tcp { port, .. } if *port != 0 => {
                 let mut routes = self.routes.lock().unwrap();
                 if routes.ports.contains_key(port) {
                     bail!("there is a remote forward on port {port} already");
                 }
-                // Routes first: a connection may arrive right after the server listens.
                 routes.ports.insert(*port, fwd.dest.clone());
             }
+            Listen::Unix(path) => {
+                let mut routes = self.routes.lock().unwrap();
+                if routes.paths.contains_key(path) {
+                    bail!("there is a remote forward on {path} already");
+                }
+                routes.paths.insert(path.clone(), fwd.dest.clone());
+            }
+            _ => {}
         }
         self.dispatch();
-        let release = |port: &u16| {
-            if *port != 0 {
+        let release = |listen: &Listen| match listen {
+            Listen::Tcp { port, .. } if *port != 0 => {
                 self.routes.lock().unwrap().ports.remove(port);
             }
+            Listen::Unix(path) => {
+                self.routes.lock().unwrap().paths.remove(path);
+            }
+            _ => {}
         };
-        let opened = self.conn().open_bi().await;
-        let (mut send, mut recv) = match (opened, &fwd.listen) {
-            (Ok(x), _) => x,
-            (Err(e), Listen::Tcp { port, .. }) => {
-                release(port);
+        let (mut send, mut recv) = match self.conn().open_bi().await {
+            Ok(x) => x,
+            Err(e) => {
+                release(&fwd.listen);
                 return Err(e);
             }
-            (Err(e), _) => return Err(e),
         };
         let bound = match &fwd.listen {
             Listen::Tcp { bind, port } => {
@@ -536,7 +546,7 @@ impl Forwarder {
                         Some(port)
                     }
                     result => {
-                        release(port);
+                        release(&fwd.listen);
                         match result {
                             Err(e) => return Err(e),
                             Ok(other) => bail!("unexpected reply {other:?}"),
@@ -545,12 +555,17 @@ impl Forwarder {
                 }
             }
             Listen::Unix(path) => {
-                if self.conn().server_version() < 6 {
-                    bail!("the server's qshd is too old for Unix socket forwarding");
+                let reply = async {
+                    if self.conn().server_version() < 6 {
+                        bail!("the server's qshd is too old for Unix socket forwarding");
+                    }
+                    write_msg(&mut send, &Request::RemoteForwardStreamLocal { path: path.clone() }).await?;
+                    expect_ok(&mut recv).await
+                };
+                if let Err(e) = reply.await {
+                    release(&fwd.listen);
+                    return Err(e);
                 }
-                write_msg(&mut send, &Request::RemoteForwardStreamLocal { path: path.clone() }).await?;
-                expect_ok(&mut recv).await?;
-                self.routes.lock().unwrap().paths.insert(path.clone(), fwd.dest.clone());
                 None
             }
         };
