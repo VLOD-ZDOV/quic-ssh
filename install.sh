@@ -191,6 +191,14 @@ if [ "$(id -u)" = 0 ] || [ -n "$sudo_bin" ]; then sys=yes; else sys=no; fi
 put_unit() { # src dest [root]
     if [ -e "$2" ]; then
         say "Keeping the existing $2"
+        # Units from before KillMode=process: a restart would end tmux and
+        # other jobs started from qsh sessions, which sshd keeps.
+        if ! grep -qs '^KillMode=' "$2" "$2.d"/*.conf; then
+            ${3:-} mkdir -p "$2.d"
+            printf '[Service]\nKillMode=process\n' >"$tmp/killmode"
+            ${3:-} cp "$tmp/killmode" "$2.d/killmode.conf"
+            say "Wrote $2.d/killmode.conf (a restart keeps tmux and nohup jobs, as with sshd)"
+        fi
     else
         sed "s|/usr/local/bin/qshd|$qshd|g" "$1" >"$tmp/unit"
         ${3:-} mkdir -p "$(dirname "$2")"
