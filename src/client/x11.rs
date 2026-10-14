@@ -179,6 +179,10 @@ async fn rewrite_setup<R: AsyncRead + Unpin>(r: &mut R, auth: &X11Auth) -> Resul
         bail!("not an X11 connection setup");
     }
     let (name_len, data_len) = (u16_at(6) as usize, u16_at(8) as usize);
+    // Only what the fake cookie can be: the server must not make us hold more.
+    if name_len != auth.proto.len() || data_len != auth.fake.len() {
+        bail!("X11 authentication data does not match the fake cookie");
+    }
     let mut rest = vec![0u8; name_len + pad4(name_len) + data_len + pad4(data_len)];
     r.read_exact(&mut rest).await?;
     let name = &rest[..name_len];
