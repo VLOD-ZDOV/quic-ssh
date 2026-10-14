@@ -146,9 +146,11 @@ const MAX_META: u64 = 64 * 1024;
 /// Watches the tar stream on its way to the tar crate and refuses oversized
 /// metadata entries before they are read. It follows the archive layout
 /// itself: 512-byte headers, then data padded to 512 bytes, its size from
-/// the header or from a preceding PAX `size=` record. Sparse and
-/// multi-volume entries, whose extra blocks it does not follow, are refused
-/// (qsh never sends them).
+/// the header, read exactly as the tar crate reads it: any difference would
+/// let a header hide in what one of them takes for data. Sparse and
+/// multi-volume entries, whose extra blocks it does not follow, and PAX
+/// `size=` records, which the tar crate applies by rules of its own, are
+/// refused (qsh never sends them).
 struct MetaLimit<R> {
     inner: R,
     header: Vec<u8>,
@@ -158,20 +160,22 @@ struct MetaLimit<R> {
     pad: u64,
     /// The data of a PAX header being passed, kept to find `size=`.
     pax: Option<Vec<u8>>,
-    /// Size from a PAX header, for the entry after it.
-    next_size: Option<u64>,
 }
 
 impl<R> MetaLimit<R> {
     fn new(inner: R) -> MetaLimit<R> {
-        MetaLimit { inner, header: Vec::with_capacity(512), data: 0, pad: 0, pax: None, next_size: None }
+        MetaLimit { inner, header: Vec::with_capacity(512), data: 0, pad: 0, pax: None }
     }
 
     fn header_done(&mut self) -> io::Result<()> {
         let h = std::mem::take(&mut self.header);
         let kind = h[156];
-        let size = self.next_size.take().unwrap_or_else(|| header_size(&h[124..136]));
         let refuse = |what: String| Err(io::Error::new(io::ErrorKind::InvalidData, what));
+        // The zero blocks at the end, which the tar crate skips.
+        let size = if h.iter().all(|&b| b == 0) { Some(0) } else { header_size(&h[124..136]) };
+        let Some(size) = size else {
+            return refuse("refusing an archive header with a bad size".into());
+        };
         match kind {
             b'S' | b'M' => return refuse("refusing a sparse or multi-volume entry in the archive".into()),
             b'L' | b'K' | b'x' | b'g' if size > MAX_META => return refuse(format!("refusing an archive header entry of {size} bytes")),
@@ -182,15 +186,17 @@ impl<R> MetaLimit<R> {
         // Padding up to the next 512 bytes (no overflow for absurd sizes).
         self.pad = (512 - size % 512) % 512;
         if size == 0 {
-            self.data_done();
+            self.data_done()?;
         }
         Ok(())
     }
 
-    fn data_done(&mut self) {
-        if let Some(pax) = self.pax.take() {
-            self.next_size = pax_value(&pax, b"size").and_then(|v| std::str::from_utf8(v).ok()?.parse().ok());
+    fn data_done(&mut self) -> io::Result<()> {
+        // Records are `LEN key=value\n`: a size key always follows a space.
+        if self.pax.take().is_some_and(|pax| pax.windows(6).any(|w| w == b" size=")) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "refusing a PAX size in the archive"));
         }
+        Ok(())
     }
 }
 
@@ -212,7 +218,7 @@ impl<R: Read> Read for MetaLimit<R> {
                 }
                 self.data -= k as u64;
                 if self.data == 0 {
-                    self.data_done();
+                    self.data_done()?;
                 }
             } else if self.pad > 0 {
                 self.pad -= take(self.pad, &mut rest) as u64;
@@ -229,31 +235,14 @@ impl<R: Read> Read for MetaLimit<R> {
     }
 }
 
-/// A header's size field: octal digits, or base-256 when the top bit is set.
-fn header_size(field: &[u8]) -> u64 {
+/// A header's size field as the tar crate reads it: octal text up to the
+/// first NUL, or base-256 in the last 8 bytes when the top bit is set.
+fn header_size(field: &[u8]) -> Option<u64> {
     if field[0] & 0x80 != 0 {
-        return field[1..].iter().fold(0u64, |n, &b| n.saturating_mul(256).saturating_add(b as u64));
+        return Some(field[field.len() - 8..].iter().fold(0, |n, &b| n << 8 | b as u64));
     }
-    let text: String = field.iter().map(|&b| b as char).filter(|c| c.is_ascii_digit()).collect();
-    u64::from_str_radix(&text, 8).unwrap_or(0)
-}
-
-/// The value of `key` in PAX records (`LEN key=value\n`).
-fn pax_value<'a>(mut data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-    while !data.is_empty() {
-        let space = data.iter().position(|&b| b == b' ')?;
-        let len: usize = std::str::from_utf8(&data[..space]).ok()?.parse().ok()?;
-        if len <= space || len > data.len() {
-            return None;
-        }
-        let record = &data[space + 1..len];
-        let record = record.strip_suffix(b"\n").unwrap_or(record);
-        if let Some(value) = record.strip_prefix(key).and_then(|r| r.strip_prefix(b"=")) {
-            return Some(value);
-        }
-        data = &data[len..];
-    }
-    None
+    let text = field.split(|&b| b == 0).next()?;
+    u64::from_str_radix(std::str::from_utf8(text).ok()?.trim(), 8).ok()
 }
 
 /// Extracts a tar stream into the existing directory `dest`.
@@ -496,10 +485,10 @@ mod meta_tests {
         assert!(format!("{err:#}").contains("refusing an archive header entry"), "{err:#}");
     }
 
-    /// The layout is followed through a PAX size, so a long name hidden
-    /// behind it is still seen.
+    /// Any size the tar crate would see differently is refused: a PAX size,
+    /// base-256 bytes it ignores, octal digits after a NUL.
     #[test]
-    fn pax_size_is_followed() {
+    fn sizes_read_otherwise_by_tar_are_refused() {
         let record = |k: &str, v: &str| {
             let body = format!(" {k}={v}\n");
             let mut len = body.len() + 1;
@@ -512,13 +501,19 @@ mod meta_tests {
         let mut data = header(b'x', "pax", pax.len() as u64).as_bytes().to_vec();
         data.extend_from_slice(pax.as_bytes());
         data.resize(data.len().div_ceil(512) * 512, 0);
-        // The entry's own header says 0 bytes; its real data (1024) holds
-        // what would look like headers to a reader that ignored the PAX size.
         data.extend_from_slice(header(b'0', "file", 0).as_bytes());
-        data.extend_from_slice(header(b'L', "fake", 8 << 30).as_bytes());
-        data.extend(std::iter::repeat_n(0u8, 512));
-        let mut guard = MetaLimit::new(data.as_slice());
-        assert!(io::copy(&mut guard, &mut io::sink()).is_ok(), "the fake header inside data was taken for a header");
+        assert!(io::copy(&mut MetaLimit::new(data.as_slice()), &mut io::sink()).is_err());
+
+        // tar reads 0 for each of these, then a header where we would see data.
+        for field in [[0x80, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], *b"0\x0077777777\0\0"] {
+            let mut h = header(b'0', "file", 0);
+            h.as_mut_bytes()[124..136].copy_from_slice(&field);
+            h.set_cksum();
+            assert_eq!(h.entry_size().unwrap(), 0);
+            let mut data = h.as_bytes().to_vec();
+            data.extend_from_slice(header(b'L', "hidden", 8 << 30).as_bytes());
+            assert!(io::copy(&mut MetaLimit::new(data.as_slice()), &mut io::sink()).is_err());
+        }
         let mut data = header(b'0', "file", 0).as_bytes().to_vec();
         data.extend_from_slice(header(b'L', "real", 8 << 30).as_bytes());
         assert!(io::copy(&mut MetaLimit::new(data.as_slice()), &mut io::sink()).is_err());
