@@ -370,12 +370,16 @@ impl Parser<'_> {
                 "include" if depth < MAX_INCLUDE_DEPTH => {
                     for pattern in &args {
                         for file in self.expand_include(pattern) {
-                            if let Some(why) = insecure_file(&file).filter(|_| self.users_file) {
-                                self.out.bad_file.get_or_insert(why);
-                                continue;
-                            }
-                            if let Ok(t) = std::fs::read_to_string(&file) {
-                                self.feed(&t, depth + 1);
+                            match read_config(&file) {
+                                Err(why) if self.users_file => {
+                                    self.out.bad_file.get_or_insert(why);
+                                }
+                                Ok(t) => self.feed(&t, depth + 1),
+                                Err(_) => {
+                                    if let Ok(t) = std::fs::read_to_string(&file) {
+                                        self.feed(&t, depth + 1);
+                                    }
+                                }
                             }
                         }
                     }
@@ -598,21 +602,23 @@ fn local_networks_match(patterns: &[String]) -> Option<bool> {
     }
 }
 
-/// Why a config file of the user's cannot be trusted: owned by someone but
-/// the user or root, or writable by others (as ssh checks them).
-fn insecure_file(path: &Path) -> Option<String> {
+/// Reads a config file; `Err` says why it cannot be trusted: owned by
+/// someone but the user or root, or writable by others (as ssh checks them).
+/// A missing or unreadable file reads as empty.
+fn read_config(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return Ok(String::new()) };
+    // The open file is checked, not the name: it could be swapped in between.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let m = std::fs::metadata(path).ok()?;
         let me = crate::platform::uid();
-        ((m.uid() != 0 && m.uid() != me) || m.mode() & 0o022 != 0).then(|| format!("Bad owner or permissions on {}", path.display()))
+        if f.metadata().is_ok_and(|m| (m.uid() != 0 && m.uid() != me) || m.mode() & 0o022 != 0) {
+            return Err(format!("Bad owner or permissions on {}", path.display()));
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
+    let mut text = String::new();
+    Ok(f.read_to_string(&mut text).map(|_| text).unwrap_or_default())
 }
 
 /// Resolves an `Include` argument (relative to the config dir, `~`, `*` in the file name).
@@ -818,8 +824,9 @@ fn lookup_pass(
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
     // A file others could change is not read at all (as by ssh): its
     // `Match exec` would run before the connection is refused.
-    let bad_file = [qsh_dir.join("config"), qsh_dir.join(UI_HOSTS), ssh_file.clone()].iter().find_map(|f| insecure_file(f));
-    let read = |p: &Path| if insecure_file(p).is_some() { String::new() } else { std::fs::read_to_string(p).unwrap_or_default() };
+    let [qsh_config, ui_hosts, ssh_config] = [qsh_dir.join("config"), qsh_dir.join(UI_HOSTS), ssh_file.clone()].map(|f| read_config(&f));
+    let bad_file = [&qsh_config, &ui_hosts, &ssh_config].into_iter().find_map(|r| r.clone().err());
+    let read = |r: Result<String, String>| r.unwrap_or_default();
     // Relative Includes in the user's file are in ~/.ssh, even with -F (as in ssh).
     let ssh_dir = home.join(".ssh");
     // -o lines come first: before any `Host` they apply to every host and win.
@@ -828,8 +835,8 @@ fn lookup_pass(
     let ours_text = format!(
         "{}\nMatch all\n{}\nMatch all\n{}",
         sources.overrides.join("\n"),
-        read(&qsh_dir.join("config")),
-        read(&qsh_dir.join(UI_HOSTS))
+        read(qsh_config),
+        read(ui_hosts)
     );
     let mut ours = Parser::new(host, &qsh_dir, true, true);
     (ours.original, ours.canonical, ours.final_pass, ours.out) = (original.to_string(), canonical, final_pass, ours_seed);
@@ -845,11 +852,11 @@ fn lookup_pass(
     if ssh.out.tag.is_none() {
         ssh.out.tag = ours.tag.clone();
     }
-    ssh.feed_file(&read(&ssh_file), &ssh_dir);
+    ssh.feed_file(&read(ssh_config), &ssh_dir);
     if sources.ssh_config.is_none() {
         let system = Path::new(SYSTEM_SSH_CONFIG);
         ssh.users_file = false;
-        ssh.feed_file(&read(system), system.parent().unwrap_or(Path::new("/")));
+        ssh.feed_file(&read(read_config(system)), system.parent().unwrap_or(Path::new("/")));
     }
     (ours, ssh.finish())
 }
