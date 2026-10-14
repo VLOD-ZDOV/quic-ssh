@@ -301,7 +301,7 @@ pub fn parse_key_list(text: &str) -> Vec<PublicKey> {
 /// symlinked directory (`~/.ssh -> /elsewhere`) is checked where it really
 /// is, all the way up to `/` if that is outside `top`, where the file itself
 /// must belong to the user.
-fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
+fn check_owner_chain(path: &Path, top: &Path, uid: u32, opened: &fs::Metadata) -> Result<()> {
     let real = fs::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
     // A path named outside the home directory (`/etc/ssh/keys/%u`) is the
     // administrator's: root may own its file, as with sshd.
@@ -311,7 +311,13 @@ fn check_owner_chain(path: &Path, top: &Path, uid: u32) -> Result<()> {
     // Reached from inside the home directory, outside it only the user's own
     // files count: root reads these, and a symlink must not make it read
     // someone else's (such as root's authorized_keys) as the user's.
-    let owner = fs::metadata(&real)?.uid();
+    let meta = fs::metadata(&real)?;
+    // A directory swapped back and forth around the checks must not make
+    // them pass for one file while another one is open.
+    if (meta.dev(), meta.ino()) != (opened.dev(), opened.ino()) {
+        bail!("{} was replaced while being checked", path.display());
+    }
+    let owner = meta.uid();
     if uid != 0 && !real.starts_with(&top) && owner != uid && !(named_outside && owner == 0) {
         bail!("{} leads outside the home directory to a file the user does not own", path.display());
     }
@@ -348,7 +354,7 @@ fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
     if !opened.is_file() {
         bail!("{} is not a regular file", path.display());
     }
-    check_owner_chain(path, home, uid)?;
+    check_owner_chain(path, home, uid, &opened)?;
     // The checks went by name: the file open must be the one they saw.
     let checked = fs::metadata(path)?;
     if (checked.dev(), checked.ino()) != (opened.dev(), opened.ino()) {
@@ -492,6 +498,21 @@ mod tests {
         assert!(format!("{err:#}").contains("does not own"), "{err:#}");
         // Named outside the home directory, root's files count (`/etc/ssh/keys/%u`).
         assert!(read_strict(Path::new("/etc/passwd"), home.path(), me.max(1)).is_ok());
+    }
+
+    /// The checks must be about the file that is open: a directory swapped
+    /// to another file for them, and back, must not pass.
+    #[test]
+    fn strict_checks_are_about_the_open_file() {
+        let home = tempfile::tempdir().unwrap();
+        let me = nix::unistd::getuid().as_raw();
+        let (open, checked) = (home.path().join("a"), home.path().join("b"));
+        std::fs::write(&open, "x").unwrap();
+        std::fs::write(&checked, "y").unwrap();
+        let opened = std::fs::metadata(&open).unwrap();
+        let err = check_owner_chain(&checked, home.path(), me, &opened).unwrap_err();
+        assert!(format!("{err:#}").contains("replaced"), "{err:#}");
+        assert!(check_owner_chain(&open, home.path(), me, &opened).is_ok());
     }
 
     #[cfg(unix)]
