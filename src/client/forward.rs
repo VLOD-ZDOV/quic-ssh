@@ -659,8 +659,10 @@ impl Forwarder {
     }
 
     /// Cancels the `kind` forward listening at `listen` (`[bind:]port` or a
-    /// path, as given when it was added). Returns whether there was one.
-    pub fn cancel(&self, kind: char, listen: &str) -> Result<bool> {
+    /// path, as given when it was added), and going to `dest` if it is given
+    /// (as ssh's `-O cancel` compares the whole spec: `-R 0:a:80` is not
+    /// `-R 0:b:80`). Returns whether there was one.
+    pub fn cancel(&self, kind: char, listen: &str, dest: Option<&Dest>) -> Result<bool> {
         let parts = split_spec(listen)?;
         let wanted = parse_listen(&parts, listen)?;
         let mut active = self.active.lock().unwrap();
@@ -668,6 +670,7 @@ impl Forwarder {
         let mut routes = self.routes.lock().unwrap();
         active.retain(|a| {
             let same = a.kind == kind
+                && dest.is_none_or(|d| *d == a.fwd.dest)
                 && match (&a.fwd.listen, &wanted) {
                     // `-KL 8080` also cancels `localhost:8080`, as in ssh.
                     (Listen::Tcp { bind, port }, Listen::Tcp { bind: b2, port: p2 }) => {
@@ -712,7 +715,9 @@ impl Forwarder {
                 },
                 Err(_) => spec.to_string(),
             };
-            return match self.cancel(kind, &listen)? {
+            // `-KR 8080` parses as a SOCKS forward: no destination was given.
+            let dest = parsed.as_ref().ok().map(|f| &f.dest).filter(|d| **d != Dest::Socks);
+            return match self.cancel(kind, &listen, dest)? {
                 true => Ok(String::new()),
                 false => bail!("no such forward: -{kind} {spec}"),
             };
