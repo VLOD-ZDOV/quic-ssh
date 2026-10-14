@@ -362,6 +362,18 @@ fn step_taken(file: &std::fs::File) -> u64 {
     }
 }
 
+/// Locks the secret file, waiting at most a few seconds.
+async fn lock_briefly(file: &std::fs::File) -> std::io::Result<()> {
+    for _ in 0..60 {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("held by another process"))
+}
+
 fn take_step(file: &std::fs::File, step: u64) {
     use nix::sys::time::TimeSpec;
     let mtime = TimeSpec::new((step * crate::totp::STEP) as i64, 0);
@@ -442,15 +454,17 @@ pub async fn second_factor(
             Auth::Done => break,
             _ => bail!("unexpected message while asking for a one-time code"),
         };
+        // Another qshd of the user's (another port, a user-mode one) may
+        // have taken a code: the lock makes check and mark one step.
+        // Without the lock (a file system without locks, or the user holds
+        // it), this qshd still takes each code once; tell why others might not.
+        // The user owns the file and can hold the lock forever: never block
+        // on it, least of all under `used`, which every login shares.
+        if let Err(e) = lock_briefly(&file).await {
+            warn!("{}: cannot lock the one-time code file ({e}); another qshd of the user could take the same code", user.name);
+        }
         {
             let mut state = used.lock().unwrap();
-            // Another qshd of the user's (another port, a user-mode one) may
-            // have taken a code: the lock makes check and mark one step.
-            // Without the lock (a file system without locks), this qshd
-            // still takes each code once; tell why others might not.
-            if let Err(e) = file.lock() {
-                warn!("{}: cannot lock the one-time code file ({e}); another qshd of the user could take the same code", user.name);
-            }
             let last = state.last_used(user.uid).max(step_taken(&file));
             if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
                 state.used.insert(user.uid, step);
@@ -469,6 +483,20 @@ pub async fn second_factor(
 
 #[cfg(test)]
 mod tests {
+    /// A lock the user holds on the secret file does not stall the login.
+    #[tokio::test]
+    async fn held_lock_is_given_up_on() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let held = std::fs::File::open(path.path()).unwrap();
+        held.lock().unwrap();
+        let mine = std::fs::File::open(path.path()).unwrap();
+        let start = std::time::Instant::now();
+        assert!(super::lock_briefly(&mine).await.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        drop(held);
+        assert!(super::lock_briefly(&mine).await.is_ok());
+    }
+
     /// The step taken is kept in the secret file for other qshd instances.
     #[test]
     fn taken_step_in_the_file() {
