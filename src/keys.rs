@@ -502,6 +502,7 @@ mod tests {
 
     /// The checks must be about the file that is open: a directory swapped
     /// to another file for them, and back, must not pass.
+    #[cfg(unix)]
     #[test]
     fn strict_checks_are_about_the_open_file() {
         let home = tempfile::tempdir().unwrap();
