@@ -639,6 +639,12 @@ fn print_config(t: &Target) {
 }
 
 async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
+    if let Some(why) = a.refused.clone() {
+        if a.full {
+            return exec_openssh("ssh", without_qsh_options(&args[1..]), &why);
+        }
+        bail!("{why}\n{USAGE}");
+    }
     let Some(dest) = a.destination.clone() else {
         // `ssh -Q kex` and the like.
         if a.full {
@@ -745,6 +751,12 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         }
         Err(e) => return Err(with_doctor_hint(e, &target)),
     };
+    // Only now: had ssh made the connection, it would have used them.
+    if !quiet {
+        for o in &a.unapplied {
+            eprintln!("qsh: warning: {o} is not supported by qsh and has no effect");
+        }
+    }
     if let Some(spec) = &a.stdio_forward {
         forward::stdio(&conn, spec).await?;
         conn.close().await;

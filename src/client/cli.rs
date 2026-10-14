@@ -63,6 +63,12 @@ pub struct SshArgs {
     pub passthrough: Vec<String>,
     /// Accepted for compatibility but without effect (reported with -v).
     pub ignored: Vec<String>,
+    /// ssh options qsh does not carry out, which the user may count on:
+    /// warned about when qsh (not ssh) makes the connection.
+    pub unapplied: Vec<String>,
+    /// Why qsh cannot make this connection itself (an option it cannot
+    /// carry out or does not know): with `--full`, ssh's job; else an error.
+    pub refused: Option<String>,
 }
 
 fn take_value(rest: &str, it: &mut impl Iterator<Item = String>, opt: char) -> Result<String, String> {
@@ -83,6 +89,44 @@ fn option_line(o: &str) -> Result<String, String> {
 
 /// `-o` keywords only qsh knows (ssh stops at them).
 const QSH_ONLY_OPTIONS: [&str; 2] = ["PersistSession", "PredictiveEcho"];
+
+/// Keywords the config parser carries out (lowercase).
+const APPLIED_OPTIONS: &[&str] = &[
+    "addkeystoagent", "addressfamily", "batchmode", "bindaddress", "bindinterface", "canonicaldomains",
+    "canonicalizefallbacklocal", "canonicalizehostname", "canonicalizemaxdots", "certificatefile", "clearallforwardings",
+    "compression", "connectionattempts", "connecttimeout", "controlmaster", "controlpath", "controlpersist", "dynamicforward",
+    "enableescapecommandline", "escapechar", "exitonforwardfailure", "forkafterauthentication", "forwardagent", "forwardx11",
+    "forwardx11timeout", "forwardx11trusted", "globalknownhostsfile", "hashknownhosts", "host", "hostkeyalias", "hostname",
+    "identitiesonly", "identityagent", "identityfile", "include", "knownhostscommand", "localcommand", "localforward",
+    "loglevel", "match", "numberofpasswordprompts", "obscurekeystroketiming", "passwordauthentication", "permitlocalcommand",
+    "persistsession", "port", "predictiveecho", "proxycommand", "proxyjump", "remotecommand", "remoteforward", "requesttty",
+    "sendenv", "serveralivecountmax", "serveraliveinterval", "sessiontype", "setenv", "stdinnull", "stricthostkeychecking",
+    "tag", "tunnel", "tunneldevice", "user", "userknownhostsfile", "xauthlocation",
+];
+
+/// ssh keywords with nothing to do in qsh: its own fixed crypto (TLS 1.3),
+/// logging, GSSAPI, host-based and keyboard-interactive login, old options.
+const QUIET_OPTIONS: &[&str] = &[
+    "casignaturealgorithms", "challengeresponseauthentication", "checkhostip", "cipher", "ciphers", "compressionlevel",
+    "enablesshkeysign", "fingerprinthash", "gssapiauthentication", "gssapiclientidentity", "gssapidelegatecredentials",
+    "gssapikeyexchange", "gssapirenewalforcesrekey", "gssapiserveridentity", "gssapitrustdns", "hostbasedacceptedalgorithms",
+    "hostbasedauthentication", "hostbasedkeytypes", "hostkeyalgorithms", "ignoreunknown", "ipqos", "kbdinteractiveauthentication",
+    "kbdinteractivedevices", "kexalgorithms", "logverbose", "macs", "nohostauthenticationforlocalhost", "preferredauthentications",
+    "protocol", "proxyusefdpass", "pubkeyacceptedalgorithms", "pubkeyacceptedkeytypes", "rekeylimit", "requiredrsasize",
+    "rhostsauthentication", "rhostsrsaauthentication", "rsaauthentication", "streamlocalbindmask", "syslogfacility",
+    "tcpkeepalive", "updatehostkeys", "usekeychain", "useprivilegedport", "useroaming", "versionaddendum", "visualhostkey",
+    "warnweakcrypto",
+];
+
+/// ssh keywords qsh does not carry out and that would make it less strict
+/// than asked if skipped: refused.
+const REFUSED_OPTIONS: &[&str] = &["permitremoteopen", "refuseconnection", "revokedhostkeys"];
+
+/// Other ssh keywords qsh does not carry out: a warning.
+const UNAPPLIED_OPTIONS: &[&str] = &[
+    "canonicalizepermittedcnames", "channeltimeout", "gatewayports", "pkcs11provider", "pubkeyauthentication",
+    "securitykeyprovider", "streamlocalbindunlink", "verifyhostkeydns",
+];
 
 /// The keyword of a `-o` value (`Key=value` or `Key value`).
 fn option_keyword(v: &str) -> &str {
@@ -118,6 +162,7 @@ impl SshArgs {
                 // ssh would use its own sockets and protocol: not passed on.
                 return Ok(());
             }
+            // Protocol, compression, GSSAPI, syslog: nothing to do in qsh.
             '1' | '2' | 'C' | 'K' | 'k' | 'y' => self.ignored.push(format!("-{c}")),
             _ => return Err(format!("unknown option -{c}")),
         }
@@ -164,7 +209,11 @@ impl SshArgs {
                 self.options.push("Tunnel yes".into());
                 self.options.push(format!("TunnelDevice {v}"));
             }
-            // Bind address/interface, ciphers, MACs, logging, PKCS#11, tags, queries.
+            'Q' => {
+                self.refused.get_or_insert_with(|| "-Q (query algorithms) is not supported: qsh uses TLS 1.3 with a fixed set".into());
+            }
+            'E' | 'I' => self.unapplied.push(format!("-{c} {v}")),
+            // Ciphers and MACs.
             _ => self.ignored.push(format!("-{c} {v}")),
         }
         if let Some(v) = pass {
@@ -241,7 +290,39 @@ impl SshArgs {
                 break;
             }
         }
+        a.check_options();
         Ok(a)
+    }
+
+    /// Sorts the `-o` options qsh does not carry out, as ssh does with
+    /// unknown ones: an unknown keyword (a typo too) is an error, unless
+    /// `-o IgnoreUnknown` names it. Only qsh's verdict: ssh, with `--full`,
+    /// may know a keyword of a newer OpenSSH.
+    fn check_options(&mut self) {
+        let ignore_unknown: Vec<String> = self
+            .options
+            .iter()
+            .filter(|o| option_keyword(o).eq_ignore_ascii_case("ignoreunknown"))
+            .flat_map(|o| o.split_whitespace().skip(1).flat_map(|v| v.split(',')).map(str::to_ascii_lowercase).collect::<Vec<_>>())
+            .collect();
+        for o in &self.options {
+            let key = option_keyword(o).to_ascii_lowercase();
+            let is = |list: &[&str]| list.contains(&key.as_str());
+            if is(APPLIED_OPTIONS) {
+                continue;
+            }
+            if is(QUIET_OPTIONS) {
+                self.ignored.push(format!("-o {o}"));
+            } else if is(REFUSED_OPTIONS) {
+                self.refused.get_or_insert_with(|| format!("-o {}: not supported by qsh (use ssh for this)", option_keyword(o)));
+            } else if is(UNAPPLIED_OPTIONS) {
+                self.unapplied.push(format!("-o {o}"));
+            } else if crate::pattern::name_matches(&ignore_unknown, &key) {
+                self.ignored.push(format!("-o {o}"));
+            } else {
+                self.refused.get_or_insert_with(|| format!("bad configuration option: {}", option_keyword(o)));
+            }
+        }
     }
 
     /// The `-o` options and other switches as config lines (highest
@@ -313,6 +394,20 @@ mod tests {
         for bad in [["-l", "bob\nProxyCommand evil"], ["-o", "User=x\nMatch exec evil"], ["-J", "gw\rProxyCommand x"], ["-l", "$(id)"]] {
             assert!(SshArgs::parse(bad.iter().map(|s| s.to_string()).chain(["host".into()])).is_err(), "{bad:?}");
         }
+    }
+
+    /// Options qsh cannot carry out do not stop parsing: with --full, ssh
+    /// gets the connection (it may know a newer keyword).
+    #[test]
+    fn options_qsh_cannot_carry_out() {
+        let p = |args: &[&str]| SshArgs::parse(args.iter().map(|s| s.to_string())).unwrap();
+        assert!(p(&["-o", "Bogus=1", "h"]).refused.unwrap().contains("Bogus"));
+        assert!(p(&["-o", "IgnoreUnknown=bog*", "-o", "Bogus=1", "h"]).refused.is_none());
+        assert!(p(&["-o", "RevokedHostKeys=/x", "h"]).refused.is_some());
+        assert!(p(&["-Q", "kex"]).refused.is_some());
+        let a = p(&["-o", "Ciphers=x", "-o", "GatewayPorts=yes", "-c", "x", "-E", "log", "h"]);
+        assert!(a.refused.is_none());
+        assert_eq!(a.unapplied, ["-E log", "-o GatewayPorts yes"]);
     }
 
     #[test]

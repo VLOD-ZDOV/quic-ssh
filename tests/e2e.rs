@@ -3402,3 +3402,23 @@ fn stuck_forwards_do_not_stall_the_connection() {
         child.wait().unwrap();
     }
 }
+
+/// ssh options qsh does not carry out are not passed over in silence: a
+/// warning once connected, an error for unknown keywords, as in ssh.
+#[test]
+fn unsupported_ssh_options_are_reported() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let out = c.run(&["-p", &port, "-o", "PubkeyAuthentication=no", "-o", "Ciphers=aes128-ctr", &dest(), "echo", "ok"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "ok\n");
+    assert!(stderr(&out).contains("PubkeyAuthentication no is not supported"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("Ciphers"), "{}", stderr(&out));
+    let out = c.run(&["-q", "-p", &port, "-o", "PubkeyAuthentication=no", &dest(), "true"]);
+    assert!(out.status.success() && stderr(&out).is_empty(), "{}", stderr(&out));
+    let out = c.run(&["-p", &port, "-o", "Bogus=1", &dest(), "true"]);
+    assert!(!out.status.success() && stderr(&out).contains("bad configuration option: Bogus"), "{}", stderr(&out));
+    let out = c.run(&["-p", &port, "-o", "IgnoreUnknown=Bog*", "-o", "Bogus=1", &dest(), "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
