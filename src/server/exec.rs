@@ -40,14 +40,15 @@ pub struct Session {
 
 impl Session {
     /// The session's environment: the user's base variables, accepted client
-    /// variables, server-set ones, and `TERM` for a terminal.
+    /// variables, `TERM` for a terminal, and server-set ones.
     pub(super) fn env(&mut self, user: &User) -> Vec<(String, String)> {
         let mut env = user.env();
         env.extend(std::mem::take(&mut self.client_env));
-        env.extend(std::mem::take(&mut self.extra_env));
+        // The server's set_env wins over the client's TERM, as SetEnv in sshd.
         if let Some(p) = &self.pty {
             env.push(("TERM".into(), p.term.clone()));
         }
+        env.extend(std::mem::take(&mut self.extra_env));
         env
     }
 }
