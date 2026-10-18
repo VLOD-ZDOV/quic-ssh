@@ -143,7 +143,8 @@ impl Client {
     fn paired(server: &Server) -> Client {
         let c = Client::new();
         let code = server.pair_code();
-        let out = c.run(&["pair", "-p", &server.port.to_string(), &dest(), &code]);
+        // As `qsh ui` hands the code over: not on the command line.
+        let out = c.cmd(&["pair", "-p", &server.port.to_string(), &dest()]).env("QSH_PAIR_CODE", &code).output().unwrap();
         assert!(out.status.success(), "pair failed: {}", String::from_utf8_lossy(&out.stderr));
         c
     }

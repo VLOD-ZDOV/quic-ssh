@@ -137,13 +137,13 @@ async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptio
             if text.contains("host key verification failed") {
                 let f = fingerprint.map(|f| format!(" ({f})")).unwrap_or_default();
                 r.line(Level::Note, "host key", format!("not known yet{f}; the login was not tried"));
-                r.hint(format!("`qsh pair {dest} CODE` (code from `qshd pair` there) confirms it, or connect once and compare"));
+                r.hint(format!("`qsh pair {dest}` (with a code from `qshd pair` there) confirms it, or connect once and compare"));
             } else if text.contains("HAS CHANGED") || text.contains("revoked") {
                 r.line(Level::Bad, "host key", text.lines().find(|l| l.contains("now presents") || l.contains("revoked")).unwrap_or(&first));
                 r.hint("if the server was reinstalled, remove its old line from known_hosts; otherwise do not connect");
             } else if e.is::<super::LoginRefused>() || text.contains("access denied") {
                 r.line(Level::Bad, "login", first);
-                r.hint(format!("add your key there: `qshd pair` on the server, then `qsh pair {dest} CODE`, or ssh-copy-id"));
+                r.hint(format!("add your key there: `qshd pair` on the server, then `qsh pair {dest}`, or ssh-copy-id"));
             } else if text.contains("one-time code") || text.contains("passphrase") || text.contains("terminal") {
                 r.line(Level::Note, "login", first);
                 r.hint("the login asks a question; that is fine when you connect yourself");

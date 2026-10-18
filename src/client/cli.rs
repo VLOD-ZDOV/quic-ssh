@@ -359,7 +359,7 @@ usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfil
            [user@]host[:port] [command [argument ...]]
 
        qsh cp [-r] SRC DST        copy files, one side is [user@]host:path
-       qsh pair [user@]host CODE  pair with a server using a code from `qshd pair`
+       qsh pair [user@]host       pair with a server using a code from `qshd pair`
        qsh keygen [FILE]          create a new key
        qsh speed [user@]host      measure latency and throughput
        qsh ui                     interactive host menu

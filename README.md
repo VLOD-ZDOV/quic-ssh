@@ -86,7 +86,7 @@ A native Android build (bionic libc, so DNS works) is in the releases as `qsh-aa
 pkg install curl
 curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/qsh-aarch64-android.tar.gz | tar xz
 install -m755 qsh-aarch64-android/qsh qsh-aarch64-android/qshd $PREFIX/bin/
-qsh pair user@server CODE      # then: qsh ui
+qsh pair user@server           # then: qsh ui
 ```
 
 Termux sends taps as mouse clicks, so `qsh ui` works by touch: tap a host to select it, tap it again to connect.
@@ -118,15 +118,18 @@ On first start it creates a host key and prints its fingerprint.
 ```sh
 qshd pair
 # Pairing code: k7f3-9qxm  (single use, valid 10 minutes)
-# On the client run:
-#   qsh pair user@server k7f3-9qxm
+# On the client run this and type the code when asked:
+#   qsh pair user@server
 ```
 
 On the client:
 
 ```sh
-qsh pair user@server k7f3-9qxm
+qsh pair user@server
+# Pairing code: k7f3-9qxm
 ```
+
+The code is asked for rather than put on the command line, where other users of the client machine could read it while pairing runs. `qsh pair user@server CODE` still works on a machine only you use.
 
 For a phone, `qshd pair --qr --host 203.0.113.10` also shows the command as a QR code: scan it with the camera and paste the text into Termux. `--host` sets the address in the command (by default the server's host name).
 

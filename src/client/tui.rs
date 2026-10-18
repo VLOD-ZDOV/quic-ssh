@@ -1276,6 +1276,11 @@ async fn run_child(args: &[String]) -> std::io::Result<std::process::ExitStatus>
     tokio::process::Command::new(exe).args(args).status().await
 }
 
+async fn run_child_env(args: &[String], (key, value): (&str, &str)) -> std::io::Result<std::process::ExitStatus> {
+    let exe = std::env::current_exe()?;
+    tokio::process::Command::new(exe).args(args).env(key, value).status().await
+}
+
 /// Common flags passed on to sessions started from the menu.
 fn child_flags(opts: &ConnectOptions) -> Vec<String> {
     let mut args = Vec::new();
@@ -1488,8 +1493,8 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                 args.extend(child_flags(&opts));
                 args.push("--".into());
                 args.push(alias.clone());
-                args.push(code);
-                let status = run_child(&args).await;
+                // Not on the command line, where other local users could read it.
+                let status = run_child_env(&args, ("QSH_PAIR_CODE", &code)).await;
                 wait_for_enter();
                 terminal = enter()?;
                 app.status = match status {

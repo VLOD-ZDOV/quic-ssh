@@ -101,8 +101,9 @@ enum Cmd {
     Pair {
         /// [user@]host[:port]
         destination: String,
-        /// Code printed by `qshd pair`
-        code: String,
+        /// Code printed by `qshd pair` (asked for when not given: other
+        /// local users can read a command line)
+        code: Option<String>,
     },
     /// Create a new key at ~/.config/qsh/id_ed25519 (or FILE)
     Keygen {
@@ -564,7 +565,12 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
         Cmd::Keygen { file } => keygen(file),
         Cmd::Pair { destination, code } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
-            client::pair(&target, &opts, &code).await.map_err(|e| with_doctor_hint(e, &target))?;
+            // The menu hands its code over in the environment, which only this user can read.
+            let code = match code.or_else(|| std::env::var("QSH_PAIR_CODE").ok().filter(|c| !c.is_empty())) {
+                Some(c) => c,
+                None => qsh::prompt::line("Pairing code: ")?,
+            };
+            client::pair(&target, &opts, code.trim()).await.map_err(|e| with_doctor_hint(e, &target))?;
             Ok(0)
         }
         Cmd::Cp { recursive, compress, paths } => cp(&paths, (recursive, compress), &cli.conn).await,

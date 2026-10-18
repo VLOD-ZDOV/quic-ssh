@@ -248,10 +248,12 @@ fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
         qsh::DEFAULT_PORT => String::new(),
         p => format!(" -p {p}"),
     };
+    // The code is typed when asked: on the command line other local users
+    // of the client could read it. The QR code is for a phone, so it has it.
     let command = format!("qsh pair{port} {user}@{host} {code}");
     println!("Pairing code: {code}  (single use, valid {} minutes)", qsh::pair::CODE_TTL.as_secs() / 60);
-    println!("On the client run:");
-    println!("  {command}");
+    println!("On the client run this and type the code when asked:");
+    println!("  qsh pair{port} {user}@{host}");
     if !given && (!host.contains('.') || host == "localhost") {
         println!("(If the client cannot find {host:?} by that name, use --host with this machine's address.)");
     }

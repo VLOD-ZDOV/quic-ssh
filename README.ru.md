@@ -86,7 +86,7 @@ sudo install -m755 qsh-$ARCH-macos/qsh qsh-$ARCH-macos/qshd /usr/local/bin/
 pkg install curl
 curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/qsh-aarch64-android.tar.gz | tar xz
 install -m755 qsh-aarch64-android/qsh qsh-aarch64-android/qshd $PREFIX/bin/
-qsh pair user@server CODE      # потом: qsh ui
+qsh pair user@server           # потом: qsh ui
 ```
 
 Termux передаёт касания как клики мышью, поэтому `qsh ui` работает пальцем: тап по хосту выбирает его, повторный тап подключается.
@@ -118,15 +118,18 @@ qshd                       # пользовательский режим: вхо
 ```sh
 qshd pair
 # Pairing code: k7f3-9qxm  (single use, valid 10 minutes)
-# On the client run:
-#   qsh pair user@server k7f3-9qxm
+# On the client run this and type the code when asked:
+#   qsh pair user@server
 ```
 
 На клиенте:
 
 ```sh
-qsh pair user@server k7f3-9qxm
+qsh pair user@server
+# Pairing code: k7f3-9qxm
 ```
+
+Код спрашивается, а не передаётся в командной строке: там его, пока идёт сопряжение, могут прочитать другие пользователи клиентской машины. На машине, которой пользуешься только ты, можно и `qsh pair user@server CODE`.
 
 Для телефона `qshd pair --qr --host 203.0.113.10` дополнительно покажет команду QR-кодом: отсканируй его камерой и вставь текст в Termux. `--host` задаёт адрес в команде (по умолчанию — имя хоста сервера).
 
