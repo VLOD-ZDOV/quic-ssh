@@ -437,7 +437,7 @@ async fn master_main(a: SshArgs) -> Result<i32> {
         }
         Err(e) => return Err(e),
     };
-    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports);
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open);
     let master = match Master::start(forwarder.connections(), &path, Some(forward_hook(&forwarder)), forwarder.activity()) {
         Ok(m) => m,
         // Another qsh got there first: use that one.
@@ -717,6 +717,9 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         }
     }
 
+    if a.full && target.permit_remote_open && remotes.iter().any(|f| matches!(f.dest, forward::Dest::Socks)) {
+        return exec_openssh("ssh", ssh_args(&a, &target), "PermitRemoteOpen applies to this dynamic remote forward");
+    }
     let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
     // -A / ForwardAgent: the agent qsh itself would use.
     let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
@@ -768,7 +771,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         conn.close().await;
         return Ok(0);
     }
-    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports);
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open);
     for (kind, list) in [('L', locals), ('D', dynamics)] {
         for (f, required) in list {
             let spec = f.describe();

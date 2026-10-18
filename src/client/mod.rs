@@ -68,6 +68,8 @@ pub struct Target {
     /// Forwards from the config, as `-L`/`-R`/`-D` specs.
     pub local_forwards: Vec<String>,
     pub remote_forwards: Vec<String>,
+    /// `PermitRemoteOpen` is set: dynamic remote forwards are refused.
+    pub permit_remote_open: bool,
     pub dynamic_forwards: Vec<String>,
     /// Jump hosts (`ProxyJump` in qsh's config or `-o`, or `-J`).
     pub proxy_jump: Option<String>,
@@ -416,6 +418,7 @@ impl Target {
             cli_port,
             local_forwards: cfg.local_forwards,
             remote_forwards: cfg.remote_forwards,
+            permit_remote_open: cfg.permit_remote_open,
             dynamic_forwards: cfg.dynamic_forwards,
             proxy_jump: cfg.proxy_jump,
             request_tty: cfg.request_tty,

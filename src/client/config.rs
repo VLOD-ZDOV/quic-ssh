@@ -54,8 +54,11 @@ pub struct HostConfig {
     pub needs_proxy: bool,
     pub batch_mode: Option<bool>,
     /// A keyword qsh cannot carry out and would be less strict without
-    /// (`RevokedHostKeys`, `PermitRemoteOpen`): such a host is ssh's.
+    /// (`RevokedHostKeys`): such a host is ssh's.
     pub refused: Option<String>,
+    /// `PermitRemoteOpen` other than `any`: qsh cannot check it, so it
+    /// refuses dynamic remote forwards (`-R port`).
+    pub permit_remote_open: bool,
     /// `StrictHostKeyChecking` (`yes`/`true`, `ask`, `accept-new`, `no`/`false`).
     pub strict_host_key_checking: Option<String>,
     pub user_known_hosts_file: Option<String>,
@@ -501,9 +504,7 @@ impl Parser<'_> {
                 "revokedhostkeys" if o.refused.is_none() && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
                     o.refused = Some("RevokedHostKeys".into());
                 }
-                "permitremoteopen" if o.refused.is_none() && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("any")) => {
-                    o.refused = Some("PermitRemoteOpen".into());
-                }
+                "permitremoteopen" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("any")) => o.permit_remote_open = true,
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -934,6 +935,7 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
         needs_proxy,
         batch_mode: ours.batch_mode.or(ssh.batch_mode),
         refused: ours.refused.or(ssh.refused),
+        permit_remote_open: ours.permit_remote_open || ssh.permit_remote_open,
         strict_host_key_checking: ours.strict_host_key_checking.or(ssh.strict_host_key_checking),
         user_known_hosts_file: ours.user_known_hosts_file,
         more_known_hosts_files: ours.more_known_hosts_files,
@@ -1026,8 +1028,9 @@ Host *
     fn keywords_qsh_would_be_less_strict_without() {
         let refused = |text: &str| parse(text, "h", Path::new("/x"), false).refused;
         assert_eq!(refused("RevokedHostKeys /etc/ssh/revoked\n").as_deref(), Some("RevokedHostKeys"));
-        assert_eq!(refused("Host h\n PermitRemoteOpen localhost:8080\n").as_deref(), Some("PermitRemoteOpen"));
-        assert_eq!(refused("RevokedHostKeys none\nPermitRemoteOpen any\n"), None);
+        assert!(parse("Host h\n PermitRemoteOpen localhost:8080\n", "h", Path::new("/x"), false).permit_remote_open);
+        assert!(!parse("PermitRemoteOpen any\n", "h", Path::new("/x"), false).permit_remote_open);
+        assert_eq!(refused("RevokedHostKeys none\n"), None);
     }
 
     #[test]

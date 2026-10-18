@@ -373,6 +373,8 @@ pub struct Forwarder {
     conn: tokio::sync::watch::Sender<Arc<Conn>>,
     /// `-g`: local forwards listen on all addresses by default.
     gateway: bool,
+    /// `PermitRemoteOpen` is set: qsh cannot check a SOCKS target against it.
+    no_dynamic_remote: bool,
     active: Mutex<Vec<Active>>,
     routes: Arc<Mutex<Routes>>,
     dispatcher: Mutex<Option<AbortHandle>>,
@@ -392,10 +394,11 @@ impl Drop for Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(conn: Arc<Conn>, gateway: bool) -> Arc<Forwarder> {
+    pub fn new(conn: Arc<Conn>, gateway: bool, no_dynamic_remote: bool) -> Arc<Forwarder> {
         Arc::new(Forwarder {
             conn: tokio::sync::watch::Sender::new(conn),
             gateway,
+            no_dynamic_remote,
             active: Mutex::default(),
             routes: Arc::default(),
             dispatcher: Mutex::default(),
@@ -493,6 +496,9 @@ impl Forwarder {
     pub async fn remote(&self, fwd: Forward) -> Result<Option<u16>> {
         if self.conn().is_shared() {
             bail!("remote forwards need a connection of their own (this one is shared)");
+        }
+        if self.no_dynamic_remote && matches!(fwd.dest, Dest::Socks) {
+            bail!("PermitRemoteOpen in the config is not supported by qsh, so dynamic remote forwards are refused (use ssh for this)");
         }
         // The server tells connections apart by port only. Checked and taken
         // at once: two requests for one port at a time must not both pass,
