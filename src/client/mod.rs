@@ -200,6 +200,16 @@ pub fn parse_escape(v: Option<&str>) -> Option<u8> {
     }
 }
 
+/// `StrictHostKeyChecking`, lowercased.
+fn host_key_policy(value: Option<&str>) -> HostKeyPolicy {
+    match value {
+        None | Some("ask") => HostKeyPolicy::Ask,
+        Some("accept-new" | "no" | "off" | "false") => HostKeyPolicy::AcceptNew,
+        // "yes", "true", and a spelling ssh would not take either: strict.
+        Some(_) => HostKeyPolicy::Strict,
+    }
+}
+
 impl Target {
     /// The name the host key is looked up and stored under (`HostKeyAlias`).
     pub fn key_name(&self) -> &str {
@@ -372,11 +382,7 @@ impl Target {
             }
             None => (crate::DEFAULT_PORT, Vec::new()),
         };
-        let host_key_policy = match cfg.strict_host_key_checking.as_deref() {
-            Some("yes") => HostKeyPolicy::Strict,
-            Some("accept-new" | "no" | "off") => HostKeyPolicy::AcceptNew,
-            _ => HostKeyPolicy::Ask,
-        };
+        let host_key_policy = host_key_policy(cfg.strict_host_key_checking.as_deref());
         let sharing = match home {
             Some(h) => control::sharing(
                 [cfg.control_master.as_deref(), cfg.control_path.as_deref(), cfg.control_persist.as_deref()],
@@ -1148,6 +1154,14 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_host_key_checking_values() {
+        use HostKeyPolicy::*;
+        for (v, want) in [(None, Ask), (Some("ask"), Ask), (Some("yes"), Strict), (Some("true"), Strict), (Some("accept-new"), AcceptNew), (Some("no"), AcceptNew), (Some("false"), AcceptNew), (Some("yse"), Strict)] {
+            assert_eq!(host_key_policy(v), want, "{v:?}");
+        }
+    }
 
     #[test]
     fn shell_metacharacters_in_host_names() {

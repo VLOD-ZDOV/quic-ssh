@@ -53,7 +53,7 @@ pub struct HostConfig {
     /// ssh's config routes the host through ProxyJump/ProxyCommand (`--full` hands it to ssh).
     pub needs_proxy: bool,
     pub batch_mode: Option<bool>,
-    /// `StrictHostKeyChecking` (`yes`, `ask`, `accept-new`, `no`).
+    /// `StrictHostKeyChecking` (`yes`/`true`, `ask`, `accept-new`, `no`/`false`).
     pub strict_host_key_checking: Option<String>,
     pub user_known_hosts_file: Option<String>,
     /// More `UserKnownHostsFile`s (read, not written).
