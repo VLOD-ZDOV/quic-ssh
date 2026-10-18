@@ -128,6 +128,8 @@ pub struct Checker<'a> {
     pub revoked: &'a super::revoked::Revocation,
     /// `authorized_keys_command`, if configured.
     pub command: Option<&'a super::keys_command::KeysCommand<'a>>,
+    /// Stands in for `authorized_keys_command` where it is not run.
+    pub mimic: Option<&'a super::keys_command::Mimic>,
     pub login: Login<'a>,
     pub exporter: [u8; 32],
 }
@@ -141,9 +143,13 @@ impl Checker<'_> {
         }
         self.revoked.check(offered)?;
         let from_files = authkeys::check(offered, self.entries, self.cas, &self.login);
-        match (from_files, self.command) {
-            (Err(_), Some(command)) => authkeys::check(offered, &command.entries(offered).await, self.cas, &self.login),
-            (result, _) => result,
+        match (from_files, self.command, self.mimic) {
+            (Err(_), Some(command), _) => authkeys::check(offered, &command.entries(offered).await, self.cas, &self.login),
+            (Err(e), None, Some(mimic)) => {
+                mimic.wait(offered).await;
+                Err(e)
+            }
+            (result, _, _) => result,
         }
     }
 

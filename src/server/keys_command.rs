@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -132,6 +133,34 @@ fn expand(arg: &str, user: &Who, key: Option<&KeyData>) -> Result<String> {
     Ok(out)
 }
 
+/// How long the command's last run took (ms), for [`Mimic`].
+static LAST_RUN_MS: AtomicU64 = AtomicU64::new(0);
+
+fn cache_key(per_key: bool, offered: &Offered) -> Vec<u8> {
+    if per_key { ssh_key::PublicKey::from(offered.signing_key().clone()).to_bytes().unwrap_or_default() } else { Vec::new() }
+}
+
+/// Stands in for the command where it is not run (an unknown user): waits
+/// as long as its last run took, once per key as its cache would, so the
+/// time does not tell which users exist.
+pub struct Mimic {
+    per_key: bool,
+    waited: Mutex<std::collections::HashSet<Vec<u8>>>,
+}
+
+impl Mimic {
+    pub fn new(cfg: &ServerConfig) -> Option<Mimic> {
+        let argv = split(cfg.authorized_keys_command.as_deref()?);
+        Some(Mimic { per_key: uses_key(&argv), waited: Mutex::default() })
+    }
+
+    pub async fn wait(&self, offered: &Offered) {
+        if self.waited.lock().unwrap().insert(cache_key(self.per_key, offered)) {
+            tokio::time::sleep(Duration::from_millis(LAST_RUN_MS.load(Ordering::Relaxed))).await;
+        }
+    }
+}
+
 /// Keys from the command for one login, cached per key.
 pub struct KeysCommand<'a> {
     argv: Vec<String>,
@@ -176,11 +205,14 @@ impl<'a> KeysCommand<'a> {
     /// Entries for `offered` (or for any key, if the command takes no key).
     pub async fn entries(&self, offered: &Offered) -> Vec<AuthorizedKey> {
         let key = offered.signing_key();
-        let cache_key = if self.per_key { ssh_key::PublicKey::from(key.clone()).to_bytes().unwrap_or_default() } else { Vec::new() };
+        let cache_key = cache_key(self.per_key, offered);
         if let Some(e) = self.cache.lock().unwrap().get(&cache_key) {
             return e.clone();
         }
-        let entries = match self.run(self.per_key.then_some(key)).await {
+        let started = std::time::Instant::now();
+        let ran = self.run(self.per_key.then_some(key)).await;
+        LAST_RUN_MS.store(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        let entries = match ran {
             Ok(e) => e,
             Err(e) => {
                 warn!("authorized_keys_command for {}: {e:#}", self.user.name);

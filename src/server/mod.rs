@@ -477,11 +477,13 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
         .await?
     };
     let command = user.as_ref().zip(runner).and_then(|(u, runner)| keys_command::KeysCommand::new(&cfg, u, runner));
+    let mimic = if command.is_none() { keys_command::Mimic::new(&cfg) } else { None };
     let checker = auth::Checker {
         entries: &entries,
         cas: &cas,
         revoked: &revoked,
         command: command.as_ref(),
+        mimic: mimic.as_ref(),
         login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now(), principals: principals.as_deref() },
         exporter: conn.exporter(),
     };
