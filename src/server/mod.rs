@@ -526,7 +526,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     });
     let (Some(user), Some((mut grant, how))) = (user, granted) else {
         *outcome = Outcome::AuthFailed;
-        warn!("{addr}: no authorized key for {name} (TLS key {})", key.fingerprint());
+        warn!("{addr}: no authorized key for {name:?} (TLS key {})", key.fingerprint());
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
     };
@@ -1151,7 +1151,7 @@ async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<
         Err(e) => return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
     };
     write_msg(&mut send, &Reply::Ok).await?;
-    info!("{}: {} listens on {path} (-R)", conn.remote_addr(), user.name);
+    info!("{}: {} listens on {path:?} (-R)", conn.remote_addr(), user.name);
     let mut probe = [0u8; 1];
     loop {
         tokio::select! {

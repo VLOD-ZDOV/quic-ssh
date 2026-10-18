@@ -180,7 +180,7 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
             Auth::Query { key } => {
                 queries += 1;
                 if queries > MAX_QUERIES {
-                    warn!("{}: {} offered more than {MAX_QUERIES} keys; giving up", checker.login.ip, checker.login.user);
+                    warn!("{}: {:?} offered more than {MAX_QUERIES} keys; giving up", checker.login.ip, checker.login.user);
                     return Ok(None);
                 }
                 let ok = match Offered::from_bytes(&key) {
@@ -192,7 +192,7 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
             Auth::PublicKey { key, signature } => match checker.verify(&key, &signature).await {
                 Ok((grant, offered)) => return Ok(Some((grant, offered.describe()))),
                 Err(reason) => {
-                    warn!("{}: {} rejected: {reason}", checker.login.ip, checker.login.user);
+                    warn!("{}: {:?} rejected: {reason}", checker.login.ip, checker.login.user);
                     failures += 1;
                     if failures >= max_tries {
                         return Ok(None);
@@ -290,7 +290,7 @@ pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Optio
         if ok {
             return Ok(true);
         }
-        warn!("{}: wrong password for {}", login.ip, login.user);
+        warn!("{}: wrong password for {:?}", login.ip, login.user);
         // Like a wrong one-time code: guessing takes time on every connection.
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
