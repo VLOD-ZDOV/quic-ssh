@@ -802,11 +802,16 @@ impl Forwarder {
 /// and its file (removed when the forward ends).
 #[cfg(unix)]
 fn bind_local_unix(path: &str) -> Result<(tokio::net::UnixListener, SocketFile)> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let l = tokio::net::UnixListener::bind(path).with_context(|| format!("cannot listen on {path}"))?;
+    use nix::sys::stat::{umask, Mode};
+    use std::os::unix::fs::MetadataExt;
+    // Like ssh's default StreamLocalBindMask 0177: private from the start, so
+    // no one else connects before a chmod. The umask is the process's, but
+    // other threads at worst create a file more private than they meant.
+    let old = umask(Mode::from_bits_truncate(0o177));
+    let bound = tokio::net::UnixListener::bind(path);
+    umask(old);
+    let l = bound.with_context(|| format!("cannot listen on {path}"))?;
     let file = SocketFile { path: PathBuf::from(path), ino: std::fs::symlink_metadata(path)?.ino() };
-    // Like ssh's default StreamLocalBindMask 0177 (on failure, the file goes with `file`).
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("cannot restrict {path}"))?;
     Ok((l, file))
 }
 
