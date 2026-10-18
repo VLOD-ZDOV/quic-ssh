@@ -331,6 +331,9 @@ impl Target {
         }
         let lookup_sources = config::Sources { user: cli_user.clone(), ..sources.clone() };
         let cfg = home.map(|h| config::lookup(h, alias, &lookup_sources)).unwrap_or_default();
+        if let Some(keyword) = &cfg.refused {
+            bail!("{keyword} in the config is not supported by qsh, which would be less strict than asked (use ssh for this host)");
+        }
 
         let host = cfg.hostname.clone().map(|h| h.replace("%h", alias)).unwrap_or_else(|| alias.to_string());
         if !valid_host(&host) {
