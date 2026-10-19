@@ -636,6 +636,18 @@ fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
     Ok((kh, path))
 }
 
+/// `qsh forget`: removes the target's host key (on each port it may be
+/// reached on) from the known_hosts file new keys go to. Returns how many
+/// lines went, and the file.
+pub fn forget(target: &Target) -> Result<(usize, PathBuf)> {
+    let (kh, path) = known_hosts_for(target)?;
+    let mut removed = 0;
+    for port in target_ports(target) {
+        removed += kh.remove(&host_id(target.key_name(), port))?;
+    }
+    Ok((removed, path))
+}
+
 /// Runs `KnownHostsCommand` (tokens as for other commands; ssh's per-key
 /// tokens are not known before the handshake) and keeps its output, which
 /// is read like a known_hosts file.
@@ -864,9 +876,10 @@ fn judge_host(target: &Target, port: u16, key: PublicKey, cert: Option<&[u8]>) -
              Someone could be eavesdropping on you right now (man-in-the-middle attack),\n\
              or the host key has just been changed.\n\
              Host '{hid}' now presents {}, expected {}.\n\
-             If the change is legitimate, remove the line for '{hid}' from {}.",
+             If the change is legitimate, run `qsh forget {}` (it edits {}) and connect again.",
             key.fingerprint(),
             known.fingerprint(),
+            if port == crate::DEFAULT_PORT { target.key_name().to_string() } else { format!("{}:{port}", target.key_name()) },
             kh_path.display()
         )),
         None => other_ports(target, port, key, &kh)?,

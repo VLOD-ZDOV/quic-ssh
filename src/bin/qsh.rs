@@ -27,7 +27,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 8] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update"];
+const TOOLS: [&str; 9] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -120,6 +120,11 @@ enum Cmd {
     },
     /// Interactive host menu with status and speed test
     Ui,
+    /// Forget a host's key (after a legitimate change), as ssh-keygen -R
+    Forget {
+        /// [user@]host[:port] or an alias
+        destination: String,
+    },
     /// Check this computer's setup and, for a host, each step of connecting
     Doctor {
         /// [user@]host[:port] or an alias
@@ -579,6 +584,14 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
         }
         Cmd::Ui => qsh::client::tui::run(opts).await,
+        Cmd::Forget { destination } => {
+            let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
+            match client::forget(&target)? {
+                (0, path) => println!("{} is not in {}", target.key_name(), path.display()),
+                (n, path) => println!("removed {n} key{} of {} from {}", if n == 1 { "" } else { "s" }, target.key_name(), path.display()),
+            }
+            Ok(0)
+        }
         Cmd::Doctor { destination } => qsh::client::doctor::run(destination.as_deref(), cli.conn.port, &opts).await,
         Cmd::Multi { groups, parallel, hosts, command } => {
             use qsh::client::{groups as host_groups, multi};

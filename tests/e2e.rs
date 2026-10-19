@@ -506,6 +506,12 @@ fn changed_host_key_is_refused() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("REMOTE HOST IDENTIFICATION HAS CHANGED"), "{}", stderr(&out));
     assert!(!stdout(&out).contains("should-not-run"));
+    // The way out the message names: forget the key, then accept the new one.
+    assert!(stderr(&out).contains("qsh forget"), "{}", stderr(&out));
+    let out = c.run(&["forget", "-p", &s.port.to_string(), &dest()]);
+    assert!(stdout(&out).contains("removed 1 key"), "{}{}", stdout(&out), stderr(&out));
+    let out = c.run(&["--accept-new-host", "-p", &s.port.to_string(), &dest(), "echo", "again"]);
+    assert_eq!(stdout(&out).trim(), "again", "{}", stderr(&out));
 }
 
 #[test]

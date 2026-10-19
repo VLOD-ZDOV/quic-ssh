@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine;
 
 use crate::keys::{create_private_dir, PublicKey};
@@ -179,6 +179,41 @@ impl KnownHosts {
     }
 }
 
+impl KnownHosts {
+    /// Removes the lines that name `id` itself (in plain or hashed, not by a
+    /// pattern) from the user's file, as `ssh-keygen -R`; returns how many.
+    pub fn remove(&self, id: &str) -> Result<usize> {
+        let Some(path) = &self.path else { anyhow::bail!("UserKnownHostsFile is none: there is no file to change") };
+        let text = match fs::read(path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
+        };
+        let lower = id.to_ascii_lowercase();
+        let names_id = |field: &str| {
+            field.split(',').any(|n| match n.strip_prefix("|1|") {
+                Some(h) => hashed_matches(h, &lower) || hashed_matches(h, id),
+                None => n.eq_ignore_ascii_case(id),
+            })
+        };
+        let mut kept = String::new();
+        let mut removed = 0;
+        for line in text.lines() {
+            let names = line.trim().split_once(char::is_whitespace).map(|(n, _)| n);
+            if names.is_some_and(|n| !n.starts_with(['@', '#']) && names_id(n)) {
+                removed += 1;
+            } else {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        if removed > 0 {
+            crate::platform::replace_file(path, kept.as_bytes()).with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        Ok(removed)
+    }
+}
+
 /// Whether the file is empty or ends with a newline.
 fn ends_with_newline(f: &mut fs::File) -> Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
@@ -195,6 +230,26 @@ fn ends_with_newline(f: &mut fs::File) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::keys::Identity;
+
+    #[test]
+    fn remove_as_ssh_keygen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let kh = KnownHosts::new(path.clone());
+        let hashed = KnownHosts::with(Some(path.clone()), Vec::new(), None, true);
+        let key = Identity::generate().public();
+        kh.add("example.com", key).unwrap();
+        hashed.add("Example.com", key).unwrap();
+        kh.add(&host_id("example.com", 2222), key).unwrap();
+        let other = format!("*.example.com {}\n@revoked example.com {}\n", key.to_openssh(""), key.to_openssh(""));
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + &other).unwrap();
+        // The plain and the hashed line; not the other port, a pattern or a marker.
+        assert_eq!(kh.remove("example.com").unwrap(), 2);
+        let left = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(left.lines().count(), 3, "{left}");
+        assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(key));
+        assert_eq!(kh.remove("example.com").unwrap(), 0);
+    }
 
     #[test]
     fn add_and_lookup() {

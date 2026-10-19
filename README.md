@@ -194,6 +194,7 @@ qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
 qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
+qsh forget myserver                    # the host key changed on purpose: forget it (as ssh-keygen -R)
 qsh update                             # install the latest release (qshd too, if it is next to qsh)
 ```
 
