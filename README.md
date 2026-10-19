@@ -195,6 +195,8 @@ qsh ui                                 # host menu with status and speed test
 qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
 qsh forget myserver                    # the host key changed on purpose: forget it (as ssh-keygen -R)
+qsh completions fish > ~/.config/fish/completions/qsh.fish   # Tab completes commands and hosts
+                                       # bash: source <(qsh completions bash) in ~/.bashrc; zsh: the same with zsh
 qsh update                             # install the latest release (qshd too, if it is next to qsh)
 ```
 

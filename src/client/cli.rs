@@ -361,6 +361,7 @@ usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfil
        qsh cp [-r] SRC DST        copy files, one side is [user@]host:path
        qsh pair [user@]host       pair with a server using a code from `qshd pair`
        qsh forget [user@]host     forget a host's key after a legitimate change
+       qsh completions SHELL      Tab completion for bash, zsh or fish
        qsh keygen [FILE]          create a new key
        qsh speed [user@]host      measure latency and throughput
        qsh ui                     interactive host menu

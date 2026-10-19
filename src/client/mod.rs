@@ -6,6 +6,7 @@ pub mod config;
 pub mod control;
 pub mod copy;
 pub mod doctor;
+pub mod completions;
 pub mod forward;
 pub mod x11;
 pub mod groups;

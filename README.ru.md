@@ -195,6 +195,8 @@ qsh ui                                 # меню хостов со статус
 qsh -O check myserver                  # общее соединение (см. ниже)
 qsh doctor myserver                    # не подключается? проверит каждый шаг и подскажет, что исправить
 qsh forget myserver                    # ключ хоста сменили намеренно: забыть его (как ssh-keygen -R)
+qsh completions fish > ~/.config/fish/completions/qsh.fish   # Tab дополняет команды и хосты
+                                       # bash: source <(qsh completions bash) в ~/.bashrc; zsh: то же с zsh
 qsh update                             # поставить последний релиз (и qshd, если он рядом с qsh)
 ```
 

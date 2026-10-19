@@ -27,7 +27,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 9] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget"];
+const TOOLS: [&str; 10] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget", "completions"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -143,6 +143,13 @@ enum Cmd {
         /// The command (after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Print a completion script: bash, zsh or fish
+    Completions {
+        shell: Option<String>,
+        /// List the host names to complete (what the scripts call)
+        #[arg(long)]
+        hosts: bool,
     },
     /// Update qsh, and qshd next to it, to the latest release; restarts a running qshd service
     Update {
@@ -584,6 +591,17 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
         }
         Cmd::Ui => qsh::client::tui::run(opts).await,
+        Cmd::Completions { shell, hosts } => {
+            if hosts {
+                for h in client::completions::hosts(&home_dir()?) {
+                    println!("{h}");
+                }
+                return Ok(0);
+            }
+            let shell = shell.context("which shell: qsh completions bash|zsh|fish")?;
+            print!("{}", client::completions::script(&shell).with_context(|| format!("no completions for {shell:?} (bash, zsh, fish)"))?);
+            Ok(0)
+        }
         Cmd::Forget { destination } => {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
             match client::forget(&target)? {
