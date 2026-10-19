@@ -408,6 +408,8 @@ connection_buffer_mb = 32       # per connection: data held for programs that ha
                                 # near 0; it fills when forwards stop reading (up to 1/8 of it each), and when full
                                 # the whole connection waits. RAM at worst: max_connections × this (256 × 32 MiB
                                 # = 8 GiB), plus up to 256 KiB per open stream over TCP. Small VM: 8-16; busy proxy: 64-256
+session_scope = true            # as root under systemd: each session in its own scope in user-UID.slice, so
+                                # `systemctl status qshd` shows qshd itself and restarting it leaves tmux running
 tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`
 gateway_ports = "no"            # -R listens on loopback only; "yes": all addresses; "clientspecified"
 

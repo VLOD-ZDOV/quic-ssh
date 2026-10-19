@@ -87,6 +87,11 @@ pub struct ServerConfig {
     /// so 7 stuck forwards cannot fill it. Worst case RAM: `max_connections`
     /// times this.
     pub connection_buffer_mb: u32,
+    /// As root under systemd: each session in a scope of its own in the
+    /// user's slice (`user-UID.slice/qsh-UID-ID.scope`), so its programs count
+    /// against the user and not qshd's service, and restarting qshd leaves
+    /// them running (tmux). Off, or without systemd, they stay in qshd's.
+    pub session_scope: bool,
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).
     pub gateway_ports: GatewayPorts,
@@ -648,6 +653,7 @@ impl Default for ServerConfig {
             permit_listen: Vec::new(),
             max_connections: 256,
             connection_buffer_mb: 32,
+            session_scope: true,
             max_startups: 64,
             max_startups_per_ip: 8,
             gateway_ports: GatewayPorts::No,

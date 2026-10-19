@@ -128,6 +128,12 @@ check "paired key stored as alice, mode 600" \
 OUT=$(q qsh-alice@127.0.0.1 id 2>&1 || true)
 check "runs as alice's uid" grep -q "uid=$ALICE_UID(qsh-alice)" <<<"$OUT"
 check "has supplementary group qsh-team" grep -q "$TEAM_GID(qsh-team)" <<<"$OUT"
+# Under systemd (real root), a session gets a scope of its own in the user's slice.
+if [[ -z ${QSH_TEST_NS:-} && -d /run/systemd/system ]]; then
+    CG=$(q qsh-alice@127.0.0.1 cat /proc/self/cgroup 2>&1 || true)
+    check "session in user-$ALICE_UID.slice/qsh-*.scope" grep -q "user-$ALICE_UID.slice/qsh-$ALICE_UID-[0-9a-f]*.scope" <<<"$CG"
+    check "a pty session is in a scope too" bash -c "HOME='$T/client' script -qec \"'$QSH' -t -p $PORT qsh-alice@127.0.0.1 cat /proc/self/cgroup\" /dev/null </dev/null | grep -q 'qsh-$ALICE_UID-'"
+fi
 check "no root group" bash -c "! grep -qE '[=,]0\(' <<<'$OUT'"
 OUT=$(q qsh-alice@127.0.0.1 "grep -E '^(CapEff|CapPrm|CapBnd)' /proc/self/status | head -2" 2>&1 || true)
 check "no effective/permitted capabilities" bash -c "[[ \$(grep -c '0000000000000000' <<<'$OUT') -eq 2 ]]"

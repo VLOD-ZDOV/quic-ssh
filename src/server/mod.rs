@@ -273,6 +273,8 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
     if passwords && !(cfg!(target_os = "linux") && nix::unistd::geteuid().is_root()) {
         warn!("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match");
     }
+    let scope = cfg.session_scope;
+    tokio::task::spawn_blocking(move || users::set_session_scope(scope)).await?;
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
     let startups = Startups::new(cfg.max_startups, cfg.max_startups_per_ip);
     let sessions = Arc::new(persist::Sessions::new(Duration::from_secs(cfg.session_timeout)));

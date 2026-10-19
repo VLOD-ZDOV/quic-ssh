@@ -119,7 +119,7 @@ fn spawn_pipes(
 ) -> Result<(tokio::process::Child, Io)> {
     let arg0 = command.is_none().then(|| user.login_arg0());
     let program = if sftp.is_some() { std::path::PathBuf::from(super::users::INTERNAL_SFTP) } else { user.shell.clone() };
-    let mut cmd = user.command_as(&program, arg0.as_deref(), prelude, env);
+    let mut cmd = user.command_as(&program, arg0.as_deref(), prelude, env, true);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
     cmd.process_group(0);

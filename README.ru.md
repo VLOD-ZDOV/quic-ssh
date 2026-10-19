@@ -409,6 +409,8 @@ connection_buffer_mb = 32       # на подключение: данные, к�
                                 # полон, ждёт всё подключение. RAM в худшем случае: max_connections × это
                                 # (256 × 32 МиБ = 8 ГиБ), плюс до 256 КиБ на открытый поток через TCP.
                                 # Маленькая VM: 8-16; нагруженный прокси: 64-256
+session_scope = true            # от root под systemd: каждая сессия в своём scope в user-UID.slice, поэтому
+                                # `systemctl status qshd` показывает сам qshd, а его перезапуск не трогает tmux
 tcp = true                      # false: только UDP, например на порту 22 рядом с sshd для `qsh --full`
 gateway_ports = "no"            # -R слушает только loopback; "yes": все адреса; "clientspecified"
 

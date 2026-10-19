@@ -271,9 +271,11 @@ impl User {
     /// to the user.
     /// `prelude`: for sessions; it needs `internal-become` even when the
     /// server does not switch users.
-    fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool, prelude: &Prelude) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    /// `scope`: a session, which goes into a systemd scope of its own when
+    /// [`set_session_scope`] turned that on; the third value says it did.
+    fn launch(&self, program: &std::ffi::OsStr, arg0: Option<&str>, tty: bool, prelude: &Prelude, scope: bool) -> (std::ffi::OsString, Vec<std::ffi::OsString>, bool) {
         if !self.wraps(program, prelude) {
-            return (program.to_owned(), Vec::new());
+            return (program.to_owned(), Vec::new(), false);
         }
         let exe = self_program();
         let groups: Vec<String> = self.groups.iter().map(|g| g.to_string()).collect();
@@ -288,7 +290,28 @@ impl User {
             "--".into(),
         ];
         args.push(program.to_owned());
-        (exe.into_os_string(), args)
+        match SCOPE.get().and_then(Option::as_ref).filter(|_| scope && self.switch) {
+            // `systemd-run --scope` waits until it is in the scope, then
+            // becomes `internal-become` in the same process: nothing the
+            // session starts is ever outside it.
+            Some(run) => {
+                let mut wrapped: Vec<std::ffi::OsString> = vec![
+                    "--scope".into(),
+                    "--quiet".into(),
+                    "--no-ask-password".into(),
+                    "--collect".into(),
+                    format!("--slice=user-{}.slice", self.uid).into(),
+                    format!("--unit=qsh-{}-{:016x}", self.uid, rand::random::<u64>()).into(),
+                    format!("--description=qsh session of {}", self.name).into(),
+                    "--".into(),
+                    // /proc/self/exe would be systemd-run itself there.
+                    format!("/proc/{}/exe", std::process::id()).into(),
+                ];
+                wrapped.extend(args);
+                (run.clone().into_os_string(), wrapped, true)
+            }
+            None => (exe.into_os_string(), args, false),
+        }
     }
 
     /// Whether programs start through `internal-become`: always as root,
@@ -299,7 +322,7 @@ impl User {
 
     /// A command that runs as this user with a clean environment in their home.
     pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-        self.command_as(program, None, &Prelude::default(), self.env())
+        self.command_as(program, None, &Prelude::default(), self.env(), false)
     }
 
     /// The environment of a launch: `env` itself, or, through
@@ -322,17 +345,20 @@ impl User {
 
     /// Like [`User::command`], with `arg0` as the program's argv[0], for a
     /// session with `prelude` and the environment `env`.
-    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, prelude: &Prelude, env: Vec<(String, String)>) -> tokio::process::Command {
-        let (exe, args) = self.launch(program.as_ref(), arg0, false, prelude);
+    pub fn command_as(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, prelude: &Prelude, env: Vec<(String, String)>, scope: bool) -> tokio::process::Command {
+        let (exe, args, scoped) = self.launch(program.as_ref(), arg0, false, prelude, scope);
         let wraps = self.wraps(program.as_ref(), prelude);
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args).env_clear().envs(self.launch_env(wraps, env, prelude)).kill_on_drop(true);
-        if wraps {
-            name_self(&mut cmd);
-        } else {
-            cmd.current_dir(&self.home);
-            if let Some(a) = arg0 {
-                cmd.arg0(a);
+        match (scoped, wraps) {
+            // systemd-run keeps its own name; it gives qshd's to `internal-become`.
+            (true, _) => {}
+            (false, true) => name_self(&mut cmd),
+            (false, false) => {
+                cmd.current_dir(&self.home);
+                if let Some(a) = arg0 {
+                    cmd.arg0(a);
+                }
             }
         }
         cmd
@@ -340,17 +366,21 @@ impl User {
 
     /// A command on a terminal, as this user (the terminal is handed to them).
     pub fn pty_command(&self, program: impl AsRef<std::ffi::OsStr>, arg0: Option<&str>, env: Vec<(String, String)>, prelude: &Prelude) -> pty_process::Command {
-        let (exe, args) = self.launch(program.as_ref(), arg0, true, prelude);
+        let (exe, args, scoped) = self.launch(program.as_ref(), arg0, true, prelude, true);
         let wraps = self.wraps(program.as_ref(), prelude);
         let mut cmd = pty_process::Command::new(exe).args(args).env_clear().envs(self.launch_env(wraps, env, prelude)).kill_on_drop(true);
-        if wraps {
-            if let Ok(p) = exe_path() {
-                cmd = cmd.arg0(p);
+        match (scoped, wraps) {
+            (true, _) => {}
+            (false, true) => {
+                if let Ok(p) = exe_path() {
+                    cmd = cmd.arg0(p);
+                }
             }
-        } else {
-            cmd = cmd.current_dir(&self.home);
-            if let Some(a) = arg0 {
-                cmd = cmd.arg0(a);
+            (false, false) => {
+                cmd = cmd.current_dir(&self.home);
+                if let Some(a) = arg0 {
+                    cmd = cmd.arg0(a);
+                }
             }
         }
         cmd
@@ -374,7 +404,7 @@ impl User {
         let Some(root) = &self.chroot else { return self.helper(args) };
         let prelude = Prelude { chroot: Some(root.clone()), ..Default::default() };
         let argv = helper_argv(args);
-        let mut cmd = self.command_as(&argv[0], None, &prelude, self.env());
+        let mut cmd = self.command_as(&argv[0], None, &prelude, self.env(), false);
         cmd.args(&argv[1..]);
         Ok(cmd)
     }
@@ -411,6 +441,31 @@ pub fn exe_path() -> Result<PathBuf> {
     })
     .clone()
     .context("cannot locate the qshd binary")
+}
+
+/// `systemd-run`, when sessions get scopes of their own.
+static SCOPE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Turns session scopes on (`session_scope`) if qshd runs as root under
+/// systemd and `systemd-run --scope` works here (it does not as root of a
+/// user namespace, say): tried once with an empty scope. Call once at start.
+pub fn set_session_scope(on: bool) {
+    let run = on && geteuid().is_root() && std::path::Path::new("/run/systemd/system").is_dir();
+    let found = run.then(|| ["/usr/bin/systemd-run", "/bin/systemd-run"].into_iter().map(PathBuf::from).find(|p| p.exists())).flatten();
+    let works = found.filter(|run| {
+        let probe = std::process::Command::new(run)
+            .args(["--scope", "--quiet", "--no-ask-password", "--collect", "--unit", &format!("qsh-probe-{:016x}", rand::random::<u64>()), "--", "/bin/true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let ok = probe.is_ok_and(|s| s.success());
+        if !ok {
+            tracing::warn!("session_scope: systemd-run --scope does not work here; sessions stay in qshd's own cgroup");
+        }
+        ok
+    });
+    let _ = SCOPE.set(works);
 }
 
 /// What to run to start qshd itself (helpers, `internal-become`): on Linux
@@ -525,7 +580,7 @@ mod tests {
         let name = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
         let Ok(user) = User::lookup(&name) else { return };
         let prelude = Prelude { x11: Some(("unix:10.0".into(), "MIT-MAGIC-COOKIE-1".into(), "0f".repeat(16))), ..Default::default() };
-        let (_, args) = user.launch(std::ffi::OsStr::new("/bin/sh"), None, false, &prelude);
+        let (_, args, _) = user.launch(std::ffi::OsStr::new("/bin/sh"), None, false, &prelude, false);
         assert!(!args.is_empty() && !args.iter().any(|a| a.to_string_lossy().contains(&prelude.encode())), "{args:?}");
         let env = user.launch_env(true, Vec::new(), &prelude);
         let passed = env.iter().find(|(k, _)| k == PRELUDE_ENV).and_then(|(_, v)| Prelude::decode(v));
