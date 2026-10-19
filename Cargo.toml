@@ -30,6 +30,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+jiff = "0.2.38"
 signature = "2"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -52,13 +53,16 @@ socket2 = { version = "0.6", features = ["all"] }
 zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
-jiff = "0.2.38"
 nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource", "net"] }
 pty-process = { version = "0.5", features = ["async"] }
 rustix = { version = "1", features = ["net"] }
 sha-crypt = "0.6"
 yescrypt = { version = "0.1", default-features = false, features = ["password-hash"] }
 
+
+[target.'cfg(windows)'.dependencies]
+# qshd's terminals: ConPTY.
+portable-pty = "0.9"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tun-rs = { version = "2", default-features = false, features = ["async_tokio"] }

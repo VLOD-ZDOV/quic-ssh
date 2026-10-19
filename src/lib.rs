@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
-#[cfg(unix)]
 pub mod authkeys;
 pub mod client;
 pub mod config;
@@ -12,7 +11,6 @@ pub mod pattern;
 pub mod platform;
 pub mod prompt;
 pub mod proto;
-#[cfg(unix)]
 pub mod server;
 pub mod tls;
 pub mod totp;

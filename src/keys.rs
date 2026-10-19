@@ -363,7 +363,6 @@ fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
     Ok(Some(f))
 }
 
-#[cfg(unix)]
 fn read_limited(f: fs::File) -> Result<String> {
     use std::io::Read;
     let mut text = String::new();
@@ -371,7 +370,6 @@ fn read_limited(f: fs::File) -> Result<String> {
     Ok(text)
 }
 
-#[cfg(unix)]
 /// Reads an authorized_keys-style file with StrictModes checks (see
 /// [`open_strict`]). A missing file reads as empty.
 pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
@@ -381,7 +379,6 @@ pub fn read_strict(path: &Path, home: &Path, uid: u32) -> Result<String> {
     }
 }
 
-#[cfg(unix)]
 /// Like [`read_strict`] for secrets: the file must also be private (no
 /// permissions for group or others). `Ok(None)` if it does not exist.
 pub fn read_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<String>> {
@@ -398,7 +395,31 @@ pub fn open_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<
     Ok(Some((read_limited(f.try_clone()?)?, f)))
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+/// On Windows: the file must be a regular one (not a link or a device).
+/// Who else may change it is up to the profile's permissions, which keep
+/// other users out by default.
+fn open_strict(path: &Path, _home: &Path, _uid: u32) -> Result<Option<fs::File>> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
+        Ok(m) if !m.file_type().is_file() => bail!("{} is not a regular file", path.display()),
+        Ok(_) => {}
+    }
+    Ok(Some(fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?))
+}
+
+#[cfg(windows)]
+/// Like [`read_strict_private`], also returning the open file.
+pub fn open_strict_private(path: &Path, home: &Path, uid: u32) -> Result<Option<(String, fs::File)>> {
+    if open_strict(path, home, uid)?.is_none() {
+        return Ok(None);
+    }
+    // Writable: marking a one-time code as used sets the file's time.
+    let f = fs::OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    Ok(Some((read_limited(f.try_clone()?)?, f)))
+}
+
 /// The Ed25519 keys of an authorized_keys-style file read with [`read_strict`].
 pub fn read_key_list_strict(path: &Path, home: &Path, uid: u32) -> Result<Vec<PublicKey>> {
     Ok(parse_key_list(&read_strict(path, home, uid)?))

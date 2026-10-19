@@ -11,19 +11,14 @@
 //! relay it. A code allows [`TRIES`] guesses (a typo does not waste it), and
 //! a pairing that succeeds deletes it.
 
-#[cfg(unix)]
 use std::fs::OpenOptions;
-#[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
 use anyhow::Context;
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
@@ -32,7 +27,6 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity as SpakeId, Password, Spake2};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-#[cfg(unix)]
 use crate::keys::{create_private_dir, qsh_dir};
 use crate::keys::PublicKey;
 use crate::proto::{read_msg, write_msg, Reply};
@@ -62,18 +56,15 @@ pub fn normalize(code: &str) -> String {
         .collect()
 }
 
-#[cfg(unix)]
 fn pending_path(home: &Path) -> PathBuf {
     qsh_dir(home).join("pending_pair")
 }
 
-#[cfg(unix)]
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Creates a new pending code for the user owning `home`, replacing any older one.
-#[cfg(unix)]
 pub fn create_pending(home: &Path) -> Result<String> {
     let code = generate_code();
     let path = pending_path(home);
@@ -84,20 +75,17 @@ pub fn create_pending(home: &Path) -> Result<String> {
     Ok(code)
 }
 
-#[cfg(unix)]
 fn write_pending(path: &Path, code: &str, expires: u64, tries: u32) -> std::io::Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut f = o.open(path)?;
     writeln!(f, "{code} {expires} {tries}")
 }
 
 /// Deletes what is left of a code a pairing used (not a fresh one from a
 /// later `qshd pair`).
-#[cfg(unix)]
 pub fn discard_used(home: &Path) {
     let path = pending_path(home);
     let fresh = std::fs::read_to_string(&path).is_ok_and(|t| t.split_whitespace().nth(2) == Some(&TRIES.to_string()));
@@ -107,14 +95,18 @@ pub fn discard_used(home: &Path) {
 }
 
 /// Reads the pending code, using up one of its tries. Runs as the target user.
-#[cfg(unix)]
 pub fn take_pending(home: &Path) -> Result<String> {
     let path = pending_path(home);
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
+    let mut o = OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    o.custom_flags(libc::O_NOFOLLOW);
+    // No O_NOFOLLOW on Windows: a link is refused before it is opened.
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        bail!("pairing file has unsafe owner or permissions");
+    }
+    let mut f = match o.open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!("no pairing code is active; run `qshd pair` on the server first")
@@ -124,7 +116,11 @@ pub fn take_pending(home: &Path) -> Result<String> {
     // Taken before anything else can fail: two tries at once cannot both have it.
     std::fs::remove_file(&path).context("cannot remove pairing file")?;
     let meta = f.metadata()?;
-    if !meta.is_file() || meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
+    #[cfg(unix)]
+    let unsafe_file = meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0;
+    #[cfg(not(unix))]
+    let unsafe_file = false;
+    if !meta.is_file() || unsafe_file {
         bail!("pairing file has unsafe owner or permissions");
     }
     let mut text = String::new();

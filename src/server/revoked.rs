@@ -46,12 +46,21 @@ impl Revocation {
     /// Reads the list, or reuses the one parsed before if the file has not
     /// changed (it is checked at every login, also for unknown users).
     pub fn load(path: Option<&Path>) -> Revocation {
-        use std::os::unix::fs::MetadataExt;
         use std::sync::{Arc, Mutex};
         type Cached = Option<((u64, u64, u64, i64, i64), Arc<Revoked>)>;
         static CACHE: Mutex<Cached> = Mutex::new(None);
         let Some(path) = path else { return Revocation::None };
-        let stamp = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()));
+        #[cfg(unix)]
+        let stamp = std::fs::metadata(path).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec())
+        });
+        // No inode on Windows: size and time say whether it changed.
+        #[cfg(not(unix))]
+        let stamp = std::fs::metadata(path).ok().map(|m| {
+            let t = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+            (0, 0, m.len(), t.as_secs() as i64, i64::from(t.subsec_nanos()))
+        });
         if let (Some(stamp), Some((cached, list))) = (stamp, CACHE.lock().unwrap().as_ref()) {
             if stamp == *cached {
                 return Revocation::List(list.clone());

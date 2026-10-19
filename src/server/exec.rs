@@ -1,5 +1,6 @@
 //! Command execution and interactive shells, with or without a PTY.
 
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,6 +30,7 @@ pub struct Session {
     pub pty: Option<PtySpec>,
     /// Where the client connects from: in system mode, terminal sessions get
     /// a login record (utmp/wtmp/lastlog) for it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub remote: Option<std::net::IpAddr>,
     /// What runs first (motd, `~/.ssh/rc`...).
     pub prelude: Prelude,
@@ -66,12 +68,20 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
         session.pty = None;
     }
     let env = session.env(user);
+    #[cfg(windows)]
+    if let Some(spec) = session.pty.take() {
+        return windows::run_pty(send, recv, user, session.command, env, &spec, closed).await;
+    }
+    #[cfg(unix)]
     let mut record = None;
     let spawned = match session.pty {
+        #[cfg(unix)]
         Some(spec) => spawn_pty(user, session.command, env, &spec, &session.prelude).map(|(c, p, tty)| {
             record = login_record(user, &tty, &c, session.remote);
             (c, Io::Pty(p))
         }),
+        #[cfg(windows)]
+        Some(_) => unreachable!("taken above"),
         None => spawn_pipes(user, session.command, session.sftp, env, &session.prelude),
     };
     let (child, io) = match spawned {
@@ -83,11 +93,13 @@ pub async fn run(mut send: SendHalf, recv: RecvHalf, user: &User, mut session: S
     };
     write_msg(&mut send, &Reply::Ok).await?;
     let result = supervise(send, recv, child, io, closed).await;
+    #[cfg(unix)]
     drop(record); // the logout
     result
 }
 
 /// A login record for a terminal session in system mode (see `login_record`).
+#[cfg(unix)]
 pub(super) fn login_record(
     user: &User,
     tty: &Option<String>,
@@ -107,6 +119,7 @@ enum Io {
         stdout: tokio::process::ChildStdout,
         stderr: tokio::process::ChildStderr,
     },
+    #[cfg(unix)]
     Pty(pty_process::Pty),
 }
 
@@ -122,13 +135,24 @@ fn spawn_pipes(
     let mut cmd = user.command_as(&program, arg0.as_deref(), prelude, env, true);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Own process group, so the whole command tree can be stopped (see `hang_up`).
+    #[cfg(unix)]
     cmd.process_group(0);
     match (sftp, command) {
         (Some(opts), _) => {
             cmd.args(opts);
         }
+        #[cfg(unix)]
         (None, Some(c)) => {
             cmd.arg("-c").arg(c);
+        }
+        // cmd.exe parses its command line itself: given as typed.
+        #[cfg(windows)]
+        (None, Some(c)) if user.command_flag() == "/c" => {
+            cmd.arg("/c").raw_arg(c);
+        }
+        #[cfg(windows)]
+        (None, Some(c)) => {
+            cmd.arg(user.command_flag()).arg(c);
         }
         (None, None) => {}
     }
@@ -141,6 +165,7 @@ fn spawn_pipes(
     Ok((child, io))
 }
 
+#[cfg(unix)]
 pub(super) fn spawn_pty(
     user: &User,
     command: Option<String>,
@@ -166,8 +191,10 @@ pub(super) fn spawn_pty(
 /// other side is closed: a hangup keeps the master "writable" while writes
 /// fail with EAGAIN, so a paste into a program that exited without reading
 /// it would take a whole core forever.
+#[cfg(unix)]
 pub(super) struct PtyInput(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
 
+#[cfg(unix)]
 impl PtyInput {
     pub(super) fn new(pty: &pty_process::Pty) -> std::io::Result<PtyInput> {
         use std::os::fd::AsFd;
@@ -294,13 +321,21 @@ async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap:
 /// Stops a session whose client is gone: SIGHUP to its process group (like a
 /// terminal hangup), then SIGKILL if it is still running after a grace period.
 /// The child leads its own group (`process_group(0)` or `setsid` for a PTY).
+#[cfg(unix)]
 pub(super) async fn hang_up(child: &mut tokio::process::Child) {
     let Some(pid) = child.id() else { return };
     let group = nix::unistd::Pid::from_raw(-(pid as i32));
     hang_up_group(group, child.wait()).await;
 }
 
+/// Windows has no hangup: the program is ended.
+#[cfg(windows)]
+pub(super) async fn hang_up(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+}
+
 /// SIGHUP to a process group, then SIGKILL unless `exited` resolves within the grace period.
+#[cfg(unix)]
 pub(super) async fn hang_up_group<F: std::future::Future>(group: nix::unistd::Pid, exited: F) {
     let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGHUP);
     tokio::pin!(exited);
@@ -317,6 +352,7 @@ pub(super) async fn hang_up_group<F: std::future::Future>(group: nix::unistd::Pi
 enum Input {
     Pipe(Option<tokio::process::ChildStdin>),
     /// The writer only resizes; data goes through [`PtyInput`].
+    #[cfg(unix)]
     Pty(pty_process::OwnedWritePty, PtyInput),
 }
 
@@ -361,6 +397,7 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
                     }
                 }
             }
+            #[cfg(unix)]
             (ClientMsg::Stdin(data), Input::Pty(_, w)) => {
                 let _ = w.write_all(&data).await;
             }
@@ -369,11 +406,14 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
                     let _ = w.shutdown().await;
                 }
             }
+            #[cfg(unix)]
             (ClientMsg::Resize { cols, rows }, Input::Pty(w, _)) => {
                 let _ = w.resize(pty_process::Size::new(rows, cols));
             }
             // EOF on a terminal is the user's ^D; resize without a PTY is meaningless.
-            (ClientMsg::StdinEof, Input::Pty(..)) | (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
+            #[cfg(unix)]
+            (ClientMsg::StdinEof, Input::Pty(..)) => {}
+            (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
             (ClientMsg::Typed { .. } | ClientMsg::Shown(_), _) => unreachable!("handled above"),
             // Only persistent sessions outlive the stream; this one ends with it anyway.
             (ClientMsg::Hangup, _) => {}
@@ -394,13 +434,17 @@ async fn supervise(
 
     let mut readers = Vec::new();
     let pacing = Arc::new(Pacing::default());
+    #[cfg(unix)]
     let terminal = matches!(io, Io::Pty(_));
+    #[cfg(windows)]
+    let terminal = false;
     let feeder = match io {
         Io::Pipes { stdin, stdout, stderr } => {
             readers.push(tokio::spawn(pump(stdout, tx.clone(), ServerMsg::Stdout)));
             readers.push(tokio::spawn(pump(stderr, tx.clone(), ServerMsg::Stderr)));
             tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone(), pacing.clone()))
         }
+        #[cfg(unix)]
         Io::Pty(pty) => {
             let input = PtyInput::new(&pty)?;
             let (r, w) = pty.into_split();
@@ -451,9 +495,144 @@ async fn supervise(
     let _ = tokio::time::timeout(DRAIN_GRACE, drain).await;
     stop.iter().for_each(tokio::task::AbortHandle::abort);
     if let Some(status) = status {
-        let _ = tx.send(ServerMsg::Exit { code: status.code(), signal: status.signal() }).await;
+        #[cfg(unix)]
+        let signal = status.signal();
+        #[cfg(windows)]
+        let signal = None;
+        let _ = tx.send(ServerMsg::Exit { code: status.code(), signal }).await;
     }
     drop(tx);
     let _ = writer.await;
     Ok(())
+}
+
+/// Terminal sessions on Windows: a ConPTY. Its pipes are blocking, so they
+/// are read and written by threads of their own.
+#[cfg(windows)]
+mod windows {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use portable_pty::{CommandBuilder, MasterPty, PtySize};
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::{mpsc, watch};
+
+    use super::super::users::User;
+    use super::DRAIN_GRACE;
+    use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg};
+    use crate::transport::{RecvHalf, SendHalf};
+
+    fn size(rows: u16, cols: u16) -> PtySize {
+        PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
+    }
+
+    pub(in super::super) async fn run_pty(
+        mut send: SendHalf,
+        mut recv: RecvHalf,
+        user: &User,
+        command: Option<String>,
+        env: Vec<(String, String)>,
+        spec: &PtySpec,
+        mut closed: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let started = (|| -> Result<_> {
+            let pair = portable_pty::native_pty_system().openpty(size(spec.rows, spec.cols))?;
+            let mut cmd = CommandBuilder::new(&user.shell);
+            if let Some(c) = &command {
+                cmd.arg(user.command_flag());
+                cmd.arg(c);
+            }
+            cmd.env_clear();
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            cmd.cwd(&user.home);
+            let child = pair.slave.spawn_command(cmd)?;
+            drop(pair.slave);
+            let reader = pair.master.try_clone_reader()?;
+            let writer = pair.master.take_writer()?;
+            Ok((pair.master, child, reader, writer))
+        })();
+        let (master, mut child, mut reader, mut writer) = match started {
+            Ok(x) => x,
+            Err(e) => return write_msg(&mut send, &Reply::Err(format!("cannot start session: {e:#}"))).await,
+        };
+        write_msg(&mut send, &Reply::Ok).await?;
+        let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> = Arc::new(Mutex::new(Some(master)));
+
+        let (tx, mut rx) = mpsc::channel::<ServerMsg>(32);
+        let out_tx = tx.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 32 * 1024];
+            while let Ok(n @ 1..) = reader.read(&mut buf) {
+                if out_tx.blocking_send(ServerMsg::Stdout(buf[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+        });
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            for data in in_rx {
+                if writer.write_all(&data).and_then(|()| writer.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+        let (gone_tx, mut gone_rx) = tokio::sync::oneshot::channel::<()>();
+        let resize = master.clone();
+        let feeder = tokio::spawn(async move {
+            loop {
+                match read_msg_opt::<_, ClientMsg>(&mut recv).await {
+                    Ok(Some(ClientMsg::Stdin(data) | ClientMsg::Typed { data, .. })) if !data.is_empty() => {
+                        let _ = in_tx.send(data);
+                    }
+                    Ok(Some(ClientMsg::Resize { cols, rows })) => {
+                        if let Some(m) = resize.lock().unwrap().as_ref() {
+                            let _ = m.resize(size(rows, cols));
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) if e.is::<crate::proto::Malformed>() => {}
+                    Ok(None) | Err(_) => {
+                        let _ = gone_tx.send(());
+                        return;
+                    }
+                }
+            }
+        });
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let last = matches!(msg, ServerMsg::Exit { .. });
+                if write_msg(&mut send, &msg).await.is_err() || last {
+                    break;
+                }
+            }
+            let _ = send.shutdown().await;
+        });
+
+        let mut killer = child.clone_killer();
+        let mut waiting = tokio::task::spawn_blocking(move || child.wait());
+        let status = tokio::select! {
+            s = &mut waiting => s.ok().and_then(Result::ok),
+            Ok(()) = &mut gone_rx => {
+                let _ = killer.kill();
+                None
+            }
+            _ = async { closed.wait_for(|c| *c).await.is_ok() } => {
+                let _ = killer.kill();
+                None
+            }
+        };
+        feeder.abort();
+        // The output pipe ends only once the pseudo console is closed.
+        drop(master.lock().unwrap().take());
+        let _ = tokio::time::timeout(DRAIN_GRACE, output).await;
+        if let Some(status) = status {
+            let _ = tx.send(ServerMsg::Exit { code: Some(status.exit_code() as i32), signal: None }).await;
+        }
+        drop(tx);
+        let _ = writer_task.await;
+        Ok(())
+    }
 }

@@ -127,8 +127,10 @@ pub struct Checker<'a> {
     pub cas: &'a [KeyData],
     pub revoked: &'a super::revoked::Revocation,
     /// `authorized_keys_command`, if configured.
+    #[cfg(unix)]
     pub command: Option<&'a super::keys_command::KeysCommand<'a>>,
     /// Stands in for `authorized_keys_command` where it is not run.
+    #[cfg(unix)]
     pub mimic: Option<&'a super::keys_command::Mimic>,
     pub login: Login<'a>,
     pub exporter: [u8; 32],
@@ -143,6 +145,9 @@ impl Checker<'_> {
         }
         self.revoked.check(offered)?;
         let from_files = authkeys::check(offered, self.entries, self.cas, &self.login);
+        #[cfg(not(unix))]
+        return from_files;
+        #[cfg(unix)]
         match (from_files, self.command, self.mimic) {
             (Err(_), Some(command), _) => authkeys::check(offered, &command.entries(offered).await, self.cas, &self.login),
             (Err(e), None, Some(mimic)) => {
@@ -214,11 +219,13 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
 
 
 /// Passwords a client may try per connection (like sshd's default 3 prompts).
+#[cfg(unix)]
 const PASSWORD_TRIES: u32 = 3;
 
 /// Whether `password` matches a crypt(3) hash: yescrypt (`$y$`) or
 /// SHA-crypt (`$5$`, `$6$`). Locked (`!`, `*`) and other hashes never match;
 /// an empty hash only for an empty password with `empty_ok`.
+#[cfg(unix)]
 pub fn password_matches(hash: &str, password: &str, empty_ok: bool) -> bool {
     use sha_crypt::PasswordVerifier as _;
     if hash.is_empty() {
@@ -235,9 +242,11 @@ pub fn password_matches(hash: &str, password: &str, empty_ok: bool) -> bool {
 
 /// Longest password checked (as in sshd): hashing a huge one would let a
 /// client keep the server busy (compare CVE-2016-6515).
+#[cfg(unix)]
 const MAX_PASSWORD: usize = 1024;
 
 /// A hash qshd can check (yescrypt or SHA-crypt).
+#[cfg(unix)]
 fn usable_hash(h: &str) -> bool {
     h.starts_with("$y$") || h.starts_with("$5$") || h.starts_with("$6$")
 }
@@ -247,6 +256,7 @@ fn usable_hash(h: &str) -> bool {
 /// or else the first usable), so its scheme and cost are the system's; a
 /// match against it never counts. Without one, a yescrypt hash of a random
 /// password.
+#[cfg(unix)]
 fn dummy_hash() -> String {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HASH.get_or_init(|| {
@@ -266,6 +276,13 @@ fn dummy_hash() -> String {
 /// Password login after keys failed (`password_authentication`): asks up to
 /// [`PASSWORD_TRIES`] times. `user` is `None` for an unknown or refused user,
 /// who gets the same questions and the same work done.
+/// Windows passwords are not checked by qshd: keys only.
+#[cfg(windows)]
+pub async fn password_auth(_send: &mut SendHalf, _recv: &mut RecvHalf, _user: Option<&User>, _empty_ok: bool, _login: &Login<'_>) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
 pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Option<&User>, empty_ok: bool, login: &Login<'_>) -> Result<bool> {
     // Only root reads /etc/shadow: without it no password can match. An
     // expired password (or one that must be changed first) does not either,
@@ -361,9 +378,9 @@ pub type UsedCodes = std::sync::Mutex<TotpState>;
 /// modification time on a step boundary (a file written by hand is not on
 /// one, to the nanosecond).
 fn step_taken(file: &std::fs::File) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    match file.metadata() {
-        Ok(m) if m.mtime_nsec() == 0 && m.mtime() > 0 && (m.mtime() as u64).is_multiple_of(crate::totp::STEP) => m.mtime() as u64 / crate::totp::STEP,
+    let mtime = file.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    match mtime {
+        Some(t) if t.subsec_nanos() == 0 && t.as_secs() > 0 && t.as_secs().is_multiple_of(crate::totp::STEP) => t.as_secs() / crate::totp::STEP,
         _ => 0,
     }
 }
@@ -381,9 +398,8 @@ async fn lock_briefly(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 fn take_step(file: &std::fs::File, step: u64) {
-    use nix::sys::time::TimeSpec;
-    let mtime = TimeSpec::new((step * crate::totp::STEP) as i64, 0);
-    if let Err(e) = nix::sys::stat::futimens(file, &TimeSpec::UTIME_OMIT, &mtime) {
+    let mtime = std::time::UNIX_EPOCH + Duration::from_secs(step * crate::totp::STEP);
+    if let Err(e) = file.set_modified(mtime) {
         warn!("cannot mark the one-time code as used for other qshd instances: {e}");
     }
 }
@@ -515,6 +531,7 @@ mod tests {
         assert_eq!(super::step_taken(&std::fs::File::open(&path).unwrap()), 59_000_000);
     }
 
+    #[cfg(unix)]
     #[test]
     fn password_hashes() {
         use super::password_matches;

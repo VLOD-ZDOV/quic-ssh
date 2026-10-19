@@ -1,17 +1,61 @@
 //! The `qshd` daemon.
 
+// Switching users, the helpers that run as them and what needs Unix
+// sockets or utmp: Unix only. On Windows qshd serves the user it runs as.
+#[cfg(unix)]
 mod agent;
 mod auth;
 mod exec;
 mod files;
+#[cfg(unix)]
 pub mod helpers;
+#[cfg(unix)]
 mod login_record;
+#[cfg(unix)]
 pub mod keys_command;
 mod penalty;
+#[cfg(unix)]
 mod persist;
+#[cfg(windows)]
+#[path = "persist_windows.rs"]
+mod persist;
+pub mod transfer;
+#[cfg(unix)]
 mod sftp;
+#[cfg(unix)]
 mod x11;
+/// Agent and X11 forwarding need Unix sockets: never set up on Windows.
+#[cfg(windows)]
+mod agent {
+    #[derive(Default)]
+    pub struct AgentSocket(());
+    impl AgentSocket {
+        pub fn path(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+}
+#[cfg(windows)]
+mod x11 {
+    pub struct Display {
+        pub display: String,
+        pub auth_display: String,
+        pub proto: String,
+        pub cookie: String,
+    }
+    #[derive(Default)]
+    pub struct X11(());
+    impl X11 {
+        pub fn display(&self) -> Option<Display> {
+            None
+        }
+    }
+}
 pub mod revoked;
+#[cfg(unix)]
+mod users;
+#[cfg(windows)]
+#[path = "users_windows.rs"]
 mod users;
 
 use std::collections::HashMap;
@@ -70,6 +114,7 @@ impl State {
 pub type Reload = Box<dyn Fn() -> Result<ServerConfig> + Send + Sync>;
 
 /// Settings that only take effect when qshd starts.
+#[cfg(unix)]
 fn restart_needed(old: &ServerConfig, new: &ServerConfig) -> Vec<&'static str> {
     let mut changed = Vec::new();
     for (name, differs) in [
@@ -194,8 +239,14 @@ fn refused(cfg: &ServerConfig, who: &crate::config::Login, user: &User) -> Optio
         return Some("root login is not permitted (permit_root_login)".into());
     }
     // Like sshd: an account whose shell is missing is not one to log in to.
-    use std::os::unix::fs::PermissionsExt;
-    if !std::fs::metadata(&user.shell).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
+    #[cfg(unix)]
+    let runnable = |m: &std::fs::Metadata| {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let runnable = |_: &std::fs::Metadata| true;
+    if !std::fs::metadata(&user.shell).is_ok_and(|m| m.is_file() && runnable(&m)) {
         return Some(format!("shell {} does not exist or is not executable", user.shell.display()));
     }
     cfg.login_refused(who)
@@ -269,8 +320,14 @@ pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
 pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reload: Option<Reload>) -> Result<()> {
     // Remember where qshd is while the path is still valid (see users::exe_path).
     let _ = users::exe_path();
+    #[cfg(not(unix))]
+    let _ = &reload;
     let passwords = cfg.password_authentication || cfg.matches.iter().any(|m| m.password_authentication == Some(true));
-    if passwords && !(cfg!(target_os = "linux") && nix::unistd::geteuid().is_root()) {
+    #[cfg(unix)]
+    let shadow = cfg!(target_os = "linux") && nix::unistd::geteuid().is_root();
+    #[cfg(not(unix))]
+    let shadow = false;
+    if passwords && !shadow {
         warn!("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match");
     }
     let scope = cfg.session_scope;
@@ -473,18 +530,27 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
                 None => cfg.authorized_principals_file.as_ref().map(|_| Vec::new()),
             };
             // KeysCommand looks its user up (NSS) too.
+            #[cfg(unix)]
             let runner = user.as_ref().and_then(|u| keys_command::KeysCommand::runner(&cfg, u));
+            #[cfg(not(unix))]
+            let runner = ();
             (entries, auth::trusted_cas(&cfg), revoked::Revocation::load(cfg.revoked_keys.as_deref()), principals, runner)
         })
         .await?
     };
+    #[cfg(unix)]
     let command = user.as_ref().zip(runner).and_then(|(u, runner)| keys_command::KeysCommand::new(&cfg, u, runner));
+    #[cfg(unix)]
     let mimic = if command.is_none() { keys_command::Mimic::new(&cfg) } else { None };
+    #[cfg(not(unix))]
+    let () = runner;
     let checker = auth::Checker {
         entries: &entries,
         cas: &cas,
         revoked: &revoked,
+        #[cfg(unix)]
         command: command.as_ref(),
+        #[cfg(unix)]
         mimic: mimic.as_ref(),
         login: crate::authkeys::Login { user: &name, ip: addr.ip().to_canonical(), now: auth::now(), principals: principals.as_deref() },
         exporter: conn.exporter(),
@@ -818,6 +884,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             // Tests reach the system-mode path without root (debug builds only).
             let testing = cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_FORWARD_HELPER").is_some();
+            #[cfg(unix)]
             if user.switches() || testing {
                 return match connect_as(user, &host, port).await {
                     Ok(tcp) => {
@@ -827,6 +894,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                     Err(e) => write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await,
                 };
             }
+            #[cfg(not(unix))]
+            let _ = testing;
             let connect = tokio::net::TcpStream::connect((host.as_str(), port));
             match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(tcp)) => {
@@ -848,12 +917,18 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         Request::DownloadFrom { path, offset, prefix } => {
             until_closed(closed, files::download_from(send, user, &path, (offset, &prefix), compressed)).await
         }
+        #[cfg(windows)]
+        Request::AgentForward | Request::DirectStreamLocal { .. } | Request::RemoteForwardStreamLocal { .. } | Request::X11Forward { .. } => {
+            write_msg(&mut send, &Reply::Err("not available from a qshd on Windows".into())).await
+        }
+        #[cfg(unix)]
         Request::AgentForward => {
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
             }
             agent::forward(send, recv, conn.clone(), user, agent).await
         }
+        #[cfg(unix)]
         Request::DirectStreamLocal { path } => {
             if !cfg.local_stream_forwarding() || limits.no_port_forwarding {
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
@@ -881,6 +956,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 Err(_) => write_msg(&mut send, &Reply::Err(format!("connect {path}: timed out"))).await,
             }
         }
+        #[cfg(unix)]
         Request::RemoteForwardStreamLocal { path } => {
             if !cfg.remote_stream_forwarding() || limits.no_port_forwarding {
                 return write_msg(&mut send, &Reply::Err("Unix socket forwarding is not allowed".into())).await;
@@ -890,6 +966,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             remote_forward_local(send, recv, conn.clone(), user, cfg, &path).await
         }
+        #[cfg(unix)]
         Request::X11Forward { proto, cookie, screen } => {
             if !cfg.x11() || limits.no_x11_forwarding {
                 return write_msg(&mut send, &Reply::Err("X11 forwarding is not allowed".into())).await;
@@ -920,8 +997,13 @@ async fn last_login(cfg: &ServerConfig, user: &User, limits: &crate::authkeys::R
     if !cfg.print_last_log || !user.switches() || spec.command.is_some() || spec.pty.is_none() || limits.command.is_some() {
         return None;
     }
-    let (uid, name) = (user.uid, user.name.clone());
-    tokio::task::spawn_blocking(move || login_record::last_login(uid, &name)).await.ok().flatten()
+    #[cfg(not(unix))]
+    return None;
+    #[cfg(unix)]
+    {
+        let (uid, name) = (user.uid, user.name.clone());
+        tokio::task::spawn_blocking(move || login_record::last_login(uid, &name)).await.ok().flatten()
+    }
 }
 
 /// Where OpenSSH's sftp-server usually lives.
@@ -948,6 +1030,7 @@ fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<Stri
         if user.chroot.is_some() {
             return Some(users::INTERNAL_SFTP.to_string());
         }
+        #[cfg(unix)]
         return users::shell_sftp_command().ok();
     }
     None
@@ -1051,6 +1134,7 @@ async fn remote_forward(
     Ok(())
 }
 
+#[cfg(unix)]
 /// A listening Unix socket at `path` that belongs to the user: bound by a
 /// helper running as them, which hands the socket over.
 async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<tokio::net::UnixListener> {
@@ -1065,6 +1149,7 @@ async fn listen_unix_as(user: &User, cfg: &ServerConfig, path: &str) -> Result<t
     Ok(tokio::net::UnixListener::from_std(std)?)
 }
 
+#[cfg(unix)]
 /// `-L` in system mode: a socket connected by a helper running as the user,
 /// so uid-based firewall rules (iptables --uid-owner) apply, as in sshd
 /// (compare CVE-2016-10010). The helper ends once it has handed it over.
@@ -1077,6 +1162,7 @@ async fn connect_as(user: &User, host: &str, port: u16) -> Result<tokio::net::Tc
     Ok(tcp)
 }
 
+#[cfg(unix)]
 /// Like [`connect_as`], to a Unix socket (inside the user's chroot, if any).
 async fn connect_unix_as(user: &User, path: &str) -> Result<tokio::net::UnixStream> {
     let fd = socket_from_helper(user.confined_helper(&["internal-connect-unix-fd", path])?).await?;
@@ -1085,6 +1171,7 @@ async fn connect_unix_as(user: &User, path: &str) -> Result<tokio::net::UnixStre
     Ok(tokio::net::UnixStream::from_std(std)?)
 }
 
+#[cfg(unix)]
 /// Runs a helper that hands a socket over its stdout (see
 /// `helpers::hand_over`); its stderr is the error otherwise.
 async fn socket_from_helper(mut helper: tokio::process::Command) -> Result<std::os::fd::OwnedFd> {
@@ -1134,6 +1221,7 @@ async fn socket_from_helper(mut helper: tokio::process::Command) -> Result<std::
     }
 }
 
+#[cfg(unix)]
 /// Takes a descriptor sent with SCM_RIGHTS (see `helpers::listen_unix`);
 /// `None` if the helper sent none.
 fn receive_fd(sock: impl std::os::fd::AsFd) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
@@ -1158,6 +1246,7 @@ fn receive_fd(sock: impl std::os::fd::AsFd) -> std::io::Result<Option<std::os::f
     Ok(None)
 }
 
+#[cfg(unix)]
 /// `-R` from a Unix socket: like [`remote_forward`], on a socket file of the user's.
 async fn remote_forward_local(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, user: &User, cfg: &ServerConfig, path: &str) -> Result<()> {
     use tokio::io::AsyncReadExt;

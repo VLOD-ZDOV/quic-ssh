@@ -1,4 +1,3 @@
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -6,7 +5,9 @@ use clap::{Parser, Subcommand};
 
 use qsh::config::ServerConfig;
 use qsh::keys::{home_dir, qsh_dir, Identity};
-use qsh::server::{self, helpers};
+#[cfg(unix)]
+use qsh::server::helpers;
+use qsh::server::{self, transfer};
 
 /// qsh server: secure shell over QUIC (UDP) and TCP on the same port.
 #[derive(Parser)]
@@ -97,8 +98,30 @@ enum Cmd {
     InternalTar { path: String },
 }
 
+#[cfg(unix)]
 fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
+}
+
+/// qshd on Windows serves only its own user: like a non-root qshd.
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
+/// The name of the user qshd runs as.
+fn user_name() -> Result<String> {
+    #[cfg(unix)]
+    return Ok(nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name);
+    #[cfg(not(unix))]
+    return std::env::var("USERNAME").context("unknown user (USERNAME)");
+}
+
+fn host_name() -> Result<String> {
+    #[cfg(unix)]
+    return Ok(nix::unistd::gethostname()?.to_string_lossy().into_owned());
+    #[cfg(not(unix))]
+    return std::env::var("COMPUTERNAME").context("unknown host name (COMPUTERNAME)");
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -113,7 +136,6 @@ const CONFIG_TEMPLATE: &str = include_str!("../../../contrib/qshd.toml");
 /// it is commented out). Readable by all in /etc/qsh, like sshd_config.
 fn create_default_config(path: Option<&PathBuf>) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if path.is_some() {
         return Ok(());
     }
@@ -127,8 +149,11 @@ fn create_default_config(path: Option<&PathBuf>) -> Result<()> {
     } else {
         qsh::keys::create_private_dir(&dir)?;
     }
-    let mode = if is_root() { 0o644 } else { 0o600 };
-    match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&file) {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, if is_root() { 0o644 } else { 0o600 });
+    match open.open(&file) {
         Ok(mut f) => {
             f.write_all(CONFIG_TEMPLATE.as_bytes())?;
             eprintln!("Created {} (all settings commented out at their defaults)", file.display());
@@ -157,6 +182,12 @@ fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
 /// public host key are no secrets, and the private key file is private
 /// itself. (Older qshd made it private as a whole, so that nothing but
 /// root could read the config, nor `qsh copy-id` the public key.)
+#[cfg(not(unix))]
+fn open_system_dir(_dir: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_system_dir(dir: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if !is_root() || dir != std::path::Path::new("/etc/qsh") {
@@ -208,12 +239,14 @@ pub fn main() {
     }));
     // Switching to a user before running their program (see `User::launch`).
     let argv = qsh::platform::args_or_exit("qshd");
+    #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some(helpers::BECOME) {
         let Err(e) = helpers::become_user(&argv[2..]);
         eprintln!("qshd: {e:#}");
         std::process::exit(126);
     }
     // The built-in SFTP server, started like a program (macOS runs it this way).
+    #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some(server::INTERNAL_SFTP) {
         if let Err(e) = helpers::run_internal(server::INTERNAL_SFTP, &argv[2..]) {
             eprintln!("qshd: {e:#}");
@@ -223,6 +256,7 @@ pub fn main() {
     }
     let cli = match argv.get(1).map(String::as_str) {
         // A helper started through the user's shell: the real arguments are in the environment.
+        #[cfg(unix)]
         Some(helpers::HELPER_FROM_ENV) => {
             let args = std::env::var(helpers::HELPER_ARGS).ok().and_then(|a| helpers::decode_args(&a));
             let Some(args) = args.filter(|a| a.first().is_some_and(|c| c.starts_with("internal-"))) else {
@@ -242,20 +276,35 @@ pub fn main() {
         return;
     }
     let result = match cli.cmd {
-        Some(Cmd::InternalRecv { path, name, size, mode }) => helpers::recv(&path, &name, size, &mode),
-        Some(Cmd::InternalSend { path }) => helpers::send(&path),
-        Some(Cmd::InternalRecvResume { path, name, size, mode }) => helpers::recv_resume(&path, &name, size, &mode),
-        Some(Cmd::InternalSendFrom { path, offset, prefix }) => helpers::send_from(&path, &offset, &prefix),
-        Some(Cmd::InternalPairTake) => helpers::pair_take(),
-        Some(Cmd::InternalAddKey { line }) => helpers::add_key(&line),
+        Some(Cmd::InternalRecv { path, name, size, mode }) => transfer::recv(&path, &name, size, &mode),
+        Some(Cmd::InternalSend { path }) => transfer::send(&path),
+        Some(Cmd::InternalRecvResume { path, name, size, mode }) => transfer::recv_resume(&path, &name, size, &mode),
+        Some(Cmd::InternalSendFrom { path, offset, prefix }) => transfer::send_from(&path, &offset, &prefix),
+        Some(Cmd::InternalPairTake) => transfer::pair_take(),
+        Some(Cmd::InternalAddKey { line }) => transfer::add_key(&line),
+        Some(Cmd::InternalUntar { path, name }) => transfer::untar(&path, &name),
+        Some(Cmd::InternalTar { path }) => transfer::tar(&path),
+        #[cfg(not(unix))]
+        Some(
+            Cmd::InternalConnect { .. }
+            | Cmd::InternalConnectUnix { .. }
+            | Cmd::InternalConnectFd { .. }
+            | Cmd::InternalConnectUnixFd { .. }
+            | Cmd::InternalTunFd { .. }
+            | Cmd::InternalListenUnix { .. },
+        ) => Err(anyhow::anyhow!("not available on Windows")),
+        #[cfg(unix)]
         Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),
+        #[cfg(unix)]
         Some(Cmd::InternalConnectUnix { path }) => helpers::connect_unix(&path),
+        #[cfg(unix)]
         Some(Cmd::InternalConnectFd { host, port }) => helpers::connect_fd(&host, port),
+        #[cfg(unix)]
         Some(Cmd::InternalConnectUnixFd { path }) => helpers::connect_unix_fd(&path),
+        #[cfg(unix)]
         Some(Cmd::InternalTunFd { kind, unit }) => helpers::tun_fd(&kind, &unit),
+        #[cfg(unix)]
         Some(Cmd::InternalListenUnix { path, mask, unlink }) => helpers::listen_unix(&path, &mask, &unlink),
-        Some(Cmd::InternalUntar { path, name }) => helpers::untar(&path, &name),
-        Some(Cmd::InternalTar { path }) => helpers::tar(&path),
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair { qr, host }) => pair(cli.config, qr, host),
         Some(Cmd::Totp { force, disable }) => totp(force, disable),
@@ -324,12 +373,12 @@ fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
             anyhow::bail!("invalid host {h:?} (a host name or IP address)")
         }
         Some(h) => h,
-        None => nix::unistd::gethostname()?.to_string_lossy().into_owned(),
+        None => host_name()?,
     };
     // An IPv6 address needs brackets, or its colons would read as a port.
     let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host };
     let code = qsh::pair::create_pending(&home_dir()?)?;
-    let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name;
+    let user = user_name()?;
     let port = match cfg.listen.port() {
         qsh::DEFAULT_PORT => String::new(),
         p => format!(" -p {p}"),
@@ -428,8 +477,8 @@ fn totp(force: bool, disable: bool) -> Result<()> {
     }
     let mut secret = [0u8; 20];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-    let user = nix::unistd::User::from_uid(nix::unistd::getuid())?.context("unknown user")?.name;
-    let host = nix::unistd::gethostname()?.to_string_lossy().into_owned();
+    let user = user_name()?;
+    let host = host_name()?;
     let uri = totp::uri(&secret, &format!("{user}@{host}"));
     println!("Scan this with an authenticator app (or enter the key by hand):\n");
     print!("{}", totp::qr_text(&uri)?);
@@ -449,7 +498,11 @@ fn totp(force: bool, disable: bool) -> Result<()> {
             qsh::keys::create_private_dir(path.parent().context("bad path")?)?;
             let tmp = path.with_extension("new");
             let _ = std::fs::remove_file(&tmp);
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let mut f = o.open(&tmp)?;
             writeln!(f, "{key}")?;
             drop(f);
             std::fs::rename(&tmp, &path)?;
@@ -486,12 +539,10 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = server::bind(&cfg, &host).await?;
-        let who = match nix::unistd::geteuid() {
-            uid if uid.is_root() => "any user can log in".to_string(),
-            uid => match nix::unistd::User::from_uid(uid) {
-                Ok(Some(u)) => format!("only {} can log in (qshd is not root)", u.name),
-                _ => "only this user can log in (qshd is not root)".to_string(),
-            },
+        let who = match (is_root(), user_name()) {
+            (true, _) => "any user can log in".to_string(),
+            (false, Ok(name)) => format!("only {name} can log in (qshd is not root)"),
+            (false, Err(_)) => "only this user can log in (qshd is not root)".to_string(),
         };
         tracing::info!(
             "listening on {} ({}; the firewall must let it in), host key {}; {who}",

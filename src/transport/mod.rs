@@ -533,7 +533,8 @@ pub struct Alive {
 
 /// Server listener bound to the same port on UDP (QUIC) and, optionally, TCP.
 pub struct Listener {
-    quic: quinn::Endpoint,
+    /// `None` where the system cannot do QUIC's UDP (see [`Listener::bind`]).
+    quic: Option<quinn::Endpoint>,
     tcp: Option<tokio::net::TcpListener>,
     tls: Arc<rustls::ServerConfig>,
     alive: Option<Alive>,
@@ -552,11 +553,24 @@ impl Listener {
         // if that TCP port is taken, try another pair.
         let attempts = if addr.port() == 0 && tcp { 20 } else { 1 };
         for attempt in 1..=attempts {
-            let quic = quic::server_endpoint(tls.clone(), addr, alive).with_context(|| format!("cannot listen on udp {addr}"))?;
+            let quic = match quic::server_endpoint(tls.clone(), addr, alive) {
+                Ok(q) => Some(q),
+                // A system without the UDP socket options QUIC needs (Wine,
+                // say): TLS over TCP still serves. A taken port is an error.
+                Err(e) if tcp && udp_unsupported(&e) => {
+                    tracing::warn!("QUIC is not available on this system ({e:#}); serving TLS over TCP only");
+                    None
+                }
+                Err(e) => return Err(e).with_context(|| format!("cannot listen on udp {addr}")),
+            };
+            let Some(udp) = &quic else {
+                let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("cannot listen on tcp {addr}"))?;
+                return Ok(Listener { quic, tcp: Some(l), tls, alive });
+            };
             if !tcp {
                 return Ok(Listener { quic, tcp: None, tls, alive });
             }
-            let tcp_addr = SocketAddr::new(addr.ip(), quic.local_addr()?.port());
+            let tcp_addr = SocketAddr::new(addr.ip(), udp.local_addr()?.port());
             match tokio::net::TcpListener::bind(tcp_addr).await {
                 Ok(l) => return Ok(Listener { quic, tcp: Some(l), tls, alive }),
                 Err(e) if attempt == attempts => return Err(e).with_context(|| format!("cannot listen on tcp {tcp_addr}")),
@@ -567,12 +581,20 @@ impl Listener {
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.quic.local_addr()?)
+        match (&self.quic, &self.tcp) {
+            (Some(q), _) => Ok(q.local_addr()?),
+            (None, Some(t)) => Ok(t.local_addr()?),
+            (None, None) => unreachable!("bind gives one or the other"),
+        }
     }
 
     /// Human-readable list of the active transports.
     pub fn transports(&self) -> &'static str {
-        if self.tcp.is_some() { "quic + tcp" } else { "quic only" }
+        match (&self.quic, &self.tcp) {
+            (Some(_), Some(_)) => "quic + tcp",
+            (Some(_), None) => "quic only",
+            (None, _) => "tcp only",
+        }
     }
 
     pub async fn accept(&self) -> Result<Incoming> {
@@ -582,8 +604,14 @@ impl Listener {
                 None => std::future::pending().await,
             }
         };
+        let quic_accept = async {
+            match &self.quic {
+                Some(q) => q.accept().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            inc = self.quic.accept() => inc.map(|i| Incoming::Quic(Box::new(i))).context("quic endpoint closed"),
+            inc = quic_accept => inc.map(|i| Incoming::Quic(Box::new(i))).context("quic endpoint closed"),
             res = tcp_accept => {
                 // A plain io::Error: the caller tells it from a closed endpoint.
                 let (sock, addr) = res.map_err(anyhow::Error::new)?;
@@ -591,6 +619,17 @@ impl Listener {
             }
         }
     }
+}
+
+/// Whether creating the UDP socket failed because the system lacks an
+/// option (not because the port is taken).
+fn udp_unsupported(e: &anyhow::Error) -> bool {
+    e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|io| {
+        io.kind() == std::io::ErrorKind::Unsupported
+            // WSAEOPNOTSUPP, WSAENOPROTOOPT; EOPNOTSUPP, ENOPROTOOPT on Linux.
+            || matches!(io.raw_os_error(), Some(10045 | 10042) if cfg!(windows))
+            || matches!(io.raw_os_error(), Some(95 | 92) if cfg!(target_os = "linux"))
+    })
 }
 
 impl Incoming {

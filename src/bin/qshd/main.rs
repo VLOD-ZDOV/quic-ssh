@@ -1,17 +1,9 @@
 #![forbid(unsafe_code)]
-//! qshd needs a Unix system (Linux, macOS, BSD): user switching, PTYs and
-//! process groups. On Windows, only the client (qsh) is available.
+//! qshd: the server. On Unix it serves every user (as root) or its own;
+//! on Windows only the user it runs as.
 
-#[cfg(unix)]
-mod unix;
+mod app;
 
-#[cfg(unix)]
 fn main() {
-    unix::main()
-}
-
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("qshd runs on Linux, macOS and other Unix systems; on Windows only the qsh client is available.");
-    std::process::exit(1);
+    app::main()
 }

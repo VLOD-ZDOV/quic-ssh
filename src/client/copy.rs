@@ -33,6 +33,11 @@ pub enum Location {
 impl Location {
     /// Like scp: `host:path` is remote unless a '/' comes before the first ':'.
     pub fn parse(s: &str) -> Location {
+        // `C:\dir` and `C:/dir` on Windows are local, as with scp there.
+        let b = s.as_bytes();
+        if cfg!(windows) && b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
+            return Location::Local(PathBuf::from(s));
+        }
         let colon = if let Some(close) = s.find("]:").filter(|_| s.contains('[')) {
             Some(close + 1)
         } else {
@@ -325,5 +330,9 @@ mod tests {
         assert_eq!(Location::parse("./a:b"), Location::Local("./a:b".into()));
         assert_eq!(Location::parse("/abs/path"), Location::Local("/abs/path".into()));
         assert_eq!(Location::parse("file.txt"), Location::Local("file.txt".into()));
+        if cfg!(windows) {
+            assert_eq!(Location::parse(r"C:\Users\a.txt"), Location::Local(r"C:\Users\a.txt".into()));
+            assert_eq!(Location::parse("d:/x"), Location::Local("d:/x".into()));
+        }
     }
 }

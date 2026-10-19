@@ -41,6 +41,9 @@ async fn failure(child: &mut Child, status: std::process::ExitStatus) -> String 
     match stderr_text(child).await {
         text if text != "helper failed" => text,
         // Through the user's shell, a signal shows as 128 + its number.
+        #[cfg(not(unix))]
+        _ => format!("helper failed ({status})"),
+        #[cfg(unix)]
         _ => {
             use std::os::unix::process::ExitStatusExt;
             let signal = status.signal().or(status.code().filter(|c| *c > 128).map(|c| c - 128));
