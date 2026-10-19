@@ -19,7 +19,7 @@ Features:
 - interactive shell with a PTY, window resizing and exit codes;
 - remote commands (`qsh host cmd`) with stdin/stdout/stderr;
 - forwarding: local (`-L`), remote (`-R`), SOCKS proxies (`-D`, `-R port`), stdio (`-W`), Unix sockets, X11 (`-X`/`-Y`), tunnel devices (`-w`), jump hosts (`-J`) and `ProxyCommand`; added and cancelled while connected with `~C` or `-O forward`/`-O cancel`;
-- file copy, including directories (`qsh cp -r`);
+- file copy, including directories (`qsh cp -r`); a single file cut off half-way goes on where it stopped when copied again;
 - the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
 - **sessions that survive network outages:** after a lost connection, qsh reconnects by itself and the shell is still there, with the output you missed;
 - key login with any SSH key (Ed25519, ECDSA, RSA, security keys), ssh-agent and agent forwarding (`-A`), OpenSSH user and host certificates;
@@ -184,6 +184,7 @@ qsh cp a.txt b.txt user@host:~/inbox   # several files into a directory (~ is th
 qsh cp user@host:logs/app.log .        # download
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
 qsh cp -C logs.txt host:               # compressed (zstd), for text on slow links
+qsh cp big.iso host:                   # cut off? run it again: it goes on where it stopped
 qsh multi -g web -- uptime             # one command on several hosts
 qsh -p 2222 user@host                  # another port (or user@host:2222)
 qsh --transport tcp user@host          # force TCP (or quic)

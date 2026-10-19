@@ -794,7 +794,12 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             remote_forward(send, recv, conn.clone(), user, cfg.gateway_ports, &bind, port).await
         }
-        Request::Upload { .. } | Request::Download { .. } | Request::UploadTree { .. } | Request::DownloadTree { .. }
+        Request::Upload { .. }
+        | Request::Download { .. }
+        | Request::UploadTree { .. }
+        | Request::DownloadTree { .. }
+        | Request::UploadResume { .. }
+        | Request::DownloadFrom { .. }
             if limits.command.is_some() =>
         {
             write_msg(&mut send, &files_denied()).await
@@ -837,6 +842,12 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             until_closed(closed, files::upload(send, recv, user, &path, &name, (size, mode), compressed)).await
         }
         Request::Download { path } => until_closed(closed, files::download(send, user, &path, compressed)).await,
+        Request::UploadResume { path, name, size, mode } => {
+            until_closed(closed, files::upload_resume(send, recv, user, &path, &name, (size, mode), compressed)).await
+        }
+        Request::DownloadFrom { path, offset, prefix } => {
+            until_closed(closed, files::download_from(send, user, &path, (offset, &prefix), compressed)).await
+        }
         Request::AgentForward => {
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;

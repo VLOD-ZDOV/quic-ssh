@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::proto::{expect_ok, write_msg, Reply, Request, Transfer};
+use crate::proto::{expect_ok, prefix_sha256, write_msg, Reply, Request, ResumeFrom, Transfer};
 use crate::transport::{compress, decompress, Conn, RecvHalf, SendHalf};
 
 /// Opens a stream for a transfer request, compressed if asked for and the
@@ -51,6 +51,12 @@ impl Location {
             _ => Location::Local(PathBuf::from(s)),
         }
     }
+}
+
+/// The SHA-256 of a file's first `n` bytes (`None` if it cannot be read).
+async fn prefix_of(path: &Path, n: u64) -> Option<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || prefix_sha256(std::fs::File::open(path).ok()?, n).ok()).await.ok().flatten()
 }
 
 /// Copies `total` bytes, drawing a progress line on stderr when it is a terminal.
@@ -115,13 +121,35 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -
     }
     let name = local.file_name().context("source has no file name")?.to_string_lossy().into_owned();
     let size = meta.len();
-    let req = Transfer::Upload { path: remote.to_string(), name: name.clone(), size, mode: crate::platform::mode(&meta) & 0o777 };
-    let (send, mut recv, compressed) = open(conn, req, compressed).await?;
+    let mode = crate::platform::mode(&meta) & 0o777;
+    // A partial copy there from before goes on where it stopped, if its
+    // beginning is ours; otherwise the whole file goes again.
+    let resume = conn.server_version() >= 8;
+    let req = if resume {
+        Transfer::UploadResume { path: remote.to_string(), name: name.clone(), size, mode }
+    } else {
+        Transfer::Upload { path: remote.to_string(), name: name.clone(), size, mode }
+    };
+    let (mut send, mut recv, compressed) = open(conn, req, compressed).await?;
+    let mut offset = 0;
+    if resume {
+        let Reply::Partial { have, prefix } = expect_ok(&mut recv).await? else { bail!("unexpected reply to an upload") };
+        if have > 0 && have <= size && prefix_of(local, have).await.as_deref() == Some(prefix.as_slice()) {
+            offset = have;
+        }
+        write_msg(&mut send, &ResumeFrom { offset }).await?;
+        if offset > 0 {
+            resuming(&name, offset, size);
+            use tokio::io::AsyncSeekExt;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+        }
+    }
     expect_ok(&mut recv).await?;
+    let left = size - offset;
     let mut send = if compressed { compress(send) } else { send };
     let mut answer = answer(recv);
     let sending = async {
-        let sent = transfer(&mut file, &mut send, size, &name).await?;
+        let sent = transfer(&mut file, &mut send, left, &name).await?;
         send.shutdown().await?;
         anyhow::Ok(sent)
     };
@@ -129,14 +157,14 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -
     let changed = || anyhow::anyhow!("{} changed size during the copy", local.display());
     tokio::select! {
         sent = &mut sending => match sent {
-            Ok(n) if n != size => Err(changed()),
+            Ok(n) if n != left => Err(changed()),
             Ok(_) => answer.await?,
             Err(e) => Err(server_reason(&mut answer, e).await),
         },
         // The server took it all; only our end of the stream was left to send.
         early = &mut answer => {
             early??;
-            if sending.await? != size { Err(changed()) } else { Ok(()) }
+            if sending.await? != left { Err(changed()) } else { Ok(()) }
         }
     }
 }
@@ -158,26 +186,54 @@ async fn server_reason(answer: &mut tokio::task::JoinHandle<Result<()>>, write: 
 }
 
 pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool) -> Result<()> {
-    let (_send, mut recv, compressed) = open(conn, Transfer::Download { path: remote.to_string() }, compressed).await?;
-    let (size, mode) = match expect_ok(&mut recv).await? {
-        Reply::File { size, mode } => (size, mode),
-        other => bail!("unexpected reply {other:?}"),
-    };
     let name = Path::new(remote).file_name().context("remote path has no file name")?;
     let target = if local.is_dir() { local.join(name) } else { local.to_path_buf() };
+    // A partial copy here from before: the server sends the rest if its
+    // beginning matches (and everything otherwise).
+    let partial = match std::fs::metadata(&target) {
+        Ok(m) if m.is_file() && m.len() > 0 && conn.server_version() >= 8 => prefix_of(&target, m.len()).await.map(|p| (m.len(), p)),
+        _ => None,
+    };
+    let have = partial.as_ref().map(|(o, _)| *o);
+    let request = match partial {
+        Some((offset, prefix)) => Transfer::DownloadFrom { path: remote.to_string(), offset, prefix },
+        None => Transfer::Download { path: remote.to_string() },
+    };
+    let (_send, mut recv, compressed) = open(conn, request, compressed).await?;
+    let (size, mode, start) = match expect_ok(&mut recv).await? {
+        Reply::File { size, mode } => (size, mode, 0),
+        Reply::FileFrom { size, mode, start } if start <= size && (start == 0 || have == Some(start)) => (size, mode, start),
+        other => bail!("unexpected reply {other:?}"),
+    };
+    if start > 0 {
+        resuming(&name.to_string_lossy(), start, size);
+    }
     let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create(true).truncate(start == 0);
     #[cfg(unix)]
     opts.mode(mode & 0o777);
     #[cfg(not(unix))]
     let _ = mode;
     let mut file = opts.open(&target).await.with_context(|| format!("cannot create {}", target.display()))?;
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+    }
     let mut recv = if compressed { decompress(recv) } else { recv };
-    let got = transfer(&mut recv, &mut file, size, &name.to_string_lossy()).await?;
-    if got != size {
-        bail!("transfer interrupted ({got} of {size} bytes)");
+    let got = transfer(&mut recv, &mut file, size - start, &name.to_string_lossy()).await?;
+    if got != size - start {
+        bail!("transfer interrupted ({} of {size} bytes; run the same copy again to go on)", start + got);
     }
     Ok(())
+}
+
+fn resuming(name: &str, offset: u64, size: u64) {
+    tracing::debug!("{name}: going on from byte {offset} of {size}");
+    if offset == size {
+        eprintln!("{name}: already complete");
+    } else if std::io::stderr().is_terminal() {
+        eprintln!("{name}: going on from {} of {}", human(offset), human(size));
+    }
 }
 
 /// `qsh cp -r` upload: sends the contents of `local` as a tar stream.

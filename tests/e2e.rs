@@ -310,6 +310,55 @@ fn copy_roundtrip() {
     assert!(stderr(&out).contains("does-not-exist"), "{}", stderr(&out));
 }
 
+/// A copy cut short goes on where it stopped when run again, both ways; a
+/// partial file with another beginning is copied whole.
+#[test]
+fn copy_goes_on_after_an_interruption() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let data = pseudo_random(3 * 1024 * 1024 + 7);
+    let local = c.home.path().join("data.bin");
+    std::fs::write(&local, &data).unwrap();
+    let remote_file = s.home.path().join("data.bin");
+    let remote = format!("{}:data.bin", dest());
+    let cp = |from: &str, to: &str| c.run(&["cp", "-v", "-p", &port, from, to]);
+
+    // Upload: a third is there already.
+    std::fs::write(&remote_file, &data[..1024 * 1024]).unwrap();
+    let out = cp(local.to_str().unwrap(), &remote);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("going on from byte 1048576"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&remote_file).unwrap(), data);
+    // Nothing left to send.
+    let out = cp(local.to_str().unwrap(), &remote);
+    assert!(stderr(&out).contains("already complete"), "{}", stderr(&out));
+    // Another beginning: copied whole.
+    std::fs::write(&remote_file, b"something else").unwrap();
+    let out = cp(local.to_str().unwrap(), &remote);
+    assert!(out.status.success() && !stderr(&out).contains("going on"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&remote_file).unwrap(), data);
+
+    // Download, the same three cases.
+    let back = c.home.path().join("back.bin");
+    std::fs::write(&back, &data[..2 * 1024 * 1024]).unwrap();
+    let out = cp(&remote, back.to_str().unwrap());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("going on from byte 2097152"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&back).unwrap(), data);
+    assert!(stderr(&cp(&remote, back.to_str().unwrap())).contains("already complete"));
+    let mut other = data.clone();
+    other[10] ^= 1;
+    std::fs::write(&back, &other[..1000]).unwrap();
+    let out = cp(&remote, back.to_str().unwrap());
+    assert!(out.status.success() && !stderr(&out).contains("going on"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(&back).unwrap(), data);
+    // A larger file here is replaced, not appended to.
+    std::fs::write(&back, [&data[..], b"tail"].concat()).unwrap();
+    assert!(cp(&remote, back.to_str().unwrap()).status.success());
+    assert_eq!(std::fs::read(&back).unwrap(), data);
+}
+
 /// Like scp: several sources into a directory (one that fails does not stop
 /// the others), and `~` on the remote side is the home directory.
 #[test]

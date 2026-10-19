@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -57,6 +57,13 @@ pub enum Reply {
     /// No key was accepted, but a password may be: answer with
     /// [`Auth::Response`] (the password) or give up with [`Auth::Done`].
     Password,
+    // --- protocol version 8 ---
+    /// Answer to `Request::UploadResume`: the target already has `have`
+    /// bytes, whose SHA-256 is `prefix` (empty when `have` is 0).
+    Partial { have: u64, prefix: Vec<u8> },
+    /// Answer to `Request::DownloadFrom`: the file's `size` and `mode`; the
+    /// bytes from `start` on follow.
+    FileFrom { size: u64, mode: u32, start: u64 },
 }
 
 /// Client messages on the hello stream while logging in (protocol version 4).
@@ -163,6 +170,15 @@ pub enum Request {
     /// `unit` picks its number. After `Reply::Ok`, packets follow both
     /// ways, each with a 4-byte big-endian length in front.
     Tunnel { ethernet: bool, unit: Option<u32> },
+    // --- protocol version 8 ---
+    /// An upload that may continue a partial file: answered with
+    /// `Reply::Partial` for what is there, then the client sends a
+    /// [`ResumeFrom`], and after `Reply::Ok` the bytes from there on.
+    UploadResume { path: String, name: String, size: u64, mode: u32 },
+    /// A download that continues a local partial file of `offset` bytes
+    /// whose SHA-256 is `prefix`: answered with `Reply::FileFrom`, and the
+    /// bytes from its `start` (`offset` if the beginnings match, else 0).
+    DownloadFrom { path: String, offset: u64, prefix: Vec<u8> },
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
@@ -174,6 +190,35 @@ pub enum Transfer {
     Download { path: String },
     UploadTree { path: String, name: String },
     DownloadTree { path: String },
+    UploadResume { path: String, name: String, size: u64, mode: u32 },
+    DownloadFrom { path: String, offset: u64, prefix: Vec<u8> },
+}
+
+/// The client's answer to `Reply::Partial`: where the upload goes on, the
+/// partial file's size if its beginning matches, else 0.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct ResumeFrom {
+    pub offset: u64,
+}
+
+/// Lower-case hex, for hashes passed on a helper's command line.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
+}
+
+/// SHA-256 of the first `n` bytes of `r` (fewer if it ends before).
+pub fn prefix_sha256(r: impl std::io::Read, n: u64) -> std::io::Result<Vec<u8>> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut r.take(n), &mut hasher)?;
+    Ok(hasher.finalize().to_vec())
 }
 
 impl From<Transfer> for Request {
@@ -183,6 +228,8 @@ impl From<Transfer> for Request {
             Transfer::Download { path } => Request::Download { path },
             Transfer::UploadTree { path, name } => Request::UploadTree { path, name },
             Transfer::DownloadTree { path } => Request::DownloadTree { path },
+            Transfer::UploadResume { path, name, size, mode } => Request::UploadResume { path, name, size, mode },
+            Transfer::DownloadFrom { path, offset, prefix } => Request::DownloadFrom { path, offset, prefix },
         }
     }
 }

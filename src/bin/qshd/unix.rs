@@ -72,6 +72,10 @@ enum Cmd {
     #[command(hide = true)]
     InternalSend { path: String },
     #[command(hide = true)]
+    InternalRecvResume { path: String, name: String, size: u64, mode: String },
+    #[command(hide = true)]
+    InternalSendFrom { path: String, offset: String, prefix: String },
+    #[command(hide = true)]
     InternalPairTake,
     #[command(hide = true)]
     InternalAddKey { line: String },
@@ -169,6 +173,8 @@ pub fn main() {
     let result = match cli.cmd {
         Some(Cmd::InternalRecv { path, name, size, mode }) => helpers::recv(&path, &name, size, &mode),
         Some(Cmd::InternalSend { path }) => helpers::send(&path),
+        Some(Cmd::InternalRecvResume { path, name, size, mode }) => helpers::recv_resume(&path, &name, size, &mode),
+        Some(Cmd::InternalSendFrom { path, offset, prefix }) => helpers::send_from(&path, &offset, &prefix),
         Some(Cmd::InternalPairTake) => helpers::pair_take(),
         Some(Cmd::InternalAddKey { line }) => helpers::add_key(&line),
         Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),

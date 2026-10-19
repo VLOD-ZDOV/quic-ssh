@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout};
 
 use super::users::User;
-use crate::proto::{write_msg, Reply};
+use crate::proto::{read_msg, write_msg, Reply, ResumeFrom};
 use crate::transport::{compress, decompress, RecvHalf, SendHalf};
 
 /// Size of the chunks a tree download is framed in (see [`crate::tree::Unchunk`]).
@@ -114,6 +114,72 @@ pub async fn upload(
     };
     write_msg(&mut send, &reply).await?;
     send.shutdown().await?;
+    Ok(())
+}
+
+/// An upload that may continue a partial target (`Request::UploadResume`).
+pub async fn upload_resume(
+    mut send: SendHalf,
+    mut recv: RecvHalf,
+    user: &User,
+    path: &str,
+    name: &str,
+    (size, mode): (u64, u32),
+    compressed: bool,
+) -> Result<()> {
+    let args = ["internal-recv-resume", path, name, &size.to_string(), &format!("{:o}", mode & 0o777)];
+    let Some((mut child, mut out)) = start(&mut send, user, &args, true).await? else { return Ok(()) };
+    // What the target holds: its size (u64 BE) and SHA-256.
+    let mut header = [0u8; 40];
+    if out.read_exact(&mut header).await.is_err() {
+        let err = stderr_text(&mut child).await;
+        return write_msg(&mut send, &Reply::Err(err)).await;
+    }
+    let have = u64::from_be_bytes(header[..8].try_into().unwrap());
+    let prefix = if have > 0 { header[8..].to_vec() } else { Vec::new() };
+    write_msg(&mut send, &Reply::Partial { have, prefix }).await?;
+    let ResumeFrom { offset } = read_msg(&mut recv).await?;
+    if offset != 0 && offset != have {
+        return write_msg(&mut send, &Reply::Err(format!("cannot go on at byte {offset}"))).await;
+    }
+    let mut stdin = child.stdin.take().expect("piped");
+    stdin.write_all(&offset.to_be_bytes()).await?;
+    write_msg(&mut send, &Reply::Ok).await?;
+    let mut recv = if compressed { decompress(recv) } else { recv };
+    let left = size - offset;
+    let copied = tokio::io::copy(&mut (&mut recv).take(left), &mut stdin).await;
+    drop(stdin);
+    let status = child.wait().await?;
+    let reply = match copied {
+        Ok(n) if n == left && status.success() => Reply::Ok,
+        Ok(n) if n != left => Reply::Err(format!("transfer interrupted after {} of {size} bytes", offset + n)),
+        _ => Reply::Err(failure(&mut child, status).await),
+    };
+    write_msg(&mut send, &reply).await?;
+    send.shutdown().await?;
+    Ok(())
+}
+
+/// A download that continues the client's partial file (`Request::DownloadFrom`).
+pub async fn download_from(mut send: SendHalf, user: &User, path: &str, (offset, prefix): (u64, &[u8]), compressed: bool) -> Result<()> {
+    let args = ["internal-send-from", path, &offset.to_string(), &crate::proto::hex(prefix)];
+    let Some((mut child, mut out)) = start(&mut send, user, &args, false).await? else {
+        return Ok(());
+    };
+    // Header from the helper: size (u64 BE), mode (u32 BE), start (u64 BE).
+    let mut header = [0u8; 20];
+    if out.read_exact(&mut header).await.is_err() {
+        let err = stderr_text(&mut child).await;
+        return write_msg(&mut send, &Reply::Err(err)).await;
+    }
+    let size = u64::from_be_bytes(header[..8].try_into().unwrap());
+    let mode = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let start = u64::from_be_bytes(header[12..].try_into().unwrap());
+    write_msg(&mut send, &Reply::FileFrom { size, mode, start }).await?;
+    let mut send = if compressed { compress(send) } else { send };
+    tokio::io::copy(&mut out.take(size.saturating_sub(start)), &mut send).await?;
+    send.shutdown().await?;
+    let _ = child.wait().await;
     Ok(())
 }
 

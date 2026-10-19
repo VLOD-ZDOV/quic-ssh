@@ -60,6 +60,73 @@ pub fn recv(path: &str, name: &str, size: u64, mode: &str) -> Result<()> {
     Ok(())
 }
 
+/// Like [`recv`], but keeps what a target no larger than `size` already
+/// holds if the client has the same beginning: writes "ok", the target's
+/// size (8 bytes) and the SHA-256 of it (32 bytes, zeros when empty), reads
+/// where to go on (8 bytes: that size or 0) and then the rest.
+pub fn recv_resume(path: &str, name: &str, size: u64, mode: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mode = u32::from_str_radix(mode, 8).context("invalid mode")? & 0o777;
+    let target = upload_target(path, name)?;
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(mode)
+        .open(&target)
+        .with_context(|| format!("{}", target.display()))?;
+    let meta = f.metadata()?;
+    let have = if meta.is_file() && meta.len() <= size { meta.len() } else { 0 };
+    let prefix = if have > 0 { crate::proto::prefix_sha256(&mut f, have)? } else { vec![0; 32] };
+    let mut out = io::stdout();
+    writeln!(out, "ok")?;
+    out.write_all(&have.to_be_bytes())?;
+    out.write_all(&prefix)?;
+    out.flush()?;
+    let mut stdin = io::stdin().lock();
+    let mut offset = [0u8; 8];
+    stdin.read_exact(&mut offset)?;
+    let offset = u64::from_be_bytes(offset);
+    if offset != 0 && offset != have {
+        bail!("{}: cannot go on at byte {offset}", target.display());
+    }
+    // Not for a device or FIFO, which cannot be cut (as `recv`'s truncate).
+    if meta.is_file() {
+        f.set_len(offset)?;
+        f.seek(SeekFrom::Start(offset))?;
+    }
+    let left = size - offset;
+    let n = pump(stdin.take(left), &mut f).with_context(|| format!("{}", target.display()))?;
+    if n != left {
+        bail!("{}: transfer interrupted ({} of {size} bytes)", target.display(), offset + n);
+    }
+    Ok(())
+}
+
+/// Like [`send`], from byte `offset` on if the file's first `offset` bytes
+/// have the SHA-256 `prefix` (hex), else from the start; the header gets the
+/// start (8 bytes) after size and mode.
+pub fn send_from(path: &str, offset: &str, prefix: &str) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let offset: u64 = offset.parse().context("invalid offset")?;
+    let mut f = fs::File::open(path).with_context(|| path.to_string())?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        bail!("{path}: not a regular file");
+    }
+    let same = offset > 0 && offset <= meta.len() && Some(crate::proto::prefix_sha256(&mut f, offset)?) == crate::proto::unhex(prefix);
+    let start = if same { offset } else { 0 };
+    f.seek(SeekFrom::Start(start))?;
+    let mut out = io::stdout().lock();
+    writeln!(out, "ok")?;
+    out.write_all(&meta.len().to_be_bytes())?;
+    out.write_all(&(meta.mode() & 0o777).to_be_bytes())?;
+    out.write_all(&start.to_be_bytes())?;
+    pump(Read::take(&mut f, meta.len() - start), &mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
 /// Writes "ok", a 12-byte header (size, mode) and then the file contents to stdout.
 pub fn send(path: &str) -> Result<()> {
     let mut f = fs::File::open(path).with_context(|| path.to_string())?;
@@ -364,6 +431,8 @@ pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
         }
         ("internal-recv", [path, name, size, mode]) => recv(path, name, size.parse()?, mode),
         ("internal-send", [path]) => send(path),
+        ("internal-recv-resume", [path, name, size, mode]) => recv_resume(path, name, size.parse()?, mode),
+        ("internal-send-from", [path, offset, prefix]) => send_from(path, offset, prefix),
         ("internal-untar", [path, name]) => untar(path, name),
         ("internal-tar", [path]) => tar(path),
         ("internal-connect-unix", [path]) => connect_unix(path),
