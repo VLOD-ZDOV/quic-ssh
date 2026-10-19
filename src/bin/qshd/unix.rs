@@ -343,8 +343,15 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = server::bind(&cfg, &host).await?;
+        let who = match nix::unistd::geteuid() {
+            uid if uid.is_root() => "any user can log in".to_string(),
+            uid => match nix::unistd::User::from_uid(uid) {
+                Ok(Some(u)) => format!("only {} can log in (qshd is not root)", u.name),
+                _ => "only this user can log in (qshd is not root)".to_string(),
+            },
+        };
         tracing::info!(
-            "listening on {} ({}), host key {}",
+            "listening on {} ({}; the firewall must let it in), host key {}; {who}",
             listener.local_addr()?,
             listener.transports(),
             host.public().fingerprint()
