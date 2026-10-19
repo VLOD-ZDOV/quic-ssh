@@ -295,6 +295,8 @@ enum InputMode {
     /// A command for every host shown.
     RunAll(String),
     Forwards(Box<forwards::Panel>),
+    /// The list of keys (`?`).
+    Help,
 }
 
 /// What the event loop must do after an input event.
@@ -617,6 +619,10 @@ impl App {
                 }
                 then.map_or(Action::None, |flags| Action::ConnectWith(panel.alias, flags))
             }
+            InputMode::Help => {
+                self.mode = InputMode::Normal;
+                Action::None
+            }
             InputMode::ConfirmDelete(name) => {
                 let name = name.clone();
                 self.mode = InputMode::Normal;
@@ -723,6 +729,10 @@ impl App {
                 Action::None
             }
             KeyCode::Char('r') => Action::Refresh,
+            KeyCode::Char('?') => {
+                self.mode = InputMode::Help;
+                Action::None
+            }
             KeyCode::Char('x') if self.view == View::Hosts && !self.visible().is_empty() => {
                 self.mode = InputMode::RunAll(String::new());
                 Action::None
@@ -754,6 +764,7 @@ impl App {
         match &self.mode {
             InputMode::Form(form) => draw_form(f, area, form),
             InputMode::Forwards(panel) => panel.draw(f, area),
+            InputMode::Help => draw_help(f, area),
             _ => {}
         }
     }
@@ -948,6 +959,7 @@ impl App {
             InputMode::Quick(dest) => format!("connect once to user@host[:port]: {dest}▏  (⏎ go, Esc cancel)"),
             InputMode::Form(_) => "Tab next field · ←→ change · ⏎ save · Esc cancel".to_string(),
             InputMode::Forwards(_) => "port forwards: pick what each one does".to_string(),
+            InputMode::Help => "any key closes".to_string(),
             InputMode::ConfirmDelete(name) => format!("delete the saved connection {name}? y/n"),
             InputMode::RunAll(cmd) => {
                 let n = self.visible().len();
@@ -955,14 +967,50 @@ impl App {
                 format!("run on {which}: {cmd}▏  (⏎ run, Esc cancel; / filters first)")
             }
             InputMode::Normal if wide => {
-                "⏎ connect · c once · n new · e edit · d delete · f forwards · Tab history · s speed · p pair · / find · x run on all · r refresh · q quit"
+                "⏎ connect · c once · n new · e edit · d delete · f forwards · Tab history · s speed · p pair · / find · x run on all · r refresh · ? keys · q quit"
                     .to_string()
             }
-            InputMode::Normal => "⏎ go · c once · n new · e edit · Tab history · q quit".to_string(),
+            InputMode::Normal => "⏎ go · c once · n new · e edit · ? more keys · q quit".to_string(),
         };
         let lines = vec![Line::styled(self.status.clone(), Style::new().fg(Color::Yellow)), Line::styled(hint, Style::new().fg(Color::DarkGray))];
         f.render_widget(Paragraph::new(lines), area);
     }
+}
+
+/// Every key of the menu, for narrow screens where the footer cannot list them.
+const HELP: [(&str, &str); 18] = [
+    ("⏎ → l", "connect (tap a selected row too)"),
+    ("↑↓ j k", "move"),
+    ("Tab h", "hosts / history"),
+    ("c", "connect once to user@host[:port]"),
+    ("n", "new connection"),
+    ("e", "edit (history: a saves it)"),
+    ("d", "delete a saved connection / history entry"),
+    ("f", "port forwards"),
+    ("s", "speed test"),
+    ("p", "pair with a code from `qshd pair`"),
+    ("/", "filter (#group: one group)"),
+    ("x", "run a command on the hosts shown"),
+    ("r", "check all hosts again"),
+    ("Home End", "first / last"),
+    ("Esc", "clear the filter, close, quit"),
+    ("q", "quit"),
+    ("?", "this list"),
+    ("Ctrl-C", "quit"),
+];
+
+/// The list of keys as a centered popup.
+fn draw_help(f: &mut Frame, area: Rect) {
+    let lines: Vec<Line> = HELP
+        .iter()
+        .map(|(keys, what)| Line::from(vec![Span::styled(format!(" {keys:>9}  "), Style::new().fg(Color::Cyan)), Span::raw(*what)]))
+        .collect();
+    let width = area.width.min(58);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+    let block = Block::bordered().border_type(BorderType::Rounded).title(" keys ".bold()).border_style(Style::new().fg(Color::Cyan));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// A host's forwards from the configs, as ssh's flags.
@@ -1766,6 +1814,17 @@ mod tests {
         let (saved, prefs) = form.result().unwrap();
         assert_eq!(saved, Saved { name: "box".into(), host: "192.0.2.5".into(), user: Some("admin".into()), port: Some(2222), identity: None, options: vec!["LocalForward 8080 localhost:80".into(), "ForwardAgent yes".into()] });
         assert_eq!(prefs, Prefs { transport: "quic".into(), ssh_fallback: false });
+    }
+
+    #[test]
+    fn help_lists_every_key() {
+        let mut app = sample();
+        assert!(render(&mut app, 60, 30).contains("? more keys"));
+        app.on_event(key(KeyCode::Char('?')));
+        let screen = render(&mut app, 60, 30);
+        assert!(screen.contains("port forwards") && screen.contains("speed test"), "{screen}");
+        app.on_event(key(KeyCode::Char('z')));
+        assert!(matches!(app.mode, InputMode::Normal));
     }
 
     #[test]
