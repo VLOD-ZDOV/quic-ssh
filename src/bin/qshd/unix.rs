@@ -51,6 +51,13 @@ enum Cmd {
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
     },
+    /// List the keys that may log in as the current user through qsh
+    /// (~/.config/qsh/authorized_keys, where `qsh pair` adds them), or remove one
+    Keys {
+        /// Remove this key: its number in the list or its fingerprint
+        #[arg(long, value_name = "N|SHA256:...")]
+        remove: Option<String>,
+    },
     /// Set up one-time codes (TOTP) as a second factor for the current user
     Totp {
         /// Replace an existing secret
@@ -175,6 +182,7 @@ pub fn main() {
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair { qr, host }) => pair(cli.config, qr, host),
         Some(Cmd::Totp { force, disable }) => totp(force, disable),
+        Some(Cmd::Keys { remove }) => keys(remove),
         Some(Cmd::Serve { listen }) => serve(cli.config, listen),
         None => serve(cli.config, None),
     };
@@ -263,6 +271,62 @@ fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
         println!("\nOr scan this and paste the text into a terminal:\n");
         print!("{}", qsh::totp::qr_text(&command)?);
     }
+    Ok(())
+}
+
+/// `qshd keys`: the keys in qsh's own authorized_keys, read as logins read
+/// them (options, any key type, `cert-authority`), so every key that can
+/// log in is listed and can be removed.
+fn keys(remove: Option<String>) -> Result<()> {
+    use ssh_key::HashAlg;
+    let path = qsh_dir(&home_dir()?).join("authorized_keys");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
+    };
+    let fingerprint = |k: &ssh_key::public::KeyData| ssh_key::PublicKey::from(k.clone()).fingerprint(HashAlg::Sha256).to_string();
+    let lines: Vec<(usize, qsh::authkeys::AuthorizedKey)> =
+        text.lines().enumerate().filter_map(|(i, l)| qsh::authkeys::parse_line(l).ok().flatten().map(|e| (i, e))).collect();
+    // One entry per key: a key on several lines is one key to remove.
+    let mut keys: Vec<&ssh_key::public::KeyData> = Vec::new();
+    for (_, e) in &lines {
+        if !keys.contains(&&e.key) {
+            keys.push(&e.key);
+        }
+    }
+    let Some(which) = remove else {
+        if keys.is_empty() {
+            println!("No keys in {} yet (`qshd pair` adds one).", path.display());
+            return Ok(());
+        }
+        for (n, key) in keys.iter().enumerate() {
+            let mine: Vec<&(usize, qsh::authkeys::AuthorizedKey)> = lines.iter().filter(|(_, e)| &e.key == *key).collect();
+            let mut notes = Vec::new();
+            if mine.iter().any(|(_, e)| e.cert_authority) {
+                notes.push("cert-authority");
+            }
+            if mine.len() > 1 {
+                notes.push("on several lines");
+            }
+            // The words after the key's type and data (shown only).
+            let words: Vec<&str> = text.lines().nth(mine[0].0).unwrap_or("").split_whitespace().collect();
+            let comment = words.iter().position(|w| *w == key.algorithm().as_str()).and_then(|i| words.get(i + 2..)).map(|r| r.join(" ")).unwrap_or_default();
+            let notes = if notes.is_empty() { String::new() } else { format!("  [{}]", notes.join(", ")) };
+            println!("{:>3}  {}  {}  {comment}{notes}", n + 1, fingerprint(key), key.algorithm());
+        }
+        println!("Remove one with: qshd keys --remove N");
+        println!("(Keys in ~/.ssh/authorized_keys are not listed: qshd reads that file only with use_ssh_authorized_keys.)");
+        return Ok(());
+    };
+    let by_number = which.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|n| keys.get(n));
+    let pick = by_number.or_else(|| keys.iter().find(|k| { let f = fingerprint(k); f == which || f.strip_prefix("SHA256:") == Some(which.as_str()) }));
+    let Some(&key) = pick else { anyhow::bail!("no key {which:?} in {} (see `qshd keys`)", path.display()) };
+    let gone: Vec<usize> = lines.iter().filter(|(_, e)| &e.key == key).map(|(i, _)| *i).collect();
+    let kept: String = text.lines().enumerate().filter(|(i, _)| !gone.contains(i)).map(|(_, l)| format!("{l}\n")).collect();
+    qsh::platform::replace_file(&path, kept.as_bytes()).with_context(|| format!("cannot write {}", path.display()))?;
+    let lines_note = if gone.len() > 1 { format!(" ({} lines)", gone.len()) } else { String::new() };
+    println!("Removed {}{lines_note}. Sessions already open with it go on until they end.", fingerprint(key));
     Ok(())
 }
 

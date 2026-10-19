@@ -493,6 +493,29 @@ fn wrong_pair_code_is_rejected_and_burned() {
 }
 
 #[test]
+fn removed_key_cannot_log_in() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let qshd = |args: &[&str]| Command::new(QSHD).args(args).env("HOME", s.home.path()).output().unwrap();
+    let list = stdout(&qshd(&["keys"]));
+    assert!(list.contains("  1  SHA256:") && list.contains("qsh-paired"), "{list}");
+    assert!(!qshd(&["keys", "--remove", "2"]).status.success());
+    let out = qshd(&["keys", "--remove", "1"]);
+    assert!(stdout(&out).contains("Removed SHA256:"), "{}", stderr(&out));
+    assert!(stdout(&qshd(&["keys"])).contains("No keys"));
+    let out = exec(&c, &s, "quic", "echo should-not-run");
+    assert!(!out.status.success() && !stdout(&out).contains("should-not-run"));
+    // Keys with options, or on several lines, are listed and removed as logins read them.
+    let line = std::fs::read_to_string(c.home.path().join(".config/qsh/id_ed25519.pub")).unwrap();
+    std::fs::write(s.authorized_keys(), format!("restrict {line}\nfrom=\"127.0.0.1\" {line}")).unwrap();
+    let list = stdout(&qshd(&["keys"]));
+    assert!(list.contains("  1  SHA256:") && list.contains("on several lines") && !list.contains("  2  "), "{list}");
+    assert!(exec(&c, &s, "quic", "echo in").status.success());
+    assert!(stdout(&qshd(&["keys", "--remove", "1"])).contains("(2 lines)"));
+    assert!(!exec(&c, &s, "quic", "echo in").status.success());
+}
+
+#[test]
 fn changed_host_key_is_refused() {
     let s = Server::start();
     let c = Client::paired(&s);

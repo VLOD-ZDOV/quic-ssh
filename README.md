@@ -500,6 +500,8 @@ A line with any other option is **not used at all**: a restriction qsh cannot en
 
 **Revoking keys.** `revoked_keys` names a file with public keys (one per line) or a KRL made with `ssh-keygen -k`, which can also revoke certificates by serial number or key ID, and whole CAs. It is read at every login, so changes apply at once. If the file is set but cannot be read, no key is accepted.
 
+**Paired keys.** `qshd keys`, as the user on the server, lists the keys that may log in through qsh (those `qsh pair` added), numbered; `qshd keys --remove N` (or a fingerprint) removes one, for a lost or retired device; a key on several lines, or with options, is removed from all of them. Sessions already open with it go on until they end. Keys in `~/.ssh/authorized_keys` are not part of this list (qshd reads them only with `use_ssh_authorized_keys`).
+
 **One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once, also across several qshd of the same user (another port, a user-mode qshd next to the system one). `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again. Right after qshd starts, codes that the previous process might have accepted are refused (up to a minute and a half), so a code seen before a restart cannot be replayed.
 
 Logs go to stderr (journald). Set the level with `QSHD_LOG`, for example `QSHD_LOG=qsh=debug`.
