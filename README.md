@@ -338,6 +338,7 @@ The session stays encrypted end to end: the public host only passes the bytes on
 - **History:** **`Tab`** shows the history with the result of each connection. **⏎** connects again, **`a`** saves an entry as a connection, **`d`** removes it.
 - **Groups:** the **`e`** form has a *groups* field (e.g. `web prod`), for any host. Groups show as `#web` tags. **`/#web`** shows exactly that group (plain `/web` matches names, addresses and groups containing "web"), and **`x`** runs one command on every host shown (`qsh multi`; without a filter, on all of them). They are kept in `~/.config/qsh/groups`.
 - **Speed test:** **`s`** runs it with a speedometer: latency (5 pings), then 5 s download and 5 s upload, with a live needle and graph.
+- **Port forwards:** **`f`** lists the host's forwards. **`a`** adds one by picking what it does (open a server's port here, share a port of this machine with the server, or a SOCKS proxy) and typing the ports; **`d`** removes one; **`⏎`** connects with them and **`t`** opens just the tunnel, without a shell. A saved connection keeps its forwards; for other hosts, added ones are for the next connection only.
 - **Other keys:** **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`q`** quits.
 - **Screens:** the layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
 

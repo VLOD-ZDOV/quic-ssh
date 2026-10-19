@@ -25,6 +25,8 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
+mod forwards;
+
 use super::groups::{self, Groups};
 use super::saved::{self, Saved};
 use super::ui_state::{ago, now, CachedProbe, Prefs, UiState};
@@ -292,6 +294,7 @@ enum InputMode {
     ConfirmDelete(String),
     /// A command for every host shown.
     RunAll(String),
+    Forwards(Box<forwards::Panel>),
 }
 
 /// What the event loop must do after an input event.
@@ -301,6 +304,10 @@ enum Action {
     Quit,
     /// Connect to an alias or `user@host[:port]`.
     Connect(String),
+    /// The same with more flags (forwards from the panel).
+    ConnectWith(String, Vec<String>),
+    /// Store a saved connection's forwards, then maybe connect with these flags.
+    SaveForwards { alias: String, lines: Vec<String>, then: Option<Vec<String>> },
     Speed(usize),
     Pair(usize, String),
     Refresh,
@@ -583,6 +590,33 @@ impl App {
                 }
                 Action::None
             }
+            InputMode::Forwards(panel) => {
+                let outcome = panel.on_key(k);
+                if outcome == forwards::Outcome::Stay {
+                    return Action::None;
+                }
+                let InputMode::Forwards(panel) = std::mem::replace(&mut self.mode, InputMode::Normal) else { unreachable!() };
+                let then = match outcome {
+                    forwards::Outcome::Connect { tunnel } => {
+                        let mut flags = panel.extra_flags();
+                        if tunnel {
+                            flags.push("-N".into());
+                        }
+                        Some(flags)
+                    }
+                    _ => None,
+                };
+                if panel.saved && panel.changed {
+                    return match panel.config_lines() {
+                        Ok(lines) => Action::SaveForwards { alias: panel.alias, lines, then },
+                        Err(e) => {
+                            self.status = format!("cannot save the forwards: {e:#}");
+                            Action::None
+                        }
+                    };
+                }
+                then.map_or(Action::None, |flags| Action::ConnectWith(panel.alias, flags))
+            }
             InputMode::ConfirmDelete(name) => {
                 let name = name.clone();
                 self.mode = InputMode::Normal;
@@ -671,6 +705,13 @@ impl App {
                 Action::None
             }
             KeyCode::Char('s') => self.current_host().map_or(Action::None, Action::Speed),
+            KeyCode::Char('f') => {
+                if let Some(i) = self.current_host() {
+                    let h = &self.hosts[i];
+                    self.mode = InputMode::Forwards(Box::new(forwards::Panel::new(&h.alias, h.source == Source::Saved, h.target.as_ref())));
+                }
+                Action::None
+            }
             KeyCode::Char('p') => {
                 if self.current_host().is_some() {
                     self.mode = InputMode::PairCode(String::new());
@@ -710,8 +751,10 @@ impl App {
             View::History => self.draw_history_details(f, detail_area),
         }
         self.draw_footer(f, footer, wide);
-        if let InputMode::Form(form) = &self.mode {
-            draw_form(f, area, form);
+        match &self.mode {
+            InputMode::Form(form) => draw_form(f, area, form),
+            InputMode::Forwards(panel) => panel.draw(f, area),
+            _ => {}
         }
     }
 
@@ -872,7 +915,7 @@ impl App {
             }
             None => {
                 lines.push(Line::raw(""));
-                lines.push(Line::styled("⏎ connect   s speed test   p pair with a code", Style::new().fg(Color::DarkGray)));
+                lines.push(Line::styled("⏎ connect   f port forwards   s speed test   p pair with a code", Style::new().fg(Color::DarkGray)));
                 f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
             }
         }
@@ -904,6 +947,7 @@ impl App {
             InputMode::PairCode(code) => format!("pairing code from `qshd pair`: {code}▏  (⏎ pair, Esc cancel)"),
             InputMode::Quick(dest) => format!("connect once to user@host[:port]: {dest}▏  (⏎ go, Esc cancel)"),
             InputMode::Form(_) => "Tab next field · ←→ change · ⏎ save · Esc cancel".to_string(),
+            InputMode::Forwards(_) => "port forwards: pick what each one does".to_string(),
             InputMode::ConfirmDelete(name) => format!("delete the saved connection {name}? y/n"),
             InputMode::RunAll(cmd) => {
                 let n = self.visible().len();
@@ -911,7 +955,7 @@ impl App {
                 format!("run on {which}: {cmd}▏  (⏎ run, Esc cancel; / filters first)")
             }
             InputMode::Normal if wide => {
-                "⏎ connect · c once · n new · e edit · d delete · Tab history · s speed · p pair · / find · x run on all · r refresh · q quit"
+                "⏎ connect · c once · n new · e edit · d delete · f forwards · Tab history · s speed · p pair · / find · x run on all · r refresh · q quit"
                     .to_string()
             }
             InputMode::Normal => "⏎ go · c once · n new · e edit · Tab history · q quit".to_string(),
@@ -1354,6 +1398,20 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
     Ok(name)
 }
 
+/// Replaces the forwards of a saved connection, keeping its other options.
+fn save_forwards(name: &str, lines: &[String]) -> Result<()> {
+    let home = home_dir()?;
+    let mut all = saved::load(&home);
+    let entry = all.iter_mut().find(|s| s.name == name).ok_or_else(|| anyhow::anyhow!("{name} is not saved here"))?;
+    let forward = |o: &String| {
+        let key = o.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        matches!(key.as_str(), "localforward" | "remoteforward" | "dynamicforward")
+    };
+    entry.options.retain(|o| !forward(o));
+    entry.options.extend(lines.iter().cloned());
+    saved::save(&home, &all)
+}
+
 fn delete_saved(app: &mut App, name: &str) -> Result<()> {
     let home = home_dir()?;
     let mut all = saved::load(&home);
@@ -1422,8 +1480,24 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
             Err(e) => break Err(e.into()),
         };
         dirty |= app.state.history.len() != history_len;
+        let action = match action {
+            Action::Connect(dest) => Action::ConnectWith(dest, Vec::new()),
+            Action::SaveForwards { alias, lines, then } => match save_forwards(&alias, &lines) {
+                Ok(()) => {
+                    app.status = format!("saved the forwards of {alias}");
+                    reload(&mut app, Some(&alias), &tx, &probe_key);
+                    then.map_or(Action::None, |flags| Action::ConnectWith(alias, flags))
+                }
+                Err(e) => {
+                    app.status = format!("cannot save the forwards: {e:#}");
+                    Action::None
+                }
+            },
+            a => a,
+        };
         match action {
-            Action::None => {}
+            // Turned into the others above.
+            Action::None | Action::Connect(_) | Action::SaveForwards { .. } => {}
             Action::Quit => break Ok(0),
             Action::Refresh => {
                 app.hosts = load_hosts();
@@ -1446,10 +1520,14 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                 }
                 Err(e) => app.status = format!("cannot delete: {e:#}"),
             },
-            Action::Connect(dest) => {
+            Action::ConnectWith(dest, extra) => {
                 leave();
                 let prefs = app.state.prefs(&dest);
-                let status = run_child(&session_args(&opts, &prefs, &dest)).await;
+                let mut args = session_args(&opts, &prefs, &dest);
+                // Before `-- dest`.
+                let at = args.len() - 2;
+                args.splice(at..at, extra);
+                let status = run_child(&args).await;
                 // 255 is how ssh and qsh report a connection that failed.
                 let ok = matches!(&status, Ok(s) if s.code() != Some(255));
                 if !ok {
@@ -1688,6 +1766,39 @@ mod tests {
         let (saved, prefs) = form.result().unwrap();
         assert_eq!(saved, Saved { name: "box".into(), host: "192.0.2.5".into(), user: Some("admin".into()), port: Some(2222), identity: None, options: vec!["LocalForward 8080 localhost:80".into(), "ForwardAgent yes".into()] });
         assert_eq!(prefs, Prefs { transport: "quic".into(), ssh_fallback: false });
+    }
+
+    #[test]
+    fn forwards_panel() {
+        let mut app = sample();
+        app.on_event(key(KeyCode::Char('f')));
+        assert!(render(&mut app, 100, 30).contains("no forwards yet"));
+        app.on_event(key(KeyCode::Char('a')));
+        typing(&mut app, "8080");
+        app.on_event(key(KeyCode::Enter));
+        // No destination: the same port on the server.
+        app.on_event(key(KeyCode::Enter));
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("here 8080  →  localhost:8080"), "{screen}");
+        // A SOCKS proxy: the kind is picked, not typed.
+        app.on_event(key(KeyCode::Char('a')));
+        app.on_event(key(KeyCode::BackTab));
+        app.on_event(key(KeyCode::Left));
+        app.on_event(key(KeyCode::Tab));
+        typing(&mut app, "1080");
+        app.on_event(key(KeyCode::Enter));
+        let flags = ["-L", "8080:localhost:8080", "-D", "1080", "-N"].map(String::from).to_vec();
+        assert_eq!(app.on_event(key(KeyCode::Char('t'))), Action::ConnectWith("alpha".into(), flags));
+        // A saved connection keeps its forwards.
+        app.selected = 1;
+        app.on_event(key(KeyCode::Char('f')));
+        app.on_event(key(KeyCode::Char('a')));
+        typing(&mut app, "5432");
+        app.on_event(key(KeyCode::Tab));
+        typing(&mut app, "db:5432");
+        app.on_event(key(KeyCode::Enter));
+        let lines = vec!["LocalForward 5432 db:5432".to_string()];
+        assert_eq!(app.on_event(key(KeyCode::Esc)), Action::SaveForwards { alias: "beta".into(), lines, then: None });
     }
 
     #[test]
