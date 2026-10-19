@@ -129,6 +129,9 @@ enum Cmd {
     Doctor {
         /// [user@]host[:port] or an alias
         destination: Option<String>,
+        /// The checks as JSON, for scripts
+        #[arg(long)]
+        json: bool,
     },
     /// Run a command on several hosts at once: qsh multi [-g GROUP] [HOST...] -- COMMAND
     Multi {
@@ -138,6 +141,9 @@ enum Cmd {
         /// How many hosts at a time
         #[arg(short = 'P', long, default_value_t = 16)]
         parallel: usize,
+        /// One JSON array at the end (host, exit code, output) instead of prefixed lines
+        #[arg(long)]
+        json: bool,
         /// [user@]host[:port] or an alias
         hosts: Vec<String>,
         /// The command (after --)
@@ -610,12 +616,12 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Doctor { destination } => qsh::client::doctor::run(destination.as_deref(), cli.conn.port, &opts).await,
-        Cmd::Multi { groups, parallel, hosts, command } => {
+        Cmd::Doctor { destination, json } => qsh::client::doctor::run(destination.as_deref(), cli.conn.port, &opts, json).await,
+        Cmd::Multi { groups, parallel, json, hosts, command } => {
             use qsh::client::{groups as host_groups, multi};
             let all = if groups.is_empty() { Default::default() } else { host_groups::load(&home_dir()?)? };
             let dests = multi::destinations(&all, &groups, &hosts)?;
-            multi::run(&dests, &command, parallel, &cli.conn.as_args()).await
+            multi::run(&dests, &command, parallel, &cli.conn.as_args(), json).await
         }
         Cmd::Update { version } => update(version.as_deref()),
     }

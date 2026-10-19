@@ -356,7 +356,7 @@ db1  | 10:21:07 up 3 days,  load average: 1.02, 0.97, 0.90
 ok on all 3 hosts
 ```
 
-Hosts run in parallel (`-P 16` by default) with `BatchMode`, so nothing can stop to ask a question: use keys that need no passphrase prompt (or an agent) and hosts already in known_hosts (or `--accept-new-host`). The words after `--` are joined and run by the remote shell, as with ssh: `qsh multi -g web -- 'cd /srv && git pull'`. The exit code is 0 if the command succeeded everywhere, 1 if it failed somewhere, and 255 if qsh itself failed on a host (it could not connect or log in, or the command exited with 255).
+Hosts run in parallel (`-P 16` by default) with `BatchMode`, so nothing can stop to ask a question: use keys that need no passphrase prompt (or an agent) and hosts already in known_hosts (or `--accept-new-host`). The words after `--` are joined and run by the remote shell, as with ssh: `qsh multi -g web -- 'cd /srv && git pull'`. The exit code is 0 if the command succeeded everywhere, 1 if it failed somewhere, and 255 if qsh itself failed on a host (it could not connect or log in, or the command exited with 255). With `--json`, the output comes as one JSON array at the end (`host`, `exit`, `stdout` and `stderr` lines), for scripts; `qsh doctor --json` does the same for its checks.
 
 `qsh speed host` runs the same test in plain text:
 

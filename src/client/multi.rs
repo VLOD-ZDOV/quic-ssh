@@ -73,14 +73,26 @@ async fn pump<R: AsyncRead + Unpin>(r: R, i: usize, err: bool, tx: mpsc::Unbound
 /// Runs `command` on every host in `dests`, at most `parallel` at a time;
 /// `flags` go to each `qsh`. Returns 0 if it succeeded everywhere, 255 if a
 /// host could not be reached, else 1.
-pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &[String]) -> Result<i32> {
+/// `json`: one JSON array on stdout at the end (host, exit code, output)
+/// instead of prefixed lines as they come.
+pub async fn run(dests: &[String], command: &[String], parallel: usize, flags: &[String], json: bool) -> Result<i32> {
     let jobs: Vec<(String, Vec<String>)> = dests.iter().map(|d| (d.clone(), flags.to_vec())).collect();
-    run_each(&jobs, command, parallel).await
+    run_each(&jobs, command, parallel, json).await
+}
+
+/// One host's result, for `--json`.
+#[derive(serde::Serialize, Default)]
+struct HostResult {
+    host: String,
+    /// `null` when qsh was killed by a signal or could not start.
+    exit: Option<i32>,
+    stdout: Vec<String>,
+    stderr: Vec<String>,
 }
 
 /// Like [`run`], with flags of its own for each host (`qsh ui` passes each
 /// host's preferences).
-pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parallel: usize) -> Result<i32> {
+pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parallel: usize, json: bool) -> Result<i32> {
     let dests: Vec<String> = jobs.iter().map(|(d, _)| d.clone()).collect();
     let dests = dests.as_slice();
     if command.is_empty() {
@@ -88,7 +100,8 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
     }
     let exe = std::env::current_exe()?;
     let width = dests.iter().map(|d| d.chars().count()).max().unwrap_or(0);
-    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let color = !json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut results: Vec<HostResult> = dests.iter().map(|d| HostResult { host: d.clone(), ..Default::default() }).collect();
     // Bounded: tokio's semaphore panics above its maximum.
     let limit = Arc::new(Semaphore::new(parallel.clamp(1, 256)));
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -138,6 +151,13 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
         use std::io::Write;
         let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
         while let Some(line) = rx.recv().await {
+            if json {
+                match line {
+                    Line::Out(i, text) => results[i].stdout.push(text),
+                    Line::Err(i, text) => results[i].stderr.push(text),
+                }
+                continue;
+            }
             let written = match line {
                 Line::Out(i, text) => writeln!(out, "{}{text}", prefix(i)),
                 Line::Err(i, text) => writeln!(err, "{}{text}", prefix(i)),
@@ -153,6 +173,14 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
         ends.push(t.await.unwrap_or(End::NotStarted));
     }
     let failed: Vec<(usize, End)> = ends.iter().copied().enumerate().filter(|&(_, e)| e != End::Code(0)).collect();
+    let broken = |e: End| matches!(e, End::Code(255) | End::Signal | End::NotStarted);
+    if json {
+        for (r, e) in results.iter_mut().zip(&ends) {
+            r.exit = if let End::Code(c) = e { Some(*c) } else { None };
+        }
+        println!("{}", serde_json::to_string_pretty(&results)?);
+        return Ok(if failed.is_empty() { 0 } else if failed.iter().any(|&(_, e)| broken(e)) { 255 } else { 1 });
+    }
     if failed.is_empty() {
         if dests.len() > 1 {
             eprintln!("ok on all {} hosts", dests.len());
@@ -170,7 +198,6 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
         eprintln!("  {}: {what}", dests[i]);
     }
     // Not the command failing, but qsh: the host may not be reachable.
-    let broken = |e: End| matches!(e, End::Code(255) | End::Signal | End::NotStarted);
     if let Some(&(i, _)) = failed.iter().find(|&&(_, e)| broken(e)) {
         eprintln!("`qsh doctor {}` shows why a host cannot be reached", dests[i]);
     }

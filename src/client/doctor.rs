@@ -23,25 +23,52 @@ enum Level {
 struct Report {
     color: bool,
     failed: bool,
+    /// `--json`: the checks are collected here and printed at the end.
+    json: Option<Vec<Check>>,
+    section: String,
+}
+
+/// One check, for `--json`.
+#[derive(serde::Serialize)]
+struct Check {
+    section: String,
+    status: &'static str,
+    check: String,
+    detail: String,
+    hints: Vec<String>,
 }
 
 impl Report {
+    fn section(&mut self, title: String) {
+        if self.json.is_none() {
+            println!("{title}");
+        }
+        self.section = title;
+    }
+
     fn line(&mut self, level: Level, what: &str, detail: impl AsRef<str>) {
-        let (mark, code) = match level {
-            Level::Ok => ("✓", "32"),
-            Level::Note => ("!", "33"),
-            Level::Bad => ("✗", "31"),
+        let (mark, code, status) = match level {
+            Level::Ok => ("✓", "32", "ok"),
+            Level::Note => ("!", "33", "note"),
+            Level::Bad => ("✗", "31", "bad"),
         };
         self.failed |= level == Level::Bad;
-        if self.color {
+        if let Some(checks) = &mut self.json {
+            let check = Check { section: self.section.clone(), status, check: what.to_string(), detail: detail.as_ref().to_string(), hints: Vec::new() };
+            checks.push(check);
+        } else if self.color {
             println!("  \x1b[{code}m{mark}\x1b[0m {what:<12} {}", detail.as_ref());
         } else {
             println!("  {mark} {what:<12} {}", detail.as_ref());
         }
     }
 
-    fn hint(&self, text: impl AsRef<str>) {
-        if self.color {
+    fn hint(&mut self, text: impl AsRef<str>) {
+        if let Some(checks) = &mut self.json {
+            if let Some(last) = checks.last_mut() {
+                last.hints.push(text.as_ref().to_string());
+            }
+        } else if self.color {
             println!("                 \x1b[2m→ {}\x1b[0m", text.as_ref());
         } else {
             println!("                 → {}", text.as_ref());
@@ -55,7 +82,7 @@ fn ms(d: Duration) -> String {
 
 async fn local(r: &mut Report) -> Result<()> {
     let home = home_dir()?;
-    println!("This computer");
+    r.section("This computer".into());
     let candidates = [home.join(".ssh/id_ed25519"), qsh_dir(&home).join("id_ed25519")];
     match candidates.iter().find(|p| p.exists()) {
         Some(p) if Identity::is_ed25519_file(p) => r.line(Level::Ok, "key", p.display().to_string()),
@@ -92,7 +119,9 @@ fn endpoint(host: &str, port: u16) -> String {
 }
 
 async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptions) -> Result<()> {
-    println!();
+    if r.json.is_none() {
+        println!();
+    }
     let target = match Target::parse(dest, port, opts.full) {
         Ok(t) => t,
         Err(e) => {
@@ -100,7 +129,7 @@ async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptio
             return Ok(());
         }
     };
-    println!("{} → {}@{}", dest, target.user, endpoint(&target.host, target.port));
+    r.section(format!("{} → {}@{}", dest, target.user, endpoint(&target.host, target.port)));
     if target.needs_proxy {
         r.line(Level::Note, "proxy", "~/.ssh/config sends this host through ProxyJump/ProxyCommand");
         r.hint("qsh does not connect directly; `qsh --full` hands it to ssh, or set ProxyJump in ~/.config/qsh/config");
@@ -225,11 +254,16 @@ async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
 }
 
 /// Runs the checks; the exit code is 1 if something is broken.
-pub async fn run(dest: Option<&str>, port: Option<u16>, opts: &ConnectOptions) -> Result<i32> {
-    let mut r = Report { color: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(), failed: false };
+/// `json`: the checks as a JSON array on stdout instead of lines.
+pub async fn run(dest: Option<&str>, port: Option<u16>, opts: &ConnectOptions, json: bool) -> Result<i32> {
+    let color = !json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let mut r = Report { color, failed: false, json: json.then(Vec::new), section: String::new() };
     local(&mut r).await?;
     if let Some(d) = dest {
         host(&mut r, d, port, opts).await?;
+    }
+    if let Some(checks) = &r.json {
+        println!("{}", serde_json::to_string_pretty(checks)?);
     }
     Ok(if r.failed { 1 } else { 0 })
 }

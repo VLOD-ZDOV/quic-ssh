@@ -1603,7 +1603,7 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                         (d.clone(), flags)
                     })
                     .collect();
-                let status = super::multi::run_each(&jobs, std::slice::from_ref(&cmd), 16).await;
+                let status = super::multi::run_each(&jobs, std::slice::from_ref(&cmd), 16, false).await;
                 wait_for_enter();
                 terminal = enter()?;
                 app.status = match status {

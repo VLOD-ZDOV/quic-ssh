@@ -2568,6 +2568,14 @@ fn command_on_several_hosts() {
     assert!(err.contains(&format!("{dead}: exit code 255")) && err.contains("qsh doctor"), "{err}");
     let out = c.run(&["multi", "-g", "nope", "--", "true"]);
     assert!(!out.status.success());
+    // --json: one array at the end, for scripts.
+    let out = c.run(&["multi", "--json", "--transport", "tcp", &host_a, &dead, "--", "echo", "hi;", "exit", "3"]);
+    assert_eq!(out.status.code(), Some(255));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v[0]["host"], host_a.as_str());
+    assert_eq!(v[0]["exit"], 3);
+    assert_eq!(v[0]["stdout"][0], "hi");
+    assert_eq!(v[1]["exit"], 255);
 }
 
 /// `qsh cp -C`: zstd-compressed copies, files and trees, both ways.
@@ -2741,6 +2749,14 @@ fn doctor_explains_problems() {
     let out = c.run(&["doctor", &format!("{}:{}", dest(), free_port())]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stdout(&out).contains("is qshd running"), "{}", stdout(&out));
+    // --json: the same checks, with their hints, for scripts.
+    let out = stranger.run(&["doctor", "--json", &host]);
+    assert_eq!(out.status.code(), Some(1));
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(checks.iter().any(|c| c["status"] == "ok" && c["check"] == "quic"), "{checks:?}");
+    let bad = checks.iter().find(|c| c["status"] == "bad").unwrap();
+    assert!(bad["hints"].to_string().contains("qsh pair"), "{bad}");
+    assert!(bad["section"].as_str().unwrap().contains(&host), "{bad}");
 }
 
 /// Findings of a review of connection sharing: `-f` does not wait for the
