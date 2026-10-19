@@ -564,6 +564,39 @@ fn removed_key_cannot_log_in() {
     assert!(!exec(&c, &s, "quic", "echo in").status.success());
 }
 
+/// `qsh copy-id`: through ssh, the key goes there and qshd's host key is
+/// pinned here; a qshd whose key ssh did not show is not trusted.
+#[cfg(unix)]
+#[test]
+fn copy_id_sets_a_host_up_over_ssh() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::start();
+    let other = Server::start();
+    let host = format!("{}:{}", dest(), s.port);
+    // An `ssh` that runs what it is given as if on the server: in its HOME.
+    let fake_ssh = |c: &Client, server: &Server| {
+        let bin = c.home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("ssh"), format!("#!/bin/sh\nHOME='{}' exec sh -s\n", server.home.path().display())).unwrap();
+        std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+    };
+    let c = Client::new();
+    let path = fake_ssh(&c, &s);
+    let out = c.cmd(&["copy-id", &host]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success() && stderr(&out).contains("added your key"), "{}", stderr(&out));
+    let out = c.run(&["-p", &s.port.to_string(), &dest(), "echo", "in"]);
+    assert_eq!(stdout(&out).trim(), "in", "{}", stderr(&out));
+    let out = c.cmd(&["copy-id", &host]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success() && stderr(&out).contains("already there"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(s.authorized_keys()).unwrap().lines().count(), 1);
+    // ssh shows another server's host key than the qshd that answers.
+    let c2 = Client::new();
+    let out = c2.cmd(&["copy-id", &host]).env("PATH", fake_ssh(&c2, &other)).output().unwrap();
+    assert!(!out.status.success() && stderr(&out).contains("not one of qshd's host keys"), "{}", stderr(&out));
+    assert!(!c2.home.path().join(".config/qsh/known_hosts").exists());
+}
+
 #[test]
 fn changed_host_key_is_refused() {
     let s = Server::start();

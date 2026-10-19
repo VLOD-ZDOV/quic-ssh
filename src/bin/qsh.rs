@@ -27,7 +27,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 10] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget", "completions"];
+const TOOLS: [&str; 11] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget", "completions", "copy-id"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -120,6 +120,11 @@ enum Cmd {
     },
     /// Interactive host menu with status and speed test
     Ui,
+    /// Set a host up for qsh through ssh: add your key there and pin qshd's host key
+    CopyId {
+        /// [user@]host[:port] or an alias, as for ssh (the port is qshd's)
+        destination: String,
+    },
     /// Forget a host's key (after a legitimate change), as ssh-keygen -R
     Forget {
         /// [user@]host[:port] or an alias
@@ -198,6 +203,7 @@ impl ConnArgs {
             full: self.full,
             resume: None,
             share: true,
+            host_keys_from_ssh: Vec::new(),
         }
     }
 }
@@ -446,6 +452,7 @@ async fn master_main(a: SshArgs) -> Result<i32> {
         full: a.full,
         resume: None,
         share: false,
+        host_keys_from_ssh: Vec::new(),
     };
     let conn = match client::connect(&target, &opts).await {
         Ok(c) => Arc::new(c),
@@ -606,6 +613,11 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             }
             let shell = shell.context("which shell: qsh completions bash|zsh|fish")?;
             print!("{}", client::completions::script(&shell).with_context(|| format!("no completions for {shell:?} (bash, zsh, fish)"))?);
+            Ok(0)
+        }
+        Cmd::CopyId { destination } => {
+            let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
+            client::copy_id::run(&target, &opts).await.map_err(|e| with_doctor_hint(e, &target))?;
             Ok(0)
         }
         Cmd::Forget { destination } => {
@@ -781,6 +793,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         full: a.full,
         resume: None,
         share,
+        host_keys_from_ssh: Vec::new(),
     };
     #[cfg(unix)]
     if share && target.sharing.background_master() {

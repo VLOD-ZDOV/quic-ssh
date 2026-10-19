@@ -5,7 +5,7 @@
 use std::path::Path;
 
 /// The tools, as the scripts complete them in the first position.
-const TOOLS: &str = "cp pair keygen speed ui multi doctor update forget completions";
+const TOOLS: &str = "cp pair copy-id keygen speed ui multi doctor update forget completions";
 
 const BASH: &str = r#"# qsh completion for bash: source <(qsh completions bash)
 _qsh() {
@@ -17,7 +17,7 @@ _qsh() {
         return
     fi
     case $first in
-        speed|doctor|forget|pair) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "$hosts" -- "$cur")) ;;
+        speed|doctor|forget|pair|copy-id) [ "$COMP_CWORD" -eq 2 ] && COMPREPLY=($(compgen -W "$hosts" -- "$cur")) ;;
         completions) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
         cp) COMPREPLY=($(compgen -f -- "$cur") $(compgen -W "$(printf '%s: ' $hosts)" -- "$cur")) ;;
         *) COMPREPLY=($(compgen -f -- "$cur")) ;;
@@ -36,7 +36,7 @@ _qsh() {
         return
     fi
     case $words[2] in
-        speed|doctor|forget|pair) (( CURRENT == 3 )) && compadd -a hosts ;;
+        speed|doctor|forget|pair|copy-id) (( CURRENT == 3 )) && compadd -a hosts ;;
         completions) compadd bash zsh fish ;;
         cp) _files; compadd -S '' -- ${^hosts}: ;;
         *) _files ;;
@@ -49,7 +49,7 @@ const FISH: &str = r#"# qsh completion for fish: qsh completions fish > ~/.confi
 complete -c qsh -f
 complete -c qsh -n __fish_use_subcommand -a '@TOOLS@' -d command
 complete -c qsh -n __fish_use_subcommand -a '(qsh completions --hosts 2>/dev/null)' -d host
-complete -c qsh -n '__fish_seen_subcommand_from speed doctor forget pair' -a '(qsh completions --hosts 2>/dev/null)' -d host
+complete -c qsh -n '__fish_seen_subcommand_from speed doctor forget pair copy-id' -a '(qsh completions --hosts 2>/dev/null)' -d host
 complete -c qsh -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'
 complete -c qsh -n '__fish_seen_subcommand_from cp' -F
 complete -c qsh -n '__fish_seen_subcommand_from cp' -a '(qsh completions --hosts 2>/dev/null | string replace -r \'$\' :)' -d host

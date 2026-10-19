@@ -131,6 +131,8 @@ qsh pair user@server
 
 The code is asked for rather than put on the command line, where other users of the client machine could read it while pairing runs. `qsh pair user@server CODE` still works on a machine only you use.
 
+**Already have ssh access?** `qsh copy-id user@server` does the same without a code, as ssh-copy-id does: over your ssh login it adds this computer's key to qsh's authorized_keys there and reads qshd's host key, which it then pins (checked by ssh's own known_hosts on the way). qshd must be installed and running there.
+
 For a phone, `qshd pair --qr --host 203.0.113.10` also shows the command as a QR code: scan it with the camera and paste the text into Termux. `--host` sets the address in the command (by default the server's host name).
 
 `pair` adds the client key on the server (`~/.config/qsh/authorized_keys`) and pins the server key on the client (`~/.config/qsh/known_hosts`). If the client has no key yet, one is created at `~/.config/qsh/id_ed25519`.

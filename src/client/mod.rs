@@ -7,6 +7,7 @@ pub mod control;
 pub mod copy;
 pub mod doctor;
 pub mod completions;
+pub mod copy_id;
 pub mod forward;
 pub mod x11;
 pub mod groups;
@@ -501,6 +502,9 @@ pub struct ConnectOptions {
     pub resume: Option<Vec<u8>>,
     /// May use the connection of a master qsh (`ControlMaster`/`ControlPath`).
     pub share: bool,
+    /// `qsh copy-id`: qshd's host keys as read over ssh. An unknown host
+    /// key is trusted (and added) only if it is one of them.
+    pub host_keys_from_ssh: Vec<PublicKey>,
 }
 
 /// Remembers for an hour that a host has no qshd, so `--full` goes straight to ssh.
@@ -969,6 +973,13 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
         HostTrust::Unknown => {
             let policy = if opts.accept_new_host { HostKeyPolicy::AcceptNew } else { target.host_key_policy };
             let trusted = match policy {
+                _ if !opts.host_keys_from_ssh.is_empty() => {
+                    if !opts.host_keys_from_ssh.contains(&key) {
+                        conn.close().await;
+                        bail!("'{hid}' presents {}, which is not one of qshd's host keys read over ssh; not trusting it", key.fingerprint());
+                    }
+                    true
+                }
                 HostKeyPolicy::AcceptNew => true,
                 HostKeyPolicy::Strict => false,
                 HostKeyPolicy::Ask if target.batch_mode => false,
@@ -1120,7 +1131,15 @@ async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Co
     if let Some(jumps) = &target.proxy_jump {
         // Jump hosts use the config files, but not this host's -o options.
         let sources = config::Sources { ssh_config: target.sources.ssh_config.clone(), ..Default::default() };
-        let hop_opts = ConnectOptions { identities: opts.identities.clone(), full: false, transport: opts.transport, resume: None, share: false, ..opts.clone() };
+        let hop_opts = ConnectOptions {
+            identities: opts.identities.clone(),
+            full: false,
+            transport: opts.transport,
+            resume: None,
+            share: false,
+            host_keys_from_ssh: Vec::new(),
+            ..opts.clone()
+        };
         for spec in jumps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let hop = Target::resolve(spec, None, &sources).with_context(|| format!("jump host {spec}"))?;
             // Each hop's host key is checked like the target's, KnownHostsCommand included.
