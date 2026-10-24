@@ -59,6 +59,13 @@ fn qshd_on_windows() {
         Command::new(QSH).args(["--accept-new-host", "--transport", transport, "-p", &port]).args(args).stdin(Stdio::null()).output().unwrap()
     };
 
+    // Policies match the name: another spelling of the account is refused.
+    let upper = std::env::var("USERNAME").unwrap().to_uppercase();
+    if upper != std::env::var("USERNAME").unwrap() {
+        let out = qsh("tcp", &[&format!("{upper}@127.0.0.1"), "echo in"]);
+        assert!(!out.status.success() && !text(&out).contains("in\n"), "{}", text(&out));
+    }
+
     let wine = std::env::var_os("QSH_WINDOWS_E2E_WINE").is_some();
     let transports: &[&str] = if wine { &["tcp"] } else { &["quic", "tcp"] };
     for &t in transports {

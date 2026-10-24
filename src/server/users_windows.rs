@@ -35,14 +35,15 @@ pub fn current_name() -> Option<String> {
 }
 
 impl User {
-    /// `name` must be the account qshd runs as (Windows compares names
-    /// without case; the name is kept as given, as policies match it).
+    /// `name` must be the account qshd runs as. Windows compares names
+    /// without case, but the account's own spelling is returned: policies
+    /// match the name, and the caller refuses other spellings.
     pub fn lookup(name: &str) -> Result<User> {
         let me = current_name().ok_or_else(|| anyhow::anyhow!("cannot tell which user qshd runs as (USERNAME)"))?;
         if !me.eq_ignore_ascii_case(name) {
             bail!("qshd on Windows serves only the user it runs as ({me}), not {name:?}");
         }
-        Ok(User { name: name.to_string(), uid: 1000, home: crate::keys::home_dir()?, shell: shell(), chroot: None })
+        Ok(User { name: me, uid: 1000, home: crate::keys::home_dir()?, shell: shell(), chroot: None })
     }
 
     pub fn group_names(&self) -> Vec<String> {

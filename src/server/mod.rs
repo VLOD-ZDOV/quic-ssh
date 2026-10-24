@@ -633,6 +633,13 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     };
     let mut user = user;
     user.chroot = match cfg.chroot_for(&user.name, user.uid, &user.home) {
+        // Nothing confines a session on Windows: refused, not ignored.
+        #[cfg(windows)]
+        Ok(Some(_)) => {
+            warn!("{addr}: {name}: chroot_directory is not supported on Windows");
+            write_msg(&mut send, &Reply::Err("access denied".into())).await?;
+            return Ok(());
+        }
         Ok(c) => c,
         Err(e) => {
             warn!("{addr}: {name}: {e:#}");
