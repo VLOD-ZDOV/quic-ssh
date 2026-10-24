@@ -397,8 +397,18 @@ async fn lock_briefly(file: &std::fs::File) -> std::io::Result<()> {
     Err(std::io::Error::other("held by another process"))
 }
 
-fn take_step(file: &std::fs::File, step: u64) {
+fn take_step(file: &std::fs::File, path: &std::path::Path, step: u64) {
     let mtime = std::time::UNIX_EPOCH + Duration::from_secs(step * crate::totp::STEP);
+    // Windows sets times only through a handle opened to change attributes.
+    #[cfg(windows)]
+    let reopened = {
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        std::os::windows::fs::OpenOptionsExt::access_mode(&mut std::fs::OpenOptions::new(), FILE_WRITE_ATTRIBUTES).open(path)
+    };
+    #[cfg(windows)]
+    let file = reopened.as_ref().unwrap_or(file);
+    #[cfg(not(windows))]
+    let _ = path;
     if let Err(e) = file.set_modified(mtime) {
         warn!("cannot mark the one-time code as used for other qshd instances: {e}");
     }
@@ -492,7 +502,7 @@ pub async fn second_factor(
             if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
                 state.used.insert(user.uid, step);
                 state.failures.remove(&user.uid);
-                take_step(&file, step);
+                take_step(&file, &path, step);
                 return Ok(Ok(true));
             }
             let _ = file.unlock();
@@ -528,7 +538,7 @@ mod tests {
         std::fs::write(&path, "x").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         assert_eq!(super::step_taken(&file), 0, "a file written normally marks nothing");
-        super::take_step(&file, 59_000_000);
+        super::take_step(&file, &path, 59_000_000);
         assert_eq!(super::step_taken(&std::fs::File::open(&path).unwrap()), 59_000_000);
     }
 
