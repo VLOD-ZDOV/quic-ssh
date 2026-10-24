@@ -1,77 +1,154 @@
-# qshd configuration. Every setting below is commented out at its default:
-# uncomment and change what you need, then check it with `qshd -t` and apply
-# it with `systemctl reload qshd` (or by restarting qshd). `qshd -T` prints
-# the settings in effect.
+# qshd configuration.
+#
+# Every setting is commented out at its default: uncomment and change what
+# you need. Check with `qshd -t`, apply with `systemctl reload qshd` (or a
+# restart). `qshd -T` prints the settings in effect.
 
-# --- Listening ---
-# listen = "[::]:4422"            # UDP (QUIC) and TCP; IPv4 only if IPv6 is off
-# tcp = true                      # false: UDP only, e.g. on port 22 next to sshd
-# host_key = "/etc/qsh/host_ed25519"   # default: host_ed25519 next to this file
-# host_certificate = "/etc/qsh/host_ed25519-cert.pub"   # default: KEY-cert.pub, if it exists
 
-# --- Keys ---
-# use_qsh_authorized_keys = true  # ~/.config/qsh/authorized_keys (`qsh pair` adds keys there)
-# use_ssh_authorized_keys = true  # also ~/.ssh/authorized_keys
+# ---------------------------------------------------------------- Listening
+
+# UDP (QUIC) and TCP. IPv4 only if IPv6 is off.
+# listen = "[::]:4422"
+
+# false: UDP only, e.g. on port 22 next to sshd.
+# tcp = true
+
+# Default: host_ed25519 next to this file.
+# host_key = "/etc/qsh/host_ed25519"
+
+# Default: the key's name plus -cert.pub, if that file exists.
+# host_certificate = "/etc/qsh/host_ed25519-cert.pub"
+
+
+# --------------------------------------------------------------------- Keys
+
+# ~/.config/qsh/authorized_keys (`qsh pair` adds keys there).
+# use_qsh_authorized_keys = true
+
+# Also the files below (default: ~/.ssh/authorized_keys).
+# use_ssh_authorized_keys = true
 # authorized_keys_file = [".ssh/authorized_keys"]
-# trusted_user_ca_keys = "/etc/qsh/user_ca.pub"   # CAs that sign user certificates
+
+# CAs that sign user certificates, and who a certificate may log in as.
+# trusted_user_ca_keys = "/etc/qsh/user_ca.pub"
 # authorized_principals_file = ".ssh/principals"
-# revoked_keys = "/etc/qsh/revoked_keys"          # a key list or a KRL
+
+# Keys that may not log in: a key list or a KRL.
+# revoked_keys = "/etc/qsh/revoked_keys"
+
+# More keys from a program (as sshd's AuthorizedKeysCommand).
 # authorized_keys_command = "/usr/local/bin/get-keys %u"
 # authorized_keys_command_user = "nobody"
 
-# --- Logging in ---
-# totp = "optional"               # one-time codes: "off", "optional" (who set them up), "required"
-# password_authentication = false # /etc/shadow passwords when no key works (as root, Linux)
+
+# --------------------------------------------------------------- Logging in
+
+# One-time codes: "off", "optional" (for who set them up), "required".
+# totp = "optional"
+
+# /etc/shadow passwords when no key works (as root, on Linux).
+# password_authentication = false
 # permit_empty_passwords = false
-# permit_root_login = "prohibit-password"   # or "yes", "no", "forced-commands-only"
+
+# Or "yes", "no", "forced-commands-only".
+# permit_root_login = "prohibit-password"
+
 # max_auth_tries = 6
-# login_grace_time = 120          # seconds; 0 = no limit
-# deny_users = ["guest"]          # checked in this order, like sshd
+
+# Seconds to log in; 0 = no limit.
+# login_grace_time = 120
+
+# Who may log in, checked in this order (as in sshd).
+# deny_users = ["guest"]
 # allow_users = ["alice", "bob@192.0.2.0/24"]
 # deny_groups = ["nossh"]
 # allow_groups = ["staff"]
-# banner = "/etc/issue.net"       # shown before login
 
-# --- Sessions ---
-# session_timeout = 3600          # seconds a dropped terminal session is kept; 0 = off
-# session_scope = true            # as root under systemd: each session in its own scope
-# max_sessions = 10               # per connection
+# Shown before login.
+# banner = "/etc/issue.net"
+
+
+# ----------------------------------------------------------------- Sessions
+
+# Seconds a dropped terminal session is kept; 0 = off.
+# session_timeout = 3600
+
+# As root under systemd: each session in a scope of its own.
+# session_scope = true
+
+# Sessions at once, per connection.
+# max_sessions = 10
+
 # permit_tty = true
 # print_motd = true
 # print_last_log = true
-# permit_user_rc = true           # ~/.ssh/rc
+
+# Run ~/.ssh/rc.
+# permit_user_rc = true
+
+# Variables a client may set.
 # accept_env = ["LANG", "LC_*", "COLORTERM"]
+
 # force_command = "/usr/local/bin/menu"
 # chroot_directory = "/srv/jail/%u"
 
-# --- Forwarding ---
-# allow_tcp_forwarding = true     # or "no", "local" (-L/-D/-W), "remote" (-R)
-# gateway_ports = "no"            # -R on loopback only; "yes": all addresses; "clientspecified"
+
+# --------------------------------------------------------------- Forwarding
+
+# Or "no", "local" (-L, -D, -W), "remote" (-R).
+# allow_tcp_forwarding = true
+
+# -R on loopback only; "yes": all addresses; or "clientspecified".
+# gateway_ports = "no"
+
+# Allowed destinations of -L/-D/-W and listeners of -R.
 # permit_open = ["db.internal:5432"]
 # permit_listen = ["8080"]
-# allow_stream_local_forwarding = true   # Unix sockets: or "no", "local", "remote"
+
+# Unix sockets: or "no", "local", "remote".
+# allow_stream_local_forwarding = true
+
 # allow_agent_forwarding = true
 # x11_forwarding = false
-# permit_tunnel = "no"            # qsh -w: "yes", "point-to-point", "ethernet"
-# disable_forwarding = false      # true: no forwarding of any kind
 
-# --- Limits ---
+# qsh -w: "yes", "point-to-point", "ethernet".
+# permit_tunnel = "no"
+
+# true: no forwarding of any kind.
+# disable_forwarding = false
+
+
+# ------------------------------------------------------------------- Limits
+
 # max_connections = 256
-# max_startups = 64               # logins in progress at once
+
+# Logins in progress at once, and from one address.
+# max_startups = 64
 # max_startups_per_ip = 8
-# connection_buffer_mb = 32       # per connection; small VM: 8-16
-# per_source_penalties = true     # slow down addresses that keep failing
+
+# MiB per connection; a small VM: 8-16.
+# connection_buffer_mb = 32
+
+# Slow down addresses that keep failing, except these.
+# per_source_penalties = true
 # per_source_penalty_exempt_list = ["192.0.2.0/24"]
-# client_alive_interval = 0       # seconds; 0 = built-in (~60 s)
+
+# Seconds between checks of a silent client; 0 = built in (about 60 s).
+# client_alive_interval = 0
 # client_alive_count_max = 3
 
-# [set_env]                       # variables every session gets
+
+# ------------------------------------------------------------------- Tables
+
+# Variables every session gets.
+# [set_env]
 # TZ = "UTC"
 
-# [subsystems]                    # for `qsh -s` and sftp
+# For `qsh -s` and sftp.
+# [subsystems]
 # sftp = "internal-sftp"
 
-# Settings for some logins, like sshd's Match:
+# Settings for some logins, like sshd's Match.
 # [[match]]
 # group = "sftponly"
 # chroot_directory = "/srv/sftp/%u"
