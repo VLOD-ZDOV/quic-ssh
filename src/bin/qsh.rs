@@ -750,26 +750,35 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let quiet = a.quiet || target.quiet;
     // ClearAllForwardings drops the forwards from the config and the command line.
     let clear = target.clear_all_forwardings;
-    let mut locals = Vec::new();
-    let mut remotes = Vec::new();
+    let mut locals: Vec<(Forward, bool)> = Vec::new();
+    let mut remotes: Vec<(Forward, bool)> = Vec::new();
     let mut dynamics: Vec<(Forward, bool)> = Vec::new();
+    // The same forward in two places (the command line, qsh's config that
+    // `qsh ui` writes, ssh's config) is set up once.
+    let add = |list: &mut Vec<(Forward, bool)>, f: Forward, required: bool| {
+        if !list.iter().any(|(g, _)| *g == f) {
+            list.push((f, required));
+        }
+    };
     if !clear {
         for (specs, required) in [(&a.local_forwards, true), (&target.local_forwards, false)] {
             for s in specs {
-                locals.push((Forward::parse(s).with_context(|| format!("-L {s}"))?, required));
+                add(&mut locals, Forward::parse(s).with_context(|| format!("-L {s}"))?, required);
             }
         }
-        for s in a.remote_forwards.iter().chain(&target.remote_forwards) {
-            remotes.push(Forward::parse_remote(s).with_context(|| format!("-R {s}"))?);
+        for (specs, required) in [(&a.remote_forwards, true), (&target.remote_forwards, false)] {
+            for s in specs {
+                add(&mut remotes, Forward::parse_remote(s).with_context(|| format!("-R {s}"))?, required);
+            }
         }
         for (specs, required) in [(&a.dynamic_forwards, true), (&target.dynamic_forwards, false)] {
             for s in specs {
-                dynamics.push((Forward::parse_dynamic(s).with_context(|| format!("-D {s}"))?, required));
+                add(&mut dynamics, Forward::parse_dynamic(s).with_context(|| format!("-D {s}"))?, required);
             }
         }
     }
 
-    if a.full && target.permit_remote_open && remotes.iter().any(|f| matches!(f.dest, forward::Dest::Socks)) {
+    if a.full && target.permit_remote_open && remotes.iter().any(|(f, _)| matches!(f.dest, forward::Dest::Socks)) {
         return exec_openssh("ssh", ssh_args(&a, &target), "PermitRemoteOpen applies to this dynamic remote forward");
     }
     let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
@@ -840,7 +849,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
     let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some() || target.tunnel.is_some();
-    for f in remotes {
+    for (f, required) in remotes {
         let spec = f.describe();
         match forwarder.remote(f.clone()).await {
             Ok(Some(port)) if matches!(f.listen, forward::Listen::Tcp { port: 0, .. }) && !quiet => {
@@ -848,7 +857,8 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             }
             Ok(_) => {}
             // As in ssh: a refused remote forward is a warning, unless ExitOnForwardFailure.
-            Err(e) if !target.exit_on_forward_failure && e.is::<qsh::proto::Refused>() => {
+            // A forward from the config is only a warning too.
+            Err(e) if !target.exit_on_forward_failure && (!required || e.is::<qsh::proto::Refused>()) => {
                 eprintln!("qsh: warning: remote port forwarding failed for {spec}: {e:#}");
             }
             Err(e) => return Err(e.context(format!("remote forward {spec}"))),

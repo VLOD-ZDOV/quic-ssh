@@ -829,6 +829,25 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
     assert_eq!(stdout(&out), "via-qsh\n");
 }
 
+/// A forward in both ~/.ssh/config and qsh's config (which `qsh ui` writes)
+/// is set up once, not twice (the second failing on the port in use).
+#[test]
+fn forward_in_both_configs_is_set_up_once() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let (local, remote, target) = (free_port(), free_port(), echo_server());
+    let block = format!("Host box\n  HostName 127.0.0.1\n  User {}\n  LocalForward {local} 127.0.0.1:{target}\n  RemoteForward {remote} 127.0.0.1:{target}\n", user());
+    std::fs::create_dir_all(c.home.path().join(".ssh")).unwrap();
+    std::fs::write(c.home.path().join(".ssh/config"), &block).unwrap();
+    let ours = c.home.path().join(".config/qsh/config");
+    let had = std::fs::read_to_string(&ours).unwrap_or_default();
+    std::fs::write(&ours, format!("Host box\n  Port {}\n{block}{had}", s.port)).unwrap();
+    let out = c.run(&["--accept-new-host", "box", "echo", "ok"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "ok\n");
+    assert!(!stderr(&out).contains("warning"), "{}", stderr(&out));
+}
+
 /// The common setup: qshd on its standard port 4422, sshd's port (22) in
 /// ~/.ssh/config. `--full` must find qshd on 4422 instead of falling back to ssh.
 #[test]
