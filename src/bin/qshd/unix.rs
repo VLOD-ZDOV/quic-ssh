@@ -105,6 +105,40 @@ fn config_dir() -> Result<PathBuf> {
     Ok(if is_root() { PathBuf::from("/etc/qsh") } else { qsh_dir(&home_dir()?) })
 }
 
+/// The commented template a missing default config is created from.
+const CONFIG_TEMPLATE: &str = include_str!("../../../contrib/qshd.toml");
+
+/// Creates the default config from [`CONFIG_TEMPLATE`] if there is none, so
+/// there is a file to look at and change (it changes nothing: everything in
+/// it is commented out). Readable by all in /etc/qsh, like sshd_config.
+fn create_default_config(path: Option<&PathBuf>) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if path.is_some() {
+        return Ok(());
+    }
+    let dir = config_dir()?;
+    let file = dir.join(if is_root() { "config.toml" } else { "qshd.toml" });
+    if file.exists() {
+        return Ok(());
+    }
+    if is_root() {
+        open_system_dir(&dir)?;
+    } else {
+        qsh::keys::create_private_dir(&dir)?;
+    }
+    let mode = if is_root() { 0o644 } else { 0o600 };
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&file) {
+        Ok(mut f) => {
+            f.write_all(CONFIG_TEMPLATE.as_bytes())?;
+            eprintln!("Created {} (all settings commented out at their defaults)", file.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("cannot create {}", file.display()))),
+    }
+}
+
 fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
     let dir = config_dir()?;
     let path = path.unwrap_or_else(|| dir.join(if is_root() { "config.toml" } else { "qshd.toml" }));
@@ -271,6 +305,7 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
 }
 
 fn init(config: Option<PathBuf>) -> Result<()> {
+    create_default_config(config.as_ref())?;
     let (cfg, key_path) = load_config(config)?;
     let id = host_key(&key_path)?;
     println!("Host key:    {}", key_path.display());
@@ -435,6 +470,7 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
         .with_writer(std::io::stderr)
         .init();
     qsh::platform::raise_fd_limit();
+    create_default_config(config.as_ref())?;
     let (mut cfg, key_path) = load_config(config.clone())?;
     if let Some(l) = listen {
         cfg.listen = l;

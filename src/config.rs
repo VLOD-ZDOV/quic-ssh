@@ -915,6 +915,22 @@ fn endpoint_list_allows(list: &[String], matches: impl Fn(&str) -> bool) -> bool
 mod tests {
     use super::*;
 
+    /// The template qshd writes (contrib/qshd.toml) changes nothing as it
+    /// is, and every setting in it parses once uncommented.
+    #[test]
+    fn config_template() {
+        let template = include_str!("../contrib/qshd.toml");
+        let as_is: ServerConfig = toml::from_str(template).unwrap();
+        assert_eq!(toml::to_string(&as_is).unwrap(), toml::to_string(&ServerConfig::default()).unwrap());
+        fn setting(l: &str) -> Option<&str> {
+            l.strip_prefix("# ").filter(|r| r.starts_with('[') || r.split_once(" = ").is_some_and(|(k, _)| !k.contains(' ')))
+        }
+        let uncommented: String = template.lines().map(|l| setting(l).unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        let cfg: ServerConfig = toml::from_str(&uncommented).unwrap_or_else(|e| panic!("{e}\n{uncommented}"));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.totp, Totp::Optional);
+    }
+
     fn parse(text: &str) -> ServerConfig {
         let cfg: ServerConfig = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
