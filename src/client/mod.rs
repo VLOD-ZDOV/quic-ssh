@@ -641,6 +641,17 @@ fn known_hosts_for(target: &Target) -> Result<(KnownHosts, PathBuf)> {
     Ok((kh, path))
 }
 
+/// A qshd answered for `target` (`qsh ui`'s check): it is no longer one
+/// that `--full` hands straight to ssh because of an earlier failure.
+pub fn qshd_answered(target: &Target) {
+    if let Ok(cache) = NoQshdCache::new() {
+        let hid = host_id(&target.host, target.port);
+        if cache.contains(&hid) {
+            cache.set(&hid, false);
+        }
+    }
+}
+
 /// `qsh forget`: removes the target's host key (on each port it may be
 /// reached on) from the known_hosts file new keys go to. Returns how many
 /// lines went, and the file.

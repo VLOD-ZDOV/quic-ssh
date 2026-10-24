@@ -2759,6 +2759,24 @@ fn reaching_a_host_without_an_open_port() {
     assert_eq!(stdout(&out), "behind-nat\n");
 }
 
+/// A host remembered as having no qshd (`--full` then goes to ssh) is
+/// taken again as soon as a check finds qshd there.
+#[test]
+fn a_check_that_finds_qshd_clears_the_no_qshd_mark() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let mark = c.home.path().join(".config/qsh/no-qshd");
+    std::fs::write(&mark, format!("[127.0.0.1]:{} {now}\n", s.port)).unwrap();
+    let full = |c: &Client| c.cmd(&["--full", "-v", "-p", &s.port.to_string(), &dest(), "echo", "via-qshd"]).env("PATH", "/nonexistent").output().unwrap();
+    // No ssh on PATH: handing over fails, which shows it was tried.
+    assert!(!stdout(&full(&c)).contains("via-qshd"));
+    assert!(c.run(&["doctor", &format!("{}:{}", dest(), s.port)]).status.success());
+    assert!(!std::fs::read_to_string(&mark).unwrap().contains("127.0.0.1"));
+    let out = full(&c);
+    assert_eq!(stdout(&out).trim(), "via-qshd", "{}", stderr(&out));
+}
+
 /// `qsh doctor`: every step for a working host; a hint where it breaks.
 #[test]
 fn doctor_explains_problems() {

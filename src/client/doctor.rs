@@ -229,6 +229,9 @@ async fn reachability(r: &mut Report, target: &Target) -> Option<String> {
         Ok(Err(e)) => Some(format!("{e:#}").lines().last().unwrap_or_default().trim().to_string()),
         Err(_) => Some("no answer".to_string()),
     };
+    if !found.is_empty() {
+        super::qshd_answered(target);
+    }
     // One transport is enough: the other one failing is only a note.
     let level = if found.is_empty() { Level::Bad } else { Level::Note };
     for (name, ok, _) in &found {

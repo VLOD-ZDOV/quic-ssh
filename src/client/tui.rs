@@ -1260,6 +1260,8 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     let ports: Vec<u16> = std::iter::once(target.port).chain(target.alt_ports.iter().copied()).collect();
     let start = Instant::now();
     if let Ok(conn) = transport::connect_probe(&target.host, &ports, target.family, &target.bind, |_| tls.clone()).await {
+        // What the menu shows is what connecting does.
+        super::qshd_answered(&target);
         let handshake = start.elapsed();
         let port = conn.remote_addr().port();
         let key = key_state(&target.host, port, conn.peer_key());
@@ -1271,6 +1273,7 @@ async fn probe(target: Target, id: Arc<Identity>) -> (Probe, Option<KeyState>) {
     let start = Instant::now();
     match tokio::time::timeout(PROBE_TCP_TIMEOUT, transport::connect(&target.host, port, Transport::Tcp, target.family, &target.bind, tls)).await {
         Ok(Ok(conn)) => {
+            super::qshd_answered(&target);
             let handshake = start.elapsed();
             let key = key_state(&target.host, port, conn.peer_key());
             conn.close().await;
