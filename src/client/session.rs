@@ -13,6 +13,20 @@ use crate::client::predict::{Mode, Predictor};
 use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reader, Reply, Request, ServerMsg};
 use crate::transport::{Conn, RecvHalf, SendHalf};
 
+/// Turns off, on drop, the terminal modes the session left on.
+struct RestoreModes(Arc<std::sync::Mutex<super::keys_vt::Modes>>);
+
+impl Drop for RestoreModes {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let reset = self.0.lock().map(|m| m.restore()).unwrap_or_default();
+        if !reset.is_empty() {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(&reset).and_then(|()| out.flush());
+        }
+    }
+}
+
 /// Puts the local terminal into raw mode and restores it on drop.
 struct RawMode;
 
@@ -80,15 +94,18 @@ enum Input {
 
 impl Input {
     #[cfg_attr(not(windows), allow(unused_variables))]
-    fn new(console: bool, cursor_keys: Arc<std::sync::Mutex<super::keys_vt::CursorKeys>>) -> Input {
+    fn new(console: bool, modes: Arc<std::sync::Mutex<super::keys_vt::Modes>>) -> Input {
         #[cfg(windows)]
         if console {
             let (tx, rx) = mpsc::channel(64);
             std::thread::spawn(move || loop {
                 use crossterm::event::Event;
                 let bytes = match crossterm::event::read() {
-                    Ok(Event::Key(k)) => super::keys_vt::encode(k, cursor_keys.lock().unwrap().app),
+                    Ok(Event::Key(k)) => super::keys_vt::encode(k, modes.lock().unwrap().app),
                     Ok(Event::Paste(text)) => text.into_bytes(),
+                    // As a terminal reports them, to a program that asked.
+                    Ok(Event::FocusGained) if modes.lock().unwrap().focus() => b"\x1b[I".to_vec(),
+                    Ok(Event::FocusLost) if modes.lock().unwrap().focus() => b"\x1b[O".to_vec(),
                     Ok(_) => continue,
                     Err(_) => break,
                 };
@@ -523,9 +540,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // terminal) could be the Enter before a password prompt, and the
     // predictor would then draw the password. Only typed input goes here.
     let (typed_tx, mut typed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // Whether the remote program wants application cursor keys (followed on
-    // Windows, where qsh encodes the keys itself).
-    let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::CursorKeys::default()));
+    // The terminal modes the remote program set: application cursor keys
+    // (for Windows, where qsh encodes the keys itself), and what to turn
+    // off at the end, so the local terminal does not keep reporting focus
+    // or the mouse to whatever runs next.
+    let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::Modes::default()));
+    let _modes_restored = raw.is_some().then(|| RestoreModes(cursor_keys.clone()));
     let typed_tx = predictor.is_some().then_some(typed_tx);
     let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
     // qsh's own messages (the `~?` help) are written by the main loop, after
@@ -744,9 +764,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     match msg {
                         ServerMsg::Stdout(d) => {
                             received += d.len() as u64;
-                            if cfg!(windows) {
-                                cursor_keys.lock().unwrap().feed(&d);
-                            }
+                            cursor_keys.lock().unwrap().feed(&d);
                             show(&mut stdout, &mut predictor, &d).await?;
                             shown += d.len() as u64;
                             // Not waiting: a later report covers this one.

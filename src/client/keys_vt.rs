@@ -105,15 +105,33 @@ fn latin_key(c: char) -> char {
     }
 }
 
-/// Follows `ESC [ ? 1 h` / `ESC [ ? 1 l` (application cursor keys) in output.
+/// DEC private modes that change what the terminal sends or shows: left
+/// on when a program ends without turning them off (a dropped connection,
+/// a crash), they would make the local terminal type focus or mouse reports
+/// into the next program, so qsh turns them off at the end ([`Modes::restore`]).
+const RESET_MODES: [u16; 9] = [1000, 1002, 1003, 1005, 1006, 1015, 1004, 2004, 1];
+/// Alternate screen modes.
+const ALT_SCREEN: [u16; 3] = [1049, 1047, 47];
+
+/// Follows the terminal modes the remote program sets in its output: the
+/// cursor keys mode (`ESC [ ? 1 h`, for [`encode`]) and those [`Modes::restore`]
+/// undoes.
 #[derive(Default)]
-pub struct CursorKeys {
+pub struct Modes {
     state: u8,
     params: Vec<u8>,
+    /// Application cursor keys.
     pub app: bool,
+    on: Vec<u16>,
+    /// `ESC [ ? 25 l`: cursor hidden.
+    hidden: bool,
+    /// `ESC =`: application keypad.
+    keypad: bool,
+    /// Kitty keyboard flags pushed (`ESC [ > n u`) and not popped.
+    kitty: u32,
 }
 
-impl CursorKeys {
+impl Modes {
     pub fn feed(&mut self, data: &[u8]) {
         for &b in data {
             self.state = match (self.state, b) {
@@ -121,6 +139,14 @@ impl CursorKeys {
                 (1, b'[') => {
                     self.params.clear();
                     2
+                }
+                (1, b'=') => {
+                    self.keypad = true;
+                    0
+                }
+                (1, b'>') => {
+                    self.keypad = false;
+                    0
                 }
                 (2, 0x20..=0x3f) => {
                     if self.params.len() < 32 {
@@ -130,20 +156,74 @@ impl CursorKeys {
                 }
                 (2, b'h' | b'l') => {
                     if let Some(list) = self.params.strip_prefix(b"?") {
-                        if list.split(|&c| c == b';').any(|p| p == b"1") {
-                            self.app = b == b'h';
+                        let set = b == b'h';
+                        let modes: Vec<u16> = list.split(|&c| c == b';').filter_map(|p| std::str::from_utf8(p).ok()?.parse().ok()).collect();
+                        for n in modes {
+                            self.private(n, set);
                         }
+                    }
+                    0
+                }
+                (2, b'u') => {
+                    match self.params.first() {
+                        Some(b'>') => self.kitty = self.kitty.saturating_add(1),
+                        Some(b'<') => {
+                            let n = std::str::from_utf8(&self.params[1..]).ok().and_then(|n| n.parse().ok()).unwrap_or(1);
+                            self.kitty = self.kitty.saturating_sub(n);
+                        }
+                        _ => {}
                     }
                     0
                 }
                 // ESC c (reset).
                 (1, b'c') => {
-                    self.app = false;
+                    *self = Modes::default();
                     0
                 }
                 _ => 0,
             };
         }
+    }
+
+    fn private(&mut self, n: u16, set: bool) {
+        match n {
+            1 => self.app = set,
+            25 => self.hidden = !set,
+            _ => {}
+        }
+        if RESET_MODES.contains(&n) || ALT_SCREEN.contains(&n) {
+            self.on.retain(|&m| m != n);
+            if set {
+                self.on.push(n);
+            }
+        }
+    }
+
+    /// Whether the program asked for focus reports (`ESC [ ? 1004 h`).
+    pub fn focus(&self) -> bool {
+        self.on.contains(&1004)
+    }
+
+    /// What turns off the modes still on: for the end of a session.
+    pub fn restore(&self) -> Vec<u8> {
+        let mut out = String::new();
+        for m in RESET_MODES.iter().filter(|m| self.on.contains(m)) {
+            out.push_str(&format!("\x1b[?{m}l"));
+        }
+        // Back to the main screen, where the shell's lines are.
+        if let Some(m) = ALT_SCREEN.iter().find(|m| self.on.contains(m)) {
+            out.push_str(&format!("\x1b[?{m}l"));
+        }
+        if self.keypad {
+            out.push_str("\x1b>");
+        }
+        if self.kitty > 0 {
+            out.push_str(&format!("\x1b[<{}u", self.kitty));
+        }
+        if self.hidden {
+            out.push_str("\x1b[?25h");
+        }
+        out.into_bytes()
     }
 }
 
@@ -184,8 +264,22 @@ mod tests {
     }
 
     #[test]
+    fn modes_left_on_are_turned_off() {
+        let mut m = Modes::default();
+        m.feed(b"\x1b[?1049h\x1b[?1000;1006h\x1b[?2004h\x1b[?1004h\x1b=\x1b[>1u\x1b[?25l");
+        assert!(m.focus());
+        m.feed(b"\x1b[?1000l");
+        assert_eq!(String::from_utf8(m.restore()).unwrap(), "\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b>\x1b[<1u\x1b[?25h");
+        // A program that cleans up after itself leaves nothing to do.
+        m.feed(b"\x1b[?1006;1004;2004l\x1b[?1049l\x1b>\x1b[<u\x1b[?25h");
+        assert!(m.restore().is_empty());
+        m.feed(b"\x1b[?1004h\x1bc");
+        assert!(m.restore().is_empty(), "ESC c resets the terminal");
+    }
+
+    #[test]
     fn cursor_mode() {
-        let mut c = CursorKeys::default();
+        let mut c = Modes::default();
         c.feed(b"text\x1b[?1h");
         assert!(c.app);
         c.feed(b"\x1b[?25;1");

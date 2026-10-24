@@ -1085,6 +1085,47 @@ fn cve_preauth_flood_is_contained() {
     drop(flood);
 }
 
+/// A program that turns on focus and mouse reports and ends without
+/// turning them off: qsh turns them off, or the local terminal would type
+/// such reports into the next program (`[I` on switching tabs).
+#[test]
+fn terminal_modes_left_on_are_turned_off() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "-p", &s.port.to_string(), &dest(), "printf", "'\\033[?1004h\\033[?1000h\\033[?1006h'"])
+        .env("HOME", c.home.path())
+        .env("TERM", "xterm")
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        let mut buf = [0u8; 4096];
+        match master.read(&mut buf) {
+            Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
+            _ => sleep(Duration::from_millis(20)),
+        }
+    }
+    sleep(Duration::from_millis(100));
+    let mut buf = [0u8; 4096];
+    while let Ok(n @ 1..) = master.read(&mut buf) {
+        out.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&out);
+    let set = text.find("\x1b[?1004h").expect("the program's output");
+    let reset = text.rfind("\x1b[?1000l\x1b[?1006l\x1b[?1004l").unwrap_or_else(|| panic!("no reset in {text:?}"));
+    assert!(reset > set, "{text:?}");
+    let _ = child.wait();
+}
+
 /// Typing into a real terminal with keystroke timing obfuscation (on by
 /// default): every character arrives, in order, and chaff never leaks into
 /// the session.
