@@ -110,7 +110,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:NAME | Out-Null
-          Copy-Item target/release/qsh.exe, README.md, README.ru.md, LICENSE $env:NAME
+          Copy-Item target/release/qsh.exe, target/release/qshd.exe, README.md, README.ru.md, LICENSE $env:NAME
           Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -134,7 +134,7 @@ jobs:
         run: |
           sha256sum *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS
           cat > notes.md <<NOTES
-          Static Linux binaries (musl) for x86_64 and aarch64, macOS (Apple Silicon and Intel), Windows (the qsh client), and a native Android build for Termux (qsh-aarch64-android).
+          Static Linux binaries (musl) for x86_64 and aarch64, macOS (Apple Silicon and Intel), Windows (qsh and qshd), and a native Android build for Termux (qsh-aarch64-android).
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh

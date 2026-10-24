@@ -1,4 +1,4 @@
-# qsh installer for Windows (qsh, and qshd when the release has it):
+# qsh installer for Windows (qsh, and qshd, which serves the Windows user it runs as):
 #   irm https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.ps1 | iex
 # QSH_VERSION=v1.0.2 picks a release (default: the latest), QSH_BIN_DIR the install directory.
 & {
@@ -64,7 +64,7 @@
             if (Test-Path $server) { Rename-Item $server 'qshd.exe.old' }
             Copy-Item "$tmp\$name\qshd.exe" $server
         }
-        Write-Host "Installed qsh to $dir"
+        Write-Host "Installed qsh and qshd to $dir"
 
         $path = [Environment]::GetEnvironmentVariable('Path', 'User')
         if (-not (($path -split ';') -contains $dir)) {
