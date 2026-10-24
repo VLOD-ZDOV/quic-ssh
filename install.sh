@@ -192,18 +192,23 @@ if [ "$what" = server ]; then say "Installed qsh and qshd to $bin"; else say "In
 qshd=$bin/qshd
 # A root service must not run a binary that a user can replace.
 if [ "$(id -u)" = 0 ] || [ -n "$sudo_bin" ]; then sys=yes; else sys=no; fi
+# Units from before KillMode=process: a restart would end tmux and other
+# jobs started from qsh sessions, which sshd keeps.
+keep_jobs() { # unit drop-in-dir [root]
+    if ! grep -qs '^KillMode=' "$1" "$2"/*.conf; then
+        ${3:-} mkdir -p "$2"
+        printf '[Service]\nKillMode=process\n' >"$tmp/killmode"
+        ${3:-} cp "$tmp/killmode" "$2/killmode.conf"
+        say "Wrote $2/killmode.conf (a restart keeps tmux and nohup jobs, as with sshd)"
+        return 0
+    fi
+    return 1
+}
 # A unit that is already there may be edited by the admin: keep it.
 put_unit() { # src dest [root]
     if [ -e "$2" ]; then
         say "Keeping the existing $2"
-        # Units from before KillMode=process: a restart would end tmux and
-        # other jobs started from qsh sessions, which sshd keeps.
-        if ! grep -qs '^KillMode=' "$2" "$2.d"/*.conf; then
-            ${3:-} mkdir -p "$2.d"
-            printf '[Service]\nKillMode=process\n' >"$tmp/killmode"
-            ${3:-} cp "$tmp/killmode" "$2.d/killmode.conf"
-            say "Wrote $2.d/killmode.conf (a restart keeps tmux and nohup jobs, as with sshd)"
-        fi
+        keep_jobs "$2" "$2.d" "${3:-}" || true
     else
         sed "s|/usr/local/bin/qshd|$qshd|g" "$1" >"$tmp/unit"
         ${3:-} mkdir -p "$(dirname "$2")"
@@ -294,8 +299,17 @@ restart_running() {
         esac
     fi
     case $running in
-        system) as_root systemctl restart qshd ;;
-        user) systemctl --user restart qshd ;;
+        system)
+            # The update path keeps the unit too: give an old one KillMode=process.
+            if keep_jobs "$(systemctl show -P FragmentPath qshd)" /etc/systemd/system/qshd.service.d "$root"; then
+                as_root systemctl daemon-reload
+            fi
+            as_root systemctl restart qshd ;;
+        user)
+            if keep_jobs "$(systemctl --user show -P FragmentPath qshd)" "$HOME/.config/systemd/user/qshd.service.d"; then
+                systemctl --user daemon-reload
+            fi
+            systemctl --user restart qshd ;;
         launchd) as_root launchctl kickstart -k system/qshd ;;
         runit) sv restart qshd >/dev/null ;;
     esac
