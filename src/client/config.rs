@@ -31,6 +31,34 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 /// OpenSSH's system-wide client config (not read with `-F`, as by ssh).
 const SYSTEM_SSH_CONFIG: &str = "/etc/ssh/ssh_config";
 
+/// What `~/.config/qsh/config` starts as: every setting commented out at
+/// its default.
+const CONFIG_TEMPLATE: &str = include_str!("../../contrib/qsh_config");
+
+/// Creates `~/.config/qsh/config` from the template if there is none, so
+/// there is a file to look at and change (it changes nothing). Best effort:
+/// qsh works without it.
+pub fn create_template(home: &Path) {
+    use std::io::Write;
+    let dir = crate::keys::qsh_dir(home);
+    let file = dir.join("config");
+    // Not into someone else's home (`sudo -E`): the file would be root's.
+    #[cfg(unix)]
+    if std::fs::metadata(home).map_or(true, |m| std::os::unix::fs::MetadataExt::uid(&m) != nix::unistd::geteuid().as_raw()) {
+        return;
+    }
+    if file.exists() || crate::keys::create_private_dir(&dir).is_err() {
+        return;
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    if let Ok(mut f) = open.open(&file) {
+        let _ = f.write_all(CONFIG_TEMPLATE.as_bytes());
+    }
+}
+
 /// Settings collected for one host alias.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct HostConfig {
@@ -1024,6 +1052,20 @@ Host *
     User fallback
     IdentityFile ~/.ssh/id_%h
 "#;
+
+    #[test]
+    fn config_template() {
+        assert_eq!(parse(CONFIG_TEMPLATE, "h", Path::new("/x"), false), HostConfig::default());
+        // Uncommented, the "Host *" settings are all ones qsh reads.
+        let all = CONFIG_TEMPLATE.split("# Host *").nth(1).unwrap();
+        let on: String = all.lines().filter_map(|l| l.strip_prefix("#     ")).filter(|l| l.starts_with(|c: char| c.is_ascii_uppercase())).map(|l| format!("{l}\n")).collect();
+        let c = parse(&on, "h", Path::new("/x"), true);
+        assert_eq!((c.persist_session, c.predictive_echo.as_deref(), c.control_master.as_deref()), (Some(true), Some("auto"), Some("no")));
+        assert_eq!((c.batch_mode, c.compression, c.exit_on_forward_failure), (Some(false), Some(false), Some(false)));
+        assert_eq!((c.strict_host_key_checking.as_deref(), c.escape_char.as_deref(), c.server_alive_count_max), (Some("ask"), Some("~"), Some(3)));
+        assert_eq!((c.port, c.connect_timeout, c.obscure_keystrokes.as_deref()), (Some(4422), Some(0), Some("yes")));
+        assert_eq!(c.refused, None);
+    }
 
     #[test]
     fn keywords_qsh_would_be_less_strict_without() {

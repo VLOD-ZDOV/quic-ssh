@@ -1,0 +1,97 @@
+# qsh client settings, in the syntax of ~/.ssh/config.
+#
+# Every setting is commented out at its default: uncomment and change what
+# you need. qsh reads this file first, then ~/.ssh/config (HostName, User and
+# IdentityFile from there); `-o Key=value` on the command line wins over
+# both. As in ssh, the first value found for a setting wins: put the blocks
+# for single hosts first and the "Host *" block for all of them last.
+# Yes/no settings take yes or no.
+
+
+# ------------------------------------------------------------- Single hosts
+
+# Host work
+#     HostName 203.0.113.10
+#     User alice
+#     Port 4422
+#     IdentityFile ~/.ssh/id_work
+#     LocalForward 5432 localhost:5432
+#     RemoteForward 9000 localhost:3000
+#     DynamicForward 1080
+
+# Through another host (qsh runs over a connection to it).
+# Host inner
+#     ProxyJump work
+
+
+# ---------------------------------------------------------------- All hosts
+
+# Host *
+
+# --- Connecting
+
+#     Without a port, qsh tries the ssh port (22) and 4422 at once.
+#     Port 4422
+
+#     any, inet (IPv4) or inet6.
+#     AddressFamily any
+
+#     Seconds to wait for a connection (0: as long as the transport
+#     tries); tries, one second apart.
+#     ConnectTimeout 0
+#     ConnectionAttempts 1
+
+#     New host keys: ask, accept-new, yes (refuse) or no.
+#     StrictHostKeyChecking ask
+
+#     yes: never ask anything (scripts).
+#     BatchMode no
+
+# --- Sessions
+
+#     Terminal sessions survive a lost connection for an hour.
+#     PersistSession yes
+
+#     Show typed characters before the echo on slow links: auto, yes, no.
+#     PredictiveEcho auto
+
+#     Hide the rhythm of typing; or interval:40 (milliseconds).
+#     ObscureKeystrokeTiming yes
+
+#     Seconds between pings of a silent server (0: off; a terminal session
+#     notices a lost connection within about 15 s anyway), and missed
+#     answers before giving up.
+#     ServerAliveInterval 0
+#     ServerAliveCountMax 3
+
+#     yes, no, force or auto (a terminal when there is one).
+#     RequestTTY auto
+
+#     The key that starts ~. and the other escapes; none: off.
+#     EscapeChar ~
+
+#     QUIET, ERROR, INFO, VERBOSE or DEBUG.
+#     LogLevel INFO
+
+# --- One connection per host
+
+#     auto: use a running connection or become one, so later sessions and
+#     copies skip the login and the one-time code. ControlPersist keeps it
+#     after the last session (10m, or yes until `qsh -O exit HOST`).
+#     ControlMaster no
+#     ControlPersist no
+#     ControlPath ~/.config/qsh/ctl/%C
+
+# --- Forwarding
+
+#     Your ssh agent on the server (root there can use it).
+#     ForwardAgent no
+
+#     X11 programs on the server, shown here.
+#     ForwardX11 no
+
+#     Exit if a -L/-R/-D forward cannot be set up.
+#     ExitOnForwardFailure no
+
+#     Compress `qsh cp` transfers.
+#     Compression no

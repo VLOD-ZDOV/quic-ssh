@@ -314,6 +314,9 @@ fi
 share_connections() {
     dir="$HOME/.config/qsh"
     cfg="$dir/config"
+    # qsh creates the config (all commented out) on its first start: the
+    # block below goes after it.
+    "$bin/qsh" -V >/dev/null 2>&1 || true
     if grep -qi '^[[:space:]]*ControlMaster' "$cfg" 2>/dev/null; then
         say "$cfg already sets ControlMaster; left as it is"
         return 0

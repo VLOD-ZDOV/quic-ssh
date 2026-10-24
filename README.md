@@ -274,7 +274,7 @@ qsh myserver                        # = qsh -i ~/.ssh/work_key root@203.0.113.10
 qsh cp backup.tar myserver:/srv/
 ```
 
-From `~/.ssh/config` qsh takes `HostName`, `User` and `IdentityFile`. `Port` is ignored there, because it is the SSH port. For qsh-specific settings, including the port, use `~/.config/qsh/config` with the same syntax; its values take precedence:
+From `~/.ssh/config` qsh takes `HostName`, `User` and `IdentityFile`. `Port` is ignored there, because it is the SSH port. For qsh-specific settings, including the port, use `~/.config/qsh/config` with the same syntax; its values take precedence. qsh creates it at its first start with every setting commented out at its default, with a note on each (the template is `contrib/qsh_config`); an existing file is never changed:
 
 ```
 # ~/.config/qsh/config

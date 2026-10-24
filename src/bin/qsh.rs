@@ -250,6 +250,9 @@ fn main() {
     }));
     qsh::platform::blocking_stdio();
     let args = qsh::platform::args_or_exit("qsh");
+    if let Ok(home) = qsh::keys::home_dir() {
+        qsh::client::config::create_template(&home);
+    }
     let as_ssh = invoked_as_ssh(&args[0]);
     // As `ssh`, every word is ssh's: `ssh cp` connects to a host named cp.
     if !as_ssh && is_tool_invocation(&args) {
