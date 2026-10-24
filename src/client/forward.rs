@@ -191,7 +191,10 @@ fn report_failure(target: &str, e: &anyhow::Error) {
     };
     // Not with -q (LogLevel quiet/error).
     if show && tracing::enabled!(tracing::Level::WARN) {
-        say(&format!("qsh: cannot forward to {target}: {e:#} (repeats are not shown for a minute)\r\n"));
+        // The target (a SOCKS request) and the server's reason are not ours:
+        // no control characters reach the terminal.
+        let text: String = format!("{target}: {e:#}").chars().flat_map(|c| if c.is_control() { c.escape_default().collect::<Vec<_>>() } else { vec![c] }).collect();
+        say(&format!("qsh: cannot forward to {text} (repeats are not shown for a minute)\r\n"));
     } else {
         debug!("forward to {target}: {e:#}");
     }
@@ -241,7 +244,8 @@ async fn serve_local<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(conn: A
                     }
                     Err(e) => {
                         let _ = req.reply(&mut sock, false).await;
-                        Err(e.context(format!("{}:{}", req.host, req.port)))
+                        report_failure(&format!("{}:{}", req.host, req.port), &e);
+                        Ok(())
                     }
                 }
             }
