@@ -7,4 +7,12 @@ ignore = [
     # secret, so a server cannot collect the many precisely timed operations
     # on chosen input that the attack needs. Keys in ssh-agent never reach qsh.
     "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 timing branches (fixed only in 0.7, which ssh-key
+    # reaches in 0.7, not yet released). It comes in through elliptic-curve
+    # for ECDSA keys. The server only verifies ECDSA signatures (public data)
+    # and signs with its ed25519 host key. The client signs with an ECDSA key
+    # file once per login, over data that includes a fresh per-connection
+    # secret, so a server cannot collect the many timed operations on chosen
+    # input such an attack needs. Keys in ssh-agent never reach qsh.
+    "RUSTSEC-2026-0387",
 ]
