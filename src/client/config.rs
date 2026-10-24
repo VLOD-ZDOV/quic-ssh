@@ -396,11 +396,12 @@ impl Parser<'_> {
                 // Accumulated, without repeats (a later pass reads the same lines again).
                 "identityfile" => push_new(&mut o.identity_files, first),
                 // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
-                "localforward" if self.full && args.len() == 2 => push_new(&mut o.local_forwards, Some(format!("{}:{}", args[0], args[1]))),
-                "remoteforward" if self.full && args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                // Forwards mean the same whichever server answers: also without --full.
+                "localforward" if args.len() == 2 => push_new(&mut o.local_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                "remoteforward" if args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
                 // `RemoteForward [bind:]port` alone: a SOCKS proxy on the server.
-                "remoteforward" if self.full && args.len() == 1 => push_new(&mut o.remote_forwards, first),
-                "dynamicforward" if self.full => push_new(&mut o.dynamic_forwards, first),
+                "remoteforward" if args.len() == 1 => push_new(&mut o.remote_forwards, first),
+                "dynamicforward" => push_new(&mut o.dynamic_forwards, first),
                 "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
                 // ProxyJump and ProxyCommand compete: the first one found wins (as in ssh).
                 "proxyjump" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
@@ -1061,7 +1062,10 @@ Host *
         let c = parse(text, "a", Path::new("/x"), true);
         assert_eq!(c.local_forwards, vec!["8000:localhost:80", "127.0.0.1:9000:db:5432"]);
         assert_eq!(c.request_tty.as_deref(), Some("force"));
-        assert!(parse(text, "a", Path::new("/x"), false).local_forwards.is_empty());
+        // Forwards also without --full; the terminal request only with it.
+        let plain = parse(text, "a", Path::new("/x"), false);
+        assert_eq!(plain.local_forwards, c.local_forwards);
+        assert_eq!(plain.request_tty, None);
         assert!(parse(text, "b", Path::new("/x"), false).needs_proxy);
         assert_eq!(parse(text, "b", Path::new("/x"), true).proxy_jump.as_deref(), Some("bastion"));
         assert!(!parse(text, "c", Path::new("/x"), true).needs_proxy);

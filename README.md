@@ -286,7 +286,7 @@ Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `Identit
 
 With `--full` (automatic when qsh is installed as `ssh`), qsh behaves like a drop-in for `ssh`:
 
-- It also reads `Port`, `LocalForward`, `RemoteForward`, `DynamicForward` and `RequestTTY` from `~/.ssh/config`. Without `--full`, these describe the ssh session and are ignored.
+- It also reads `Port` and `RequestTTY` from `~/.ssh/config`. Without `--full`, these describe the ssh session and are ignored. `LocalForward`, `RemoteForward` and `DynamicForward` from there apply either way.
 - It looks for qshd **both** on the ssh port (default 22) **and** on 4422, in parallel, and uses whichever answers. On 22, qshd can run UDP-only next to sshd (`tcp = false` in the server config). An explicit qsh port (`-p`, `:port` or `Port` in `~/.config/qsh/config`) means only that port is tried.
 - If no qshd answers within 1 s, or `~/.ssh/config` gives the host a `ProxyJump`/`ProxyCommand` (the hops may not run qshd), qsh runs the regular **`ssh`** (or **`scp`** for `qsh --full cp`) with the same arguments. ssh then applies its whole config itself: agent, jump hosts, its own known_hosts.
 - Hosts without qshd are remembered for an hour, so later connections go straight to ssh. `--transport quic` forces a new check.
