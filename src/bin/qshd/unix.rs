@@ -119,7 +119,44 @@ fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
     Ok((cfg, key))
 }
 
+/// `/etc/qsh` is readable by all, like `/etc/ssh`: the config and the
+/// public host key are no secrets, and the private key file is private
+/// itself. (Older qshd made it private as a whole, so that nothing but
+/// root could read the config, nor `qsh copy-id` the public key.)
+fn open_system_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !is_root() || dir != std::path::Path::new("/etc/qsh") {
+        return Ok(());
+    }
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(m) if m.permissions().mode() & 0o777 == 0o700 => {
+            // Only what is meant to be read: files (and directories) that
+            // only the private directory kept from others stay out of reach.
+            let exposed = std::fs::read_dir(dir)?.filter_map(Result::ok).find(|e| {
+                let public = e.file_name().to_str().is_some_and(|n| n.ends_with(".pub") || n == "config.toml");
+                let open = e.path().symlink_metadata().map_or(true, |m| m.file_type().is_symlink() || m.permissions().mode() & 0o077 != 0);
+                open && !public
+            });
+            if let Some(e) = exposed {
+                eprintln!("{} stays private: {} is not private itself (chmod 600 it to let the config be read)", dir.display(), e.path().display());
+                return Ok(());
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+            eprintln!("{} is readable by all now, like /etc/ssh (the private host key stays private)", dir.display());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn host_key(path: &std::path::Path) -> Result<Identity> {
+    if let Some(dir) = path.parent() {
+        open_system_dir(dir)?;
+    }
     let (id, created) = Identity::load_or_generate(path, "qshd host key")?;
     if created {
         eprintln!("Generated host key {}", path.display());
