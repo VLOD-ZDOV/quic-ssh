@@ -3,6 +3,7 @@
 #   curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.sh | sh
 # Asks what to install. Without a terminal, or to skip the questions:
 #   ... | sh -s -- --client | --server [--service | --no-service] [--share | --no-share]
+#                  [--port N] [--totp off|optional|required] [--defaults]
 # QSH_VERSION=v1.0.2 picks a release (default: the latest), QSH_BIN_DIR the install directory.
 set -eu
 
@@ -14,6 +15,7 @@ die() { printf 'qsh install: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<EOF
 Usage: install.sh [--client | --server | --update] [--service | --no-service] [--share | --no-share]
+                  [--port N] [--totp off|optional|required] [--defaults]
   --client      install qsh only
   --update      update what is installed in QSH_BIN_DIR (what qsh update runs)
   --server      install qsh and qshd
@@ -22,13 +24,27 @@ Usage: install.sh [--client | --server | --update] [--service | --no-service] [-
   --share       one connection per host for 10 minutes (ControlMaster): later
                 qsh runs to it skip the login and its one-time code
   --no-share    leave the client config as it is
+  --port N      qshd listens on port N (UDP and TCP; default 4422)
+  --totp MODE   one-time codes: off, optional (for who sets them up, the
+                default) or required
+  --defaults    ask nothing more: what is not given keeps its default
 Without options it asks. QSH_VERSION picks a release, QSH_BIN_DIR the directory.
 EOF
 }
 
-what='' service='' share=''
+what='' service='' share='' port='' totp='' defaults=no
+next=''
 for a in "$@"; do
+    case $next in
+        port) port=$a; next=''; continue ;;
+        totp) totp=$a; next=''; continue ;;
+    esac
     case $a in
+        --port) next=port ;;
+        --port=*) port=${a#--port=} ;;
+        --totp) next=totp ;;
+        --totp=*) totp=${a#--totp=} ;;
+        --defaults) defaults=yes ;;
         --client) what=client ;;
         --server) what=server ;;
         --update) what=update ;;
@@ -40,6 +56,16 @@ for a in "$@"; do
         *) die "unknown option: $a" ;;
     esac
 done
+[ -z "$next" ] || die "--$next needs a value"
+case $port in
+    "" | default) port='' ;;
+    *[!0-9]* | 0) die "--port: not a port number: $port" ;;
+    *) [ "$port" -le 65535 ] || die "--port: not a port number: $port" ;;
+esac
+case $totp in
+    "" | default | off | optional | required) [ "$totp" = default ] && totp='' ;;
+    *) die "--totp: off, optional or required, not $totp" ;;
+esac
 
 # Piped into sh, stdin is this script, so questions go to the terminal.
 has_tty() { (exec </dev/tty) 2>/dev/null; }
@@ -93,6 +119,31 @@ if [ "$what" = server ] && [ -z "$service" ]; then
         service=no
     fi
 fi
+
+# A few settings of qshd, asked once. Enter keeps the default, s skips the
+# question; either way the config keeps that setting commented out.
+if [ "$what" = server ] && [ "$defaults" = no ] && has_tty; then
+    say ""
+    say "qshd settings (Enter: the default in brackets, s: skip):"
+    while [ -z "$port" ]; do
+        ask "  Port for UDP and TCP [4422]: "
+        case $REPLY in
+            "" | [Ss]) break ;;
+            *[!0-9]* | 0) say "  A number from 1 to 65535, please." ;;
+            *) if [ "$REPLY" -le 65535 ]; then port=$REPLY; else say "  A number from 1 to 65535, please."; fi ;;
+        esac
+    done
+    while [ -z "$totp" ]; do
+        ask "  One-time codes: off, optional (for who sets them up), required [optional]: "
+        case $REPLY in
+            "" | [Ss]) break ;;
+            off | optional | required) totp=$REPLY ;;
+            *) say "  off, optional or required, please." ;;
+        esac
+    done
+fi
+[ "$port" = 4422 ] && port=''
+[ "$totp" = optional ] && totp=''
 
 # root: how to run commands as root ("" when we are root, "none" when we cannot).
 if [ "$(id -u)" = 0 ]; then
@@ -316,7 +367,39 @@ restart_running() {
     say "Restarted the qshd service"
 }
 
+# Writes the settings asked for into qshd's config (created first, all
+# commented out); one already set by hand is left as it is.
+configure_qshd() {
+    [ -n "$port$totp" ] || return 0
+    if [ "$sys" = yes ]; then
+        as_root "$qshd" init >/dev/null
+        cfg=/etc/qsh/config.toml
+    else
+        "$qshd" init >/dev/null
+        cfg=$HOME/.config/qsh/qshd.toml
+    fi
+    if [ "$sys" = yes ]; then as_root cat "$cfg" >"$tmp/config"; else cat "$cfg" >"$tmp/config"; fi
+    for kv in ${port:+"listen=\"[::]:$port\""} ${totp:+"totp=\"$totp\""}; do
+        key=${kv%%=*} val=${kv#*=}
+        if grep -q "^$key[[:space:]]*=" "$tmp/config"; then
+            say "$cfg already sets $key; left as it is"
+            continue
+        fi
+        # The commented-out default becomes the setting; else it goes at the top.
+        if grep -q "^# $key = " "$tmp/config"; then
+            sed "s|^# $key = .*|$key = $val|" "$tmp/config" >"$tmp/config.new"
+        else
+            { printf '%s = %s\n' "$key" "$val"; cat "$tmp/config"; } >"$tmp/config.new"
+        fi
+        mv "$tmp/config.new" "$tmp/config"
+        say "Set $key = $val in $cfg"
+    done
+    # tee keeps the file's owner and mode.
+    if [ "$sys" = yes ]; then as_root tee "$cfg" <"$tmp/config" >/dev/null; else cat "$tmp/config" >"$cfg"; fi
+}
+
 if [ "$what" = server ]; then
+    [ "$update" = yes ] || configure_qshd
     if [ "$service" = yes ]; then
         "service_$plat"
     else
@@ -368,7 +451,7 @@ case :$PATH: in
 esac
 say ""
 if [ "$what" = server ]; then
-    say "Open port 4422 for UDP and TCP in the firewall. To add a client, run 'qshd pair' on this"
+    say "Open port ${port:-4422} for UDP and TCP in the firewall. To add a client, run 'qshd pair' on this"
     say "machine as the user who will log in, then the 'qsh pair' command it prints on the client."
 else
     say "Next: run 'qshd pair' on the server, then 'qsh pair user@server' here and type the code."
