@@ -40,7 +40,7 @@ curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/instal
 
 Скрипт спросит, что ставить: только клиент (`qsh`) или клиент и сервер (`qsh` + `qshd`), а для сервера спросит, запускать ли qshd службой при загрузке (systemd, launchd или termux-services). Программы он кладёт в `/usr/local/bin` (попросит sudo), а если sudo нет, то в `~/.local/bin`, и сверяет скачанное с `SHA256SUMS`. Уже существующий файл службы он не трогает. Чтобы обойтись без вопросов: `... | sh -s -- --server --service` (или `--client`, `--no-service`). Ещё он спросит, держать ли одно соединение с хостом 10 минут (`ControlMaster`), чтобы одноразовый код вводился один раз, а следующие `qsh` и `qsh cp` шли без нового входа (`--share` / `--no-share`); сервер может ограничить это настройкой `totp_valid_for`.
 
-Windows (qsh и qshd), в PowerShell:
+Windows (qsh), в PowerShell:
 
 ```powershell
 irm https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.ps1 | iex
@@ -76,9 +76,9 @@ sudo install -m755 qsh-$ARCH-macos/qsh qsh-$ARCH-macos/qshd /usr/local/bin/
 
 ### Windows
 
-Клиент `qsh.exe` лежит в `qsh-x86_64-windows.zip`. Распакуй его в папку из `PATH`. qsh использует `%USERPROFILE%\.ssh` (ключи, `config`, отметки `known_hosts`) и `%USERPROFILE%\.config\qsh` и сам работает со службой агента OpenSSH для Windows (`ssh-agent`). Доступно всё, кроме `-f`. `--full` запускает `ssh.exe` и ждёт его завершения. Сборка под Windows новая и проверяется автоматически, но интерактивную работу с ней проверяли меньше, чем под Linux; если что-то не так, сообщи. В архиве есть и сервер `qshd.exe`, который обслуживает того пользователя Windows, от которого запущен (см. ниже).
+Клиент `qsh.exe` лежит в `qsh-x86_64-windows.zip`. Распакуй его в папку из `PATH`. qsh использует `%USERPROFILE%\.ssh` (ключи, `config`, отметки `known_hosts`) и `%USERPROFILE%\.config\qsh` и сам работает со службой агента OpenSSH для Windows (`ssh-agent`). Доступно всё, кроме `-f`. `--full` запускает `ssh.exe` и ждёт его завершения. Сборка под Windows новая и проверяется автоматически, но интерактивную работу с ней проверяли меньше, чем под Linux; если что-то не так, сообщи. Сервера `qshd.exe` в релизе пока нет: его ещё проверяют на Windows (см. ниже).
 
-**qshd на Windows.** Запусти `qshd.exe` от того пользователя, под которым будут входить (автозапуск при входе: `schtasks /create /tn qshd /sc onlogon /tr "%LOCALAPPDATA%\Programs\qsh\qshd.exe"`), и открой в брандмауэре UDP и TCP 4422. Ключи лежат в `%USERPROFILE%\.config\qsh\authorized_keys`; `qshd pair`, `qshd keys` и `qshd totp` работают как на Linux. Команды выполняются в `cmd.exe` (другую оболочку задаёт `QSHD_SHELL`, например `pwsh.exe`), терминал работает через ConPTY. Копирование (с докачкой), пробросы `-L`/`-R`/`-D` и одноразовые коды работают. На Windows нет: других пользователей, паролей, sftp, проброса агента и X11, проброса Unix-сокетов, `chroot_directory` (вход, к которому он относится, отклоняется) и сессий, переживающих обрыв связи. Имя пользователя пишется так же, как у аккаунта, с теми же заглавными буквами. qshd не проверяет, кто ещё может писать в `authorized_keys`: других пользователей не пускают права самого профиля.
+**qshd на Windows (экспериментально, в релизе пока нет).** Собери его командой `cargo build --release --bin qshd`. Запусти `qshd.exe` от того пользователя, под которым будут входить (автозапуск при входе: `schtasks /create /tn qshd /sc onlogon /tr "%LOCALAPPDATA%\Programs\qsh\qshd.exe"`), и открой в брандмауэре UDP и TCP 4422. Ключи лежат в `%USERPROFILE%\.config\qsh\authorized_keys`; `qshd pair`, `qshd keys` и `qshd totp` работают как на Linux. Команды выполняются в `cmd.exe` (другую оболочку задаёт `QSHD_SHELL`, например `pwsh.exe`), терминал работает через ConPTY. Копирование (с докачкой), пробросы `-L`/`-R`/`-D` и одноразовые коды работают. На Windows нет: других пользователей, паролей, sftp, проброса агента и X11, проброса Unix-сокетов, `chroot_directory` (вход, к которому он относится, отклоняется) и сессий, переживающих обрыв связи. Имя пользователя пишется так же, как у аккаунта, с теми же заглавными буквами. qshd не проверяет, кто ещё может писать в `authorized_keys`: других пользователей не пускают права самого профиля.
 
 ### Android (Termux)
 
@@ -596,7 +596,7 @@ python3 bench/bench.py
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.
 - `-J` работает, только если на всех промежуточных хостах есть qshd (через другие хосты — `ProxyCommand ssh -W %h:%p bastion` в `~/.config/qsh/config` до TCP-порта qshd); с `--full` хосты с `ProxyJump`/`ProxyCommand` из конфига ssh отдаются ssh.
 - Нет GSSAPI/Kerberos, PKCS#11 и FIDO-ключей без агента, `UpdateHostKeys`, `VerifyHostKeyDNS` и `CheckHostIP` (у qshd один ключ хоста, а записи known_hosts привязаны к имени).
-- qshd на Windows обслуживает только пользователя, от которого запущен, без sftp, проброса агента и X11 и долгих сессий (см. раздел Windows выше).
+- qshd на Windows экспериментальный и в релиз не входит; он обслуживает только пользователя, от которого запущен, без sftp, проброса агента и X11 и долгих сессий (см. раздел Windows выше).
 
 ### Обновление
 
