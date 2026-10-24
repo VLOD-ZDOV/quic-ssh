@@ -21,16 +21,19 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Also accept the TLS-over-TCP fallback. With `false` qshd listens on UDP
     /// only, so it can share a port number with sshd (e.g. 22) for `qsh --full`.
+    #[serde(deserialize_with = "flag")]
     pub tcp: bool,
     /// Host key path; defaults to `host_ed25519` next to the config file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key: Option<PathBuf>,
     /// Also accept keys from `~/.ssh/authorized_keys` (the files in
     /// `authorized_keys_file`).
+    #[serde(deserialize_with = "flag")]
     pub use_ssh_authorized_keys: bool,
     /// Accept keys from qsh's own `~/.config/qsh/authorized_keys` (where
     /// `qsh pair` puts them). Off where keys are managed
     /// centrally (`authorized_keys_file`, `authorized_keys_command`).
+    #[serde(deserialize_with = "flag")]
     pub use_qsh_authorized_keys: bool,
     /// The OpenSSH key files read with `use_ssh_authorized_keys` (like
     /// AuthorizedKeysFile): relative to the home, `%h` home, `%u` user,
@@ -46,6 +49,7 @@ pub struct ServerConfig {
     /// `false`/`"no"`, `"local"` or `"remote"` (like AllowTcpForwarding).
     pub allow_tcp_forwarding: Forwarding,
     /// Turns all forwarding off: ports, Unix sockets, agent (like DisableForwarding).
+    #[serde(deserialize_with = "flag")]
     pub disable_forwarding: bool,
     /// Unix socket forwarding (`-L`/`-R` with paths), like
     /// AllowStreamLocalForwarding: `yes`, `no`, `local`, `remote`.
@@ -54,12 +58,15 @@ pub struct ServerConfig {
     /// StreamLocalBindMask): "0177" leaves them to their owner.
     pub stream_local_bind_mask: String,
     /// Remove a stale socket file before listening on it (StreamLocalBindUnlink).
+    #[serde(deserialize_with = "flag")]
     pub stream_local_bind_unlink: bool,
     /// Allow `qsh -X`/`-Y` (like X11Forwarding).
+    #[serde(deserialize_with = "flag")]
     pub x11_forwarding: bool,
     /// The first display number used (like X11DisplayOffset).
     pub x11_display_offset: u32,
     /// Displays listen on loopback only (like X11UseLocalhost).
+    #[serde(deserialize_with = "flag")]
     pub x11_use_localhost: bool,
     /// The xauth program (like XAuthLocation).
     pub xauth_location: PathBuf,
@@ -91,6 +98,7 @@ pub struct ServerConfig {
     /// user's slice (`user-UID.slice/qsh-UID-ID.scope`), so its programs count
     /// against the user and not qshd's service, and restarting qshd leaves
     /// them running (tmux). Off, or without systemd, they stay in qshd's.
+    #[serde(deserialize_with = "flag")]
     pub session_scope: bool,
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).
@@ -106,6 +114,7 @@ pub struct ServerConfig {
     /// Failed key proofs allowed per connection (like sshd's MaxAuthTries).
     pub max_auth_tries: u32,
     /// Allow `qsh -A` (ssh-agent forwarding).
+    #[serde(deserialize_with = "flag")]
     pub allow_agent_forwarding: bool,
     /// One-time codes (TOTP) as a second factor after the key.
     pub totp: Totp,
@@ -151,15 +160,19 @@ pub struct ServerConfig {
     pub banner: Option<PathBuf>,
     /// Show /etc/motd when a login shell starts (like PrintMotd);
     /// `~/.hushlogin` turns this and the last login off.
+    #[serde(deserialize_with = "flag")]
     pub print_motd: bool,
     /// Show when and from where the user last logged in (like PrintLastLog).
+    #[serde(deserialize_with = "flag")]
     pub print_last_log: bool,
     /// Run `~/.ssh/rc` (or else /etc/ssh/sshrc) before a session's program,
     /// as sshd does (like PermitUserRC).
+    #[serde(deserialize_with = "flag")]
     pub permit_user_rc: bool,
     /// Commands, shells and subsystems at once per connection (like MaxSessions).
     pub max_sessions: usize,
     /// Allow terminals (like PermitTTY).
+    #[serde(deserialize_with = "flag")]
     pub permit_tty: bool,
     /// Client variables a session gets: name patterns (like AcceptEnv).
     #[serde(deserialize_with = "names")]
@@ -182,12 +195,15 @@ pub struct ServerConfig {
     pub client_alive_interval: u64,
     pub client_alive_count_max: u32,
     /// Refuse the connection (like RefuseConnection; for `[[match]]`).
+    #[serde(deserialize_with = "flag")]
     pub refuse_connection: bool,
     /// Accept passwords from /etc/shadow when no key works (like
     /// PasswordAuthentication; off by default). System mode on Linux only;
     /// yescrypt and SHA-crypt hashes.
+    #[serde(deserialize_with = "flag")]
     pub password_authentication: bool,
     /// Accept an empty password for accounts that have none (PermitEmptyPasswords).
+    #[serde(deserialize_with = "flag")]
     pub permit_empty_passwords: bool,
     /// Drop connections from addresses that keep failing to log in (like
     /// PerSourcePenalties): `true`, `false`, or sshd's settings, e.g.
@@ -253,6 +269,34 @@ impl PermitTunnel {
             PermitTunnel::Ethernet => ethernet,
         }
     }
+}
+
+/// A yes/no setting: TOML's `true`/`false`, or as sshd and people write
+/// them, `yes`/`no`, `on`/`off`, `1`/`0`.
+fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Int(i64),
+        Text(String),
+    }
+    let bad = |v: String| serde::de::Error::custom(format!("{v} is not yes or no (true/false, yes/no, on/off, 1/0)"));
+    match Raw::deserialize(d)? {
+        Raw::Bool(b) => Ok(b),
+        Raw::Int(1) => Ok(true),
+        Raw::Int(0) => Ok(false),
+        Raw::Int(n) => Err(bad(n.to_string())),
+        Raw::Text(t) => match t.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "on" | "1" => Ok(true),
+            "no" | "false" | "off" | "0" => Ok(false),
+            _ => Err(bad(format!("{t:?}"))),
+        },
+    }
+}
+
+fn opt_flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    flag(d).map(Some)
 }
 
 /// Which way forwarding may go (sshd's `yes`/`all`, `no`, `local`, `remote`).
@@ -358,8 +402,8 @@ impl Penalties {
     fn parse(text: &str) -> Result<Penalties, String> {
         let mut p = Penalties::default();
         match text.trim().to_ascii_lowercase().as_str() {
-            "yes" => return Ok(p),
-            "no" => return Ok(Penalties { enabled: false, ..p }),
+            "yes" | "true" | "on" | "1" => return Ok(p),
+            "no" | "false" | "off" | "0" => return Ok(Penalties { enabled: false, ..p }),
             _ => {}
         }
         for word in text.split_whitespace() {
@@ -390,10 +434,13 @@ impl<'de> Deserialize<'de> for Penalties {
         #[serde(untagged)]
         enum Raw {
             Bool(bool),
+            Int(i64),
             Text(String),
         }
         match Raw::deserialize(d)? {
             Raw::Bool(enabled) => Ok(Penalties { enabled, ..Penalties::default() }),
+            Raw::Int(n @ (0 | 1)) => Ok(Penalties { enabled: n == 1, ..Penalties::default() }),
+            Raw::Int(n) => Err(serde::de::Error::custom(format!("per_source_penalties: {n} is not 1 or 0"))),
             Raw::Text(t) => Penalties::parse(&t).map_err(serde::de::Error::custom),
         }
     }
@@ -508,12 +555,14 @@ overrides! {
     plain {
         #[serde(deserialize_with = "opt_names")]
         accept_env: Vec<String>,
+        #[serde(deserialize_with = "opt_flag")]
         allow_agent_forwarding: bool,
         #[serde(deserialize_with = "opt_names")]
         allow_groups: Vec<String>,
         allow_tcp_forwarding: Forwarding,
         allow_stream_local_forwarding: Forwarding,
         stream_local_bind_mask: String,
+        #[serde(deserialize_with = "opt_flag")]
         stream_local_bind_unlink: bool,
         #[serde(deserialize_with = "opt_user_entries")]
         allow_users: Vec<String>,
@@ -523,27 +572,37 @@ overrides! {
         deny_groups: Vec<String>,
         #[serde(deserialize_with = "opt_user_entries")]
         deny_users: Vec<String>,
+        #[serde(deserialize_with = "opt_flag")]
         disable_forwarding: bool,
         gateway_ports: GatewayPorts,
         max_auth_tries: u32,
         max_sessions: usize,
+        #[serde(deserialize_with = "opt_flag")]
         password_authentication: bool,
+        #[serde(deserialize_with = "opt_flag")]
         permit_empty_passwords: bool,
         #[serde(deserialize_with = "opt_names")]
         permit_listen: Vec<String>,
         #[serde(deserialize_with = "opt_names")]
         permit_open: Vec<String>,
         permit_root_login: PermitRootLogin,
+        #[serde(deserialize_with = "opt_flag")]
         permit_tty: bool,
         permit_tunnel: PermitTunnel,
+        #[serde(deserialize_with = "opt_flag")]
         permit_user_rc: bool,
+        #[serde(deserialize_with = "opt_flag")]
         refuse_connection: bool,
         set_env: BTreeMap<String, String>,
         totp: Totp,
+        #[serde(deserialize_with = "opt_flag")]
         use_qsh_authorized_keys: bool,
+        #[serde(deserialize_with = "opt_flag")]
         use_ssh_authorized_keys: bool,
         x11_display_offset: u32,
+        #[serde(deserialize_with = "opt_flag")]
         x11_forwarding: bool,
+        #[serde(deserialize_with = "opt_flag")]
         x11_use_localhost: bool,
     }
     optional {
@@ -917,6 +976,16 @@ mod tests {
 
     /// The template qshd writes (contrib/qshd.toml) changes nothing as it
     /// is, and every setting in it parses once uncommented.
+    #[test]
+    fn yes_no_settings() {
+        let cfg: ServerConfig = toml::from_str("tcp = \"no\"\nprint_motd = 0\npermit_tty = \"Off\"\nx11_forwarding = \"yes\"\nper_source_penalties = \"off\"\n[[match]]\nuser = \"a\"\npermit_tty = \"on\"\n").unwrap();
+        assert!(!cfg.tcp && !cfg.print_motd && !cfg.permit_tty && cfg.x11_forwarding && !cfg.per_source_penalties.enabled);
+        assert_eq!(cfg.matches[0].permit_tty, Some(true));
+        let err = toml::from_str::<ServerConfig>("tcp = \"maybe\"\n").unwrap_err().to_string();
+        assert!(err.contains("yes or no"), "{err}");
+        assert!(toml::from_str::<ServerConfig>("tcp = 2\n").is_err());
+    }
+
     #[test]
     fn config_template() {
         let template = include_str!("../contrib/qshd.toml");

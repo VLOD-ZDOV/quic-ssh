@@ -2,7 +2,8 @@
 #
 # Every setting is commented out at its default: uncomment and change what
 # you need. Check with `qshd -t`, apply with `systemctl reload qshd` (or a
-# restart). `qshd -T` prints the settings in effect.
+# restart). `qshd -T` prints the settings in effect. Yes/no settings take
+# true/false, yes/no, on/off or 1/0.
 
 
 # ---------------------------------------------------------------- Listening

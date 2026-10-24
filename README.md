@@ -398,7 +398,7 @@ Like mosh, qsh shows what you type before the server's echo arrives, when echoes
 | system | root | any user (with their own keys) | `/etc/qsh/config.toml`, `/etc/qsh/host_ed25519` |
 | user | a regular user | only that user | `~/.config/qsh/qshd.toml`, `~/.config/qsh/host_ed25519` |
 
-At the first start (or `qshd init`) qshd creates the config with every setting commented out at its default (the template is `contrib/qshd.toml`): readable by all in `/etc/qsh`, like `sshd_config`, private in user mode. An existing file is never changed. All settings, at their defaults:
+At the first start (or `qshd init`) qshd creates the config with every setting commented out at its default (the template is `contrib/qshd.toml`): readable by all in `/etc/qsh`, like `sshd_config`, private in user mode. An existing file is never changed. Yes/no settings take `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0`. All settings, at their defaults:
 
 ```toml
 listen = "[::]:4422"            # UDP and TCP; falls back to 0.0.0.0 if IPv6 is disabled
