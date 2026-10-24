@@ -36,7 +36,7 @@ jobs:
       # Load tests, one at a time: beside the others they slow handshakes down.
       - run: cargo test --locked --test e2e -- --ignored --test-threads=1
 
-  # The client on Windows (qshd is Unix-only).
+  # qsh and qshd on Windows; tests/windows.rs runs them against each other.
   windows:
     runs-on: windows-latest
     steps:
@@ -47,7 +47,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: cargo build --locked --release --bin qsh
+        env:
+          QSH_WINDOWS_E2E: "1"
+      - run: cargo build --locked --release --bins
 
   # qshd as real root: creates temporary users and checks privilege dropping,
   # file ownership, PTY ownership, StrictModes and pairing (tests/system-mode.sh).

@@ -105,12 +105,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo build --release --locked --bin qsh
+        run: cargo build --release --locked --bins
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:NAME | Out-Null
-          Copy-Item target/release/qsh.exe, README.md, README.ru.md, LICENSE $env:NAME
+          Copy-Item target/release/qsh.exe, target/release/qshd.exe, README.md, README.ru.md, LICENSE $env:NAME
           Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip"
       - uses: actions/upload-artifact@v4
         with:
