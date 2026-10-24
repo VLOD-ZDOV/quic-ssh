@@ -322,8 +322,10 @@ share_connections() {
         return 0
     fi
     [ -d "$dir" ] || { mkdir -p "$dir" && chmod 700 "$dir"; }
+    gap=''
+    [ -s "$cfg" ] && gap=yes
     {
-        [ -s "$cfg" ] && echo
+        [ -n "$gap" ] && echo
         echo "# One connection per host for 10 minutes after the last use: later qsh and"
         echo "# qsh cp runs to it skip the login, and its one-time code. 'qsh -O exit HOST' ends it."
         echo "Host *"
