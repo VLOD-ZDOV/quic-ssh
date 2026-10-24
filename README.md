@@ -421,6 +421,10 @@ gateway_ports = "no"            # -R listens on loopback only; "yes": all addres
 max_auth_tries = 6              # failed key proofs per connection
 allow_agent_forwarding = true
 totp = "optional"               # one-time codes: "off", "optional" (for users who set them up), "required"
+totp_valid_for = 3600           # seconds a code lasts on its connection (0: as long as it); then it opens nothing
+                                # new (sessions, copies, forwarded connections) while what is under way goes on: a
+                                # shared connection (ControlMaster) logs in again with a code, a long -L tunnel
+                                # takes no new connections
 session_timeout = 3600          # seconds a disconnected terminal session is kept; 0 = off
 # trusted_user_ca_keys = "/etc/qsh/user_ca.pub"   # CAs that sign user certificates (principal = user name)
 # host_certificate = "/etc/qsh/host_ed25519-cert.pub"   # used automatically if it exists

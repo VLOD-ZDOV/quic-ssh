@@ -1116,6 +1116,21 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
     }
 }
 
+/// Whether the server says the one-time code of a shared connection has
+/// run out (`totp_valid_for`; servers from protocol version 9 tell).
+#[cfg(unix)]
+async fn shared_code_expired(conn: &Conn) -> bool {
+    if conn.server_version() < 9 {
+        return false;
+    }
+    let ping = async {
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_msg(&mut send, &crate::proto::Request::MayStart).await?;
+        crate::proto::read_msg::<_, crate::proto::Reply>(&mut recv).await
+    };
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ping).await, Ok(Ok(crate::proto::Reply::Err(e))) if e.contains("one-time code") && e.contains("expired"))
+}
+
 /// Connects, verifies the host key against known_hosts and logs in, going
 /// through the target's jump hosts (`-J`/`ProxyJump`) if it has any.
 pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
@@ -1123,8 +1138,14 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     #[cfg(unix)]
     if let (true, None, Some(path)) = (opts.share, &opts.resume, &target.sharing.path) {
         if let Some(conn) = transport::shared::attach(path).await {
-            tracing::info!("using the shared connection at {}", path.display());
-            return Ok(conn);
+            if shared_code_expired(&conn).await {
+                // Sessions through it go on; new ones log in, with a code.
+                tracing::info!("the shared connection's one-time code has expired; logging in again");
+                let _ = transport::shared::control(path, transport::shared::Command::Stop).await;
+            } else {
+                tracing::info!("using the shared connection at {}", path.display());
+                return Ok(conn);
+            }
         }
     }
     // Before any jump host is contacted.

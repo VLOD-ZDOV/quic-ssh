@@ -613,11 +613,11 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     *outcome = Outcome::AuthFailed;
     let second = async {
         if resume.is_some() {
-            return Ok(Ok(()));
+            return Ok(Ok(false));
         }
         auth::second_factor(&mut send, &mut recv, &user, cfg.totp, version, &state.totp_used).await
     };
-    match tokio::time::timeout(left(), second).await {
+    let code_given = match tokio::time::timeout(left(), second).await {
         Err(_) => {
             *outcome = Outcome::GraceExceeded;
             bail!("login took too long");
@@ -629,8 +629,8 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
             write_msg(&mut send, &Reply::Err(msg)).await?;
             return Ok(());
         }
-        Ok(Ok(Ok(()))) => {}
-    }
+        Ok(Ok(Ok(code))) => code,
+    };
     let mut user = user;
     user.chroot = match cfg.chroot_for(&user.name, user.uid, &user.home) {
         Ok(c) => c,
@@ -658,6 +658,8 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     let user = Arc::new(user);
     let grant = Arc::new(grant);
     let sessions_limit = Arc::new(Semaphore::new(cfg.max_sessions));
+    // A shared connection outlives the code it was opened with only so long.
+    let code_expires = (code_given && cfg.totp_valid_for > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(cfg.totp_valid_for));
     let agent = Arc::new(agent::AgentSocket::default());
     let x11 = Arc::new(x11::X11::default());
     // Lets running sessions notice a dead connection even after the client
@@ -687,6 +689,7 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
                 agent: &agent,
                 x11: &x11,
                 resume_only: resume.as_deref(),
+                code_expires,
             };
             if let Err(e) = handle_stream(send, recv, ctx, closed).await {
                 debug!("{addr}: stream error: {e:#}");
@@ -733,10 +736,12 @@ struct StreamCtx<'a> {
     x11: &'a x11::X11,
     /// Logged in with `Hello::Resume` (no second factor): only this session may be resumed.
     resume_only: Option<&'a [u8]>,
+    /// `totp_valid_for`: when the one-time code of this connection runs out.
+    code_expires: Option<tokio::time::Instant>,
 }
 
 async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_>, closed: watch::Receiver<bool>) -> Result<()> {
-    let StreamCtx { conn, user, grant, state, cfg, sessions, agent, x11, resume_only } = ctx;
+    let StreamCtx { conn, user, grant, state, cfg, sessions, agent, x11, resume_only, code_expires } = ctx;
     let request = match read_msg(&mut recv).await {
         Ok(r) => r,
         // A request type from a newer client: say so instead of dropping the stream.
@@ -745,6 +750,15 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         }
         Err(e) => return Err(e),
     };
+    // Once the code has run out, nothing new: not a session, a copy, a
+    // forward, a socket or a resumed session, any of which a shared
+    // connection could otherwise go on opening without a code. What is
+    // under way goes on, and so do pings (ServerAlive). `MayStart` is
+    // refused too: that is how a client learns it.
+    let starts = !matches!(request, Request::Ping);
+    if starts && code_expires.is_some_and(|t| tokio::time::Instant::now() >= t) {
+        return write_msg(&mut send, &Reply::Err("the one-time code of this connection has expired (totp_valid_for): connect again".into())).await;
+    }
     if let Some(allowed) = resume_only {
         if !matches!(&request, Request::Resume { token, .. } if token == allowed) {
             return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
@@ -979,7 +993,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             tunnel(send, recv, conn, user, ethernet, unit).await
         }
-        Request::Ping => write_msg(&mut send, &Reply::Ok).await,
+        Request::Ping | Request::MayStart => write_msg(&mut send, &Reply::Ok).await,
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
         Request::Compressed(_) => unreachable!("unwrapped above"),

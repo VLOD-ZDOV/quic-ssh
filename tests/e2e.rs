@@ -1880,6 +1880,45 @@ fn one_time_codes() {
     assert!(!out.status.success(), "a world-readable secret turned 2FA off");
 }
 
+/// `totp_valid_for`: a shared connection opened with a one-time code works
+/// without one, but only that long; then a new login asks for a code again.
+#[test]
+fn one_time_code_lasts_on_a_shared_connection_only_so_long() {
+    use qsh::totp;
+    let s = Server::start_with("127.0.0.1", "totp_valid_for = 3\n");
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let ctl = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath {}/%C\n", ctl.path().display())).unwrap();
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let dir = tempfile::tempdir().unwrap();
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step))]);
+    let port = s.port.to_string();
+    let run = |what: &str| c.cmd(&["-p", &port, &dest(), "echo", what]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap();
+    assert_eq!(stdout(&run("first")), "first\n");
+    // Through the master: no code asked; a session started then outlives
+    // the code, with ServerAlive pings going on.
+    std::fs::remove_file(dir.path().join("asked")).unwrap();
+    let out = c
+        .cmd(&["-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-p", &port, &dest(), "sleep 5; echo shared"])
+        .env("SSH_ASKPASS", &script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out), "shared\n", "{}", stderr(&out));
+    assert!(!dir.path().join("asked").exists(), "a code was asked through the master");
+    // After totp_valid_for, the master's connection starts nothing new: qsh
+    // logs in again, with the next code.
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step + 1))]);
+    let late = c.cmd(&["-p", &port, &dest(), "echo", "late"]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap();
+    assert_eq!(stdout(&late), "late\n", "{}", stderr(&late));
+    assert!(std::fs::read_to_string(dir.path().join("asked")).unwrap().contains("One-time code"));
+    let _ = c.run(&["-O", "exit", "-p", &port, &dest()]);
+}
+
 #[test]
 fn one_time_codes_required() {
     let s = Server::start_with("127.0.0.1", "totp = \"required\"\n");

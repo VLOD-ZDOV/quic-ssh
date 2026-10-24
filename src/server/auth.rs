@@ -405,7 +405,8 @@ fn take_step(file: &std::fs::File, step: u64) {
 }
 
 /// Second factor after a key: asks for a one-time code if the user has set
-/// one up (or if the server requires it). `Err(message)` = deny with that answer.
+/// one up (or if the server requires it). `Err(message)` = deny with that
+/// answer; `Ok(true)`: a code was given.
 pub async fn second_factor(
     send: &mut SendHalf,
     recv: &mut RecvHalf,
@@ -413,9 +414,9 @@ pub async fn second_factor(
     mode: Totp,
     version: u32,
     used: &UsedCodes,
-) -> Result<Result<(), String>> {
+) -> Result<Result<bool, String>> {
     if mode == Totp::Off {
-        return Ok(Ok(()));
+        return Ok(Ok(false));
     }
     let path = crate::totp::secret_path(&user.home);
     let read = {
@@ -433,7 +434,7 @@ pub async fn second_factor(
         Ok(None) if mode == Totp::Required => {
             return Ok(Err("this server requires a one-time code, but none is set up for the account (`qshd totp`)".into()));
         }
-        Ok(None) => return Ok(Ok(())),
+        Ok(None) => return Ok(Ok(false)),
         // A secret that cannot be read safely must not turn 2FA off.
         Err(e) => {
             warn!("{e:#}; login refused");
@@ -492,7 +493,7 @@ pub async fn second_factor(
                 state.used.insert(user.uid, step);
                 state.failures.remove(&user.uid);
                 take_step(&file, step);
-                return Ok(Ok(()));
+                return Ok(Ok(true));
             }
             let _ = file.unlock();
             state.failures.entry(user.uid).or_default().push_back(std::time::Instant::now());

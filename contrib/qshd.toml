@@ -47,6 +47,13 @@
 # One-time codes: "off", "optional" (for who set them up), "required".
 # totp = "optional"
 
+# Seconds a code lasts on its connection: then the connection opens nothing
+# new (sessions, copies, forwarded connections) until a new login with a
+# code; what is under way goes on. A shared connection (the client's
+# ControlMaster) logs in again by itself; a long `qsh -L` tunnel takes no
+# new connections then. 0 = as long as the connection.
+# totp_valid_for = 3600
+
 # /etc/shadow passwords when no key works (as root, on Linux).
 # password_authentication = false
 # permit_empty_passwords = false

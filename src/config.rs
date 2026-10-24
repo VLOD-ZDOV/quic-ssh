@@ -113,6 +113,11 @@ pub struct ServerConfig {
     pub trusted_user_ca_keys: Option<PathBuf>,
     /// Failed key proofs allowed per connection (like sshd's MaxAuthTries).
     pub max_auth_tries: u32,
+    /// Seconds a one-time code lasts on its connection: after them, it
+    /// opens nothing new, no session, copy or forwarded connection (a shared
+    /// one, `ControlMaster`, then logs in with a code again; what is under
+    /// way goes on); 0 = as long as the connection.
+    pub totp_valid_for: u64,
     /// Allow `qsh -A` (ssh-agent forwarding).
     #[serde(deserialize_with = "flag")]
     pub allow_agent_forwarding: bool,
@@ -595,6 +600,7 @@ overrides! {
         refuse_connection: bool,
         set_env: BTreeMap<String, String>,
         totp: Totp,
+        totp_valid_for: u64,
         #[serde(deserialize_with = "opt_flag")]
         use_qsh_authorized_keys: bool,
         #[serde(deserialize_with = "opt_flag")]
@@ -719,6 +725,7 @@ impl Default for ServerConfig {
             subsystems: BTreeMap::new(),
             trusted_user_ca_keys: None,
             max_auth_tries: 6,
+            totp_valid_for: 3600,
             allow_agent_forwarding: true,
             totp: Totp::Optional,
             host_certificate: None,

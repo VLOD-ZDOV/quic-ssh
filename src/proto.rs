@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -179,6 +179,11 @@ pub enum Request {
     /// whose SHA-256 is `prefix`: answered with `Reply::FileFrom`, and the
     /// bytes from its `start` (`offset` if the beginnings match, else 0).
     DownloadFrom { path: String, offset: u64, prefix: Vec<u8> },
+    // --- protocol version 9 ---
+    /// Answered with `Reply::Ok` if this connection may start sessions, or
+    /// an error if its one-time code has run out (`totp_valid_for`): for a
+    /// shared connection, before it is used.
+    MayStart,
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
