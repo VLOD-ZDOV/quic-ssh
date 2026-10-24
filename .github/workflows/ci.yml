@@ -46,9 +46,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # tests/windows.rs (QSH_WINDOWS_E2E=1) hangs on a real Windows: off
-      # until that is found, and qshd.exe stays out of the release.
       - run: cargo test --locked
+      # qshd.exe end to end (tests/windows.rs): not passing yet, so it does
+      # not fail the job, and qshd.exe stays out of the release until it does.
+      - run: cargo test --locked --test windows -- --nocapture
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          QSH_WINDOWS_E2E: "1"
       - run: cargo build --locked --release --bins
 
   # qshd as real root: creates temporary users and checks privilege dropping,

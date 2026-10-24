@@ -28,6 +28,43 @@ fn text(out: &Output) -> String {
     format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
+/// What qshd has logged so far.
+type Log = std::sync::Arc<std::sync::Mutex<String>>;
+
+/// Runs one step with a time limit: a step that hangs fails with its own
+/// output and qshd's log, instead of holding the whole CI job.
+fn step(name: &str, mut cmd: Command, log: &Log) -> Output {
+    use std::io::Read;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let pipe = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let (out, err) = (pipe(Box::new(child.stdout.take().unwrap())), pipe(Box::new(child.stderr.take().unwrap())));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let (out, err) = (out.join().unwrap(), err.join().unwrap());
+            panic!(
+                "{name}: still running after 60 s\n--- its output:\n{}{}\n--- qshd:\n{}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err),
+                log.lock().unwrap()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    Output { status, stdout: out.join().unwrap(), stderr: err.join().unwrap() }
+}
+
 #[test]
 fn qshd_on_windows() {
     if std::env::var_os("QSH_WINDOWS_E2E").is_none() {
@@ -45,7 +82,7 @@ fn qshd_on_windows() {
         std::fs::write(&keys, format!("{had}{key}")).unwrap();
     }
 
-    let mut server = Server(Command::new(QSHD).args(["serve", "--listen", "127.0.0.1:0"]).stderr(Stdio::piped()).spawn().unwrap());
+    let mut server = Server(Command::new(QSHD).args(["serve", "--listen", "127.0.0.1:0"]).env("QSHD_LOG", "qsh=debug").stderr(Stdio::piped()).spawn().unwrap());
     let mut lines = BufReader::new(server.0.stderr.take().unwrap()).lines();
     let port = loop {
         let line = lines.next().expect("qshd ended").unwrap();
@@ -53,10 +90,20 @@ fn qshd_on_windows() {
             break rest.split(|c: char| !c.is_ascii_digit()).next().unwrap().to_string();
         }
     };
-    std::thread::spawn(move || lines.for_each(drop));
+    let log = Log::default();
+    let sink = log.clone();
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            let mut log = sink.lock().unwrap();
+            log.push_str(&line);
+            log.push('\n');
+        }
+    });
     let dest = format!("{}@127.0.0.1", std::env::var("USERNAME").unwrap());
     let qsh = |transport: &str, args: &[&str]| {
-        Command::new(QSH).args(["--accept-new-host", "--transport", transport, "-p", &port]).args(args).stdin(Stdio::null()).output().unwrap()
+        let mut cmd = Command::new(QSH);
+        cmd.args(["-v", "--accept-new-host", "--transport", transport, "-p", &port]).args(args);
+        step(&format!("qsh {transport} {args:?}"), cmd, &log)
     };
 
     // Policies match the name: another spelling of the account is refused.
@@ -81,10 +128,14 @@ fn qshd_on_windows() {
         let local = std::env::temp_dir().join(format!("qsh-win-{t}.bin"));
         std::fs::write(&local, &data).unwrap();
         let remote = format!("{dest}:qsh-win-{t}.bin");
-        let out = Command::new(QSH).args(["cp", "--transport", t, "-p", &port]).arg(&local).arg(&remote).output().unwrap();
+        let mut cmd = Command::new(QSH);
+        cmd.args(["cp", "-v", "--transport", t, "-p", &port]).arg(&local).arg(&remote);
+        let out = step(&format!("qsh cp {t} up"), cmd, &log);
         assert!(out.status.success(), "{t}: {}", text(&out));
         let back = std::env::temp_dir().join(format!("qsh-win-{t}.back"));
-        let out = Command::new(QSH).args(["cp", "--transport", t, "-p", &port, &remote]).arg(&back).output().unwrap();
+        let mut cmd = Command::new(QSH);
+        cmd.args(["cp", "-v", "--transport", t, "-p", &port, &remote]).arg(&back);
+        let out = step(&format!("qsh cp {t} down"), cmd, &log);
         assert!(out.status.success(), "{t}: {}", text(&out));
         assert_eq!(std::fs::read(&back).unwrap(), data);
         let _ = std::fs::remove_file(home.join(format!("qsh-win-{t}.bin")));
