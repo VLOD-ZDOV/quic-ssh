@@ -381,7 +381,7 @@ configure_qshd() {
     if [ "$sys" = yes ]; then as_root cat "$cfg" >"$tmp/config"; else cat "$cfg" >"$tmp/config"; fi
     for kv in ${port:+"listen=\"[::]:$port\""} ${totp:+"totp=\"$totp\""}; do
         key=${kv%%=*} val=${kv#*=}
-        if grep -q "^$key[[:space:]]*=" "$tmp/config"; then
+        if grep -q "^${key}[[:space:]]*=" "$tmp/config"; then
             say "$cfg already sets $key; left as it is"
             continue
         fi
