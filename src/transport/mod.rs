@@ -299,6 +299,8 @@ async fn resolve(host: &str, port: u16, family: Family) -> Result<Vec<SocketAddr
         .with_context(|| format!("cannot resolve {host}"))?
         .filter(|a| family.allows(a))
         .collect();
+    let list: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
+    debug!("{host} is {}", if list.is_empty() { "no address of the allowed family".to_string() } else { list.join(", ") });
     Ok(addrs)
 }
 
@@ -365,8 +367,12 @@ async fn quic_all(tls: &Arc<rustls::ClientConfig>, addrs: &[SocketAddr], bind: &
     let mut errors = Vec::new();
     for &addr in addrs {
         let local = bind.local_for(&addr).map_err(|e| vec![format!("quic {addr}: {e:#}")])?;
+        debug!("QUIC (UDP): connecting to {addr}");
         match tokio::time::timeout(timeout, quic::connect(tls.clone(), addr, local)).await {
-            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Ok(conn)) => {
+                debug!("QUIC: {addr} answered, TLS 1.3 handshake done");
+                return Ok(conn);
+            }
             Ok(Err(e)) => errors.push(format!("quic {addr}: {e:#}")),
             Err(_) => errors.push(format!("quic {addr}: timed out")),
         }
@@ -380,8 +386,12 @@ async fn tcp_all(tls: &Arc<rustls::ClientConfig>, addrs: &[SocketAddr], bind: &B
     let mut errors = Vec::new();
     for &addr in addrs {
         let local = bind.local_for(&addr).map_err(|e| vec![format!("tcp {addr}: {e:#}")])?;
+        debug!("TLS over TCP: connecting to {addr}");
         match tokio::time::timeout(TCP_TIMEOUT, tcp::connect(tls.clone(), addr, local)).await {
-            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Ok(conn)) => {
+                debug!("TCP: connected to {addr}, TLS 1.3 handshake done");
+                return Ok(conn);
+            }
             Ok(Err(e)) => errors.push(format!("tcp {addr}: {e:#}")),
             Err(_) => errors.push(format!("tcp {addr}: timed out")),
         }
@@ -434,11 +444,18 @@ pub async fn connect_probe(host: &str, ports: &[u16], family: Family, bind: &Bin
             }
         })
         .collect();
+    debug!("looking for qshd over QUIC (UDP) on port {} at once", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" and "));
     let mut errors = Vec::new();
     while let Some(result) = attempts.next().await {
         match result {
-            Ok(conn) => return Ok(conn),
-            Err(e) => errors.push(e),
+            Ok(conn) => {
+                debug!("QUIC: {} answered", conn.remote_addr());
+                return Ok(conn);
+            }
+            Err(e) => {
+                debug!("{e}");
+                errors.push(e);
+            }
         }
     }
     let ports: Vec<String> = ports.iter().map(u16::to_string).collect();

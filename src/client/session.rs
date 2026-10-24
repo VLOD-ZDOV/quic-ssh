@@ -462,6 +462,19 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         (None, Some(spec)) if persistent => Request::Persistent { command: opts.command.clone(), env: opts.env.clone(), pty: spec.clone() },
         (None, _) => Request::Exec { command: opts.command.clone(), env: opts.env.clone(), pty: pty.clone() },
     };
+    tracing::debug!(
+        "starting {}{}",
+        match (&opts.subsystem, &opts.command) {
+            (Some(name), _) => format!("subsystem {name}"),
+            (None, Some(c)) => format!("command {c:?}"),
+            (None, None) => "a login shell".into(),
+        },
+        match (&pty, persistent) {
+            (Some(_), true) => " in a terminal that survives a lost connection",
+            (Some(_), false) => " in a terminal",
+            (None, _) => " without a terminal",
+        }
+    );
     write_msg(&mut send, &request).await?;
     let token = match expect_ok(&mut recv).await? {
         Reply::Session { token } => Some(token),
@@ -774,6 +787,11 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                         }
                         ServerMsg::Stderr(d) => show(&mut stderr, &mut predictor, &d).await?,
                         ServerMsg::Exit { code, signal } => {
+                            match (code, signal) {
+                                (Some(c), _) => tracing::debug!("the remote command ended with exit code {c}"),
+                                (None, Some(s)) => tracing::debug!("the remote command was killed by signal {s}"),
+                                (None, None) => tracing::debug!("the remote command ended without an exit code"),
+                            }
                             // Tells the server we have the end; until then it keeps the
                             // session for a resume, in case the exit got lost on the way.
                             if token.is_some() {

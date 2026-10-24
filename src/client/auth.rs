@@ -120,7 +120,10 @@ impl Keyring {
         // Public halves of the key files (readable without a passphrase).
         let mut file_keys = Vec::new();
         for path in &files {
-            let Ok(text) = std::fs::read_to_string(path) else { continue };
+            let Ok(text) = std::fs::read_to_string(path) else {
+            debug!("no key file {}", path.display());
+            continue;
+        };
             match PrivateKey::from_openssh(&text) {
                 Ok(k) => file_keys.push((path.clone(), k.public_key().key_data().clone())),
                 Err(e) => debug!("skipping {}: {e}", path.display()),
@@ -153,7 +156,7 @@ impl Keyring {
         }
 
         // Already proven in the handshake if it was the TLS key (then `seen` has it).
-        add(&mut out, own.public().ssh_blob(), format!("ED25519 {}", own.public().fingerprint()), Signer::Own);
+        add(&mut out, own.public().ssh_blob(), format!("qsh's own key (ED25519 {})", own.public().fingerprint()), Signer::Own);
 
         let agent = match &target.identity_agent {
             Some(None) => None,
@@ -186,6 +189,8 @@ impl Keyring {
                 add(&mut out, blob, format!("{} {}", key.algorithm(), path.display()), Signer::File(path.clone()));
             }
         }
+        let labels: Vec<&str> = out.iter().map(|c| c.label.as_str()).collect();
+        debug!("keys to offer: {}", labels.join("; "));
         Keyring { agent, candidates: out, next: 0, add_to_agent: target.add_keys_to_agent.clone() }
     }
 
@@ -281,9 +286,15 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
     for _ in 0..MAX_LOGIN_STEPS {
         reply = match reply {
             Reply::Ok => return Ok(Outcome::Welcome(3)),
-            Reply::Welcome { version } => return Ok(Outcome::Welcome(version)),
+            Reply::Welcome { version } => {
+                if keyring.is_none() {
+                    debug!("the server took qsh's own key from the TLS handshake");
+                }
+                return Ok(Outcome::Welcome(version));
+            }
             Reply::Err(e) => {
                 let reason = server_text(&e).trim_start_matches("(server) ").to_string();
+                debug!("login refused: {reason}");
                 return Ok(Outcome::Denied { reason, asked_for_keys: keyring.is_some() });
             }
             Reply::Banner(text) => {
@@ -293,6 +304,7 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
                 read_msg(recv).await?
             }
             Reply::Password => {
+                debug!("server asks for the account's password");
                 let answer = if target.password_authentication && !target.batch_mode && passwords < target.password_prompts {
                     passwords += 1;
                     crate::prompt::secret(&format!("{}@{}'s password: ", target.user, target.host)).ok()
@@ -312,11 +324,13 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
                 read_msg(recv).await?
             }
             Reply::Prompt { text, echo } => {
+                debug!("server asks: {}", server_text(&text).trim());
                 let answer = ask(&text, echo, target.batch_mode)?;
                 write_msg(send, &Auth::Response(answer)).await?;
                 read_msg(recv).await?
             }
             Reply::AuthKey => {
+                debug!("server asks for a key");
                 if keyring.is_none() {
                     keyring = Some(Keyring::new(target, explicit, tls, own).await);
                 }
@@ -339,10 +353,14 @@ async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: 
         let index = ring.next;
         ring.next += 1;
         let blob = ring.candidates[index].blob.clone();
+        debug!("offering {}", ring.candidates[index].label);
         write_msg(send, &Auth::Query { key: blob.clone() }).await?;
         match read_msg::<_, Reply>(recv).await? {
             Reply::Ok => {}
-            Reply::AuthKey => continue,
+            Reply::AuthKey => {
+                debug!("server does not take {}", ring.candidates[index].label);
+                continue;
+            }
             other => return Ok(other),
         }
         debug!("server accepts {}", ring.candidates[index].label);
@@ -357,6 +375,7 @@ async fn offer_next(ring: &mut Keyring, conn: &Conn, send: &mut SendHalf, recv: 
         write_msg(send, &Auth::PublicKey { key: blob, signature }).await?;
         return read_msg(recv).await;
     }
+    debug!("no more keys to offer");
     write_msg(send, &Auth::Done).await?;
     read_msg(recv).await
 }

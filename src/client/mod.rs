@@ -972,6 +972,7 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
     let port = conn.remote_addr().port();
     let hid = host_id(target.key_name(), port);
     let key = conn.peer_key();
+    tracing::debug!("server host key: ED25519 {}{}", key.fingerprint(), if conn.host_cert().is_some() { " with a certificate" } else { "" });
     match judge_host(target, port, key, conn.host_cert())? {
         HostTrust::Trusted(how) => {
             tracing::info!("host '{hid}' verified by {how}");
@@ -982,6 +983,7 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
             bail!("{reason}");
         }
         HostTrust::Unknown => {
+            tracing::debug!("'{hid}' is not in known_hosts");
             let policy = if opts.accept_new_host { HostKeyPolicy::AcceptNew } else { target.host_key_policy };
             let trusted = match policy {
                 _ if !opts.host_keys_from_ssh.is_empty() => {

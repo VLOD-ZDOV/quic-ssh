@@ -199,6 +199,7 @@ qsh --full myserver                    # режим совместимости �
 qsh ui                                 # меню хостов со статусом и замером скорости
 qsh -O check myserver                  # общее соединение (см. ниже)
 qsh doctor myserver                    # не подключается? проверит каждый шаг и подскажет, что исправить
+qsh -v myserver                        # каждый шаг подключения и входа, как ssh -v
 qsh forget myserver                    # ключ хоста сменили намеренно: забыть его (как ssh-keygen -R)
 qsh completions fish > ~/.config/fish/completions/qsh.fish   # Tab дополняет команды и хосты
                                        # bash: source <(qsh completions bash) в ~/.bashrc; zsh: то же с zsh

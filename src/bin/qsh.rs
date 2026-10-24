@@ -716,6 +716,13 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         Err(e) if a.full => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),
         Err(e) => return Err(e),
     };
+    tracing::debug!(
+        "{dest}: user {}, host {}, port {}{} (~/.config/qsh/config, then ~/.ssh/config; `qsh -G {dest}` shows all)",
+        target.user,
+        target.host,
+        target.port,
+        target.alt_ports.iter().map(|p| format!(" or {p}")).collect::<String>()
+    );
     if a.print_config {
         print_config(&target);
         return Ok(0);

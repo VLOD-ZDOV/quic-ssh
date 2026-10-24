@@ -829,6 +829,19 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
     assert_eq!(stdout(&out), "via-qsh\n");
 }
 
+/// `-v` tells each step, as `ssh -v` does, so a failed login shows where.
+#[test]
+fn verbose_tells_each_step() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let out = c.run(&["-v", "--accept-new-host", "-p", &s.port.to_string(), &format!("{}@127.0.0.1", user()), "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    for step in ["127.0.0.1 is 127.0.0.1", "connecting to 127.0.0.1:", "TLS 1.3 handshake done", "server host key: ED25519", "qsh's own key", "starting command \"true\"", "exit code 0"] {
+        assert!(err.contains(step), "no {step:?} in:\n{err}");
+    }
+}
+
 /// A forward in both ~/.ssh/config and qsh's config (which `qsh ui` writes)
 /// is set up once, not twice (the second failing on the port in use).
 #[test]
