@@ -523,6 +523,9 @@ mod windows {
     use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg};
     use crate::transport::{RecvHalf, SendHalf};
 
+    /// How long a client terminal has to say where its cursor is.
+    const CURSOR_ANSWER: std::time::Duration = std::time::Duration::from_secs(1);
+
     fn size(rows: u16, cols: u16) -> PtySize {
         PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
     }
@@ -561,17 +564,37 @@ mod windows {
         write_msg(&mut send, &Reply::Ok).await?;
         let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> = Arc::new(Mutex::new(Some(master)));
 
+        // portable-pty makes the pseudo console inherit the cursor: it asks
+        // where the cursor is (ESC [6n) and shows nothing until it hears. A
+        // client terminal answers; without one (`qsh -tt cmd | tee`, scripts)
+        // qshd answers for it, or the session would wait forever.
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, mut rx) = mpsc::channel::<ServerMsg>(32);
         let out_tx = tx.clone();
+        let ask = asked.clone();
         let output = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 32 * 1024];
+            let mut first = true;
             while let Ok(n @ 1..) = reader.read(&mut buf) {
+                if first && buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                    first = false;
+                    ask.notify_one();
+                }
                 if out_tx.blocking_send(ServerMsg::Stdout(buf[..n].to_vec())).is_err() {
                     break;
                 }
             }
         });
         let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (stand_in, heard) = (in_tx.clone(), answered.clone());
+        let stand_in = tokio::spawn(async move {
+            asked.notified().await;
+            tokio::time::sleep(CURSOR_ANSWER).await;
+            if !heard.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = stand_in.send(b"\x1b[1;1R".to_vec());
+            }
+        });
         std::thread::spawn(move || {
             for data in in_rx {
                 if writer.write_all(&data).and_then(|()| writer.flush()).is_err() {
@@ -585,6 +608,10 @@ mod windows {
             loop {
                 match read_msg_opt::<_, ClientMsg>(&mut recv).await {
                     Ok(Some(ClientMsg::Stdin(data) | ClientMsg::Typed { data, .. })) if !data.is_empty() => {
+                        // A cursor position report (ESC [ row ; col R).
+                        if data.starts_with(b"\x1b[") && data.ends_with(b"R") {
+                            answered.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let _ = in_tx.send(data);
                     }
                     Ok(Some(ClientMsg::Resize { cols, rows })) => {
@@ -625,6 +652,7 @@ mod windows {
             }
         };
         feeder.abort();
+        stand_in.abort();
         // The output pipe ends only once the pseudo console is closed.
         drop(master.lock().unwrap().take());
         let _ = tokio::time::timeout(DRAIN_GRACE, output).await;
