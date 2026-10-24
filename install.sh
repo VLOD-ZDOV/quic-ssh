@@ -2,7 +2,7 @@
 # qsh installer for Linux, macOS and Termux:
 #   curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.sh | sh
 # Asks what to install. Without a terminal, or to skip the questions:
-#   ... | sh -s -- --client | --server [--service | --no-service]
+#   ... | sh -s -- --client | --server [--service | --no-service] [--share | --no-share]
 # QSH_VERSION=v1.0.2 picks a release (default: the latest), QSH_BIN_DIR the install directory.
 set -eu
 
@@ -13,17 +13,20 @@ die() { printf 'qsh install: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<EOF
-Usage: install.sh [--client | --server | --update] [--service | --no-service]
+Usage: install.sh [--client | --server | --update] [--service | --no-service] [--share | --no-share]
   --client      install qsh only
   --update      update what is installed in QSH_BIN_DIR (what qsh update runs)
   --server      install qsh and qshd
   --service     run qshd as a service that starts at boot
   --no-service  do not set up a service
+  --share       one connection per host for 10 minutes (ControlMaster): later
+                qsh runs to it skip the login and its one-time code
+  --no-share    leave the client config as it is
 Without options it asks. QSH_VERSION picks a release, QSH_BIN_DIR the directory.
 EOF
 }
 
-what='' service=''
+what='' service='' share=''
 for a in "$@"; do
     case $a in
         --client) what=client ;;
@@ -31,6 +34,8 @@ for a in "$@"; do
         --update) what=update ;;
         --service) service=yes ;;
         --no-service) service=no ;;
+        --share) share=yes ;;
+        --no-share) share=no ;;
         -h | --help) usage; exit 0 ;;
         *) die "unknown option: $a" ;;
     esac
@@ -305,6 +310,35 @@ if [ "$what" = server ]; then
     fi
 fi
 
+# Connection sharing for the client (`--share`), unless its config already has a say.
+share_connections() {
+    dir="$HOME/.config/qsh"
+    cfg="$dir/config"
+    if grep -qi '^[[:space:]]*ControlMaster' "$cfg" 2>/dev/null; then
+        say "$cfg already sets ControlMaster; left as it is"
+        return 0
+    fi
+    [ -d "$dir" ] || { mkdir -p "$dir" && chmod 700 "$dir"; }
+    {
+        [ -s "$cfg" ] && echo
+        echo "# One connection per host for 10 minutes after the last use: later qsh and"
+        echo "# qsh cp runs to it skip the login, and its one-time code. 'qsh -O exit HOST' ends it."
+        echo "Host *"
+        echo "    ControlMaster auto"
+        echo "    ControlPersist 10m"
+    } >>"$cfg"
+    chmod 600 "$cfg"
+    say "Turned on connection sharing in $cfg"
+}
+if [ "$update" != yes ] && [ -z "$share" ] && has_tty; then
+    ask "Share one connection per host for 10 minutes, so a one-time code is typed once? [y/N]: "
+    case $REPLY in
+        [Yy]*) share=yes ;;
+        *) share=no ;;
+    esac
+fi
+[ "$share" = yes ] && share_connections
+
 if [ "$update" = yes ]; then
     say "Updated to $("$bin/qsh" --version 2>&1 | awk '{ print $2 }')"
     exit 0
@@ -318,5 +352,6 @@ if [ "$what" = server ]; then
     say "Open port 4422 for UDP and TCP in the firewall. To add a client, run 'qshd pair' on this"
     say "machine as the user who will log in, then the 'qsh pair' command it prints on the client."
 else
-    say "Next: run 'qshd pair' on the server, then the 'qsh pair user@server CODE' command it prints."
+    say "Next: run 'qshd pair' on the server, then 'qsh pair user@server' here and type the code."
+    say "With ssh access to the server already: 'qsh copy-id user@server' instead."
 fi

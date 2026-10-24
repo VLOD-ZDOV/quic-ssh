@@ -38,7 +38,7 @@ Linux, macOS and Termux:
 curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.sh | sh
 ```
 
-It asks whether to install only the client (`qsh`) or the client and the server (`qsh` + `qshd`), and, for the server, whether to run qshd as a service that starts at boot (systemd, launchd, or termux-services). It puts the programs in `/usr/local/bin` (asking for sudo), or in `~/.local/bin` when there is no sudo, and checks the download against `SHA256SUMS`. A service file that is already there is kept as it is. To skip the questions: `... | sh -s -- --server --service` (or `--client`, `--no-service`).
+It asks whether to install only the client (`qsh`) or the client and the server (`qsh` + `qshd`), and, for the server, whether to run qshd as a service that starts at boot (systemd, launchd, or termux-services). It puts the programs in `/usr/local/bin` (asking for sudo), or in `~/.local/bin` when there is no sudo, and checks the download against `SHA256SUMS`. A service file that is already there is kept as it is. To skip the questions: `... | sh -s -- --server --service` (or `--client`, `--no-service`). It also asks whether to share one connection per host for 10 minutes (`ControlMaster`), so that a one-time code is typed once and later `qsh` and `qsh cp` runs skip the login (`--share` / `--no-share`); the server can limit that with `totp_valid_for`.
 
 Windows (qsh and qshd), in PowerShell:
 

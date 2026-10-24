@@ -38,7 +38,7 @@ Linux, macOS и Termux:
 curl -fsSL https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.sh | sh
 ```
 
-Скрипт спросит, что ставить: только клиент (`qsh`) или клиент и сервер (`qsh` + `qshd`), а для сервера спросит, запускать ли qshd службой при загрузке (systemd, launchd или termux-services). Программы он кладёт в `/usr/local/bin` (попросит sudo), а если sudo нет, то в `~/.local/bin`, и сверяет скачанное с `SHA256SUMS`. Уже существующий файл службы он не трогает. Чтобы обойтись без вопросов: `... | sh -s -- --server --service` (или `--client`, `--no-service`).
+Скрипт спросит, что ставить: только клиент (`qsh`) или клиент и сервер (`qsh` + `qshd`), а для сервера спросит, запускать ли qshd службой при загрузке (systemd, launchd или termux-services). Программы он кладёт в `/usr/local/bin` (попросит sudo), а если sudo нет, то в `~/.local/bin`, и сверяет скачанное с `SHA256SUMS`. Уже существующий файл службы он не трогает. Чтобы обойтись без вопросов: `... | sh -s -- --server --service` (или `--client`, `--no-service`). Ещё он спросит, держать ли одно соединение с хостом 10 минут (`ControlMaster`), чтобы одноразовый код вводился один раз, а следующие `qsh` и `qsh cp` шли без нового входа (`--share` / `--no-share`); сервер может ограничить это настройкой `totp_valid_for`.
 
 Windows (qsh и qshd), в PowerShell:
 
