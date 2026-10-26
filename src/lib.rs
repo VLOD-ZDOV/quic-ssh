@@ -1,5 +1,7 @@
 //! qsh — secure shell over QUIC with automatic TCP fallback.
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "pam"), forbid(unsafe_code))]
+// The `pam` feature brings the one module that calls C (libpam); nothing else may.
+#![cfg_attr(feature = "pam", deny(unsafe_code))]
 
 pub mod agent;
 pub mod authkeys;

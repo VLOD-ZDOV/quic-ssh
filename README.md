@@ -23,7 +23,7 @@ Features:
 - the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
 - **sessions that survive network outages:** after a lost connection, qsh reconnects by itself and the shell is still there, with the output you missed;
 - key login with any SSH key (Ed25519, ECDSA, RSA, security keys), ssh-agent and agent forwarding (`-A`), OpenSSH user and host certificates;
-- optional one-time codes (TOTP) as a second factor, without PAM, and optional passwords;
+- optional one-time codes (TOTP) as a second factor, built in, and optional passwords; PAM (`pam_access`, `pam_limits`, `pam_systemd`) in builds with the `pam` feature;
 - sshd's server controls: `allow_users`/`deny_users` and groups, `permit_root_login`, `[[match]]` blocks, `force_command`, `chroot_directory` with a built-in `internal-sftp`, banner, motd, `~/.ssh/rc`, per-source penalties, `qshd -t`/`-T` and reload on SIGHUP;
 - pairing with a one-time code, so you never copy keys by hand;
 - host aliases from your existing `~/.ssh/config` (`qsh myserver`).
@@ -96,6 +96,8 @@ Termux sends taps as mouse clicks, so `qsh ui` works by touch: tap a host to sel
 ### From source
 
 You need a recent stable Rust toolchain. No C libraries are required.
+
+For PAM in qshd (`use_pam`, Linux), build with `cargo build --release --features pam`; that needs libpam's development files (`libpam0g-dev` on Debian and Ubuntu, `pam-devel` on Fedora). The release binaries are static and have no PAM.
 
 ```sh
 git clone https://github.com/VLOD-ZDOV/quic-ssh && cd quic-ssh
@@ -441,6 +443,8 @@ session_timeout = 3600          # seconds a disconnected terminal session is kep
 permit_root_login = "prohibit-password"   # root with keys only; "yes", "no", "forced-commands-only" (keys with command=)
 password_authentication = false # accept /etc/shadow passwords when no key works (system mode, Linux; not expired ones)
 permit_empty_passwords = false
+use_pam = false                 # PAM account checks, passwords and sessions (built with --features pam; system mode, Linux)
+pam_service = "qshd"           # its file in /etc/pam.d (see contrib/qshd.pam)
 login_grace_time = 120          # seconds to log in; 0 = no limit
 # banner = "/etc/issue.net"     # shown before login
 print_motd = true               # /etc/motd for login shells (~/.hushlogin turns it off)
@@ -515,6 +519,14 @@ A line with any other option is **not used at all**: a restriction qsh cannot en
 **Paired keys.** `qshd keys`, as the user on the server, lists the keys that may log in through qsh (those `qsh pair` added), numbered; `qshd keys --remove N` (or a fingerprint) removes one, for a lost or retired device; a key on several lines, or with options, is removed from all of them. Sessions already open with it go on until they end. Keys in `~/.ssh/authorized_keys` are not part of this list (qshd reads them only with `use_ssh_authorized_keys`).
 
 **One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once, also across several qshd of the same user (another port, a user-mode qshd next to the system one). `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again. Right after qshd starts, codes that the previous process might have accepted are refused (up to a minute and a half), so a code seen before a restart cannot be replayed.
+
+**PAM.** A qshd built with `--features pam` (see [From source](#from-source)) can use PAM, like sshd's `UsePAM`: set `use_pam = true` and install a service file as `/etc/pam.d/qshd` (`contrib/qshd.pam` is one for Debian and Ubuntu; elsewhere, start from the system's `/etc/pam.d/sshd`; `pam_service` names another file). Then:
+
+- every login, with a key too, must pass PAM's account check (`pam_nologin`, `pam_access`, `pam_time`, expired accounts); a refused one gets "access denied" and the reason goes to the log. An expired password does not stop a key, as without PAM;
+- with `password_authentication`, passwords are checked by PAM (`pam_authenticate`) instead of /etc/shadow, so LDAP, SSSD and other modules work; their questions go to the client, and an expired password is refused, as qshd cannot have it changed;
+- in system mode, each session's program (a shell, a command, a subsystem) runs in a PAM session opened as root before qshd switches to the user, so `pam_limits`, `pam_env`, `pam_loginuid` and `pam_systemd` (a logind session, `loginctl`, `XDG_RUNTIME_DIR`) apply. A small process stays as root beside the program to close the session when it ends. With PAM, `session_scope` is not used: `pam_systemd` places the session. File copies and forwarded connections run without a PAM session.
+
+PAM's authentication and the session have separate PAM handles (the session's is in the process that starts the program), so credentials that a module sets while authenticating (a Kerberos ticket) do not reach the session. `pam_motd` and `pam_lastlog` are not needed: qshd shows those itself.
 
 Logs go to stderr (journald). Set the level with `QSHD_LOG`, for example `QSHD_LOG=qsh=debug`.
 
@@ -591,7 +603,7 @@ This is still a young project and has not had an external audit. For critical sy
 
 ## Limitations
 
-- No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). Sessions still get `XDG_RUNTIME_DIR` and the session bus when `/run/user/UID` exists (another login of the user, or `loginctl enable-linger`), so `systemctl --user` works. 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
+- PAM and `systemd-logind` sessions only in builds with the `pam` feature and `use_pam` (see [PAM](#server-configuration)); the release binaries have no PAM (for `pam_access` use `allow_users`/`allow_groups`), and `loginctl` does not show their logins. Without them, sessions still get `XDG_RUNTIME_DIR` and the session bus when `/run/user/UID` exists (another login of the user, or `loginctl enable-linger`), so `systemctl --user` works. 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd (for other hops, use `ProxyCommand ssh -W %h:%p bastion` in `~/.config/qsh/config` to reach qshd's TCP port); with `--full`, hosts with ssh's `ProxyJump`/`ProxyCommand` are handed to ssh.

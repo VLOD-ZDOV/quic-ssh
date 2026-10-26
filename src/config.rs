@@ -210,6 +210,14 @@ pub struct ServerConfig {
     /// Accept an empty password for accounts that have none (PermitEmptyPasswords).
     #[serde(deserialize_with = "flag")]
     pub permit_empty_passwords: bool,
+    /// Use PAM (like UsePAM; qshd built with the `pam` feature, Linux, as
+    /// root): every login passes the account check (`pam_acct_mgmt`),
+    /// passwords are checked by `pam_authenticate`, and each session's
+    /// program runs in a PAM session (pam_limits, pam_systemd, pam_env).
+    #[serde(deserialize_with = "flag")]
+    pub use_pam: bool,
+    /// The PAM service: its file in /etc/pam.d.
+    pub pam_service: String,
     /// Drop connections from addresses that keep failing to log in (like
     /// PerSourcePenalties): `true`, `false`, or sshd's settings, e.g.
     /// `"authfail:5s noauth:1s grace-exceeded:10s min:15s max:10m"`.
@@ -754,6 +762,8 @@ impl Default for ServerConfig {
             refuse_connection: false,
             password_authentication: false,
             permit_empty_passwords: false,
+            use_pam: false,
+            pam_service: "qshd".into(),
             per_source_penalties: Penalties::default(),
             per_source_penalty_exempt_list: Vec::new(),
             matches: Vec::new(),
@@ -793,6 +803,12 @@ impl ServerConfig {
             if u32::from_str_radix(mask, 8).map_or(true, |m| m > 0o777) {
                 bail!("stream_local_bind_mask: {mask:?} is not an octal mask like \"0177\"");
             }
+        }
+        if self.use_pam && !cfg!(all(feature = "pam", target_os = "linux")) {
+            bail!("use_pam: this qshd was built without PAM (build it on Linux with `cargo build --features pam`)");
+        }
+        if self.pam_service.is_empty() || !self.pam_service.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            bail!("pam_service: {:?} is not a file name in /etc/pam.d", self.pam_service);
         }
         check_user_entries("allow_users", &self.allow_users)?;
         check_user_entries("deny_users", &self.deny_users)?;
@@ -1109,11 +1125,22 @@ mod tests {
             "[[match]]\naddress = \"2001:db8::/200\"",
             "deny_users = [\"*@2001:db8::/129\"]",
             "[set_env]\n\"A=B\" = \"x\"",
+            "pam_service = \"../sshd\"",
+            "pam_service = \"\"",
         ] {
             let parsed = toml::from_str::<ServerConfig>(bad).map_err(anyhow::Error::from).and_then(|c| c.validate().map(|_| c));
             assert!(parsed.is_err(), "{bad}");
         }
         assert_eq!(parse("permit_root_login = \"without-password\"").permit_root_login, PermitRootLogin::ProhibitPassword);
+    }
+
+    /// `use_pam` is refused, not ignored, by a qshd built without PAM.
+    #[test]
+    fn use_pam_needs_the_feature() {
+        assert!(!parse("").use_pam);
+        assert_eq!(parse("").pam_service, "qshd");
+        let c = toml::from_str::<ServerConfig>("use_pam = true\npam_service = \"sshd\"").unwrap();
+        assert_eq!(c.validate().is_ok(), cfg!(all(feature = "pam", target_os = "linux")));
     }
 
     #[test]

@@ -58,6 +58,12 @@
 # password_authentication = false
 # permit_empty_passwords = false
 
+# PAM, like sshd's UsePAM (qshd built with `--features pam`, Linux, as
+# root): account checks for every login, passwords through PAM and a PAM
+# session around each session's program. See contrib/qshd.pam.
+# use_pam = false
+# pam_service = "qshd"
+
 # Or "yes", "no", "forced-commands-only".
 # permit_root_login = "prohibit-password"
 

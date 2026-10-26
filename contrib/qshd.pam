@@ -1,0 +1,20 @@
+# PAM service for qshd's `use_pam`: install as /etc/pam.d/qshd.
+# Written for Debian and Ubuntu (like their /etc/pam.d/sshd). On Fedora,
+# RHEL and openSUSE, copy that system's /etc/pam.d/sshd instead and leave
+# out pam_motd and pam_lastlog: qshd shows the motd and last login itself.
+
+# Passwords (with password_authentication = true).
+@include common-auth
+
+# Every login, with a key too: /etc/nologin, account expiry, pam_access.
+account    required     pam_nologin.so
+# account  required     pam_access.so
+@include common-account
+
+# Around each session's program.
+session    required     pam_loginuid.so
+session    optional     pam_keyinit.so force revoke
+@include common-session
+session    required     pam_limits.so
+session    required     pam_env.so
+session    required     pam_env.so envfile=/etc/default/locale

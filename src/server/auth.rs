@@ -320,6 +320,108 @@ pub async fn password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Optio
     Ok(false)
 }
 
+/// Questions and messages from PAM modules per login.
+#[cfg(all(feature = "pam", target_os = "linux"))]
+const PAM_MESSAGES: u32 = 32;
+
+/// Password login through PAM (`use_pam`): `pam_authenticate`, up to
+/// [`PASSWORD_TRIES`] times, then `pam_acct_mgmt`. The modules' questions go
+/// to the client: one for a password as [`Reply::Password`] (so qsh asks
+/// it as for a password of its own), others as [`Reply::Prompt`], their
+/// messages as [`Reply::Banner`]. `user` is `None` for an unknown or refused
+/// user: PAM is asked for `NOUSER` with a wrong answer, like sshd, so it
+/// takes the same steps and time. True when logged in.
+#[cfg(all(feature = "pam", target_os = "linux"))]
+pub async fn pam_password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: Option<&User>, cfg: &ServerConfig, login: &Login<'_>) -> Result<bool> {
+    use super::pam::{Conversation, Message, Pam, PAM_DISALLOW_NULL_AUTHTOK, PAM_NEW_AUTHTOK_REQD};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
+
+    enum Ask {
+        Prompt { text: String, echo: bool, answer: oneshot::Sender<Option<zeroize::Zeroizing<String>>> },
+        Info(String),
+    }
+    /// What an unknown user's answers become.
+    const WRONG: &str = "\x08\n\r\x7fINCORRECT";
+    let (tx, mut rx) = mpsc::channel::<Ask>(1);
+    let gave_up = Arc::new(AtomicBool::new(false));
+    let known = user.is_some();
+    let name = user.map(|u| u.name.clone()).unwrap_or_else(|| "NOUSER".into());
+    let (service, rhost) = (cfg.pam_service.clone(), login.ip.to_string());
+    let flags = if cfg.permit_empty_passwords { 0 } else { PAM_DISALLOW_NULL_AUTHTOK };
+    let stopped = gave_up.clone();
+    let worker = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut asked = 0u32;
+        let conv: Conversation = Box::new(move |m| {
+            asked += 1;
+            if asked > PAM_MESSAGES {
+                return None;
+            }
+            match m {
+                Message::Prompt { text, echo } => {
+                    let (answer, answered) = oneshot::channel();
+                    tx.blocking_send(Ask::Prompt { text: text.to_string(), echo, answer }).ok()?;
+                    let given = answered.blocking_recv().ok().flatten()?;
+                    Some(if known && given.len() <= MAX_PASSWORD { given.to_string() } else { WRONG.to_string() })
+                }
+                Message::Info { text, .. } => {
+                    let _ = tx.blocking_send(Ask::Info(text.to_string()));
+                    None
+                }
+            }
+        });
+        let mut pam = Pam::start(&service, &name, conv)?;
+        pam.set_rhost(&rhost)?;
+        pam.set_tty("ssh")?;
+        for _ in 0..PASSWORD_TRIES {
+            match pam.authenticate(flags) {
+                Ok(()) if known => {
+                    return Ok(match pam.acct_mgmt(0) {
+                        Ok(()) => true,
+                        // It cannot be changed here; keys still work.
+                        Err(e) if e.code == PAM_NEW_AUTHTOK_REQD => {
+                            warn!("{rhost}: the password of {name:?} has expired");
+                            false
+                        }
+                        Err(e) => {
+                            warn!("{rhost}: PAM account check refused {name:?}: {e}");
+                            false
+                        }
+                    });
+                }
+                Ok(()) => warn!("{rhost}: PAM accepted the wrong answer for {name:?}"),
+                Err(e) => warn!("{rhost}: PAM authentication of {name:?} failed: {e}"),
+            }
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        Ok(false)
+    });
+    // The worker drops its end of the channel when it is done with PAM.
+    while let Some(ask) = rx.recv().await {
+        match ask {
+            Ask::Prompt { text, echo, answer } => {
+                let reply = if !echo && text.to_lowercase().contains("password") { Reply::Password } else { Reply::Prompt { text, echo } };
+                write_msg(send, &reply).await?;
+                match read_msg::<_, Auth>(recv).await? {
+                    Auth::Response(p) => {
+                        let _ = answer.send(Some(zeroize::Zeroizing::new(p)));
+                    }
+                    Auth::Done => {
+                        gave_up.store(true, Ordering::Relaxed);
+                        let _ = answer.send(None);
+                    }
+                    _ => bail!("unexpected message while asking for a password"),
+                }
+            }
+            Ask::Info(text) => write_msg(send, &Reply::Banner(text)).await?,
+        }
+    }
+    worker.await?
+}
+
 /// Wrong one-time codes allowed per connection.
 const TOTP_TRIES: u32 = 3;
 

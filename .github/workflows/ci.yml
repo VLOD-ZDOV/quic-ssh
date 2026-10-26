@@ -60,7 +60,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
+      - run: sudo apt-get install -y libpam0g-dev
+      # With PAM: tests/system-mode.sh then checks use_pam too.
+      - run: cargo clippy --all-targets --locked --features pam -- -D warnings
+      - run: cargo build --locked --features pam
       - run: sudo tests/system-mode.sh target/debug
 
   # Known vulnerabilities in dependencies (RustSec advisory database).

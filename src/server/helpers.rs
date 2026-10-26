@@ -174,6 +174,21 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
             let _ = fchmod(io::stdin(), Mode::from_bits_truncate(mode));
         }
     }
+    // The PAM session is opened as root, outside the chroot, by a process
+    // that stays to close it; this one goes on as its child.
+    #[cfg(all(feature = "pam", target_os = "linux"))]
+    let pam_session = match prelude.pam.as_ref().filter(|_| switch) {
+        Some((service, rhost)) => {
+            let name = nix::unistd::User::from_uid(uid)?.context("no such user")?.name;
+            let terminal = if tty == "tty" { nix::unistd::ttyname(io::stdin()).ok().map(|p| p.to_string_lossy().into_owned()) } else { None };
+            Some(super::pam::run_session(service, &name, rhost, terminal.as_deref())?)
+        }
+        None => None,
+    };
+    #[cfg(not(all(feature = "pam", target_os = "linux")))]
+    if prelude.pam.is_some() {
+        bail!("this qshd was built without PAM");
+    }
     let mut cmd = std::process::Command::new(program);
     cmd.args(rest);
     if !arg0.is_empty() {
@@ -197,6 +212,10 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
         // Refuse to go on if root privileges could be regained.
         if !uid.is_root() && nix::unistd::setuid(Uid::from_raw(0)).is_ok() {
             bail!("failed to drop privileges");
+        }
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        if let Some(session) = &pam_session {
+            session.hang_up_with_parent()?;
         }
     }
     // macOS: the system drops root's supplementary groups when it switches
@@ -223,6 +242,11 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
                 std::env::set_var(k, v);
             }
         }
+    }
+    // The modules' variables last, as sshd sets them (pam_env's PATH, locale).
+    #[cfg(all(feature = "pam", target_os = "linux"))]
+    for (k, v) in pam_session.iter().flat_map(|s| &s.env) {
+        std::env::set_var(k, v);
     }
     let home = Path::new(home);
     let in_home = std::env::set_current_dir(home).is_ok();

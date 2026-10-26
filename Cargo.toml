@@ -9,6 +9,11 @@ readme = "README.md"
 keywords = ["ssh", "quic", "remote-shell", "networking"]
 categories = ["command-line-utilities", "network-programming"]
 
+[features]
+# PAM for qshd (`use_pam`), on Linux; needs libpam (libpam0g-dev,
+# pam-devel). Not in the static release builds.
+pam = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

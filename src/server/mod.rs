@@ -13,6 +13,9 @@ pub mod helpers;
 mod login_record;
 #[cfg(unix)]
 pub mod keys_command;
+#[cfg(all(feature = "pam", target_os = "linux"))]
+#[allow(unsafe_code)]
+pub mod pam;
 mod penalty;
 #[cfg(unix)]
 mod persist;
@@ -327,7 +330,7 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
     let shadow = cfg!(target_os = "linux") && nix::unistd::geteuid().is_root();
     #[cfg(not(unix))]
     let shadow = false;
-    if passwords && !shadow {
+    if passwords && !shadow && !cfg.use_pam {
         warn!("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match");
     }
     let scope = cfg.session_scope;
@@ -566,15 +569,31 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
             }
         };
     }
+    // Whether PAM's account check has been done (`use_pam`).
+    let mut account_checked = false;
     // Passwords, if allowed, when no key worked (never for root unless
     // permit_root_login = "yes"). Unknown users are asked too.
     if granted.is_none() && version >= 6 && cfg.password_authentication {
         // Guessing passwords counts as a failed login even if the client hangs up midway.
         *outcome = Outcome::AuthFailed;
         let root_ok = user.as_ref().is_none_or(|u| u.uid != 0) || cfg.permit_root_login == PermitRootLogin::Yes;
-        let attempt = auth::password_auth(&mut send, &mut recv, user.as_ref().filter(|_| root_ok), cfg.permit_empty_passwords, &checker.login);
+        let candidate = user.as_ref().filter(|_| root_ok);
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        let attempt = async {
+            if cfg.use_pam {
+                auth::pam_password_auth(&mut send, &mut recv, candidate, &cfg, &checker.login).await
+            } else {
+                auth::password_auth(&mut send, &mut recv, candidate, cfg.permit_empty_passwords, &checker.login).await
+            }
+        };
+        #[cfg(not(all(feature = "pam", target_os = "linux")))]
+        let attempt = auth::password_auth(&mut send, &mut recv, candidate, cfg.permit_empty_passwords, &checker.login);
         match tokio::time::timeout(left(), attempt).await {
-            Ok(Ok(true)) => granted = Some((crate::authkeys::Grant::default(), "password".to_string())),
+            Ok(Ok(true)) => {
+                granted = Some((crate::authkeys::Grant::default(), "password".to_string()));
+                // pam_password_auth checked the account already.
+                account_checked = cfg.use_pam;
+            }
             Ok(Ok(false)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -600,6 +619,24 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
         write_msg(&mut send, &Reply::Err("access denied".into())).await?;
         return Ok(());
     };
+    // PAM's account check (pam_access, pam_nologin, expiry) for every login.
+    #[cfg(all(feature = "pam", target_os = "linux"))]
+    if cfg.use_pam && !account_checked {
+        let (service, account, rhost) = (cfg.pam_service.clone(), user.name.clone(), addr.ip().to_canonical().to_string());
+        match tokio::task::spawn_blocking(move || pam::account(&service, &account, &rhost)).await? {
+            pam::Account::Ok => {}
+            // Like qshd without PAM: an expired password does not stop keys.
+            pam::Account::PasswordExpired => warn!("{addr}: {name}: the password has expired (logging in with {how})"),
+            pam::Account::Refused(reason) => {
+                *outcome = Outcome::AuthFailed;
+                warn!("{addr}: {name}: refused by PAM's account check: {reason}");
+                write_msg(&mut send, &Reply::Err("access denied".into())).await?;
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(not(all(feature = "pam", target_os = "linux")))]
+    let _ = account_checked;
     // Resuming a session that this user started after a full login: the
     // session token stands in for the second factor, but such a connection
     // can do nothing except resume that one session (see StreamCtx::resume_only).
@@ -819,6 +856,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                     && std::fs::metadata("/etc/motd").is_ok_and(|m| m.len() > 0),
                 last_login: None,
                 chroot: user.chroot.clone(),
+                // A PAM session around the program, opened as root.
+                pam: (cfg.use_pam && user.switches()).then(|| (cfg.pam_service.clone(), conn.remote_addr().ip().to_canonical().to_string())),
             },
             command: run,
             sftp,
