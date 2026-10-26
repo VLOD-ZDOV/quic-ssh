@@ -79,8 +79,9 @@
 #     copies skip the login and the one-time code. yes: always open a new
 #     one (and log in again) that later runs may share; no: share only when
 #     ControlPath is set. ControlPersist keeps it after the last session
-#     (10m, or yes until `qsh -O exit HOST`). Runs with -R or -A (also from
-#     RemoteForward or ForwardAgent here) open a connection of their own.
+#     (10m, or yes until `qsh -O exit HOST`). A run's -R goes through it and
+#     ends with the run; runs with -A or -X (also ForwardAgent, ForwardX11)
+#     open a connection of their own.
 #     ControlMaster no
 #     ControlPersist no
 #     ControlPath ~/.config/qsh/ctl/%C

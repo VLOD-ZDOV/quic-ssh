@@ -49,6 +49,9 @@ pub enum MuxRequest {
     /// Add (`-O forward`) or cancel (`-O cancel`) a forward of the master's
     /// connection: `kind` is 'L', 'R' or 'D', `spec` as on the command line.
     Forward { kind: char, spec: String, cancel: bool },
+    /// Add a forward for as long as this socket stays open: a client's own
+    /// `-R`, taken back when the client ends, however it ends.
+    HoldForward { kind: char, spec: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -199,6 +202,26 @@ pub async fn control(path: &Path, command: Command) -> Result<(u32, String)> {
         .await
         .context("the master does not answer")?
         .with_context(|| format!("control socket {}", path.display()))
+}
+
+/// A forward the master holds for this client (see
+/// [`MuxRequest::HoldForward`]); dropping it takes the forward back.
+pub struct HeldForward(#[allow(dead_code)] UnixStream);
+
+/// Asks the master at `path` to add a forward while the returned handle
+/// lives. Returns the master's message (an allocated port).
+pub async fn hold_forward(path: &Path, kind: char, spec: &str) -> Result<(HeldForward, String)> {
+    let hold = async {
+        let mut sock = connect(path).await?;
+        write_msg(&mut sock, &MuxRequest::HoldForward { kind, spec: spec.to_string() }).await?;
+        match read_msg(&mut sock).await {
+            Ok(MuxReply::Done(msg)) => Ok((HeldForward(sock), msg)),
+            Ok(MuxReply::Err(e)) => bail!("{e}"),
+            Ok(other) => bail!("unexpected answer {other:?}"),
+            Err(_) => bail!("the connection master is older than this qsh (`qsh -O exit` it, then run again)"),
+        }
+    };
+    tokio::time::timeout(FORWARD_TIMEOUT, hold).await.context("the connection master does not answer")?
 }
 
 /// The master's socket file; removed only while it is still ours (after
@@ -551,6 +574,26 @@ async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>
                 None => MuxReply::Err("this master cannot change forwards".into()),
             };
             write_msg(&mut sock, &reply).await?;
+        }
+        MuxRequest::HoldForward { kind, spec } => {
+            let Some(hook) = shared.hook else {
+                return write_msg(&mut sock, &MuxReply::Err("this master cannot change forwards".into())).await;
+            };
+            match hook(kind, spec.clone(), false).await {
+                Ok(msg) => write_msg(&mut sock, &MuxReply::Done(msg)).await?,
+                Err(e) => return write_msg(&mut sock, &MuxReply::Err(format!("{e:#}"))).await,
+            }
+            // The client's end (an exit, a crash, `kill -9`) closes the socket.
+            use tokio::io::AsyncReadExt;
+            let mut buf = [0u8; 1];
+            tokio::select! {
+                () = conn.closed() => {}
+                _ = sock.read(&mut buf) => {}
+                _ = exit_rx.wait_for(|e| *e) => {}
+            }
+            if let Err(e) = hook(kind, spec.clone(), true).await {
+                debug!("taking back -{kind} {spec}: {e:#}");
+            }
         }
     }
     Ok(())

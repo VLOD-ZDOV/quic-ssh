@@ -255,7 +255,7 @@ Host *
 - `ControlPersist 10m` keeps the master in the background for 10 minutes after the last session (`yes` until `-O exit`); connections through the master's own forwards count as sessions. Without it the first qsh is the master and, when its own session ends, waits for the others.
 - The socket is in `~/.config/qsh/ctl/` by default (`ControlPath`, or `-S path`; tokens `%h %p %r %C`). ssh's `ControlPath` is not used: those sockets speak ssh's protocol.
 - `qsh -O check host`, `-O exit`, `-O stop`, `-O forward -L ...` and `-O cancel -L ...` as in ssh.
-- Runs with `-R` or `-A` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it. A master whose own terminal session reconnects keeps sharing the new connection.
+- A run's `-R` goes through the master, which takes it back when the run ends, however it ends (unlike ssh, where it stays until the master exits). A master whose own session ends takes back its own forwards before it waits for the others. Runs with `-A` or `-X` use a connection of their own. A terminal session started through a master survives the master: qsh logs in by itself and resumes it. A master whose own terminal session reconnects keeps sharing the new connection.
 - Not on Windows.
 
 ### Host aliases (`~/.ssh/config`)

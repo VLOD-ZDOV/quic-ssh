@@ -2466,9 +2466,33 @@ fn connection_sharing_with_a_background_master() {
         !process_alive(&pid)
     });
     assert!(gone, "the command outlived its client");
-    // -R needs a connection of its own (the server's streams would reach the master).
-    let out = c.run(&["-o", "BatchMode=yes", "-R", "0:127.0.0.1:9", "-p", &port, &dest(), "true"]);
-    assert!(!out.status.success(), "-R went through the master");
+    // -R goes through the master (no login: the key is gone), held for as
+    // long as its run lives: a run killed with SIGKILL gives the port back.
+    let (rport, target) = (free_port(), echo_server());
+    let spec = format!("{rport}:127.0.0.1:{target}");
+    for round in 0..2 {
+        let mut child = c.cmd(&["-o", "BatchMode=yes", "-R", &spec, "-p", &port, &dest(), "sleep", "30"]).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sock = loop {
+            if let Ok(sock) = std::net::TcpStream::connect(("127.0.0.1", rport)) {
+                break sock;
+            }
+            assert!(Instant::now() < deadline, "round {round}: -R through the master did not come up");
+            sleep(Duration::from_millis(50));
+        };
+        sock.write_all(b"held").unwrap();
+        sock.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        sock.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "echo:held");
+        child.kill().unwrap();
+        let _ = child.wait();
+        let freed = (0..50).any(|_| {
+            sleep(Duration::from_millis(100));
+            std::net::TcpStream::connect(("127.0.0.1", rport)).is_err()
+        });
+        assert!(freed, "round {round}: the master kept -R {spec} after its run was killed");
+    }
     let out = c.run(&["-O", "exit", "-p", &port, &dest()]);
     assert!(out.status.success(), "{}", stderr(&out));
     sleep(Duration::from_millis(300));
@@ -2979,13 +3003,20 @@ fn master_waits_for_shared_sessions() {
     let c = Client::paired(&s);
     std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    ControlMaster auto\n    ControlPath /tmp/qsh-test-%C\n").unwrap();
     let port = s.port.to_string();
-    let mut master = c.cmd(&["-p", &port, &dest(), "sleep 2"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    // The master's own -L ends with its session, not when it stops waiting.
+    let (lport, target) = (free_port(), echo_server());
+    let spec = format!("{lport}:127.0.0.1:{target}");
+    let mut master = c.cmd(&["-L", &spec, "-p", &port, &dest(), "sleep 2"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !c.run(&["-O", "check", "-p", &port, &dest()]).status.success() {
         assert!(Instant::now() < deadline, "no master");
         sleep(Duration::from_millis(100));
     }
-    let out = c.run(&["-p", &port, &dest(), "sleep 4; echo still-here"]);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", lport)).is_ok(), "the master's -L is not up");
+    let other = c.cmd(&["-p", &port, &dest(), "sleep 4; echo still-here"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    sleep(Duration::from_millis(3000));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", lport)).is_err(), "the waiting master kept its own -L");
+    let out = other.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "still-here");
     assert!(master.wait().unwrap().success());

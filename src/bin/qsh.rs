@@ -798,9 +798,10 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         },
         false => None,
     };
-    // Streams the server opens (-R, -A, -X) would reach the master, not this
-    // qsh: such a run uses a connection of its own.
-    let share = remotes.is_empty() && agent.is_none() && target.forward_x11.is_none();
+    // Streams the server opens for -A and -X would reach the master, not
+    // this qsh: such a run uses a connection of its own. A -R is the
+    // master's to hold for this run (below).
+    let share = agent.is_none() && target.forward_x11.is_none();
     // The agent and the display are offered to every session of the
     // connection: one with them is not one to share with later runs.
     #[cfg(unix)]
@@ -841,11 +842,13 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open);
+    // This run's own forwards, taken back before a master waits for others.
+    let mut own: Vec<(char, String)> = Vec::new();
     for (kind, list) in [('L', locals), ('D', dynamics)] {
         for (f, required) in list {
             let spec = f.describe();
             match forwarder.local(kind, f).await {
-                Ok(()) => {}
+                Ok(()) => own.push((kind, spec)),
                 // Like ssh: a forward from the config that cannot bind is only a warning.
                 Err(e) if !required && !target.exit_on_forward_failure => eprintln!("qsh: warning: forward {spec}: {e:#}"),
                 Err(e) => return Err(e.context(format!("-{kind} {spec}"))),
@@ -856,9 +859,22 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
     let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some() || target.tunnel.is_some();
+    // Remote forwards held by the master for this run: taken back when it ends.
+    #[cfg(unix)]
+    let mut held = Vec::new();
     for (f, required) in remotes {
         let spec = f.describe();
-        match forwarder.remote(f.clone()).await {
+        #[cfg(unix)]
+        let result = match (&target.sharing.path, conn.is_shared()) {
+            (Some(path), true) => qsh::transport::shared::hold_forward(path, 'R', &spec).await.map(|(h, msg)| {
+                held.push(h);
+                msg.parse::<u16>().ok()
+            }),
+            _ => forwarder.remote(f.clone()).await.inspect(|_| own.push(('R', spec.clone()))),
+        };
+        #[cfg(not(unix))]
+        let result = forwarder.remote(f.clone()).await.inspect(|_| own.push(('R', spec.clone())));
+        match result {
             Ok(Some(port)) if matches!(f.listen, forward::Listen::Tcp { port: 0, .. }) && !quiet => {
                 eprintln!("Allocated port {port} for remote forward {spec}");
             }
@@ -1001,8 +1017,17 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let conn = forwarder.conn();
     #[cfg(unix)]
     if let Some(m) = master {
+        if m.active() > 0 {
+            for (kind, spec) in &own {
+                if let Err(e) = forwarder.request(*kind, spec, true).await {
+                    tracing::debug!("taking back -{kind} {spec}: {e:#}");
+                }
+            }
+        }
         wait_for_shared(m, &conn, quiet).await;
     }
+    #[cfg(not(unix))]
+    let _ = own;
     conn.close().await;
     Ok(code)
 }
