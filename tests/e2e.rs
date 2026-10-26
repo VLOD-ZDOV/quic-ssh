@@ -829,6 +829,22 @@ fn full_mode_uses_qshd_on_ssh_port_and_config() {
     assert_eq!(stdout(&out), "via-qsh\n");
 }
 
+/// Like an sshd session through pam_systemd: the user's runtime directory
+/// and session bus are set, so `systemctl --user` finds the user's systemd.
+#[test]
+fn session_has_the_runtime_dir() {
+    let uid = nix::unistd::getuid().as_raw();
+    let dir = format!("/run/user/{uid}");
+    if !std::path::Path::new(&dir).is_dir() {
+        eprintln!("skipped: no {dir} here");
+        return;
+    }
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let out = c.run(&["-p", &s.port.to_string(), &dest(), "echo $XDG_RUNTIME_DIR"]);
+    assert_eq!(stdout(&out), format!("{dir}\n"), "{}", stderr(&out));
+}
+
 /// `-v` tells each step, as `ssh -v` does, so a failed login shows where.
 #[test]
 fn verbose_tells_each_step() {

@@ -591,7 +591,7 @@ This is still a young project and has not had an external audit. For critical sy
 
 ## Limitations
 
-- No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
+- No PAM (`pam_limits`; for `pam_access` use `allow_users`/`allow_groups`) or `systemd-logind` sessions (`loginctl` will not show the login). Sessions still get `XDG_RUNTIME_DIR` and the session bus when `/run/user/UID` exists (another login of the user, or `loginctl enable-linger`), so `systemctl --user` works. 2FA is built in (TOTP). In system mode, terminal sessions are recorded in utmp, wtmp and lastlog where those files exist (`who`, `last`); systems that moved to wtmpdb do not see them.
 - Security keys only through ssh-agent; no PKCS#11 in qsh itself (use the agent for that too).
 - As with scp and sftp, a shell startup file that prints text for non-interactive shells (e.g. `~/.zshenv`) breaks `qsh cp`.
 - `-J` works only when every hop runs qshd (for other hops, use `ProxyCommand ssh -W %h:%p bastion` in `~/.config/qsh/config` to reach qshd's TCP port); with `--full`, hosts with ssh's `ProxyJump`/`ProxyCommand` are handed to ssh.

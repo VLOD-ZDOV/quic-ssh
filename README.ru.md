@@ -592,7 +592,7 @@ python3 bench/bench.py
 
 ## Ограничения
 
-- Нет PAM (`pam_limits`; вместо `pam_access` — `allow_users`/`allow_groups`) и `systemd-logind`-сессий (`loginctl` не увидит вход). 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
+- Нет PAM (`pam_limits`; вместо `pam_access` — `allow_users`/`allow_groups`) и `systemd-logind`-сессий (`loginctl` не увидит вход). При этом сессии получают `XDG_RUNTIME_DIR` и шину сессии, если есть `/run/user/UID` (другой вход пользователя или `loginctl enable-linger`), так что `systemctl --user` работает. 2FA встроена (TOTP). В системном режиме терминальные сессии записываются в utmp, wtmp и lastlog, если эти файлы есть (`who`, `last`); системы, перешедшие на wtmpdb, их не увидят.
 - Аппаратные ключи только через ssh-agent; PKCS#11 в самом qsh нет (для него тоже используй агент).
 - Как и со scp и sftp, файл запуска shell, который печатает текст в неинтерактивном режиме (например, `~/.zshenv`), ломает `qsh cp`.
 - `-J` работает, только если на всех промежуточных хостах есть qshd (через другие хосты — `ProxyCommand ssh -W %h:%p bastion` в `~/.config/qsh/config` до TCP-порта qshd); с `--full` хосты с `ProxyJump`/`ProxyCommand` из конфига ssh отдаются ssh.

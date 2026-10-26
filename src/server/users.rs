@@ -248,13 +248,32 @@ impl User {
         } else {
             "/usr/local/bin:/usr/bin:/bin"
         };
-        vec![
+        let mut env = vec![
             ("HOME".into(), self.home.to_string_lossy().into_owned()),
             ("USER".into(), self.name.clone()),
             ("LOGNAME".into(), self.name.clone()),
             ("SHELL".into(), self.shell.to_string_lossy().into_owned()),
             ("PATH".into(), path.into()),
-        ]
+        ];
+        env.extend(self.runtime_env());
+        env
+    }
+
+    /// What pam_systemd gives an sshd session: the user's runtime directory
+    /// and session bus, so `systemctl --user` and the like work. Only if
+    /// systemd made the directory for this user (a login or linger).
+    fn runtime_env(&self) -> Vec<(String, String)> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = PathBuf::from(format!("/run/user/{}", self.uid));
+        if self.chroot.is_some() || !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && m.uid() == self.uid) {
+            return Vec::new();
+        }
+        let mut env = vec![("XDG_RUNTIME_DIR".to_string(), dir.to_string_lossy().into_owned())];
+        let bus = dir.join("bus");
+        if std::fs::symlink_metadata(&bus).is_ok_and(|m| m.uid() == self.uid) {
+            env.push(("DBUS_SESSION_BUS_ADDRESS".into(), format!("unix:path={}", bus.display())));
+        }
+        env
     }
 
     /// `-bash`-style argv[0] that makes the shell a login shell.
