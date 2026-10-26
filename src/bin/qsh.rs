@@ -242,6 +242,10 @@ fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = crossterm::terminal::disable_raw_mode();
+        // `qsh ui` reads the mouse: left on, every scroll would type escape codes.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+        }
         if qsh::platform::is_broken_pipe_print(info) {
             std::process::exit(141);
         }
