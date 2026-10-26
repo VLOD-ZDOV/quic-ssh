@@ -857,7 +857,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 last_login: None,
                 chroot: user.chroot.clone(),
                 // A PAM session around the program, opened as root.
-                pam: (cfg.use_pam && user.switches()).then(|| (cfg.pam_service.clone(), conn.remote_addr().ip().to_canonical().to_string())),
+                pam: (cfg.use_pam && user.switches()).then(|| (cfg.pam_service.clone(), conn.remote_addr().ip().to_canonical().to_string(), user.name.clone())),
             },
             command: run,
             sftp,
