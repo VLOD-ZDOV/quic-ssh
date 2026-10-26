@@ -118,6 +118,9 @@ pub struct Prelude {
     pub last_login: Option<String>,
     /// `chroot_directory`, with its tokens replaced.
     pub chroot: Option<PathBuf>,
+    /// `use_pam`: the PAM service and the client's address, for a PAM
+    /// session around the program (see `pam::run_session`).
+    pub pam: Option<(String, String)>,
 }
 
 impl Prelude {
@@ -152,6 +155,9 @@ impl Prelude {
         if let Some(c) = &self.chroot {
             items.push(format!("chroot={}", c.display()));
         }
+        if let Some((service, rhost)) = &self.pam {
+            items.push(format!("pam={service} {rhost}"));
+        }
         encode_args(&items)
     }
 
@@ -171,6 +177,10 @@ impl Prelude {
                 _ if item.starts_with("xauth=") => p.xauth = Some(item["xauth=".len()..].to_string()),
                 "motd" => p.motd = true,
                 _ if item.starts_with("chroot=") => p.chroot = Some(PathBuf::from(&item["chroot=".len()..])),
+                _ if item.starts_with("pam=") => {
+                    let (service, rhost) = item["pam=".len()..].split_once(' ')?;
+                    p.pam = Some((service.to_string(), rhost.to_string()));
+                }
                 _ => p.last_login = Some(item.strip_prefix("last=")?.to_string()),
             }
         }
@@ -290,7 +300,8 @@ impl User {
             "--".into(),
         ];
         args.push(program.to_owned());
-        match SCOPE.get().and_then(Option::as_ref).filter(|_| scope && self.switch) {
+        // With a PAM session, pam_systemd gives it a logind session of its own.
+        match SCOPE.get().and_then(Option::as_ref).filter(|_| scope && self.switch && prelude.pam.is_none()) {
             // `systemd-run --scope` waits until it is in the scope, then
             // becomes `internal-become` in the same process: nothing the
             // session starts is ever outside it.
@@ -579,7 +590,11 @@ mod tests {
     fn prelude_stays_off_the_command_line() {
         let name = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
         let Ok(user) = User::lookup(&name) else { return };
-        let prelude = Prelude { x11: Some(("unix:10.0".into(), "MIT-MAGIC-COOKIE-1".into(), "0f".repeat(16))), ..Default::default() };
+        let prelude = Prelude {
+            x11: Some(("unix:10.0".into(), "MIT-MAGIC-COOKIE-1".into(), "0f".repeat(16))),
+            pam: Some(("qshd".into(), "2001:db8::1".into())),
+            ..Default::default()
+        };
         let (_, args, _) = user.launch(std::ffi::OsStr::new("/bin/sh"), None, false, &prelude, false);
         assert!(!args.is_empty() && !args.iter().any(|a| a.to_string_lossy().contains(&prelude.encode())), "{args:?}");
         let env = user.launch_env(true, Vec::new(), &prelude);

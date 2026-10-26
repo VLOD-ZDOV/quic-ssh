@@ -25,6 +25,7 @@ PASS=0
 FAIL=0
 SERVER_PID=
 JAIL=
+PAM_SERVICE=
 
 ok() { echo "  ok   $1"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL $1"; FAIL=$((FAIL + 1)); }
@@ -39,6 +40,7 @@ cleanup() {
         groupdel qsh-team 2>/dev/null || true
     fi
     [[ -n ${JAIL:-} ]] && rm -rf "$JAIL"
+    [[ -n ${PAM_SERVICE:-} ]] && rm -f "/etc/pam.d/$PAM_SERVICE"
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -352,6 +354,62 @@ check "password login with the right password" test "$(pw_login 'correct horse')
 OUT=$(pw_login 'wrong horse' || true)
 check "a wrong password is refused" test -z "$OUT"
 check "no password for users without it enabled" bash -c "! HOME='$T/client-pw' SSH_ASKPASS='$T/askpass' SSH_ASKPASS_REQUIRE=force QSH_TEST_PASSWORD=x '$QSH' -p $PORT qsh-alice@127.0.0.1 true </dev/null 2>/dev/null"
+
+# --- PAM (use_pam; a qshd built with `--features pam`) -------------------------------------
+printf 'use_pam = true\n' > "$T/pam-probe.toml"
+if [[ -n ${QSH_TEST_NS:-} ]] || ! "$QSHD" -c "$T/pam-probe.toml" -t >/dev/null 2>&1; then
+    echo "  skip PAM (needs real root and qshd built with --features pam)"
+else
+    PAM_SERVICE=qsh-test-$$
+    printf '%s\n' '#!/bin/sh' "echo \"\$PAM_TYPE \$PAM_USER \$PAM_RHOST \$PAM_TTY\" >> $T/pam-events" > "$T/pam-exec"
+    chmod 755 "$T/pam-exec"
+    echo "QSH_PAM_TEST DEFAULT=from-pam" > "$T/pam-env.conf"
+    echo "qsh-alice - nofile 1234" > "$T/pam-limits.conf"
+    : > "$T/pam-access.conf"
+    cat > "/etc/pam.d/$PAM_SERVICE" <<EOF
+auth     required pam_unix.so
+account  required pam_access.so accessfile=$T/pam-access.conf
+account  required pam_unix.so
+session  required pam_env.so conffile=$T/pam-env.conf readenv=0
+session  required pam_limits.so conf=$T/pam-limits.conf
+session  required pam_exec.so $T/pam-exec
+EOF
+    sed -i "1i use_pam = true\npam_service = \"$PAM_SERVICE\"" "$T/config.toml"
+    kill -HUP "$SERVER_PID"
+    sleep 0.5
+    OUT=$(q qsh-alice@127.0.0.1 'echo "pam=$QSH_PAM_TEST nofile=$(ulimit -n) uid=$(id -u)"' 2>&1 || true)
+    check "a key login runs in a PAM session (pam_env)" grep -q "pam=from-pam " <<<"$OUT"
+    check "... with pam_limits applied" grep -q "nofile=1234 " <<<"$OUT"
+    check "... as the user" grep -q "uid=$ALICE_UID" <<<"$OUT"
+    for _ in $(seq 20); do grep -q '^close_session qsh-alice' "$T/pam-events" 2>/dev/null && break; sleep 0.1; done
+    check "the PAM session is opened with the client's address" grep -q '^open_session qsh-alice 127.0.0.1 ssh$' "$T/pam-events"
+    check "... and closed when the program ends" grep -q '^close_session qsh-alice 127.0.0.1 ssh$' "$T/pam-events"
+    OUT=$(q qsh-alice@127.0.0.1 'exit 7' >/dev/null 2>&1; echo "code=$?")
+    check "the exit code comes through the PAM session process" test "$OUT" = "code=7"
+    : > "$T/pam-events"
+    HOME="$T/client" "$QSH" -p "$PORT" qsh-alice@127.0.0.1 "echo \$\$ > $T/shared/pam-sleep; exec sleep 60" </dev/null >/dev/null 2>&1 &
+    PAM_CLIENT=$!
+    for _ in $(seq 50); do [[ -s $T/shared/pam-sleep ]] && break; sleep 0.1; done
+    kill "$PAM_CLIENT" 2>/dev/null || true
+    wait "$PAM_CLIENT" 2>/dev/null || true
+    for _ in $(seq 150); do grep -q "^close_session" "$T/pam-events" && break; sleep 0.1; done
+    check "a session whose client is gone still closes its PAM session" grep -q '^close_session qsh-alice' "$T/pam-events"
+    check "... and its program is ended" bash -c "! kill -0 \$(cat '$T/shared/pam-sleep') 2>/dev/null"
+    OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'echo PAMTTY=\$QSH_PAM_TEST'" /dev/null < /dev/null || true)
+    check "a pty session gets a PAM session too" grep -q "PAMTTY=from-pam" <<<"$OUT"
+    check "... with its terminal as PAM_TTY" grep -q '^open_session qsh-alice 127.0.0.1 /dev/pts/' "$T/pam-events"
+    check "password login through pam_unix" test "$(pw_login 'correct horse')" = "$BOB_UID"
+    OUT=$(pw_login 'wrong horse' || true)
+    check "a wrong password is refused by PAM" test -z "$OUT"
+    echo "-:qsh-alice:ALL" > "$T/pam-access.conf"
+    OUT=$(q qsh-alice@127.0.0.1 true 2>&1 || true)
+    check "pam_access refuses a key login" grep -q "access denied" <<<"$OUT"
+    check "... and the log says why" grep -q "refused by PAM's account check" "$T/server.log"
+    sed -i '/^use_pam = true$/d; /^pam_service = /d' "$T/config.toml"
+    kill -HUP "$SERVER_PID"
+    sleep 0.5
+    rm -f "/etc/pam.d/$PAM_SERVICE"
+fi
 
 # --- tunnel devices (-w) ---------------------------------------------------------------------
 if [[ -n ${QSH_TEST_NS:-} || ! -c /dev/net/tun ]] || ! command -v ip >/dev/null; then

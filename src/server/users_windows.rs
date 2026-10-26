@@ -16,6 +16,7 @@ pub struct Prelude {
     pub motd: bool,
     pub last_login: Option<String>,
     pub chroot: Option<PathBuf>,
+    pub pam: Option<(String, String)>,
 }
 
 /// The user sessions run as: the one qshd runs as.
