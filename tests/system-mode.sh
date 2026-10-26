@@ -363,10 +363,11 @@ else
     PAM_SERVICE=qsh-test-$$
     printf '%s\n' '#!/bin/sh' "echo \"\$PAM_TYPE \$PAM_USER \$PAM_RHOST \$PAM_TTY\" >> $T/pam-events" > "$T/pam-exec"
     chmod 755 "$T/pam-exec"
-    echo "QSH_PAM_TEST DEFAULT=from-pam" > "$T/pam-env.conf"
-    echo "qsh-alice - nofile 1234" > "$T/pam-limits.conf"
+    printf '%s\n' "QSH_PAM_TEST DEFAULT=from-pam" "QSH_SETENV DEFAULT=from-pam" "SSH_ORIGINAL_COMMAND DEFAULT=from-pam" > "$T/pam-env.conf"
+    printf '%s\n' "qsh-alice - nofile 1234" "qsh-alice - core unlimited" > "$T/pam-limits.conf"
     : > "$T/pam-access.conf"
     cat > "/etc/pam.d/$PAM_SERVICE" <<EOF
+auth     optional pam_echo.so QSH-PAM-NOTICE
 auth     required pam_unix.so
 account  required pam_access.so accessfile=$T/pam-access.conf
 account  required pam_unix.so
@@ -375,12 +376,18 @@ session  required pam_limits.so conf=$T/pam-limits.conf
 session  required pam_exec.so $T/pam-exec
 EOF
     sed -i "1i use_pam = true\npam_service = \"$PAM_SERVICE\"" "$T/config.toml"
+    printf '\n[set_env]\nQSH_SETENV = "from-server"\n' >> "$T/config.toml"
     kill -HUP "$SERVER_PID"
     sleep 0.5
     OUT=$(q qsh-alice@127.0.0.1 'echo "pam=$QSH_PAM_TEST nofile=$(ulimit -n) uid=$(id -u)"' 2>&1 || true)
     check "a key login runs in a PAM session (pam_env)" grep -q "pam=from-pam " <<<"$OUT"
     check "... with pam_limits applied" grep -q "nofile=1234 " <<<"$OUT"
     check "... as the user" grep -q "uid=$ALICE_UID" <<<"$OUT"
+    OUT=$(q qsh-alice@127.0.0.1 'echo "setenv=$QSH_SETENV orig=$SSH_ORIGINAL_COMMAND"' 2>&1 || true)
+    check "PAM variables do not replace set_env" grep -q "setenv=from-server " <<<"$OUT"
+    check "... nor SSH_* variables" grep -q "orig=$" <<<"$OUT"
+    OUT=$(q qsh-alice@127.0.0.1 'echo "core=$(ulimit -c) parent=$(awk "/core file size/{print \$5}" /proc/$PPID/limits)"' 2>&1 || true)
+    check "the root process holding the session writes no core file" grep -q "core=unlimited parent=0$" <<<"$OUT"
     for _ in $(seq 20); do grep -q '^close_session qsh-alice' "$T/pam-events" 2>/dev/null && break; sleep 0.1; done
     check "the PAM session is opened with the client's address" grep -q '^open_session qsh-alice 127.0.0.1 ssh$' "$T/pam-events"
     check "... and closed when the program ends" grep -q '^close_session qsh-alice 127.0.0.1 ssh$' "$T/pam-events"
@@ -395,10 +402,24 @@ EOF
     for _ in $(seq 150); do grep -q "^close_session" "$T/pam-events" && break; sleep 0.1; done
     check "a session whose client is gone still closes its PAM session" grep -q '^close_session qsh-alice' "$T/pam-events"
     check "... and its program is ended" bash -c "! kill -0 \$(cat '$T/shared/pam-sleep') 2>/dev/null"
+    : > "$T/pam-events"
+    rm -f "$T/shared/pam-sleep"
+    HOME="$T/client" "$QSH" -p "$PORT" qsh-alice@127.0.0.1 "trap '' HUP TERM; echo \$\$ > $T/shared/pam-sleep; while :; do sleep 1; done" </dev/null >/dev/null 2>&1 &
+    PAM_CLIENT=$!
+    for _ in $(seq 50); do [[ -s $T/shared/pam-sleep ]] && break; sleep 0.1; done
+    kill "$PAM_CLIENT" 2>/dev/null || true
+    wait "$PAM_CLIENT" 2>/dev/null || true
+    for _ in $(seq 150); do grep -q "^close_session" "$T/pam-events" && break; sleep 0.1; done
+    check "a program that ignores hangups is killed and the PAM session closed" grep -q '^close_session qsh-alice' "$T/pam-events"
+    check "... and it is gone" bash -c "! kill -0 \$(cat '$T/shared/pam-sleep') 2>/dev/null"
     OUT=$(HOME="$T/client" script -qec "'$QSH' -t -p $PORT qsh-alice@127.0.0.1 'echo PAMTTY=\$QSH_PAM_TEST'" /dev/null < /dev/null || true)
     check "a pty session gets a PAM session too" grep -q "PAMTTY=from-pam" <<<"$OUT"
     check "... with its terminal as PAM_TTY" grep -q '^open_session qsh-alice 127.0.0.1 /dev/pts/' "$T/pam-events"
     check "password login through pam_unix" test "$(pw_login 'correct horse')" = "$BOB_UID"
+    OUT=$(HOME="$T/client-pw" SSH_ASKPASS="$T/askpass" SSH_ASKPASS_REQUIRE=force QSH_TEST_PASSWORD='wrong horse' \
+        "$QSH" -p "$PORT" qsh-bob@127.0.0.1 true </dev/null 2>&1 || true)
+    check "PAM messages do not reach a client that is not logged in" bash -c "! grep -q QSH-PAM-NOTICE <<<'$OUT'"
+    check "... they go to the log" grep -q "QSH-PAM-NOTICE" "$T/server.log"
     OUT=$(pw_login 'wrong horse' || true)
     check "a wrong password is refused by PAM" test -z "$OUT"
     echo "-:qsh-alice:ALL" > "$T/pam-access.conf"

@@ -178,10 +178,9 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     // that stays to close it; this one goes on as its child.
     #[cfg(all(feature = "pam", target_os = "linux"))]
     let pam_session = match prelude.pam.as_ref().filter(|_| switch) {
-        Some((service, rhost)) => {
-            let name = nix::unistd::User::from_uid(uid)?.context("no such user")?.name;
+        Some((service, rhost, name)) => {
             let terminal = if tty == "tty" { nix::unistd::ttyname(io::stdin()).ok().map(|p| p.to_string_lossy().into_owned()) } else { None };
-            Some(super::pam::run_session(service, &name, rhost, terminal.as_deref())?)
+            Some(super::pam::run_session(service, name, uid.as_raw(), rhost, terminal.as_deref())?)
         }
         None => None,
     };
@@ -235,17 +234,23 @@ pub fn become_user(args: &[String]) -> Result<std::convert::Infallible> {
     #[cfg(not(target_vendor = "apple"))]
     let as_user = |_: &mut std::process::Command| {};
     // The session's variables, now that they cannot act as root (see `User::launch_env`).
+    let mut session_env = Vec::new();
     if let Ok(encoded) = std::env::var(SESSION_ENV) {
         std::env::remove_var(SESSION_ENV);
         for pair in decode_args(&encoded).context("bad session environment")? {
             if let Some((k, v)) = pair.split_once('=').filter(|(k, _)| !k.is_empty()) {
-                std::env::set_var(k, v);
+                session_env.push((k.to_string(), v.to_string()));
             }
         }
     }
-    // The modules' variables last, as sshd sets them (pam_env's PATH, locale).
+    // The modules' variables (pam_env, pam_systemd) come between the base
+    // ones and the rest, as in sshd: never over what the server or the
+    // client set (`set_env`, SSH_ORIGINAL_COMMAND, an accepted LANG).
     #[cfg(all(feature = "pam", target_os = "linux"))]
-    for (k, v) in pam_session.iter().flat_map(|s| &s.env) {
+    if let Some(session) = &pam_session {
+        session_env = super::pam::merge_env(session_env, &session.env);
+    }
+    for (k, v) in session_env {
         std::env::set_var(k, v);
     }
     let home = Path::new(home);

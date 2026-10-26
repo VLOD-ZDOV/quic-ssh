@@ -118,9 +118,10 @@ pub struct Prelude {
     pub last_login: Option<String>,
     /// `chroot_directory`, with its tokens replaced.
     pub chroot: Option<PathBuf>,
-    /// `use_pam`: the PAM service and the client's address, for a PAM
-    /// session around the program (see `pam::run_session`).
-    pub pam: Option<(String, String)>,
+    /// `use_pam`: the PAM service, the client's address and the account
+    /// that logged in, for a PAM session around the program (see
+    /// `pam::run_session`).
+    pub pam: Option<(String, String, String)>,
 }
 
 impl Prelude {
@@ -155,8 +156,8 @@ impl Prelude {
         if let Some(c) = &self.chroot {
             items.push(format!("chroot={}", c.display()));
         }
-        if let Some((service, rhost)) = &self.pam {
-            items.push(format!("pam={service} {rhost}"));
+        if let Some((service, rhost, user)) = &self.pam {
+            items.push(format!("pam={service} {rhost} {user}"));
         }
         encode_args(&items)
     }
@@ -178,8 +179,8 @@ impl Prelude {
                 "motd" => p.motd = true,
                 _ if item.starts_with("chroot=") => p.chroot = Some(PathBuf::from(&item["chroot=".len()..])),
                 _ if item.starts_with("pam=") => {
-                    let (service, rhost) = item["pam=".len()..].split_once(' ')?;
-                    p.pam = Some((service.to_string(), rhost.to_string()));
+                    let mut f = item["pam=".len()..].splitn(3, ' ').map(str::to_string);
+                    p.pam = Some((f.next()?, f.next()?, f.next()?));
                 }
                 _ => p.last_login = Some(item.strip_prefix("last=")?.to_string()),
             }
@@ -611,7 +612,7 @@ mod tests {
         let Ok(user) = User::lookup(&name) else { return };
         let prelude = Prelude {
             x11: Some(("unix:10.0".into(), "MIT-MAGIC-COOKIE-1".into(), "0f".repeat(16))),
-            pam: Some(("qshd".into(), "2001:db8::1".into())),
+            pam: Some(("qshd".into(), "2001:db8::1".into(), "alice".into())),
             ..Default::default()
         };
         let (_, args, _) = user.launch(std::ffi::OsStr::new("/bin/sh"), None, false, &prelude, false);

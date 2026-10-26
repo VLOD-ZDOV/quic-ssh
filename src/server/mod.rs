@@ -625,8 +625,14 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
         let (service, account, rhost) = (cfg.pam_service.clone(), user.name.clone(), addr.ip().to_canonical().to_string());
         match tokio::task::spawn_blocking(move || pam::account(&service, &account, &rhost)).await? {
             pam::Account::Ok => {}
-            // Like qshd without PAM: an expired password does not stop keys.
-            pam::Account::PasswordExpired => warn!("{addr}: {name}: the password has expired (logging in with {how})"),
+            // As sshd: a password marked for a change (`passwd -e`) must be
+            // changed first; qsh cannot change it, so it is refused.
+            pam::Account::PasswordExpired => {
+                *outcome = Outcome::AuthFailed;
+                warn!("{addr}: {name}: the password has expired and must be changed (login with {how} refused)");
+                write_msg(&mut send, &Reply::Err("your password has expired: change it first (passwd, as root or over ssh)".into())).await?;
+                return Ok(());
+            }
             pam::Account::Refused(reason) => {
                 *outcome = Outcome::AuthFailed;
                 warn!("{addr}: {name}: refused by PAM's account check: {reason}");
@@ -857,7 +863,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 last_login: None,
                 chroot: user.chroot.clone(),
                 // A PAM session around the program, opened as root.
-                pam: (cfg.use_pam && user.switches()).then(|| (cfg.pam_service.clone(), conn.remote_addr().ip().to_canonical().to_string())),
+                pam: (cfg.use_pam && user.switches()).then(|| (cfg.pam_service.clone(), conn.remote_addr().ip().to_canonical().to_string(), user.name.clone())),
             },
             command: run,
             sftp,
