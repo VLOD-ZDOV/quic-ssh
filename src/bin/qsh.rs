@@ -27,7 +27,7 @@ struct ToolCli {
     conn: ConnArgs,
 }
 
-const TOOLS: [&str; 11] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget", "completions", "copy-id"];
+const TOOLS: [&str; 12] = ["cp", "pair", "keygen", "speed", "ui", "multi", "doctor", "update", "forget", "completions", "copy-id", "punch"];
 
 /// True when the first positional argument names a tool command. Only the
 /// first position counts, so `qsh host cp a b` runs `cp a b` remotely.
@@ -166,6 +166,51 @@ enum Cmd {
     Update {
         /// Release tag instead of the latest, for example v1.0.2
         version: Option<String>,
+    },
+    /// Experimental: reach a qshd behind NAT by punching a UDP hole
+    Punch {
+        #[command(subcommand)]
+        cmd: PunchCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PunchCmd {
+    /// The side behind NAT: wait for the other side and pass the packets to the local qshd
+    Serve {
+        /// Where the local qshd listens
+        #[arg(long, default_value = "127.0.0.1:4422")]
+        to: std::net::SocketAddr,
+        /// The other side's public address (asked for on stdin when missing)
+        #[arg(long)]
+        peer: Option<String>,
+        /// Keep this local UDP port between runs, so its NAT mapping survives
+        #[arg(long)]
+        punch_port: Option<u16>,
+        /// The shared secret both sides give (a fresh one is printed when missing)
+        #[arg(long, value_name = "STRING")]
+        id: Option<String>,
+        /// Do not ask STUN servers for the public address
+        #[arg(long)]
+        no_stun: bool,
+    },
+    /// The side that connects: punch the hole and listen on loopback for qsh
+    Dial {
+        /// The other side's public address
+        #[arg(long)]
+        peer: String,
+        /// Where the local qsh connects (4422 keeps the host key entry the same as a normal connection)
+        #[arg(long, default_value = "127.0.0.1:4422")]
+        listen: std::net::SocketAddr,
+        /// Keep this local UDP port between runs, so its NAT mapping survives
+        #[arg(long)]
+        punch_port: Option<u16>,
+        /// The shared secret both sides give (a fresh one is printed when missing)
+        #[arg(long, value_name = "STRING")]
+        id: Option<String>,
+        /// Do not ask STUN servers for the public address
+        #[arg(long)]
+        no_stun: bool,
     },
 }
 
@@ -643,6 +688,34 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             multi::run(&dests, &command, parallel, &cli.conn.as_args(), json).await
         }
         Cmd::Update { version } => update(version.as_deref()),
+        Cmd::Punch { cmd } => {
+            use qsh::punch;
+            match cmd {
+                PunchCmd::Serve { to, peer, punch_port, id, no_stun } => {
+                    let (secret, fresh) = punch::secret(id);
+                    if fresh {
+                        println!("qsh punch: shared id {secret} (give it to the other side with --id)");
+                    }
+                    let peer = match peer {
+                        Some(p) => Some(punch::resolve(&p).await?),
+                        None => None,
+                    };
+                    let bind = punch::bind_for(peer, punch_port);
+                    punch::serve(punch::ServeOptions { bind, peer, secret, stun: !no_stun, target: to }).await?;
+                    Ok(0)
+                }
+                PunchCmd::Dial { peer, listen, punch_port, id, no_stun } => {
+                    let (secret, fresh) = punch::secret(id);
+                    if fresh {
+                        println!("qsh punch: shared id {secret} (give it to the other side with --id)");
+                    }
+                    let peer = punch::resolve(&peer).await?;
+                    let bind = punch::bind_for(Some(peer), punch_port);
+                    punch::dial(punch::DialOptions { bind, peer, secret, stun: !no_stun, listen }).await?;
+                    Ok(0)
+                }
+            }
+        }
     }
 }
 

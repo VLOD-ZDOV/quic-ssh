@@ -3727,3 +3727,73 @@ fn unsupported_ssh_options_are_reported() {
     let out = c.run(&["-p", &port, "-o", "IgnoreUnknown=Bog*", "-o", "Bogus=1", &dest(), "true"]);
     assert!(out.status.success(), "{}", stderr(&out));
 }
+
+/// Experimental NAT traversal: `qsh cp` through two `qsh punch` shims. On
+/// loopback there is no NAT to punch, but the path is the same one a punched
+/// hole carries, so this checks the shim end to end: qsh -> dial -> serve -> qshd.
+#[test]
+fn copy_through_a_punched_hole() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let (a, b, l) = (free_port(), free_port(), free_port());
+    let mut serve = Command::new(QSH)
+        .args([
+            "punch", "serve", "--no-stun", "--to", &format!("127.0.0.1:{}", s.port),
+            "--punch-port", &a.to_string(), "--peer", &format!("127.0.0.1:{b}"), "--id", "test-hole",
+        ])
+        .env("HOME", c.home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut dial = Command::new(QSH)
+        .args([
+            "punch", "dial", "--no-stun", "--peer", &format!("127.0.0.1:{a}"),
+            "--punch-port", &b.to_string(), "--listen", &format!("127.0.0.1:{l}"), "--id", "test-hole",
+        ])
+        .env("HOME", c.home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = dial.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut ready = false;
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(10)) {
+        if line.contains("listening for qsh on") {
+            ready = true;
+            break;
+        }
+    }
+    let file = c.home.path().join("hole.txt");
+    std::fs::write(&file, b"through the hole\n").unwrap();
+    let remote = format!("{}:hole.txt", dest());
+    let mut last = None;
+    for _ in 0..20 {
+        if !ready {
+            sleep(Duration::from_millis(250));
+            continue;
+        }
+        let out = c.run(&["cp", "--transport", "quic", "--accept-new-host", "-p", &l.to_string(), file.to_str().unwrap(), &remote]);
+        let done = out.status.success();
+        last = Some(out);
+        if done {
+            break;
+        }
+        sleep(Duration::from_millis(250));
+    }
+    let _ = dial.kill();
+    let _ = serve.kill();
+    let _ = dial.wait();
+    let _ = serve.wait();
+    let out = last.expect("no copy attempt");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(s.home.path().join("hole.txt")).unwrap(), b"through the hole\n");
+}

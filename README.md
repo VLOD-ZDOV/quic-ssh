@@ -334,6 +334,8 @@ qsh -J user@public.example.com you@localhost:14422
 
 The session stays encrypted end to end: the public host only passes the bytes on, and the hidden host's key is checked as usual. The port on the public host listens on loopback only. To keep the tunnel up, use `contrib/qsh-tunnel@.service` (a systemd user unit; instructions inside).
 
+**Experimental: `qsh punch`.** If no public host is available, `qsh punch` tries to open the NAT itself: both sides learn their public address from STUN, exchange it in a chat message, and then send UDP packets to each other until the mappings line up, with a normal qsh connection running through the hole. It works through cone NATs; symmetric NAT and most CGNAT defeat it, and there is no relay fallback. See [docs/hole-punch.md](docs/hole-punch.md).
+
 ### Host menu and speed test (`qsh ui`, `qsh speed`)
 
 `qsh ui` opens a connection menu with every host from `~/.ssh/config`, `~/.config/qsh/config`, known_hosts and the connections you saved in it:
