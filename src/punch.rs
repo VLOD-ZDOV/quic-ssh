@@ -137,7 +137,7 @@ pub async fn serve(o: ServeOptions) -> Result<()> {
     let peer = match o.peer {
         Some(p) => p,
         None => {
-            say("qsh punch: send the address above to the other side, then paste theirs here and press Enter.");
+            say("qsh punch: paste the other side's public address here and press Enter:");
             read_peer().await?
         }
     };
@@ -306,7 +306,7 @@ async fn report_public(sock: &UdpSocket) {
         };
         match stun_once(sock, server).await {
             Ok(addr) => {
-                say(format!("qsh punch: STUN says your address is {addr}"));
+                say(format!("qsh punch: STUN says your public address is {addr} -- send it to the other side"));
                 seen.push(addr);
             }
             Err(e) => tracing::debug!("{host}:{port}: {e:#}"),
