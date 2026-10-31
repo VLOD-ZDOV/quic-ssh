@@ -810,7 +810,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         return write_msg(&mut send, &Reply::Err("the one-time code of this connection has expired (totp_valid_for): connect again".into())).await;
     }
     if let Some(allowed) = resume_only {
-        if !matches!(&request, Request::Resume { token, .. } if token == allowed) {
+        // Pings go on: the client's ServerAlive runs on this connection too.
+        if !matches!(&request, Request::Ping) && !matches!(&request, Request::Resume { token, .. } if token == allowed) {
             return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
         }
     }

@@ -1951,6 +1951,47 @@ fn one_time_code_survives_a_connection_lost_at_the_prompt() {
     assert_eq!(std::fs::read_to_string(dir.path().join("count")).unwrap().trim(), "1", "the code was asked twice");
 }
 
+/// Pings work on a connection that resumed a session: a quiet terminal must
+/// not count as a lost connection and reconnect over and over.
+#[test]
+fn quiet_session_stays_connected_after_a_resume() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let mut child = c
+        .cmd(&["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-p", &port, &dest(), "sh"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for pipe in [Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>, Box::new(child.stderr.take().unwrap())] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        });
+    }
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    let pid = child.id().to_string();
+    assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(Command::new("kill").args(["-CONT", &pid]).status().unwrap().success());
+    wait_for_output(&rx, &mut seen, "reconnected", 30);
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    seen.extend(rx.try_iter());
+    assert_eq!(seen.matches("reconnected").count(), 1, "{seen}");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// `totp_valid_for`: a shared connection opened with a one-time code works
 /// without one, but only that long; then a new login asks for a code again.
 #[test]
