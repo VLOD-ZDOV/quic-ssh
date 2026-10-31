@@ -1027,11 +1027,19 @@ fn refuse_proxy(target: &Target) -> Result<()> {
 async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -> Result<Conn> {
     refuse_proxy(target)?;
     let own = find_identity(&opts.identities, &target.identity_files, false, target.batch_mode)?;
-    let result = match login_once(target, opts, via, own.as_ref(), false).await {
-        // qshd before 0.5 knows only the TLS key: log in again with the own key
-        // in the handshake (the host has been accepted by now, so this is no leak).
-        Err(e) if e.is::<TlsKeyOnly>() => login_once(target, opts, via, own.as_ref(), true).await,
-        result => result,
+    let mut typed = None;
+    let mut retries = LOGIN_RETRIES;
+    let result = loop {
+        match login_once(target, opts, via, own.as_ref(), false, &mut typed).await {
+            // qshd before 0.5 knows only the TLS key: log in again with the own key
+            // in the handshake (the host has been accepted by now, so this is no leak).
+            Err(e) if e.is::<TlsKeyOnly>() => break login_once(target, opts, via, own.as_ref(), true, &mut typed).await,
+            Err(e) if e.is::<auth::LostAtPrompt>() && retries > 0 => {
+                tracing::debug!("{e}; connecting again");
+                retries -= 1;
+            }
+            result => break result,
+        }
     };
     if let (Ok(_), Some(id), Some(policy)) = (&result, &own, &target.add_keys_to_agent) {
         add_own_key_to_agent(target, id, policy).await;
@@ -1069,9 +1077,12 @@ impl std::fmt::Display for TlsKeyOnly {
 
 impl std::error::Error for TlsKeyOnly {}
 
+/// New logins after a connection ended at a question (see [`auth::LostAtPrompt`]).
+const LOGIN_RETRIES: u32 = 2;
+
 /// One connection and login. `own`: the client's Ed25519 key, if it has
 /// one; `real_tls`: use it in the handshake on every port.
-async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, own: Option<&Identity>, real_tls: bool) -> Result<Conn> {
+async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, own: Option<&Identity>, real_tls: bool, typed: &mut auth::Typed) -> Result<Conn> {
     let throwaway = Identity::generate();
     let own = own.unwrap_or(&throwaway);
     let rejected = Rejection::default();
@@ -1091,7 +1102,7 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
         None => Hello::Login { version: VERSION, user: target.user.clone() },
     };
     write_msg(&mut send, &hello).await?;
-    match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, tls_id, own).await {
+    match auth::login(&conn, &mut send, &mut recv, target, &opts.identities, tls_id, own, typed).await {
         Ok(auth::Outcome::Welcome(version)) => {
             tracing::debug!("logged in, server protocol version {version}");
             conn.set_server_version(version);

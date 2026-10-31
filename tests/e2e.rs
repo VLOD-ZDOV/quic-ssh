@@ -1928,6 +1928,29 @@ fn one_time_codes() {
     assert!(!out.status.success(), "a world-readable secret turned 2FA off");
 }
 
+/// The server gives up while the user fetches the code (Android stops Termux
+/// meanwhile): the login starts over with the code already typed.
+#[test]
+fn one_time_code_survives_a_connection_lost_at_the_prompt() {
+    use qsh::totp;
+    let s = Server::start_with("127.0.0.1", "login_grace_time = 1\n");
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let dir = tempfile::tempdir().unwrap();
+    let inner = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step))]);
+    let script = dir.path().join("slow.sh");
+    std::fs::write(&script, format!("#!/bin/sh\nsleep 2\nexec '{}' \"$@\"\n", inner.display())).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let port = s.port.to_string();
+    let out = c.cmd(&["-p", &port, &dest(), "echo", "in"]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap();
+    assert_eq!(stdout(&out), "in\n", "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(dir.path().join("count")).unwrap().trim(), "1", "the code was asked twice");
+}
+
 /// `totp_valid_for`: a shared connection opened with a one-time code works
 /// without one, but only that long; then a new login asks for a code again.
 #[test]

@@ -274,10 +274,29 @@ pub enum Outcome {
     Denied { reason: String, asked_for_keys: bool },
 }
 
+/// The connection ended while the user answered a question: Android stops
+/// Termux while the user is in the authenticator app, or the login took too
+/// long for the server.
+#[derive(Debug)]
+pub struct LostAtPrompt;
+
+impl std::fmt::Display for LostAtPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the connection ended during the login")
+    }
+}
+
+impl std::error::Error for LostAtPrompt {}
+
+/// A question and the answer the server did not get (see [`LostAtPrompt`]):
+/// the next login uses it, as a one-time code is not typed twice.
+pub type Typed = Option<(String, String)>;
+
 /// Runs the login conversation after `Hello::Login` until the server lets us
 /// in or refuses. `tls`: the key the handshake used; `own`: the client's own
 /// Ed25519 key (the same, unless the handshake used a throwaway key).
-pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, explicit: &[PathBuf], tls: &Identity, own: &Identity) -> Result<Outcome> {
+#[allow(clippy::too_many_arguments)]
+pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target: &Target, explicit: &[PathBuf], tls: &Identity, own: &Identity, typed: &mut Typed) -> Result<Outcome> {
     let mut keyring: Option<Keyring> = None;
     let mut passwords = 0u32;
     let mut reply: Reply = read_msg(recv).await?;
@@ -325,9 +344,23 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             }
             Reply::Prompt { text, echo } => {
                 debug!("server asks: {}", server_text(&text).trim());
-                let answer = ask(&text, echo, target.batch_mode)?;
-                write_msg(send, &Auth::Response(answer)).await?;
-                read_msg(recv).await?
+                let answer = match typed.take() {
+                    Some((asked, answer)) if asked == text => answer,
+                    _ => ask(&text, echo, target.batch_mode)?,
+                };
+                let answered = async {
+                    write_msg(send, &Auth::Response(answer.clone())).await?;
+                    read_msg(recv).await
+                };
+                match answered.await {
+                    Ok(reply) => reply,
+                    Err(e) if !e.is::<crate::proto::Malformed>() => {
+                        debug!("while answering: {e:#}");
+                        *typed = Some((text, answer));
+                        return Err(LostAtPrompt.into());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Reply::AuthKey => {
                 debug!("server asks for a key");
