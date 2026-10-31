@@ -1,8 +1,12 @@
 //! ssh-agent forwarding (`qsh -A`): a Unix socket on the server, owned by the
-//! user, whose connections are relayed to the client's agent.
+//! user, or on Windows a named pipe, whose connections are relayed to the
+//! client's agent.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -10,8 +14,11 @@ use tokio::task::AbortHandle;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncReadExt;
+#[cfg(unix)]
 use tokio::net::UnixListener;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(unix)]
+use tracing::warn;
 
 use super::users::User;
 use crate::proto::{write_msg, Opened, Reply};
@@ -41,6 +48,7 @@ impl AgentSocket {
 pub struct Relay {
     conn: watch::Sender<Option<Arc<Conn>>>,
     path: PathBuf,
+    #[cfg(unix)]
     dir: AgentDir,
     listening: AbortHandle,
 }
@@ -48,10 +56,12 @@ pub struct Relay {
 impl Drop for Relay {
     fn drop(&mut self) {
         self.listening.abort();
+        #[cfg(unix)]
         cleanup(&self.dir);
     }
 }
 
+#[cfg(unix)]
 /// The socket's directory, kept open: cleaning up goes through this
 /// descriptor, never through the path inside a directory the user owns
 /// (they could swap it for a symlink to make root delete elsewhere).
@@ -60,14 +70,17 @@ struct AgentDir {
     dir: PathBuf,
 }
 
+#[cfg(unix)]
 impl AgentDir {
     fn socket(&self) -> PathBuf {
         self.dir.join(SOCKET)
     }
 }
 
+#[cfg(unix)]
 const SOCKET: &str = "agent.sock";
 
+#[cfg(unix)]
 /// A fresh private directory with a listening socket in it, both owned by the
 /// user. Root creates them in a directory nobody else can enter yet, and only
 /// then hands it over, so no path the user controls is ever followed.
@@ -105,6 +118,7 @@ fn listen(user: &User) -> Result<(UnixListener, AgentDir)> {
     }
 }
 
+#[cfg(unix)]
 fn cleanup(d: &AgentDir) {
     use nix::unistd::{unlinkat, UnlinkatFlags};
     // Relative to the directory itself, wherever its path now leads. Then the
@@ -123,8 +137,8 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, us
     }
     let relay = match kept {
         Some(relay) => relay,
-        None => match listen(user) {
-            Ok((listener, dir)) => Arc::new(relay(listener, dir, user.uid)),
+        None => match relay(user) {
+            Ok(relay) => Arc::new(relay),
             Err(e) => {
                 socket.active.store(false, Ordering::SeqCst);
                 return write_msg(&mut send, &Reply::Err(format!("{e:#}"))).await;
@@ -155,7 +169,27 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, us
     result
 }
 
-fn relay(listener: UnixListener, dir: AgentDir, uid: u32) -> Relay {
+/// Takes one client of the socket to the connection there is now.
+fn serve<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static>(sock: S, current: &watch::Receiver<Option<Arc<Conn>>>) {
+    let Some(conn) = current.borrow().clone() else { return };
+    tokio::spawn(async move {
+        let result = async {
+            let (mut s, r) = conn.open_bi().await?;
+            write_msg(&mut s, &Opened::Agent).await?;
+            let (sr, sw) = tokio::io::split(sock);
+            crate::transport::bridge(sr, sw, s, r).await
+        }
+        .await;
+        if let Err(e) = result {
+            debug!("forwarded agent connection: {e:#}");
+        }
+    });
+}
+
+#[cfg(unix)]
+fn relay(user: &User) -> Result<Relay> {
+    let (listener, dir) = listen(user)?;
+    let uid = user.uid;
     let (conn, current) = watch::channel(None::<Arc<Conn>>);
     let path = dir.socket();
     let task = tokio::spawn(async move {
@@ -175,20 +209,38 @@ fn relay(listener: UnixListener, dir: AgentDir, uid: u32) -> Relay {
                     continue;
                 }
             }
-            let Some(conn) = current.borrow().clone() else { continue };
-            tokio::spawn(async move {
-                let result = async {
-                    let (mut s, r) = conn.open_bi().await?;
-                    write_msg(&mut s, &Opened::Agent).await?;
-                    let (sr, sw) = sock.into_split();
-                    crate::transport::bridge(sr, sw, s, r).await
-                }
-                .await;
-                if let Err(e) = result {
-                    debug!("forwarded agent connection: {e:#}");
-                }
-            });
+            serve(sock, &current);
         }
     });
-    Relay { conn, path, dir, listening: task.abort_handle() }
+    Ok(Relay { conn, path, dir, listening: task.abort_handle() })
+}
+
+/// A pipe has an instance per client: a new one waits for the next. Its name
+/// is random and its default rights let other users only read, which gets
+/// them nothing: the agent answers requests, and they cannot send any.
+#[cfg(windows)]
+fn relay(_user: &User) -> Result<Relay> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = format!(r"\\.\pipe\qsh-agent-{:032x}", rand::random::<u128>());
+    let mut pipe = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name).context("cannot create the agent's pipe")?;
+    let (conn, current) = watch::channel(None::<Arc<Conn>>);
+    let path = PathBuf::from(&name);
+    let task = tokio::spawn(async move {
+        loop {
+            if let Err(e) = pipe.connect().await {
+                debug!("agent pipe: {e}");
+                crate::transport::accept_failed(&e).await;
+                continue;
+            }
+            let next = match ServerOptions::new().reject_remote_clients(true).create(&name) {
+                Ok(next) => next,
+                Err(e) => {
+                    debug!("agent pipe: {e}");
+                    return;
+                }
+            };
+            serve(std::mem::replace(&mut pipe, next), &current);
+        }
+    });
+    Ok(Relay { conn, path, listening: task.abort_handle() })
 }

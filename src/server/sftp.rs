@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -133,6 +134,7 @@ fn expand(s: &str, user: &str, home: &str) -> Result<String> {
 
 /// Runs the server until the client closes stdin.
 pub fn serve(opts: Options) -> Result<()> {
+    #[cfg(unix)]
     if let Some(mask) = opts.umask {
         nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(mask as libc::mode_t));
     }
@@ -164,7 +166,7 @@ pub fn serve(opts: Options) -> Result<()> {
 
 enum Handle {
     File(File),
-    Dir { path: PathBuf, entries: Option<fs::ReadDir>, dots: bool },
+    Dir { path: PathBuf, entries: Option<Box<fs::ReadDir>>, dots: bool },
 }
 
 struct Server {
@@ -184,17 +186,11 @@ struct Owners {
 
 impl Owners {
     fn user(&mut self, uid: u32) -> &str {
-        self.users.entry(uid).or_insert_with(|| {
-            let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok().flatten();
-            user.map(|u| u.name).unwrap_or_else(|| uid.to_string())
-        })
+        self.users.entry(uid).or_insert_with(|| sys::user_name(uid))
     }
 
     fn group(&mut self, gid: u32) -> &str {
-        self.groups.entry(gid).or_insert_with(|| {
-            let group = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid)).ok().flatten();
-            group.map(|g| g.name).unwrap_or_else(|| gid.to_string())
-        })
+        self.groups.entry(gid).or_insert_with(|| sys::group_name(gid))
     }
 }
 
@@ -227,13 +223,12 @@ impl<'a> Msg<'a> {
         self.bytes().map(|b| String::from_utf8_lossy(b).into_owned())
     }
     fn path(&mut self) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
         let b = self.bytes()?;
         // NUL bytes cannot be in paths; refuse instead of cutting the name.
         if b.contains(&0) {
             return None;
         }
-        Some(PathBuf::from(std::ffi::OsStr::from_bytes(if b.is_empty() { b"." } else { b })))
+        sys::path(if b.is_empty() { b"." } else { b })
     }
     fn attrs(&mut self) -> Option<Attrs> {
         let flags = self.u32()?;
@@ -287,8 +282,9 @@ impl Out {
     }
     fn attrs(mut self, m: &fs::Metadata) -> Out {
         self = self.u32(ATTR_SIZE | ATTR_UIDGID | ATTR_PERMISSIONS | ATTR_ACMODTIME);
-        self = self.u64(m.size()).u32(m.uid()).u32(m.gid()).u32(m.mode());
-        self.u32(m.atime() as u32).u32(m.mtime() as u32)
+        let st = sys::stat(m);
+        self = self.u64(m.len()).u32(st.uid).u32(st.gid).u32(st.mode);
+        self.u32(st.atime as u32).u32(st.mtime as u32)
     }
 }
 
@@ -320,42 +316,34 @@ fn ok(id: u32) -> Vec<u8> {
 /// `-rw-r--r--    1 alice    staff        1234 Oct  9 12:00 name`, as `ls -l` (for sftp's `ls`).
 /// Names are bytes: not every file name is UTF-8.
 fn long_name(name: &[u8], m: &fs::Metadata, owners: &mut Owners) -> Vec<u8> {
-    use std::os::unix::fs::FileTypeExt;
-    let mode = m.mode();
+    let st = sys::stat(m);
     let t = m.file_type();
     let kind = if t.is_dir() {
         'd'
     } else if t.is_symlink() {
         'l'
-    } else if t.is_char_device() {
-        'c'
-    } else if t.is_block_device() {
-        'b'
-    } else if t.is_fifo() {
-        'p'
-    } else if t.is_socket() {
-        's'
     } else {
-        '-'
+        sys::special_kind(&t).unwrap_or('-')
     };
     let mut perms = String::from(kind);
     for (i, c) in "rwxrwxrwx".chars().enumerate() {
         let bit = 0o400 >> i;
-        perms.push(if mode & bit != 0 { c } else { '-' });
+        perms.push(if st.mode & bit != 0 { c } else { '-' });
     }
-    let when = jiff::Timestamp::from_second(m.mtime())
+    let when = jiff::Timestamp::from_second(st.mtime)
         .map(|t| t.to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)))
         .map(|z| {
-            let recent = (jiff::Timestamp::now().as_second() - m.mtime()).abs() < 182 * 86400;
+            let recent = (jiff::Timestamp::now().as_second() - st.mtime).abs() < 182 * 86400;
             z.strftime(if recent { "%b %e %H:%M" } else { "%b %e  %Y" }).to_string()
         })
         .unwrap_or_default();
-    let user = owners.user(m.uid()).to_string();
-    let mut line = format!("{perms} {:>4} {user:<8} {:<8} {:>8} {when} ", m.nlink(), owners.group(m.gid()), m.size()).into_bytes();
+    let user = owners.user(st.uid).to_string();
+    let mut line = format!("{perms} {:>4} {user:<8} {:<8} {:>8} {when} ", st.links, owners.group(st.gid), m.len()).into_bytes();
     line.extend_from_slice(name);
     line
 }
 
+#[cfg(unix)]
 fn apply_attrs(path: &Path, a: &Attrs, follow: bool) -> io::Result<()> {
     use nix::sys::stat::{utimensat, UtimensatFlags};
     use nix::sys::time::TimeSpec;
@@ -388,7 +376,7 @@ impl Server {
         let Some(kind) = m.u8() else { return status(0, BAD_MESSAGE, "empty packet") };
         if kind == INIT {
             let mut out = Out::new(R_VERSION, VERSION);
-            for (name, version) in [
+            let extensions = [
                 ("posix-rename@openssh.com", "1"),
                 ("statvfs@openssh.com", "2"),
                 ("fstatvfs@openssh.com", "2"),
@@ -398,7 +386,8 @@ impl Server {
                 ("limits@openssh.com", "1"),
                 ("expand-path@openssh.com", "1"),
                 ("home-directory", "1"),
-            ] {
+            ];
+            for (name, version) in extensions.into_iter().filter(|(name, _)| cfg!(unix) || !name.contains("statvfs")) {
                 out = out.str(name).str(version);
             }
             return out.0;
@@ -438,6 +427,7 @@ impl Server {
             OPEN => {
                 let path = m.path()?;
                 let flags = m.u32()?;
+                #[cfg_attr(not(unix), allow(unused_variables))]
                 let attrs = m.attrs()?;
                 if flags & (FXF_WRITE | FXF_APPEND | FXF_CREAT | FXF_TRUNC) != 0 {
                     if let Some(denied) = self.writable(id) {
@@ -454,6 +444,7 @@ impl Server {
                     }
                 }
                 o.truncate(flags & FXF_TRUNC != 0);
+                #[cfg(unix)]
                 o.mode(attrs.perm.unwrap_or(0o666) & 0o777);
                 match o.open(&path) {
                     Ok(f) if f.metadata().is_ok_and(|md| md.is_dir()) => status(id, FAILURE, "is a directory"),
@@ -465,9 +456,9 @@ impl Server {
                 let h = Self::handle_id(m)?;
                 match self.handles.remove(&h) {
                     // A failed close can be the first word of a failed write (NFS, quotas).
-                    Some(Handle::File(f)) => match nix::unistd::close(f) {
+                    Some(Handle::File(f)) => match sys::close(f) {
                         Ok(()) => ok(id),
-                        Err(e) => io_status(id, &e.into()),
+                        Err(e) => io_status(id, &e),
                     },
                     Some(_) => ok(id),
                     None => status(id, FAILURE, "invalid handle"),
@@ -561,7 +552,7 @@ impl Server {
             OPENDIR => {
                 let path = m.path()?;
                 match fs::read_dir(&path) {
-                    Ok(entries) => self.new_handle(id, Handle::Dir { path, entries: Some(entries), dots: true }),
+                    Ok(entries) => self.new_handle(id, Handle::Dir { path, entries: Some(Box::new(entries)), dots: true }),
                     Err(e) => io_status(id, &e),
                 }
             }
@@ -570,7 +561,6 @@ impl Server {
                 let Some(Handle::Dir { path, entries, dots }) = self.handles.get_mut(&h) else {
                     return Some(status(id, FAILURE, "invalid handle"));
                 };
-                use std::os::unix::ffi::OsStrExt;
                 let owners = &mut self.owners;
                 let mut names: Vec<(Vec<u8>, Vec<u8>, fs::Metadata)> = Vec::new();
                 if std::mem::take(dots) {
@@ -583,7 +573,7 @@ impl Server {
                 if let Some(it) = entries {
                     for entry in it.by_ref() {
                         let Ok(entry) = entry else { continue };
-                        let name = entry.file_name().as_bytes().to_vec();
+                        let name = sys::bytes(&entry.file_name());
                         if let Ok(md) = fs::symlink_metadata(entry.path()) {
                             let long = long_name(&name, &md, owners);
                             names.push((name, long, md));
@@ -621,7 +611,7 @@ impl Server {
                 if let Some(denied) = self.writable(id) {
                     return Some(denied);
                 }
-                match fs::DirBuilder::new().mode(attrs.perm.unwrap_or(0o777) & 0o777).create(&path) {
+                match sys::mkdir(&path, attrs.perm.unwrap_or(0o777) & 0o777) {
                     Ok(()) => ok(id),
                     Err(e) => io_status(id, &e),
                 }
@@ -672,10 +662,7 @@ impl Server {
             READLINK => {
                 let path = m.path()?;
                 match fs::read_link(&path) {
-                    Ok(target) => {
-                        use std::os::unix::ffi::OsStrExt;
-                        Out::new(R_NAME, id).u32(1).bytes(target.as_os_str().as_bytes()).str("").u32(0).0
-                    }
+                    Ok(target) => Out::new(R_NAME, id).u32(1).bytes(&sys::bytes(target.as_os_str())).str("").u32(0).0,
                     Err(e) => io_status(id, &e),
                 }
             }
@@ -685,7 +672,7 @@ impl Server {
                 if let Some(denied) = self.writable(id) {
                     return Some(denied);
                 }
-                match std::os::unix::fs::symlink(&target, &link) {
+                match sys::symlink(&target, &link) {
                     Ok(()) => ok(id),
                     Err(e) => io_status(id, &e),
                 }
@@ -742,6 +729,7 @@ impl Server {
                     None => status(id, FAILURE, "invalid handle"),
                 }
             }
+            #[cfg(unix)]
             "statvfs@openssh.com" => {
                 let path = m.path()?;
                 match nix::sys::statvfs::statvfs(&path) {
@@ -749,6 +737,7 @@ impl Server {
                     Err(e) => io_status(id, &e.into()),
                 }
             }
+            #[cfg(unix)]
             "fstatvfs@openssh.com" => {
                 let h = Self::handle_id(m)?;
                 match self.file(h) {
@@ -778,8 +767,8 @@ impl Server {
             }
             "home-directory" => {
                 let user = m.string()?;
-                match nix::unistd::User::from_name(&user).ok().flatten() {
-                    Some(u) => name_reply(id, &u.dir),
+                match sys::home_of(&user) {
+                    Some(home) => name_reply(id, &home),
                     None => status(id, NO_SUCH_FILE, "no such user"),
                 }
             }
@@ -788,6 +777,7 @@ impl Server {
     }
 }
 
+#[cfg(unix)]
 fn fsetstat(f: &File, a: &Attrs) -> io::Result<()> {
     use nix::sys::stat::futimens;
     use nix::sys::time::TimeSpec;
@@ -811,12 +801,7 @@ fn fsetstat(f: &File, a: &Attrs) -> io::Result<()> {
 fn expand_tilde(path: &str) -> Option<PathBuf> {
     let Some(rest) = path.strip_prefix('~') else { return Some(PathBuf::from(if path.is_empty() { "." } else { path })) };
     let (user, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    let home = if user.is_empty() {
-        std::env::var_os("HOME").map(PathBuf::from).or_else(|| nix::unistd::User::from_uid(nix::unistd::getuid()).ok().flatten().map(|u| u.dir))?
-    } else {
-        nix::unistd::User::from_name(user).ok().flatten()?.dir
-    };
-    Some(home.join(tail))
+    Some(sys::home_of(user)?.join(tail))
 }
 
 /// Like OpenBSD's realpath, which sftp-server uses: the last component
@@ -835,12 +820,13 @@ fn realpath(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn name_reply(id: u32, path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
     let attrs_none = 0u32;
-    Out::new(R_NAME, id).u32(1).bytes(path.as_os_str().as_bytes()).bytes(path.as_os_str().as_bytes()).u32(attrs_none).0
+    let name = sys::bytes(path.as_os_str());
+    Out::new(R_NAME, id).u32(1).bytes(&name).bytes(&name).u32(attrs_none).0
 }
 
 // The field types differ between systems (32 or 64 bits).
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn statvfs_reply(id: u32, v: &nix::sys::statvfs::Statvfs) -> Vec<u8> {
     use nix::sys::statvfs::FsFlags;
@@ -866,7 +852,240 @@ fn statvfs_reply(id: u32, v: &nix::sys::statvfs::Statvfs) -> Vec<u8> {
         .0
 }
 
-#[cfg(test)]
+/// What differs between systems: how names and file details look on the
+/// wire, and what a program may change.
+struct Stat {
+    uid: u32,
+    gid: u32,
+    /// As `st_mode`, with the file type.
+    mode: u32,
+    atime: i64,
+    mtime: i64,
+    links: u64,
+}
+
+#[cfg(unix)]
+mod sys {
+    use std::ffi::OsStr;
+    use std::fs::{self, File};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn path(b: &[u8]) -> Option<PathBuf> {
+        Some(PathBuf::from(OsStr::from_bytes(b)))
+    }
+
+    pub(super) fn bytes(name: &OsStr) -> Vec<u8> {
+        name.as_bytes().to_vec()
+    }
+
+    pub(super) fn stat(m: &fs::Metadata) -> super::Stat {
+        super::Stat { uid: m.uid(), gid: m.gid(), mode: m.mode(), atime: m.atime(), mtime: m.mtime(), links: m.nlink() }
+    }
+
+    pub(super) fn special_kind(t: &fs::FileType) -> Option<char> {
+        [(t.is_char_device(), 'c'), (t.is_block_device(), 'b'), (t.is_fifo(), 'p'), (t.is_socket(), 's')].into_iter().find(|(is, _)| *is).map(|(_, c)| c)
+    }
+
+    pub(super) fn user_name(uid: u32) -> String {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)).ok().flatten();
+        user.map(|u| u.name).unwrap_or_else(|| uid.to_string())
+    }
+
+    pub(super) fn group_name(gid: u32) -> String {
+        let group = nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(gid)).ok().flatten();
+        group.map(|g| g.name).unwrap_or_else(|| gid.to_string())
+    }
+
+    /// The home of `user`, or this process's own for an empty name.
+    pub(super) fn home_of(user: &str) -> Option<PathBuf> {
+        if user.is_empty() {
+            return std::env::var_os("HOME").map(PathBuf::from).or_else(|| nix::unistd::User::from_uid(nix::unistd::getuid()).ok().flatten().map(|u| u.dir));
+        }
+        Some(nix::unistd::User::from_name(user).ok().flatten()?.dir)
+    }
+
+    /// A failed close can be the first word of a failed write (NFS, quotas).
+    pub(super) fn close(f: File) -> io::Result<()> {
+        nix::unistd::close(f).map_err(io::Error::from)
+    }
+
+    pub(super) fn mkdir(path: &Path, mode: u32) -> io::Result<()> {
+        fs::DirBuilder::new().mode(mode).create(path)
+    }
+
+    pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::ffi::OsStr;
+    use std::fs::{self, File};
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// CreateFile needs it to open a directory.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    /// SFTP paths are Unix-like: `C:\Users` travels as `/C:/Users`, as with
+    /// Win32-OpenSSH, and only UTF-8 names can be written on the wire.
+    pub(super) fn path(b: &[u8]) -> Option<PathBuf> {
+        let text = std::str::from_utf8(b).ok()?;
+        let drive = |t: &str| t.as_bytes().get(1) == Some(&b':') && t.as_bytes()[0].is_ascii_alphabetic();
+        let text = text.strip_prefix('/').filter(|t| drive(t)).unwrap_or(text);
+        // A drive alone means its current directory.
+        Some(PathBuf::from(if text.len() == 2 && drive(text) { format!("{text}/") } else { text.to_string() }))
+    }
+
+    pub(super) fn bytes(name: &OsStr) -> Vec<u8> {
+        let text = name.to_string_lossy();
+        let text = text.strip_prefix(r"\\?\UNC\").map(|t| format!(r"\\{t}")).unwrap_or_else(|| text.trim_start_matches(r"\\?\").to_string());
+        let text = text.replace('\\', "/");
+        let drive = text.as_bytes().get(1) == Some(&b':');
+        if drive { format!("/{text}") } else { text }.into_bytes()
+    }
+
+    fn seconds(t: io::Result<SystemTime>) -> i64 {
+        t.ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64)
+    }
+
+    pub(super) fn stat(m: &fs::Metadata) -> super::Stat {
+        let t = m.file_type();
+        let mode = if t.is_symlink() {
+            0o120777
+        } else if t.is_dir() {
+            0o040755
+        } else {
+            0o100644
+        };
+        let mode = if m.permissions().readonly() { mode & !0o222 } else { mode };
+        super::Stat { uid: 0, gid: 0, mode, atime: seconds(m.accessed()), mtime: seconds(m.modified()), links: 1 }
+    }
+
+    pub(super) fn special_kind(_: &fs::FileType) -> Option<char> {
+        None
+    }
+
+    pub(super) fn user_name(_: u32) -> String {
+        std::env::var("USERNAME").unwrap_or_default()
+    }
+
+    pub(super) fn group_name(_: u32) -> String {
+        user_name(0)
+    }
+
+    /// qshd serves the user it runs as: nobody else has a home here.
+    pub(super) fn home_of(user: &str) -> Option<PathBuf> {
+        (user.is_empty() || user.eq_ignore_ascii_case(&user_name(0))).then(crate::keys::home_dir).and_then(Result::ok)
+    }
+
+    pub(super) fn close(f: File) -> io::Result<()> {
+        drop(f);
+        Ok(())
+    }
+
+    pub(super) fn mkdir(path: &Path, _mode: u32) -> io::Result<()> {
+        fs::create_dir(path)
+    }
+
+    /// Fails without the right to make symlinks (Developer Mode or a policy).
+    pub(super) fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+        if link.parent().map(|p| p.join(target)).is_some_and(|t| t.is_dir()) {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+    }
+
+    pub(super) fn open_for_attrs(path: &Path) -> io::Result<File> {
+        fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
+    }
+}
+
+/// Windows has no modes or owners to speak of: only "read-only" is applied,
+/// and owners are ignored, so that `sftp -p` works.
+#[cfg(windows)]
+fn apply_attrs(path: &Path, a: &Attrs, _follow: bool) -> io::Result<()> {
+    if a.size.is_some() || a.times.is_some() {
+        let f = sys::open_for_attrs(path)?;
+        set_size_and_times(&f, a)?;
+    }
+    if let Some(perm) = a.perm {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(perm & 0o200 == 0);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fsetstat(f: &File, a: &Attrs) -> io::Result<()> {
+    set_size_and_times(f, a)?;
+    if let Some(perm) = a.perm {
+        let mut permissions = f.metadata()?.permissions();
+        permissions.set_readonly(perm & 0o200 == 0);
+        f.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_size_and_times(f: &File, a: &Attrs) -> io::Result<()> {
+    if let Some(size) = a.size {
+        f.set_len(size)?;
+    }
+    if let Some((atime, mtime)) = a.times {
+        let t = |s: u32| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s as u64);
+        f.set_times(fs::FileTimes::new().set_accessed(t(atime)).set_modified(t(mtime)))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn paths_on_the_wire() {
+        assert_eq!(sys::path(b"/C:/Users/me").unwrap(), Path::new("C:/Users/me"));
+        assert_eq!(sys::path(b"/C:").unwrap(), Path::new("C:/"));
+        assert_eq!(sys::path(b"docs/a.txt").unwrap(), Path::new("docs/a.txt"));
+        assert_eq!(sys::path(b"\xff"), None);
+        assert_eq!(sys::bytes(std::ffi::OsStr::new(r"\\?\C:\Users\me")), b"/C:/Users/me");
+        assert_eq!(sys::bytes(std::ffi::OsStr::new(r"\\?\UNC\host\share")), b"//host/share");
+        assert_eq!(sys::bytes(std::ffi::OsStr::new("a.txt")), b"a.txt");
+    }
+
+    #[test]
+    fn serves_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"12345").unwrap();
+        let wire = String::from_utf8(sys::bytes(file.as_os_str())).unwrap();
+        let mut name = (wire.len() as u32).to_be_bytes().to_vec();
+        name.extend_from_slice(wire.as_bytes());
+        let mut server = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
+        let mut stat = vec![STAT, 0, 0, 0, 1];
+        stat.extend_from_slice(&name);
+        let reply = server.handle(&stat);
+        assert_eq!(reply[0], R_ATTRS, "{reply:?}");
+        assert_eq!(u64::from_be_bytes(reply[9..17].try_into().unwrap()), 5);
+        let attrs = Attrs { size: Some(2), times: Some((1_000_000, 1_000_000)), perm: Some(0o444), ..Default::default() };
+        apply_attrs(&file, &attrs, true).unwrap();
+        let m = std::fs::metadata(&file).unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(m.permissions().readonly());
+        assert_eq!(sys::stat(&m).mtime, 1_000_000);
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     #[test]
     fn size_of_a_fifo_is_refused_at_once() {

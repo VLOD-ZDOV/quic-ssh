@@ -140,6 +140,89 @@ fn qshd_on_windows() {
         assert_eq!(std::fs::read(&back).unwrap(), data);
         let _ = std::fs::remove_file(home.join(format!("qsh-win-{t}.bin")));
     }
+    // The built-in SFTP server, with Windows's own sftp and qsh as its transport.
+    if !wine {
+        let local = std::env::temp_dir().join("qsh-win-sftp.txt");
+        std::fs::write(&local, "via sftp").unwrap();
+        let back = std::env::temp_dir().join("qsh-win-sftp.back");
+        let batch = std::env::temp_dir().join("qsh-win-sftp.batch");
+        std::fs::write(&batch, format!("put \"{}\" qsh-win-sftp.txt\nget qsh-win-sftp.txt \"{}\"\nrm qsh-win-sftp.txt\n", local.display(), back.display())).unwrap();
+        let mut cmd = Command::new("sftp");
+        cmd.arg("-b").arg(&batch).args(["-S", QSH, "-P", &port, &dest]);
+        let out = step("sftp", cmd, &log);
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(std::fs::read_to_string(&back).unwrap(), "via sftp");
+    }
+    // The forwarded agent: a pipe named in SSH_AUTH_SOCK leads to this side.
+    {
+        use qsh::client::{self, ConnectOptions, Target};
+        use qsh::proto::{read_msg, read_msg_opt, write_msg, Opened, Reply, Request, ServerMsg};
+        use std::io::Write;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut target = Target::parse_with(&dest, Some(port.parse().unwrap()), Some(&home), false).unwrap();
+            target.identity_agent = Some(None);
+            let opts = ConnectOptions { identities: vec![dir.join("id_ed25519")], accept_new_host: true, ..Default::default() };
+            let conn = client::connect(&target, &opts).await.unwrap();
+            let (mut held_send, mut held_recv) = conn.open_bi().await.unwrap();
+            write_msg(&mut held_send, &Request::AgentForward).await.unwrap();
+            assert!(matches!(read_msg(&mut held_recv).await.unwrap(), Reply::Ok));
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            write_msg(&mut send, &Request::Exec { command: Some("echo %SSH_AUTH_SOCK%".into()), env: vec![], pty: None }).await.unwrap();
+            assert!(matches!(read_msg(&mut recv).await.unwrap(), Reply::Ok));
+            let mut printed = Vec::new();
+            while let Some(msg) = read_msg_opt::<_, ServerMsg>(&mut recv).await.unwrap() {
+                match msg {
+                    ServerMsg::Stdout(data) => printed.extend(data),
+                    ServerMsg::Exit { .. } => break,
+                    _ => {}
+                }
+            }
+            let pipe = String::from_utf8(printed).unwrap().trim().to_string();
+            assert!(pipe.starts_with(r"\\.\pipe\qsh-agent-"), "{pipe}");
+            let mut client = std::fs::OpenOptions::new().read(true).write(true).open(&pipe).unwrap();
+            client.write_all(b"ping").unwrap();
+            let (_to_agent, mut from_agent) = conn.accept_bi().await.expect("no stream for the agent");
+            assert!(matches!(read_msg(&mut from_agent).await.unwrap(), Opened::Agent));
+            let mut got = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut from_agent, &mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            conn.close().await;
+        });
+    }
+    // A terminal session outlives its connection: a new one gets all the output.
+    if !wine {
+        use qsh::client::{self, ConnectOptions, Target};
+        use qsh::proto::{read_msg, read_msg_opt, write_msg, PtySpec, Reply, Request, ServerMsg};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let printed = rt.block_on(async {
+            let port = port.parse::<u16>().unwrap();
+            let mut target = Target::parse_with(&dest, Some(port), Some(&home), false).unwrap();
+            target.identity_agent = Some(None);
+            let opts = ConnectOptions { identities: vec![dir.join("id_ed25519")], accept_new_host: true, ..Default::default() };
+            let conn = client::connect(&target, &opts).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let pty = PtySpec { term: "xterm".into(), cols: 80, rows: 24 };
+            let command = Some("echo before& ping -n 4 127.0.0.1 >nul& echo after".to_string());
+            write_msg(&mut send, &Request::Persistent { command, env: vec![], pty }).await.unwrap();
+            let Reply::Session { token } = read_msg(&mut recv).await.unwrap() else { panic!("no session") };
+            conn.close().await;
+            let conn = client::connect(&target, &ConnectOptions { resume: Some(token.clone()), ..opts.clone() }).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            write_msg(&mut send, &Request::Resume { token, received: 0 }).await.unwrap();
+            let Reply::Session { .. } = read_msg(&mut recv).await.unwrap() else { panic!("not resumed") };
+            let mut printed = Vec::new();
+            while let Some(msg) = read_msg_opt::<_, ServerMsg>(&mut recv).await.unwrap() {
+                match msg {
+                    ServerMsg::Stdout(data) => printed.extend(data),
+                    ServerMsg::Exit { .. } => break,
+                    _ => {}
+                }
+            }
+            String::from_utf8_lossy(&printed).into_owned()
+        });
+        assert!(printed.contains("before") && printed.contains("after"), "{printed}");
+    }
     drop(server);
     std::fs::write(&keys, had).unwrap();
 }

@@ -44,7 +44,7 @@ const READ_AHEAD: u64 = 2 * CHUNK as u64;
 type Token = [u8; 16];
 
 /// Exit status: (code, signal).
-type Status = (Option<i32>, Option<i32>);
+pub(super) type Status = (Option<i32>, Option<i32>);
 
 struct Output {
     /// The last up to [`BUFFER`] bytes of output; `start` is the offset of the first.
@@ -246,17 +246,17 @@ impl Sessions {
         }
         let env = session.env(user);
         let spec = session.pty.clone().expect("persistent sessions have a terminal");
-        let spawned = exec::spawn_pty(user, session.command.take(), env, &spec, &session.prelude)
-            .and_then(|(child, pty, tty)| Ok((child, exec::PtyInput::new(&pty)?, pty, tty)));
-        let (mut child, pty_input, pty, tty) = match spawned {
-            Ok(x) => x,
+        #[cfg(unix)]
+        let spawned = exec::Terminal::spawn(user, session.command.take(), env, &spec, &session.prelude, session.remote);
+        #[cfg(windows)]
+        let spawned = exec::Terminal::spawn(user, session.command.take(), env, &spec);
+        let exec::Terminal { mut output, input: pty_input, resizer, mut process } = match spawned {
+            Ok(t) => t,
             Err(e) => {
                 self.map.lock().unwrap().release(user.uid);
                 return write_msg(&mut send, &Reply::Err(format!("cannot start session: {e:#}"))).await;
             }
         };
-        let record = exec::login_record(user, &tty, &child, session.remote);
-        let (mut reader, resizer) = pty.into_split();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
         let (kill_tx, kill_rx) = oneshot::channel();
         let (changed, _) = watch::channel(());
@@ -304,7 +304,7 @@ impl Sessions {
                             sess.pacing.input_waits(false);
                         }
                         Input::Resize { cols, rows } => {
-                            let _ = resizer.resize(pty_process::Size::new(rows, cols));
+                            resizer.resize(rows, cols);
                         }
                     }
                     sess.pending_input.fetch_sub(cost, Ordering::SeqCst);
@@ -331,8 +331,7 @@ impl Sessions {
                         }
                         sess.output_taken.notified().await;
                     }
-                    // EIO is how a PTY master reports that the slave side was closed.
-                    let Ok(n @ 1..) = exec::read_ready(&mut reader, &mut buf).await else { break };
+                    let Ok(n @ 1..) = output.read(&mut buf).await else { break };
                     let dropped = {
                         let mut out = sess.out.lock().unwrap();
                         out.buf.extend(&buf[..n]);
@@ -351,21 +350,17 @@ impl Sessions {
                 }
             })
         };
-        // The only owner of the child: waits for it, or hangs it up on request.
-        // Signals go through `child`, which never addresses a reaped (and
-        // possibly reused) process ID.
+        // Waits for the program, or hangs it up on request.
         {
             let (sessions, sess) = (self.clone(), sess.clone());
             tokio::spawn(async move {
-                use std::os::unix::process::ExitStatusExt;
                 let status = tokio::select! {
-                    s = child.wait() => s.ok(),
+                    s = process.wait() => s,
                     _ = kill_rx => {
-                        exec::hang_up(&mut child).await;
+                        process.hang_up().await;
                         None
                     }
                 };
-                drop(record); // the logout
                 drain(&sess, &mut collector).await;
                 // Whatever still holds the terminal (a background job) gets a
                 // hangup once the master is closed.
@@ -373,7 +368,7 @@ impl Sessions {
                 input.abort();
                 let attached = {
                     let mut out = sess.out.lock().unwrap();
-                    out.exit = Some(status.map(|s| (s.code(), s.signal())).unwrap_or((None, None)));
+                    out.exit = Some(status.unwrap_or((None, None)));
                     out.attached
                 };
                 sess.changed.send_replace(());

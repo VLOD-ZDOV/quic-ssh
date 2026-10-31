@@ -254,6 +254,14 @@ pub fn main() {
         }
         return;
     }
+    #[cfg(windows)]
+    if argv.get(1).map(String::as_str) == Some(server::INTERNAL_SFTP) {
+        if let Err(e) = server::run_sftp(&argv[2..]) {
+            eprintln!("qshd: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let cli = match argv.get(1).map(String::as_str) {
         // A helper started through the user's shell: the real arguments are in the environment.
         #[cfg(unix)]

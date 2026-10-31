@@ -2,7 +2,6 @@
 
 // Switching users, the helpers that run as them and what needs Unix
 // sockets or utmp: Unix only. On Windows qshd serves the user it runs as.
-#[cfg(unix)]
 mod agent;
 mod auth;
 mod exec;
@@ -17,31 +16,12 @@ pub mod keys_command;
 #[allow(unsafe_code)]
 pub mod pam;
 mod penalty;
-#[cfg(unix)]
-mod persist;
-#[cfg(windows)]
-#[path = "persist_windows.rs"]
 mod persist;
 pub mod transfer;
-#[cfg(unix)]
 mod sftp;
 #[cfg(unix)]
 mod x11;
-/// Agent and X11 forwarding need Unix sockets: never set up on Windows.
-#[cfg(windows)]
-mod agent {
-    #[derive(Default)]
-    pub struct AgentSocket(());
-    pub struct Relay;
-    impl AgentSocket {
-        pub fn path(&self) -> Option<std::path::PathBuf> {
-            None
-        }
-        pub fn relay(&self) -> Option<std::sync::Arc<Relay>> {
-            None
-        }
-    }
-}
+/// X11 forwarding needs Unix sockets: never set up on Windows.
 #[cfg(windows)]
 mod x11 {
     pub struct Display {
@@ -83,6 +63,14 @@ use crate::proto::{read_msg, valid_user_name, write_msg, Hello, PtySpec, Reply, 
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use penalty::Outcome;
 pub use users::INTERNAL_SFTP;
+
+/// `qshd internal-sftp`: on Unix through [`helpers::run_internal`].
+#[cfg(windows)]
+pub fn run_sftp(args: &[String]) -> Result<()> {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let home = crate::keys::home_dir()?;
+    sftp::serve(sftp::Options::parse(args, &user, &home.to_string_lossy())?)
+}
 use users::User;
 
 /// Time a connected client has to open its first stream and say hello.
@@ -1007,10 +995,9 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             until_closed(closed, files::download_from(send, user, &path, (offset, &prefix), compressed)).await
         }
         #[cfg(windows)]
-        Request::AgentForward | Request::DirectStreamLocal { .. } | Request::RemoteForwardStreamLocal { .. } | Request::X11Forward { .. } => {
+        Request::DirectStreamLocal { .. } | Request::RemoteForwardStreamLocal { .. } | Request::X11Forward { .. } => {
             write_msg(&mut send, &Reply::Err("not available from a qshd on Windows".into())).await
         }
-        #[cfg(unix)]
         Request::AgentForward => {
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
@@ -1097,6 +1084,7 @@ async fn last_login(cfg: &ServerConfig, user: &User, limits: &crate::authkeys::R
 }
 
 /// Where OpenSSH's sftp-server usually lives.
+#[cfg(unix)]
 const SFTP_SERVERS: [&str; 5] = [
     "/usr/lib/openssh/sftp-server",
     "/usr/libexec/openssh/sftp-server",
@@ -1114,6 +1102,7 @@ fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<Stri
         // OpenSSH's sftp-server if installed, else the built-in one: in a
         // chroot (set up for it) directly, otherwise through the user's
         // shell like any other subsystem, so nologin and git-shell refuse it.
+        #[cfg(unix)]
         if let Some(installed) = SFTP_SERVERS.iter().find(|p| std::path::Path::new(p).exists()) {
             return Some(installed.to_string());
         }
@@ -1122,6 +1111,9 @@ fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<Stri
         }
         #[cfg(unix)]
         return users::shell_sftp_command().ok();
+        // No login shell to go through, and qshd is this user already.
+        #[cfg(windows)]
+        return Some(users::INTERNAL_SFTP.to_string());
     }
     None
 }

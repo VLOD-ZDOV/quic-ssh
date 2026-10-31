@@ -118,6 +118,5 @@ pub fn exe_path() -> Result<PathBuf> {
 
 pub fn set_session_scope(_on: bool) {}
 
-/// The command name of the built-in SFTP server (Unix only; on Windows the
-/// name is still refused as a subsystem rather than run as a program).
+/// The command name of the built-in SFTP server.
 pub const INTERNAL_SFTP: &str = "internal-sftp";
