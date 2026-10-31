@@ -1992,6 +1992,163 @@ fn quiet_session_stays_connected_after_a_resume() {
     let _ = child.wait();
 }
 
+/// A terminal session, with what it prints, for a test of what survives.
+fn terminal(mut command: Command) -> (Child, std::process::ChildStdin, std::sync::mpsc::Receiver<String>) {
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for pipe in [Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>, Box::new(child.stderr.take().unwrap())] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+        });
+    }
+    (child, stdin, rx)
+}
+
+/// Stops qsh long enough for its liveness check to give up, so that it
+/// reconnects when it goes on.
+fn lose_connection(child: &Child, rx: &std::sync::mpsc::Receiver<String>, seen: &mut String) {
+    let pid = child.id().to_string();
+    assert!(Command::new("kill").args(["-STOP", &pid]).status().unwrap().success());
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(Command::new("kill").args(["-CONT", &pid]).status().unwrap().success());
+    wait_for_output(rx, seen, "reconnected", 30);
+}
+
+/// What the other end of a forward sends, tried until the forward is back.
+fn hello_through(port: u16) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut text = String::new();
+        let read = std::net::TcpStream::connect(("127.0.0.1", port)).and_then(|mut s| {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            s.read_to_string(&mut text)
+        });
+        if read.is_ok() && !text.is_empty() {
+            return text;
+        }
+        assert!(std::time::Instant::now() < deadline, "no answer through port {port}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// `-L`, `-D` and `-R` do not keep a terminal session from surviving, and work after it.
+#[test]
+fn forwards_survive_a_reconnect() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let to = target.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in target.incoming().map_while(Result::ok) {
+            let _ = conn.write_all(b"hello");
+        }
+    });
+    let (local, remote) = (free_port(), free_port());
+    let (l, r) = (format!("{local}:127.0.0.1:{to}"), format!("{remote}:127.0.0.1:{to}"));
+    let args = ["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-L", &l, "-R", &r, "-p", &port, &dest(), "sh"];
+    let (mut child, mut stdin, rx) = terminal(c.cmd(&args));
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    assert_eq!(hello_through(local), "hello");
+    assert_eq!(hello_through(remote), "hello");
+    lose_connection(&child, &rx, &mut seen);
+    assert_eq!(hello_through(local), "hello");
+    assert_eq!(hello_through(remote), "hello");
+    stdin.write_all(b"echo af$((3+3))ter\n").unwrap();
+    wait_for_output(&rx, &mut seen, "af6ter", 10);
+    assert!(!seen.contains("ended with the old connection"), "{seen}");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The session token stands in for the one-time code, but no longer than
+/// the code lasts: the terminal comes back, new forwarded connections do not.
+#[test]
+fn one_time_code_limits_forwards_after_a_reconnect() {
+    use qsh::totp;
+    let s = Server::start_with("127.0.0.1", "totp_valid_for = 2\n");
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let dir = tempfile::tempdir().unwrap();
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step))]);
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let to = target.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in target.incoming().map_while(Result::ok) {
+            let _ = conn.write_all(b"hello");
+        }
+    });
+    let port = s.port.to_string();
+    let local = free_port();
+    let l = format!("{local}:127.0.0.1:{to}");
+    let mut command = c.cmd(&["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-L", &l, "-p", &port, &dest(), "sh"]);
+    command.env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force");
+    let (mut child, mut stdin, rx) = terminal(command);
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    lose_connection(&child, &rx, &mut seen);
+    stdin.write_all(b"echo af$((3+3))ter\n").unwrap();
+    wait_for_output(&rx, &mut seen, "af6ter", 10);
+    let mut text = String::new();
+    let mut through = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+    through.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let _ = through.read_to_string(&mut text);
+    assert_eq!(text, "", "a forward outlived the one-time code");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A session's programs have the agent's path in `SSH_AUTH_SOCK`, so it must
+/// stay the same, and work, on the new connection.
+#[test]
+fn forwarded_agent_survives_a_reconnect() {
+    if !have("ssh-agent") || !have("ssh-add") {
+        return eprintln!("skipped: no ssh-agent");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let key = keygen(keys.path(), "fwd", "ecdsa");
+    let (s, c) = server_with_keys("", &[public(&key)]);
+    let agent = start_agent();
+    let out = Command::new("ssh-add").arg(&key).env("SSH_AUTH_SOCK", &agent.sock).output().unwrap();
+    assert!(out.status.success(), "ssh-add: {}", stderr(&out));
+    let port = s.port.to_string();
+    let mut command = c.cmd(&["--accept-new-host", "-tt", "-A", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-p", &port, &dest(), "sh"]);
+    command.env("SSH_AUTH_SOCK", &agent.sock);
+    let (mut child, mut stdin, rx) = terminal(command);
+    let mut seen = String::new();
+    stdin.write_all(b"ssh-add -l; echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    assert!(seen.contains("fwd (ECDSA)"), "{seen}");
+    lose_connection(&child, &rx, &mut seen);
+    seen.clear();
+    // The agent comes back a moment after the session.
+    for _ in 0..50 {
+        stdin.write_all(b"ssh-add -l; echo af$((3+3))ter\n").unwrap();
+        wait_for_output(&rx, &mut seen, "af6ter", 10);
+        if seen.contains("fwd (ECDSA)") {
+            break;
+        }
+        seen.clear();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(seen.contains("fwd (ECDSA)"), "{seen}");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// `UserKnownHostsFile none`: nothing is kept, which is no error.
 #[test]
 fn known_hosts_file_none_keeps_nothing() {
@@ -2351,7 +2508,7 @@ fn resume_login_can_only_resume() {
         for request in [
             Request::Exec { command: Some("id".into()), env: vec![], pty: None },
             Request::Download { path: ".config/qsh/authorized_keys".into() },
-            Request::DirectTcp { host: "127.0.0.1".into(), port: s.port },
+            Request::Subsystem { name: "sftp".into(), env: vec![] },
             Request::Resume { token: vec![0; 16], received: 0 },
         ] {
             let (mut send, mut recv) = resumed.open_bi().await.unwrap();
@@ -2361,6 +2518,10 @@ fn resume_login_can_only_resume() {
                 other => panic!("{request:?} was answered with {other:?}"),
             }
         }
+        // Forwards go on, as the session they belong to may have them.
+        let (mut send, mut recv) = resumed.open_bi().await.unwrap();
+        write_msg(&mut send, &Request::DirectTcp { host: "127.0.0.1".into(), port: s.port }).await.unwrap();
+        assert!(matches!(read_msg::<_, Reply>(&mut recv).await.unwrap(), Reply::Ok));
         let (mut send, mut recv) = resumed.open_bi().await.unwrap();
         write_msg(&mut send, &Request::Resume { token, received: 0 }).await.unwrap();
         assert!(matches!(read_msg::<_, Reply>(&mut recv).await.unwrap(), Reply::Session { .. }));

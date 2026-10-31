@@ -865,7 +865,6 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if a.full && target.permit_remote_open && remotes.iter().any(|(f, _)| matches!(f.dest, forward::Dest::Socks)) {
         return exec_openssh("ssh", ssh_args(&a, &target), "PermitRemoteOpen applies to this dynamic remote forward");
     }
-    let uses_forwards = !locals.is_empty() || !remotes.is_empty() || !dynamics.is_empty();
     // -A / ForwardAgent: the agent qsh itself would use.
     let agent = match a.forward_agent.unwrap_or(target.forward_agent) {
         true => match (&target.forward_agent_socket, &target.identity_agent) {
@@ -935,7 +934,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
-    let uses_forwards = uses_forwards || agent.is_some() || target.forward_x11.is_some() || target.tunnel.is_some();
+    let needs_this_connection = target.forward_x11.is_some() || target.tunnel.is_some();
     // Remote forwards held by the master for this run: taken back when it ends.
     #[cfg(unix)]
     let mut held = Vec::new();
@@ -945,6 +944,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         let result = match (&target.sharing.path, conn.is_shared()) {
             (Some(path), true) => qsh::transport::shared::hold_forward(path, 'R', &spec).await.map(|(h, msg)| {
                 held.push(h);
+                forwarder.held_by_master(f.clone());
                 msg.parse::<u16>().ok()
             }),
             _ => forwarder.remote(f.clone()).await.inspect(|_| own.push(('R', spec.clone()))),
@@ -1040,9 +1040,10 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         Some(e) => client::parse_escape(Some(e)),
         None => target.escape_char,
     };
-    // A terminal session survives lost connections (unless forwards depend on
-    // this connection, or PersistSession is off): qsh logs in again by itself.
-    let reconnect: Option<session::Reconnect> = (pty && target.persist_session && !uses_forwards).then(|| {
+    // A terminal session survives lost connections (unless X11 or a tunnel
+    // depends on this connection, or PersistSession is off): qsh logs in
+    // again by itself.
+    let reconnect: Option<session::Reconnect> = (pty && target.persist_session && !needs_this_connection).then(|| {
         let target = Target { batch_mode: true, quiet: true, ..target.clone() };
         let opts = opts.clone();
         Arc::new(move |token: Vec<u8>| {

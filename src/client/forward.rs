@@ -320,6 +320,11 @@ async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String
     }
 }
 
+/// How long a `-R` is tried again after a reconnect: longer than a server
+/// takes to give up on a connection that went silent.
+const RESTORE_TIME: std::time::Duration = std::time::Duration::from_secs(90);
+const RESTORE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Where connections the server opens go.
 #[derive(Default)]
 struct Routes {
@@ -380,6 +385,7 @@ pub struct Forwarder {
     /// `PermitRemoteOpen` is set: qsh cannot check a SOCKS target against it.
     no_dynamic_remote: bool,
     active: Mutex<Vec<Active>>,
+    held: Mutex<Vec<Forward>>,
     routes: Arc<Mutex<Routes>>,
     dispatcher: Mutex<Option<AbortHandle>>,
     /// Agent and X11 forwarding requested (their streams are kept here).
@@ -404,6 +410,7 @@ impl Forwarder {
             gateway,
             no_dynamic_remote,
             active: Mutex::default(),
+            held: Mutex::default(),
             routes: Arc::default(),
             dispatcher: Mutex::default(),
             agent_request: Mutex::default(),
@@ -427,23 +434,83 @@ impl Forwarder {
         self.activity.clone()
     }
 
-    /// A persistent session got a new connection: the forwards of the old
-    /// one are gone with it (added later with `~C` or `-O forward`; a
-    /// session with forwards from the start does not reconnect). Returns
-    /// them, as `~#` shows them, so they can be added again.
-    pub fn reconnected(&self, conn: Arc<Conn>) -> Vec<String> {
-        let gone = self.list();
-        self.conn.send_replace(conn);
-        self.active.lock().unwrap().clear();
-        {
-            let mut routes = self.routes.lock().unwrap();
-            routes.ports.clear();
-            routes.paths.clear();
-        }
+    /// A persistent session got a new connection. Local listeners go on
+    /// with it; `-R` forwards and the agent are asked for again, in the
+    /// background. Connections forwarded on the old one are gone. An older
+    /// server allows no forwards on such a connection: then all of them
+    /// end, and they are returned, as `~#` shows them, to tell the user.
+    pub fn reconnected(self: &Arc<Self>, conn: Arc<Conn>) -> Vec<String> {
+        let keeps = conn.server_version() >= crate::proto::FORWARDS_ON_RESUME;
+        let gone = if keeps { Vec::new() } else { self.list() };
+        self.conn.send_replace(conn.clone());
         if let Some(d) = self.dispatcher.lock().unwrap().take() {
             d.abort();
         }
+        let mut remotes = std::mem::take(&mut *self.held.lock().unwrap());
+        {
+            let mut active = self.active.lock().unwrap();
+            active.retain_mut(|a| {
+                if a.kind != 'R' {
+                    return keeps;
+                }
+                let mut fwd = a.fwd.clone();
+                // Where the server listened (`-R 0:...` gets the port it had).
+                if let (Listen::Tcp { port, .. }, Some(bound)) = (&mut fwd.listen, a.bound) {
+                    *port = bound;
+                }
+                remotes.push(fwd);
+                false
+            });
+        }
+        let agent = {
+            let mut routes = self.routes.lock().unwrap();
+            routes.ports.clear();
+            routes.paths.clear();
+            routes.agent.clone()
+        };
+        *self.agent_request.lock().unwrap() = None;
+        if keeps {
+            tokio::spawn(self.clone().restore(conn, remotes, agent));
+        }
         gone
+    }
+
+    /// Asks the new connection for what the old one had. The server may
+    /// still hold a `-R` port until it sees that the old connection is gone,
+    /// so those are tried for a while.
+    async fn restore(self: Arc<Self>, conn: Arc<Conn>, mut remotes: Vec<Forward>, agent: Option<Arc<PathBuf>>) {
+        if let Some(path) = agent {
+            self.agent((*path).clone(), false).await;
+        }
+        let deadline = tokio::time::Instant::now() + RESTORE_TIME;
+        while !remotes.is_empty() {
+            let mut failed = Vec::new();
+            for fwd in remotes {
+                // Yet another reconnect: that one takes over.
+                if !Arc::ptr_eq(&self.conn(), &conn) {
+                    return;
+                }
+                if let Err(e) = self.remote(fwd.clone()).await {
+                    failed.push((fwd, e));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                for (fwd, e) in &failed {
+                    say(&format!("[qsh: -R {} did not come back: {e:#}]\r\n", fwd.describe()));
+                }
+                return;
+            }
+            remotes = failed.into_iter().map(|(fwd, _)| fwd).collect();
+            if !remotes.is_empty() {
+                tokio::time::sleep(RESTORE_RETRY).await;
+            }
+        }
+    }
+
+    /// A `-R` the master holds for this run: if the session outlives the
+    /// master, it is asked for again on the session's own connection.
+    pub fn held_by_master(&self, fwd: Forward) {
+        self.held.lock().unwrap().push(fwd);
     }
 
     /// `-L` (`kind` 'L') or `-D` ('D'): listens here.
@@ -454,7 +521,7 @@ impl Forwarder {
         match &fwd.listen {
             Listen::Tcp { bind, port } => {
                 for listener in bind_local(bind.as_deref(), *port, self.gateway).await? {
-                    let (conn, dest, activity) = (self.conn(), fwd.dest.clone(), self.activity.clone());
+                    let (conns, dest, activity) = (self.connections(), fwd.dest.clone(), self.activity.clone());
                     tasks.push(
                         tokio::spawn(async move {
                             loop {
@@ -462,7 +529,8 @@ impl Forwarder {
                                     Ok((tcp, peer)) => {
                                         let _ = tcp.set_nodelay(true);
                                         let busy = activity.hold();
-                                        tokio::spawn(serve_local(conn.clone(), dest.clone(), tcp, peer.to_string(), busy));
+                                        let conn = conns.borrow().clone();
+                                        tokio::spawn(serve_local(conn, dest.clone(), tcp, peer.to_string(), busy));
                                     }
                                     Err(e) => crate::transport::accept_failed(&e).await,
                                 }
@@ -476,12 +544,15 @@ impl Forwarder {
             Listen::Unix(path) => {
                 let (listener, file) = bind_local_unix(path)?;
                 socket = Some(file);
-                let (conn, dest, path, activity) = (self.conn(), fwd.dest.clone(), path.clone(), self.activity.clone());
+                let (conns, dest, path, activity) = (self.connections(), fwd.dest.clone(), path.clone(), self.activity.clone());
                 tasks.push(
                     tokio::spawn(async move {
                         loop {
                             match listener.accept().await {
-                                Ok((sock, _)) => drop(tokio::spawn(serve_local(conn.clone(), dest.clone(), sock, path.clone(), activity.hold()))),
+                                Ok((sock, _)) => {
+                                    let conn = conns.borrow().clone();
+                                    drop(tokio::spawn(serve_local(conn, dest.clone(), sock, path.clone(), activity.hold())));
+                                }
                                 Err(e) => crate::transport::accept_failed(&e).await,
                             }
                         }

@@ -80,6 +80,10 @@ enum Input {
 
 struct Detachable {
     uid: u32,
+    /// Stays while the session does (see [`super::agent::Relay`]).
+    agent: Option<Arc<super::agent::Relay>>,
+    /// Forwards on a resumed connection stop here, as on the first one.
+    code_expires: Option<tokio::time::Instant>,
     /// What the key that started the session was allowed; resuming needs the same.
     restrictions: Restrictions,
     input: mpsc::UnboundedSender<Input>,
@@ -167,6 +171,20 @@ impl Sessions {
     }
 
     /// Whether `token` is a live session of user `uid`.
+    /// The forwarded agent's socket of a session.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn agent(&self, token: &[u8]) -> Option<Arc<super::agent::Relay>> {
+        let token = Token::try_from(token).ok()?;
+        self.map.lock().unwrap().sessions.get(&token)?.agent.clone()
+    }
+
+    /// Whether the one-time code of a session's first login has run out.
+    pub fn code_expired(&self, token: &[u8]) -> bool {
+        let Ok(token) = Token::try_from(token) else { return true };
+        let map = self.map.lock().unwrap();
+        map.sessions.get(&token).is_none_or(|s| s.code_expires.is_some_and(|t| tokio::time::Instant::now() >= t))
+    }
+
     pub fn owns(&self, token: &[u8], uid: u32) -> bool {
         Token::try_from(token)
             .ok()
@@ -245,6 +263,8 @@ impl Sessions {
         let now = Instant::now();
         let sess = Arc::new(Detachable {
             uid: user.uid,
+            agent: session.agent.take(),
+            code_expires: session.code_expires,
             restrictions: restrictions.clone(),
             input: input_tx,
             pending_input: AtomicUsize::new(0),

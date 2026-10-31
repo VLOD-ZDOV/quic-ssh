@@ -32,8 +32,12 @@ mod x11;
 mod agent {
     #[derive(Default)]
     pub struct AgentSocket(());
+    pub struct Relay;
     impl AgentSocket {
         pub fn path(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        pub fn relay(&self) -> Option<std::sync::Arc<Relay>> {
             None
         }
     }
@@ -810,9 +814,23 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         return write_msg(&mut send, &Reply::Err("the one-time code of this connection has expired (totp_valid_for): connect again".into())).await;
     }
     if let Some(allowed) = resume_only {
-        // Pings go on: the client's ServerAlive runs on this connection too.
-        if !matches!(&request, Request::Ping) && !matches!(&request, Request::Resume { token, .. } if token == allowed) {
+        // Pings and forwards go on: the session they belong to may have them
+        // anyway, and what the login may do still limits them below.
+        let goes_on = matches!(
+            request,
+            Request::Ping
+                | Request::DirectTcp { .. }
+                | Request::DirectStreamLocal { .. }
+                | Request::RemoteForward { .. }
+                | Request::RemoteForwardStreamLocal { .. }
+                | Request::AgentForward
+        );
+        if !goes_on && !matches!(&request, Request::Resume { token, .. } if token == allowed) {
             return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
+        }
+        // The token stands in for the code, not for longer than the code lasts.
+        if goes_on && !matches!(request, Request::Ping) && state.sessions.code_expired(allowed) {
+            return write_msg(&mut send, &Reply::Err("the one-time code of this session has expired (totp_valid_for): connect again".into())).await;
         }
     }
     // Compression only wraps file transfers.
@@ -883,6 +901,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             client_env: client_env.into_iter().filter(|(k, _)| cfg.accepts_env(k)).collect(),
             pty: pty.filter(|_| !limits.no_pty),
             remote: Some(conn.remote_addr().ip().to_canonical()),
+            agent: None,
+            code_expires: None,
         }
     };
     let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
@@ -899,6 +919,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if spec.pty.is_none() || !state.sessions.enabled() || spec.sftp.is_some() {
                 return exec::run(send, recv, user, spec, closed).await;
             }
+            spec.agent = agent.relay();
+            spec.code_expires = code_expires;
             state.sessions.start(send, recv, user, limits, spec, closed).await
         }
         Request::Resume { token, received } => state.sessions.resume(send, recv, user, limits, &token, received, closed).await,
@@ -993,7 +1015,8 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
             }
-            agent::forward(send, recv, conn.clone(), user, agent).await
+            let kept = resume_only.and_then(|token| state.sessions.agent(token));
+            agent::forward(send, recv, conn.clone(), user, agent, kept).await
         }
         #[cfg(unix)]
         Request::DirectStreamLocal { path } => {

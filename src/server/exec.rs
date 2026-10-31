@@ -38,6 +38,10 @@ pub struct Session {
     /// shell: only for `internal-sftp` as a command the server chose (a
     /// subsystem, `force_command`, a key's `command=`), never the client's.
     pub sftp: Option<Vec<String>>,
+    /// The forwarded agent's socket, which a persistent session keeps.
+    pub agent: Option<Arc<super::agent::Relay>>,
+    /// When the one-time code of the login that started it runs out.
+    pub code_expires: Option<tokio::time::Instant>,
 }
 
 impl Session {

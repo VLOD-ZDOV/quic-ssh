@@ -26,6 +26,10 @@ impl Sessions {
         false
     }
 
+    pub fn code_expired(&self, _token: &[u8]) -> bool {
+        true
+    }
+
     pub fn owns(&self, _token: &[u8], _uid: u32) -> bool {
         false
     }
