@@ -163,7 +163,8 @@ impl KnownHosts {
     /// (`qsh multi` to new hosts) never mix; starts a new line if the file
     /// does not end with one.
     pub fn add(&self, id: &str, key: PublicKey) -> Result<()> {
-        let Some(path) = &self.path else { anyhow::bail!("UserKnownHostsFile is none: the key is not saved") };
+        // `UserKnownHostsFile none`: nothing is kept, as with ssh's /dev/null.
+        let Some(path) = &self.path else { return Ok(()) };
         if let Some(dir) = path.parent() {
             create_private_dir(dir)?;
         }
@@ -183,7 +184,7 @@ impl KnownHosts {
     /// Removes the lines that name `id` itself (in plain or hashed, not by a
     /// pattern) from the user's file, as `ssh-keygen -R`; returns how many.
     pub fn remove(&self, id: &str) -> Result<usize> {
-        let Some(path) = &self.path else { anyhow::bail!("UserKnownHostsFile is none: there is no file to change") };
+        let Some(path) = &self.path else { return Ok(0) };
         let text = match fs::read(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),

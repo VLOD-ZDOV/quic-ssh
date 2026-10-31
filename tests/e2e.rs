@@ -1992,6 +1992,23 @@ fn quiet_session_stays_connected_after_a_resume() {
     let _ = child.wait();
 }
 
+/// `UserKnownHostsFile none`: nothing is kept, which is no error.
+#[test]
+fn known_hosts_file_none_keeps_nothing() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let none = ["-o", "UserKnownHostsFile=none", "-o", "GlobalKnownHostsFile=none", "--accept-new-host", "-p", &port];
+    let d = dest();
+    let mut args = none.to_vec();
+    args.extend([d.as_str(), "echo", "in"]);
+    let out = c.run(&args);
+    assert_eq!(stdout(&out), "in\n", "{}", stderr(&out));
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    UserKnownHostsFile none\n").unwrap();
+    let out = c.run(&["forget", "-p", &port, &d]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
 /// `totp_valid_for`: a shared connection opened with a one-time code works
 /// without one, but only that long; then a new login asks for a code again.
 #[test]
