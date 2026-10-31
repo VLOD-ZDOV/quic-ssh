@@ -26,6 +26,7 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
 mod forwards;
+mod text;
 
 use super::groups::{self, Groups};
 use super::saved::{self, Saved};
@@ -328,6 +329,8 @@ struct App {
     selected: usize,
     filter: String,
     mode: InputMode,
+    /// The cursor in the line being edited (see [`text`]).
+    back: usize,
     speed: Option<SpeedTest>,
     status: String,
     list_state: ListState,
@@ -351,6 +354,7 @@ impl App {
             view: View::Hosts,
             selected: 0,
             filter: String::new(),
+            back: 0,
             mode: InputMode::Normal,
             speed: None,
             status,
@@ -501,11 +505,9 @@ impl App {
                         self.mode = InputMode::Normal;
                     }
                     KeyCode::Enter => self.mode = InputMode::Normal,
-                    KeyCode::Backspace => {
-                        self.filter.pop();
+                    key => {
+                        text::edit(&mut self.filter, &mut self.back, key);
                     }
-                    KeyCode::Char(c) => self.filter.push(c),
-                    _ => {}
                 }
                 self.selected = 0;
                 Action::None
@@ -523,15 +525,10 @@ impl App {
                         self.visible().iter().map(|&i| self.hosts[i].alias.clone()).filter(|a| !a.starts_with('-')).collect();
                     if cmd.is_empty() || dests.is_empty() { Action::None } else { Action::RunAll(cmd, dests) }
                 }
-                KeyCode::Backspace => {
-                    cmd.pop();
+                key => {
+                    text::edit(cmd, &mut self.back, key);
                     Action::None
                 }
-                KeyCode::Char(c) => {
-                    cmd.push(c);
-                    Action::None
-                }
-                _ => Action::None,
             },
             InputMode::PairCode(code) | InputMode::Quick(code) => match k.code {
                 KeyCode::Esc => {
@@ -548,23 +545,24 @@ impl App {
                         (false, false) => self.current_host().map_or(Action::None, |i| Action::Pair(i, text)),
                     }
                 }
-                KeyCode::Backspace => {
-                    code.pop();
+                key => {
+                    text::edit(code, &mut self.back, key);
                     Action::None
                 }
-                KeyCode::Char(c) => {
-                    code.push(c);
-                    Action::None
-                }
-                _ => Action::None,
             },
             InputMode::Form(form) => {
                 let last = FORM_FIELDS.len() - 1;
                 match k.code {
                     KeyCode::Esc => self.mode = InputMode::Normal,
-                    KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1).min(last),
+                    KeyCode::Tab | KeyCode::Down => {
+                        form.focus = (form.focus + 1).min(last);
+                        self.back = 0;
+                    }
                     // Locked forms only have the menu's own fields.
-                    KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.saturating_sub(1).max(if form.locked { FIRST_MENU_FIELD } else { 0 }),
+                    KeyCode::BackTab | KeyCode::Up => {
+                        form.focus = form.focus.saturating_sub(1).max(if form.locked { FIRST_MENU_FIELD } else { 0 });
+                        self.back = 0;
+                    }
                     KeyCode::Enter => match form.result() {
                         Ok(_) => {
                             let InputMode::Form(form) = std::mem::replace(&mut self.mode, InputMode::Normal) else { unreachable!() };
@@ -577,18 +575,14 @@ impl App {
                         form.transport = (form.transport + step) % TRANSPORTS.len();
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focus == FALLBACK_FIELD => form.fallback = !form.fallback,
-                    KeyCode::Backspace => {
+                    key => {
                         if let Some(t) = form.text_mut() {
-                            t.pop();
+                            let typed = matches!(key, KeyCode::Char(_));
+                            if text::edit(t, &mut self.back, key) && typed {
+                                form.error = None;
+                            }
                         }
                     }
-                    KeyCode::Char(c) => {
-                        if let Some(t) = form.text_mut() {
-                            t.push(c);
-                            form.error = None;
-                        }
-                    }
-                    _ => {}
                 }
                 Action::None
             }
@@ -633,6 +627,7 @@ impl App {
     }
 
     fn on_normal_key(&mut self, k: KeyEvent) -> Action {
+        self.back = 0;
         match k.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Esc if self.speed.is_some() => {
@@ -762,7 +757,7 @@ impl App {
         }
         self.draw_footer(f, footer, wide);
         match &self.mode {
-            InputMode::Form(form) => draw_form(f, area, form),
+            InputMode::Form(form) => draw_form(f, area, form, self.back),
             InputMode::Forwards(panel) => panel.draw(f, area),
             InputMode::Help => draw_help(f, area),
             _ => {}
@@ -830,7 +825,7 @@ impl App {
         };
         let name = if self.view == View::Hosts { "hosts" } else { "history" };
         let title = match &self.mode {
-            InputMode::Filter => format!(" {name}  /{}▏", self.filter),
+            InputMode::Filter => format!(" {name}  /{}", text::with_cursor(&self.filter, self.back)),
             _ if !self.filter.is_empty() => format!(" {name}  /{} ", self.filter),
             _ => format!(" {name} "),
         };
@@ -955,16 +950,16 @@ impl App {
     fn draw_footer(&self, f: &mut Frame, area: Rect, wide: bool) {
         let hint = match &self.mode {
             InputMode::Filter => "type to filter · ⏎ done · Esc clear".to_string(),
-            InputMode::PairCode(code) => format!("pairing code from `qshd pair`: {code}▏  (⏎ pair, Esc cancel)"),
-            InputMode::Quick(dest) => format!("connect once to user@host[:port]: {dest}▏  (⏎ go, Esc cancel)"),
-            InputMode::Form(_) => "Tab next field · ←→ change · ⏎ save · Esc cancel".to_string(),
+            InputMode::PairCode(code) => format!("pairing code from `qshd pair`: {}  (⏎ pair, Esc cancel)", text::with_cursor(code, self.back)),
+            InputMode::Quick(dest) => format!("connect once to user@host[:port]: {}  (⏎ go, Esc cancel)", text::with_cursor(dest, self.back)),
+            InputMode::Form(_) => "Tab next field · ←→ move or change · ⏎ save · Esc cancel".to_string(),
             InputMode::Forwards(_) => "port forwards: pick what each one does".to_string(),
             InputMode::Help => "any key closes".to_string(),
             InputMode::ConfirmDelete(name) => format!("delete the saved connection {name}? y/n"),
             InputMode::RunAll(cmd) => {
                 let n = self.visible().len();
                 let which = if self.filter.is_empty() { format!("ALL {n} hosts") } else { format!("the {n} hosts shown") };
-                format!("run on {which}: {cmd}▏  (⏎ run, Esc cancel; / filters first)")
+                format!("run on {which}: {}  (⏎ run, Esc cancel; / filters first)", text::with_cursor(cmd, self.back))
             }
             InputMode::Normal if wide => {
                 "⏎ connect · c once · n new · e edit · d delete · f forwards · Tab history · s speed · p pair · / find · x run on all · r refresh · ? keys · q quit"
@@ -1020,7 +1015,7 @@ fn forward_flags(t: &Target) -> String {
 }
 
 /// The new/edit form as a centered popup.
-fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
+fn draw_form(f: &mut Frame, area: Rect, form: &Form, back: usize) {
     let width = area.width.min(64);
     let height = (FORM_FIELDS.len() as u16 + 5).min(area.height);
     let popup = Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
@@ -1048,7 +1043,6 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
         .map(|(i, (name, value))| {
             let focused = i == form.focus;
             let label = Span::styled(format!("{name:>9}  "), Style::new().fg(if focused { Color::Cyan } else { Color::DarkGray }));
-            let cursor = if focused && i < TEXT_FIELDS { "▏" } else { "" };
             let style = match (focused, form.locked && i < FIRST_MENU_FIELD) {
                 (_, true) => Style::new().fg(Color::DarkGray),
                 (true, false) => Style::new().bold().bg(Color::Rgb(40, 60, 90)),
@@ -1066,12 +1060,12 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
             let room = (width as usize).saturating_sub(2 + 11 + 1).max(2);
             let chars: Vec<char> = value.chars().collect();
             let shown: String = match (chars.len() > room, focused) {
+                // Typing: around the cursor.
+                (_, true) if i < TEXT_FIELDS => text::window(&value, back, room),
                 (false, _) => value,
-                // Typing: the end, where the cursor is.
-                (true, true) => std::iter::once('…').chain(chars[chars.len() - (room - 1)..].iter().copied()).collect(),
-                (true, false) => chars[..room - 1].iter().copied().chain(std::iter::once('…')).collect(),
+                (true, _) => chars[..room - 1].iter().copied().chain(std::iter::once('…')).collect(),
             };
-            Line::from(vec![label, Span::styled(format!("{shown}{cursor}"), style)])
+            Line::from(vec![label, Span::styled(shown, style)])
         })
         .collect();
     lines.push(if form.locked {
@@ -1081,7 +1075,7 @@ fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
     });
     lines.push(match &form.error {
         Some(e) => Line::styled(e.clone(), Style::new().fg(Color::Red)),
-        None => Line::styled("Tab next · ←→ change · ⏎ save · Esc cancel", Style::new().fg(Color::DarkGray)),
+        None => Line::styled("Tab next · ←→ move or change · ⏎ save · Esc cancel", Style::new().fg(Color::DarkGray)),
     });
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
@@ -1812,6 +1806,18 @@ mod tests {
         app.on_event(key(KeyCode::Right)); // transport: quic
         app.on_event(key(KeyCode::Tab));
         app.on_event(key(KeyCode::Char(' '))); // no ssh fallback
+        // Back to a text field: the arrows move inside it, from its end.
+        for _ in 0..3 {
+            app.on_event(key(KeyCode::Up));
+        }
+        app.on_event(key(KeyCode::Left));
+        app.on_event(key(KeyCode::Left));
+        app.on_event(key(KeyCode::Char('X')));
+        assert!(render(&mut app, 100, 30).contains("-L 8080:localhost:80 X▏-A"), "the cursor is where the arrows put it");
+        app.on_event(key(KeyCode::Backspace));
+        for _ in 0..3 {
+            app.on_event(key(KeyCode::Down));
+        }
         let Action::Save(form) = app.on_event(key(KeyCode::Enter)) else { panic!("not saved") };
         assert_eq!(form.group_list().unwrap(), ["web", "prod"]);
         let (saved, prefs) = form.result().unwrap();

@@ -109,6 +109,8 @@ struct Draft {
     dest: String,
     /// 0 kind, 1 listen, 2 destination.
     focus: usize,
+    /// The cursor in the field (see [`super::text`]).
+    back: usize,
 }
 
 impl Draft {
@@ -189,13 +191,22 @@ impl Panel {
         if let Some(d) = &mut self.draft {
             match k.code {
                 KeyCode::Esc => self.draft = None,
-                KeyCode::Tab | KeyCode::Down => d.focus = (d.focus + 1).min(d.fields() - 1),
-                KeyCode::BackTab | KeyCode::Up => d.focus = d.focus.saturating_sub(1),
+                KeyCode::Tab | KeyCode::Down => {
+                    d.focus = (d.focus + 1).min(d.fields() - 1);
+                    d.back = 0;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    d.focus = d.focus.saturating_sub(1);
+                    d.back = 0;
+                }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if d.focus == 0 => {
                     let step = if k.code == KeyCode::Left { KINDS.len() - 1 } else { 1 };
                     d.kind = (d.kind + step) % KINDS.len();
                 }
-                KeyCode::Enter if d.focus + 1 < d.fields() => d.focus += 1,
+                KeyCode::Enter if d.focus + 1 < d.fields() => {
+                    d.focus += 1;
+                    d.back = 0;
+                }
                 KeyCode::Enter => match d.finish() {
                     Ok(fwd) => {
                         self.list.push(fwd);
@@ -205,22 +216,19 @@ impl Panel {
                     }
                     Err(e) => self.error = Some(e),
                 },
-                KeyCode::Backspace => {
-                    match d.focus {
-                        1 => d.listen.pop(),
-                        2 => d.dest.pop(),
+                key => {
+                    let text = match d.focus {
+                        1 => Some(&mut d.listen),
+                        2 => Some(&mut d.dest),
                         _ => None,
                     };
-                }
-                KeyCode::Char(c) => {
-                    match d.focus {
-                        1 => d.listen.push(c),
-                        2 => d.dest.push(c),
-                        _ => {}
+                    if let Some(text) = text {
+                        super::text::edit(text, &mut d.back, key);
                     }
-                    self.error = None;
+                    if matches!(key, KeyCode::Char(_)) {
+                        self.error = None;
+                    }
                 }
-                _ => {}
             }
             return Outcome::Stay;
         }
@@ -271,8 +279,8 @@ impl Panel {
                     return Line::from(vec![label, Span::styled(hint.to_string(), Style::new().fg(Color::DarkGray))]);
                 }
                 let style = if focused { Style::new().bold().bg(Color::Rgb(40, 60, 90)) } else { Style::new() };
-                let cursor = if focused && i > 0 { "▏" } else { "" };
-                Line::from(vec![label, Span::styled(format!("{value}{cursor}"), style)])
+                let shown = if focused && i > 0 { super::text::with_cursor(&value, d.back) } else { value };
+                Line::from(vec![label, Span::styled(shown, style)])
             };
             lines.push(field(0, "kind", format!("‹ {} ›", kind.title()), ""));
             lines.push(field(1, kind.listen_label(), d.listen.clone(), "8080"));
