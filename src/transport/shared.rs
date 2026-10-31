@@ -297,30 +297,39 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     }
     lock.lock()?;
     let listener = UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
-    let result = (|| {
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        for attempt in 0..2 {
-            match std::fs::hard_link(&tmp, path) {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    match std::os::unix::net::UnixStream::connect(path) {
-                        Ok(_) => return Err(InUse.into()),
-                        Err(_) => {
-                            debug!("removing stale control socket {}", path.display());
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(InUse.into()),
-                Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot create {}", path.display()))),
-            }
-        }
-        Err(InUse.into())
-    })();
     let ino = std::fs::symlink_metadata(&tmp).map(|m| m.ino());
+    let result = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(anyhow::Error::from).and_then(|()| publish(&tmp, path, |a, b| std::fs::hard_link(a, b)));
     let _ = std::fs::remove_file(&tmp);
     result?;
     Ok((listener, SocketFile { path: path.to_path_buf(), ino: ino?, removed: Default::default() }))
+}
+
+/// Gives the socket at `tmp` its real name. To be called with the lock held.
+fn publish(tmp: &Path, path: &Path, link: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Result<()> {
+    let in_use = || std::os::unix::net::UnixStream::connect(path).is_ok();
+    for attempt in 0..2 {
+        match link(tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                if in_use() {
+                    return Err(InUse.into());
+                }
+                debug!("removing stale control socket {}", path.display());
+                let _ = std::fs::remove_file(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(InUse.into()),
+            // No hard links here: Android refuses them to apps (EACCES), some
+            // filesystems have none (EPERM). The lock keeps this from racing.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                if in_use() {
+                    return Err(InUse.into());
+                }
+                return std::fs::rename(tmp, path).with_context(|| format!("cannot create {}", path.display()));
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot create {}", path.display()))),
+        }
+    }
+    Err(InUse.into())
 }
 
 impl Master {
@@ -597,4 +606,40 @@ async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EACCES))
+    }
+
+    #[test]
+    fn publishes_without_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, path) = (dir.path().join("s.tmp"), dir.path().join("s"));
+        let _listener = UnixListener::bind(&tmp).unwrap();
+        publish(&tmp, &path, no_hard_links).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
+        assert!(!tmp.exists());
+
+        // A live master keeps its name.
+        let other = dir.path().join("s.other");
+        let _second = UnixListener::bind(&other).unwrap();
+        assert!(publish(&other, &path, no_hard_links).unwrap_err().is::<InUse>());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn replaces_a_stale_socket_without_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, path) = (dir.path().join("s.tmp"), dir.path().join("s"));
+        drop(UnixListener::bind(&path).unwrap());
+        let _listener = UnixListener::bind(&tmp).unwrap();
+        publish(&tmp, &path, no_hard_links).unwrap();
+        assert!(UnixStream::connect(&path).is_ok());
+    }
 }
