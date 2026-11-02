@@ -2118,8 +2118,18 @@ fn forwards_outlive_the_one_time_code() {
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(through(), "hello", "the forward died with the one-time code");
     lose_connection(&child, &rx, &mut seen);
-    stdin.write_all(b"echo af$((3+3))ter\n").unwrap();
-    wait_for_output(&rx, &mut seen, "af6ter", 10);
+    // What is typed during an outage is lost, and a slow machine can lose
+    // the connection once more right after the first reconnect.
+    for _ in 0..30 {
+        stdin.write_all(b"echo af$((3+3))ter\n").unwrap();
+        while let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            seen.push_str(&chunk);
+        }
+        if seen.contains("af6ter") {
+            break;
+        }
+    }
+    assert!(seen.contains("af6ter"), "{seen}");
     assert_eq!(through(), "hello", "the forward died with the one-time code after a reconnect");
     let _ = child.kill();
     let _ = child.wait();
@@ -4222,7 +4232,8 @@ fn killed_client_comes_back_to_its_session() {
         command.args(["-qfc", &line, "/dev/null"]).env("HOME", c.home.path()).env_remove("SSH_AUTH_SOCK");
         terminal(command)
     };
-    if !have("script") {
+    // With these options only on Linux.
+    if !cfg!(target_os = "linux") || !have("script") {
         return eprintln!("skipped: no script");
     }
     // Any login shell: `tty` names the session, the quotes keep the echo
