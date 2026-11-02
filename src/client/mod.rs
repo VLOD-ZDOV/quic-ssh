@@ -15,6 +15,7 @@ pub mod keys_vt;
 pub mod keystroke;
 pub mod multi;
 pub mod predict;
+pub mod restore;
 mod known_hosts;
 pub mod session;
 mod socks;
@@ -131,6 +132,9 @@ pub struct Target {
     pub certificate_files: Vec<PathBuf>,
     /// Keep terminal sessions across lost connections (`PersistSession`, default yes).
     pub persist_session: bool,
+    /// `RestoreSession`: a terminal session outlives qsh itself; the next
+    /// run to the host goes back to it.
+    pub restore_session: bool,
     /// `ServerAliveInterval` and `ServerAliveCountMax`: ping the server when
     /// it has been quiet this long, give up after this many unanswered pings.
     pub server_alive: Option<(std::time::Duration, u32)>,
@@ -140,6 +144,8 @@ pub struct Target {
     pub predict: predict::Mode,
     /// `Compression`: compress file copies.
     pub compression: bool,
+    /// Terminal output is compressed unless `Compression no` says otherwise.
+    pub compress_output: bool,
     /// The config sources, reused for jump hosts.
     pub sources: config::Sources,
     /// The host as given, before `HostName` (`%n`).
@@ -458,6 +464,7 @@ impl Target {
             identity_agent,
             certificate_files,
             persist_session: cfg.persist_session.unwrap_or(true),
+            restore_session: cfg.restore_session.unwrap_or(false),
             server_alive: cfg
                 .server_alive_interval
                 .filter(|&s| s > 0)
@@ -465,6 +472,7 @@ impl Target {
             sharing,
             predict: cfg.predictive_echo.as_deref().map(predict::parse_mode).unwrap_or_default(),
             compression: cfg.compression.unwrap_or(false),
+            compress_output: cfg.compression.unwrap_or(true),
             sources: sources.clone(),
             alias: alias.to_string(),
             proxy_command: cfg.proxy_command,
@@ -1129,19 +1137,31 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
     }
 }
 
-/// Whether the server says the one-time code of a shared connection has
-/// run out (`totp_valid_for`; servers from protocol version 9 tell).
+/// How long a shared connection has to answer before qsh logs in itself.
 #[cfg(unix)]
-async fn shared_code_expired(conn: &Conn) -> bool {
-    if conn.server_version() < 9 {
-        return false;
-    }
-    let ping = async {
+const SHARED_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why a shared connection cannot take a new session, if it cannot.
+#[cfg(unix)]
+async fn shared_problem(conn: &Conn) -> Option<&'static str> {
+    // Servers from protocol version 9 tell about the one-time code.
+    let request = if conn.server_version() < 9 { crate::proto::Request::Ping } else { crate::proto::Request::MayStart };
+    let asked = async {
         let (mut send, mut recv) = conn.open_bi().await?;
-        write_msg(&mut send, &crate::proto::Request::MayStart).await?;
+        write_msg(&mut send, &request).await?;
         crate::proto::read_msg::<_, crate::proto::Reply>(&mut recv).await
     };
-    matches!(tokio::time::timeout(std::time::Duration::from_secs(10), ping).await, Ok(Ok(crate::proto::Reply::Err(e))) if e.contains("one-time code") && e.contains("expired"))
+    match tokio::time::timeout(SHARED_WAIT, asked).await {
+        Ok(Ok(crate::proto::Reply::Err(e))) if e.contains("one-time code") && e.contains("expired") => Some("its one-time code has expired"),
+        Ok(Ok(_)) => None,
+        // A master does not always know: a phone that slept, say, leaves it
+        // with a connection the server has long forgotten.
+        Ok(Err(e)) => {
+            tracing::debug!("the shared connection did not answer: {e:#}");
+            Some("it has stopped working")
+        }
+        Err(_) => Some("it does not answer"),
+    }
 }
 
 /// Connects, verifies the host key against known_hosts and logs in, going
@@ -1151,13 +1171,16 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     #[cfg(unix)]
     if let (true, None, Some(path)) = (opts.share, &opts.resume, &target.sharing.path) {
         if let Some(conn) = transport::shared::attach(path).await {
-            if shared_code_expired(&conn).await {
-                // Sessions through it go on; new ones log in, with a code.
-                tracing::info!("the shared connection's one-time code has expired; logging in again");
-                let _ = transport::shared::control(path, transport::shared::Command::Stop).await;
-            } else {
-                tracing::info!("using the shared connection at {}", path.display());
-                return Ok(conn);
+            match shared_problem(&conn).await {
+                // Sessions through it go on; new ones log in.
+                Some(why) => {
+                    tracing::info!("not using the shared connection: {why}; logging in again");
+                    let _ = transport::shared::control(path, transport::shared::Command::Stop).await;
+                }
+                None => {
+                    tracing::info!("using the shared connection at {}", path.display());
+                    return Ok(conn);
+                }
             }
         }
     }

@@ -145,6 +145,7 @@ pub struct HostConfig {
     pub certificate_files: Vec<String>,
     /// qsh's `PersistSession`: terminal sessions survive lost connections.
     pub persist_session: Option<bool>,
+    pub restore_session: Option<bool>,
     /// `ServerAliveInterval` (seconds; 0 = off).
     pub server_alive_interval: Option<u64>,
     /// `ServerAliveCountMax`.
@@ -155,7 +156,7 @@ pub struct HostConfig {
     pub control_persist: Option<String>,
     /// qsh's `PredictiveEcho` (`auto`, `yes`, `no`).
     pub predictive_echo: Option<String>,
-    /// `Compression` (used by `qsh cp`).
+    /// `Compression`: output and `qsh cp` (`auto` means yes).
     pub compression: Option<bool>,
     /// `BindAddress` and `BindInterface` (`-b`, `-B`).
     pub bind_address: Option<String>,
@@ -521,13 +522,14 @@ impl Parser<'_> {
                 "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
                 "certificatefile" => push_new(&mut o.certificate_files, first),
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
+                "restoresession" if o.restore_session.is_none() => o.restore_session = first.as_deref().map(yes),
                 "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
                 "controlmaster" if o.control_master.is_none() => o.control_master = first,
                 "controlpath" if self.ours && o.control_path.is_none() => o.control_path = first,
                 "controlpersist" if o.control_persist.is_none() => o.control_persist = first,
                 "predictiveecho" if o.predictive_echo.is_none() => o.predictive_echo = first,
-                "compression" if o.compression.is_none() => o.compression = first.as_deref().map(yes),
+                "compression" if o.compression.is_none() => o.compression = first.as_deref().map(|v| yes(v) || v.eq_ignore_ascii_case("auto")),
                 "bindaddress" if o.bind_address.is_none() => o.bind_address = first,
                 "bindinterface" if o.bind_interface.is_none() => o.bind_interface = first,
                 "revokedhostkeys" if o.refused.is_none() && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
@@ -1001,6 +1003,7 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
         identity_agent: ours.identity_agent.or(ssh.identity_agent),
         certificate_files: ours.certificate_files.into_iter().chain(ssh.certificate_files).collect(),
         persist_session: ours.persist_session.or(ssh.persist_session),
+        restore_session: ours.restore_session,
         server_alive_interval: ours.server_alive_interval.or(ssh.server_alive_interval),
         server_alive_count_max: ours.server_alive_count_max.or(ssh.server_alive_count_max),
         control_master: ours.control_master.or(ssh.control_master),

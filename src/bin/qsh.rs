@@ -73,9 +73,9 @@ struct ConnArgs {
     #[arg(long, global = true)]
     accept_new_host: bool,
 
-    /// Verbose output
-    #[arg(short = 'v', long, global = true)]
-    verbose: bool,
+    /// Verbose output: -vv and -vvv for more
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// OpenSSH compatibility: use the ssh config fully, and fall back to
     /// OpenSSH's scp/ssh where the host has no qshd
@@ -231,7 +231,7 @@ impl ConnArgs {
         if self.accept_new_host {
             args.push("--accept-new-host".into());
         }
-        if self.verbose {
+        for _ in 0..self.verbose {
             args.push("-v".into());
         }
         if self.full {
@@ -258,8 +258,15 @@ fn invoked_as_ssh(argv0: &str) -> bool {
     Path::new(argv0).file_stem().is_some_and(|n| n == "ssh")
 }
 
-fn init_logging(verbose: bool, quiet: bool) {
-    let filter = if verbose { "qsh=debug" } else if quiet { "qsh=error" } else { "qsh=warn" };
+fn init_logging(verbose: u8, quiet: bool) {
+    let filter = match verbose {
+        0 if quiet => "qsh=error",
+        0 => "qsh=warn",
+        1 => "qsh=debug",
+        2 => "qsh=trace",
+        // The libraries too: the transport and TLS.
+        _ => "qsh=trace,quinn=debug,quinn_proto=debug,rustls=debug",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_writer(std::io::stderr)
@@ -268,12 +275,24 @@ fn init_logging(verbose: bool, quiet: bool) {
         .init();
 }
 
+/// What the transport's own words mean for the person reading them.
+fn hint(e: &anyhow::Error) -> &'static str {
+    let text = format!("{e:#}");
+    if text.contains("reset by peer") {
+        "\nThe server no longer knows this connection, as after a long sleep or a restart of qshd. Run qsh again."
+    } else if text.contains("timed out") && text.contains("connection lost") {
+        "\nNothing came back from the server for too long. Check the network and run qsh again."
+    } else {
+        ""
+    }
+}
+
 fn finish(result: Result<i32>) -> ! {
     let code = match result {
         Ok(code) => code,
         Err(e) => {
             // Not eprintln: a closed stderr must not turn the code into a panic's.
-            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("qsh: {e:#}\n"));
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("qsh: {e:#}{}\n", hint(&e)));
             255
         }
     };
@@ -338,7 +357,7 @@ fn main() {
     }
     #[cfg(unix)]
     if std::env::var_os(MASTER_FD).is_some() {
-        init_logging(a.verbose > 0, a.quiet);
+        init_logging(a.verbose, a.quiet);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         finish(rt.block_on(master_main(a)));
     }
@@ -362,7 +381,7 @@ fn main() {
     if a.background && std::env::var_os(DAEMON_FD).is_none() {
         finish(run_in_background(&args));
     }
-    init_logging(a.verbose > 0, a.quiet);
+    init_logging(a.verbose, a.quiet);
     for ignored in &a.ignored {
         tracing::debug!("ignoring {ignored}");
     }
@@ -497,6 +516,12 @@ async fn master_main(a: SshArgs) -> Result<i32> {
     let target = Target::resolve(&dest, a.port, &sources(&a))?;
     let path = target.sharing.path.clone().context("no ControlPath")?;
     prepare_control_dir(&path)?;
+    // Before the login: failing after it would ask for a one-time code twice.
+    if let Err(e) = qsh::transport::shared::can_listen(&path) {
+        eprintln!("qsh: not sharing the connection: {e:#}");
+        detach(MASTER_FD, "none", true)?;
+        return Ok(255);
+    }
     let opts = ConnectOptions {
         identities: a.identities.clone(),
         transport: a.transport,
@@ -878,10 +903,6 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     // this qsh: such a run uses a connection of its own. A -R is the
     // master's to hold for this run (below).
     let share = agent.is_none() && target.forward_x11.is_none();
-    // The agent and the display are offered to every session of the
-    // connection: one with them is not one to share with later runs.
-    #[cfg(unix)]
-    let private = agent.is_some() || target.forward_x11.is_some();
     let opts = ConnectOptions {
         identities: a.identities.clone(),
         transport: a.transport,
@@ -891,15 +912,58 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         share,
         host_keys_from_ssh: Vec::new(),
     };
+    let needs_this_connection = target.forward_x11.is_some() || target.tunnel.is_some();
+    // Only a plain login in a terminal goes back to what was left there.
+    let restoring = target.restore_session
+        && target.persist_session
+        && !needs_this_connection
+        && a.command.is_empty()
+        && !a.no_command
+        && !a.no_tty
+        && !a.subsystem
+        && !a.background
+        && a.stdio_forward.is_none()
+        && std::io::stdin().is_terminal();
+    let session_key = qsh::client::control::connection_hash(&target.host, target.port, &target.user);
+    let (mut claim, mut left_behind, mut resumed) = (None, None, None);
+    if restoring {
+        let home = home_dir()?;
+        for (found, token) in qsh::client::restore::left_behind(&home, &session_key) {
+            let quiet_target = Target { batch_mode: true, quiet: true, ..target.clone() };
+            match client::connect(&quiet_target, &ConnectOptions { resume: Some(token.clone()), ..opts.clone() }).await {
+                Ok(c) => {
+                    (claim, left_behind, resumed) = (Some(found), Some(token), Some(c));
+                    break;
+                }
+                Err(e) if e.is::<client::LoginRefused>() => found.forget(),
+                Err(e) => tracing::debug!("not going back to a session left running: {e:#}"),
+            }
+        }
+        if claim.is_none() {
+            match qsh::client::restore::Claim::new(&home, &session_key) {
+                Ok(c) => claim = Some(c),
+                Err(e) => eprintln!("qsh: warning: RestoreSession: {e:#}"),
+            }
+        }
+    }
+    // The agent and the display are offered to every session of the
+    // connection: one with them is not one to share with later runs, and a
+    // connection that came back with a token can do nothing else.
     #[cfg(unix)]
-    if share && target.sharing.background_master() {
+    let private = agent.is_some() || target.forward_x11.is_some() || left_behind.is_some();
+    #[cfg(unix)]
+    if share && resumed.is_none() && target.sharing.background_master() {
         if let Some(code) = start_background_master(&target, args).await? {
             return Ok(code);
         }
     }
     #[cfg(not(unix))]
     let _ = args;
-    let conn = match client::connect(&target, &opts).await {
+    let connected = match resumed {
+        Some(c) => Ok(c),
+        None => client::connect(&target, &opts).await,
+    };
+    let conn = match connected {
         Ok(c) => Arc::new(c),
         Err(e) if a.full && e.is::<Unreachable>() => {
             return exec_openssh("ssh", ssh_args(&a, &target), &format!("{e:#}"));
@@ -934,7 +998,6 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if a.forward_agent == Some(true) && agent.is_none() && !quiet {
         eprintln!("qsh: warning: -A: no ssh-agent to forward (SSH_AUTH_SOCK is not set)");
     }
-    let needs_this_connection = target.forward_x11.is_some() || target.tunnel.is_some();
     // Remote forwards held by the master for this run: taken back when it ends.
     #[cfg(unix)]
     let mut held = Vec::new();
@@ -995,6 +1058,15 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         detach(DAEMON_FD, "ok", false)?;
     }
 
+    // Logs in again by itself: `quiet`, and with no one to ask for anything.
+    let reconnect = || -> session::Reconnect {
+        let target = Target { batch_mode: true, quiet: true, ..target.clone() };
+        let opts = opts.clone();
+        Arc::new(move |token: Vec<u8>| {
+            let (target, opts) = (target.clone(), ConnectOptions { resume: Some(token), ..opts.clone() });
+            Box::pin(async move { client::connect(&target, &opts).await.map(Arc::new) }) as futures::future::BoxFuture<'static, _>
+        })
+    };
     if a.no_command {
         #[cfg(unix)]
         let exit_requested = async {
@@ -1005,13 +1077,17 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         };
         #[cfg(not(unix))]
         let exit_requested = std::future::pending::<()>();
-        tokio::select! {
-            _ = conn.closed() => bail!("connection closed"),
-            _ = session::termination_signal(true) => {}
-            () = exit_requested => {}
-        }
-        conn.close().await;
-        return Ok(0);
+        let signal = session::termination_signal(true);
+        let end = async {
+            tokio::select! {
+                _ = signal => {}
+                () = exit_requested => {}
+            }
+        };
+        let back = (target.persist_session && !needs_this_connection).then(reconnect);
+        let code = session::hold(conn.clone(), back, forwarder.clone(), target.server_alive, end).await?;
+        forwarder.conn().close().await;
+        return Ok(code);
     }
     let command = (!a.command.is_empty()).then(|| a.command.join(" "));
     let subsystem = a.subsystem.then(|| command.clone()).flatten();
@@ -1043,14 +1119,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     // A terminal session survives lost connections (unless X11 or a tunnel
     // depends on this connection, or PersistSession is off): qsh logs in
     // again by itself.
-    let reconnect: Option<session::Reconnect> = (pty && target.persist_session && !needs_this_connection).then(|| {
-        let target = Target { batch_mode: true, quiet: true, ..target.clone() };
-        let opts = opts.clone();
-        Arc::new(move |token: Vec<u8>| {
-            let (target, opts) = (target.clone(), ConnectOptions { resume: Some(token), ..opts.clone() });
-            Box::pin(async move { client::connect(&target, &opts).await.map(Arc::new) }) as futures::future::BoxFuture<'static, _>
-        }) as session::Reconnect
-    });
+    let reconnect = (pty && target.persist_session && !needs_this_connection).then(reconnect);
     let quit = Arc::new(tokio::sync::Notify::new());
     let session = session::run(
         conn.clone(),
@@ -1064,6 +1133,9 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             escape_commandline: target.escape_commandline,
             stdin_null: a.stdin_null || a.background,
             reconnect,
+            compress: a.compress || target.compress_output,
+            left_behind,
+            claim: claim.filter(|_| pty).map(Arc::new),
             server_alive: target.server_alive,
             predict: target.predict,
             quit: quit.clone(),
@@ -1361,7 +1433,7 @@ async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnAr
         if compress {
             v.push("-C".into());
         }
-        if args.verbose {
+        if args.verbose > 0 {
             v.push("-v".into());
         }
         for o in &target.ssh_options {

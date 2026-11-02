@@ -1,6 +1,6 @@
 [package]
 name = "qsh"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "Secure shell over QUIC with automatic TCP fallback"
 license = "GPL-3.0-only"
@@ -54,6 +54,7 @@ x509-parser = "0.18"
 libc = "0.2"
 vt100 = "0.16.2"
 async-compression = { version = "0.4.50", features = ["tokio", "zstd"] }
+zstd = "0.14"
 socket2 = { version = "0.6", features = ["all"] }
 zeroize = "1"
 

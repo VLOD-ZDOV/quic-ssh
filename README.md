@@ -22,6 +22,7 @@ Features:
 - file copy, including directories (`qsh cp -r`); a single file cut off half-way goes on where it stopped when copied again;
 - the same command-line options as `ssh`, so `sftp`, `scp`, `rsync`, `git` and `sshfs` can run over qsh;
 - **sessions that survive network outages:** after a lost connection, qsh reconnects by itself and the shell is still there, with the output you missed;
+- **compressed output:** on by default, with a known risk you should read about (see [Compression](#compression));
 - key login with any SSH key (Ed25519, ECDSA, RSA, security keys), ssh-agent and agent forwarding (`-A`), OpenSSH user and host certificates;
 - optional one-time codes (TOTP) as a second factor, built in, and optional passwords; PAM (`pam_access`, `pam_limits`, `pam_systemd`) in builds with the `pam` feature;
 - sshd's server controls: `allow_users`/`deny_users` and groups, `permit_root_login`, `[[match]]` blocks, `force_command`, `chroot_directory` with a built-in `internal-sftp`, banner, motd, `~/.ssh/rc`, per-source penalties, `qshd -t`/`-T` and reload on SIGHUP;
@@ -177,6 +178,7 @@ qsh -L 8080:localhost:80 user@host     # port forward (+ shell)
 qsh -N -L 5432:db.internal:5432 host   # port forward only
 qsh -N -R 8080:localhost:3000 host     # remote forward: host's port 8080 -> your port 3000
 qsh -N -D 1080 host                    # SOCKS4/5 proxy on localhost:1080
+qsh -vv host                           # more detail: -v steps, -vv each output chunk, -vvv also QUIC and TLS
 qsh -N -R 1080 host                    # SOCKS proxy on the server, connections go out from here
 qsh -L /tmp/docker.sock:/var/run/docker.sock host   # Unix sockets on either side of -L/-R
 qsh -J bastion user@internal           # through a jump host (both run qshd)
@@ -239,6 +241,21 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - Up to 16 such sessions per user. At the limit, a new one closes the session that has been detached the longest (one left behind by a killed client, say).
 - Quitting normally (exit, `~.`, closing the terminal) ends the session on the server as usual.
 - Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Port forwards and the forwarded agent survive with the session (with qshd 1.5 or newer; an older qshd ends them and qsh says which): `-L` and `-D` keep listening, `-R` and the agent come back on the new connection, and only connections open through them at that moment are lost. Sessions with X11 forwarding or a tunnel (`-w`) are not kept.
+- `-N` survives too, with qsh and qshd 1.6 or newer: the forwards come back after a lost connection, with one-time codes on as well.
+- A reconnect that takes longer than 10 s says why and when the next try is.
+
+### Compression
+
+Terminal and command output is compressed with zstd when qsh and qshd are 1.6 or newer. It costs next to nothing and matters most when output outruns a slow link: there, ^C or a key takes effect in about half a second instead of ten. Full-screen programs repeat most of each screen, so `btop` or `hollywood` send 15 to 30 times less. Short lines, as from `tail -f`, shrink about 2 times. Output that does not shrink goes as it is, and a typed character's echo is never touched. `Compression no` in `~/.config/qsh/config` or `~/.ssh/config`, or `-o Compression=no`, turns it off. `qsh cp` has its own switch, `-C`.
+
+**Compression is useful, but it can reveal data.** It has a known weakness, the one behind CRIME, BREACH and VORACLE: encryption hides content but not length, so someone who watches the traffic and can also put text on your screen, for example into a log you are following, may guess a secret shown there from how well the guess compresses. qsh defends against this in several ways:
+
+- What looks like a secret never enters the compression context: long random tokens, and the values after words like `password`, `token`, `secret`, `session`, `Cookie` and `Authorization`. These cannot be guessed this way at all.
+- Sizes are rounded to 16 bytes, with a random step added, so a single match does not show.
+- The context lasts as long as the stream. A clean start is what such an attack needs, so a session that keeps losing its connection (5 times in 10 minutes, or 32 times in all) stops compressing.
+
+A secret that does not look like one, such as a plain word with no such keyword before it, is covered only by the last two, which make guessing slow and not impossible. On a host where that matters, and where others can write to what you watch, set `Compression no`.
+- With `RestoreSession yes` in `~/.config/qsh/config`, a terminal session also outlives qsh itself: if qsh is killed or its terminal is closed, the next plain `qsh host` goes back to the session while the server keeps it (`session_timeout`). A window that is still open keeps its session. It is off by default: the session's token then sits in a private file under `~/.config/qsh/sessions`, and that file plus your key get back into the session without a one-time code.
 - After `^C`, at most about 1 MiB of output that was already on its way scrolls by (ssh: about 2 MiB), in every terminal session with qshd 1.0.5 or newer.
 - `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
 
@@ -426,10 +443,9 @@ gateway_ports = "no"            # -R listens on loopback only; "yes": all addres
 max_auth_tries = 6              # failed key proofs per connection
 allow_agent_forwarding = true
 totp = "optional"               # one-time codes: "off", "optional" (for users who set them up), "required"
-totp_valid_for = 3600           # seconds a code lasts on its connection (0: as long as it); then it opens nothing
-                                # new (sessions, copies, forwarded connections) while what is under way goes on: a
-                                # shared connection (ControlMaster) logs in again with a code, a long -L tunnel
-                                # takes no new connections
+totp_valid_for = 3600           # seconds a code lasts on its connection (0: as long as it); then it starts no
+                                # new sessions or copies, so a shared connection (ControlMaster) logs in again with
+                                # a code. What is under way goes on, forwards included: a -L port keeps working
 session_timeout = 3600          # seconds a disconnected terminal session is kept; 0 = off
 # trusted_user_ca_keys = "/etc/qsh/user_ca.pub"   # CAs that sign user certificates (principal = user name)
 # host_certificate = "/etc/qsh/host_ed25519-cert.pub"   # used automatically if it exists

@@ -102,6 +102,14 @@ impl Server {
         Server { child, home, port, log }
     }
 
+    /// The same server, with every connection to it gone.
+    fn restarted(mut self) -> Server {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let home = std::mem::replace(&mut self.home, tempfile::tempdir().unwrap());
+        Self::start_in(home, &format!("127.0.0.1:{}", self.port), "")
+    }
+
     /// What qshd logged lately.
     fn log(&self) -> String {
         self.log.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n")
@@ -2069,10 +2077,11 @@ fn forwards_survive_a_reconnect() {
     let _ = child.wait();
 }
 
-/// The session token stands in for the one-time code, but no longer than
-/// the code lasts: the terminal comes back, new forwarded connections do not.
+/// `totp_valid_for` limits what starts, not a forward the session has: a
+/// port stays usable as long as the connection, or the session across a
+/// reconnect, is there.
 #[test]
-fn one_time_code_limits_forwards_after_a_reconnect() {
+fn forwards_outlive_the_one_time_code() {
     use qsh::totp;
     let s = Server::start_with("127.0.0.1", "totp_valid_for = 2\n");
     let c = Client::paired(&s);
@@ -2096,19 +2105,74 @@ fn one_time_code_limits_forwards_after_a_reconnect() {
     let mut command = c.cmd(&["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-L", &l, "-p", &port, &dest(), "sh"]);
     command.env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force");
     let (mut child, mut stdin, rx) = terminal(command);
+    let through = || {
+        let mut text = String::new();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let _ = stream.read_to_string(&mut text);
+        text
+    };
     let mut seen = String::new();
     stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
     wait_for_output(&rx, &mut seen, "be2fore", 10);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(through(), "hello", "the forward died with the one-time code");
     lose_connection(&child, &rx, &mut seen);
     stdin.write_all(b"echo af$((3+3))ter\n").unwrap();
     wait_for_output(&rx, &mut seen, "af6ter", 10);
-    let mut text = String::new();
-    let mut through = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
-    through.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    let _ = through.read_to_string(&mut text);
-    assert_eq!(text, "", "a forward outlived the one-time code");
+    assert_eq!(through(), "hello", "the forward died with the one-time code after a reconnect");
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// With `ControlMaster` too, also once a later run has stopped the master
+/// because of the expired code.
+#[test]
+fn forwards_through_a_master_outlive_the_one_time_code() {
+    use qsh::totp;
+    let s = Server::start_with("127.0.0.1", "totp_valid_for = 2\n");
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let ctl = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath {}/%C\n", ctl.path().display())).unwrap();
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let dir = tempfile::tempdir().unwrap();
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step))]);
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let to = target.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in target.incoming().map_while(Result::ok) {
+            let _ = conn.write_all(b"hello");
+        }
+    });
+    let port = s.port.to_string();
+    let local = free_port();
+    let l = format!("{local}:127.0.0.1:{to}");
+    let mut command = c.cmd(&["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-L", &l, "-p", &port, &dest(), "sh"]);
+    command.env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force");
+    let (mut child, mut stdin, rx) = terminal(command);
+    let through = || {
+        let mut text = String::new();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", local)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let _ = stream.read_to_string(&mut text);
+        text
+    };
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(through(), "hello", "the forward died with the one-time code");
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step + 1))]);
+    let late = c.cmd(&["-p", &port, &dest(), "echo", "late"]).env("SSH_ASKPASS", &script).env("SSH_ASKPASS_REQUIRE", "force").output().unwrap();
+    assert_eq!(stdout(&late), "late\n", "{}", stderr(&late));
+    assert_eq!(through(), "hello", "the forward died with the master");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = c.run(&["-O", "exit", "-p", &port, &dest()]);
 }
 
 /// A session's programs have the agent's path in `SSH_AUTH_SOCK`, so it must
@@ -4038,4 +4102,182 @@ fn copy_through_a_punched_hole() {
     let out = last.expect("no copy attempt");
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(std::fs::read(s.home.path().join("hole.txt")).unwrap(), b"through the hole\n");
+}
+
+/// A master can sit on a connection that is dead without knowing it (a
+/// phone waking up): a new run must log in on its own instead of failing.
+#[test]
+fn dead_master_connection_is_not_used() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let ctl = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::write(c.home.path().join(".config/qsh/config"), format!("Host *\n    ControlMaster auto\n    ControlPersist 60\n    ControlPath {}/%C\n", ctl.path().display())).unwrap();
+    let port = s.port.to_string();
+    let run = |what: &str| c.cmd(&["-p", &port, &dest(), "echo", what]).output().unwrap();
+    assert_eq!(stdout(&run("first")), "first\n");
+    let _s = s.restarted();
+    let started = std::time::Instant::now();
+    let out = run("second");
+    assert_eq!(stdout(&out), "second\n", "{}", stderr(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "took {:?}", started.elapsed());
+    let _ = c.run(&["-O", "exit", "-p", &port, &dest()]);
+}
+
+/// Output is compressed unless turned off, and comes through whole either way.
+#[test]
+fn compressed_output_arrives_whole() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let plain = c.run(&["-v", "-o", "Compression=no", "-p", &port, &dest(), "seq 1 100000"]);
+    assert!(stderr(&plain).contains("output is not compressed"), "{}", stderr(&plain));
+    let packed = c.run(&["-v", "-p", &port, &dest(), "seq 1 100000"]);
+    assert!(packed.status.success(), "{}", stderr(&packed));
+    assert!(stderr(&packed).contains("output is compressed"), "{}", stderr(&packed));
+    assert_eq!(packed.stdout, plain.stdout);
+    let terminal = c.run(&["-C", "-tt", "-p", &port, &dest(), "seq 1 100000; head -c 200000 /dev/urandom | od -An -x | wc -l"]);
+    assert!(terminal.status.success(), "{}", stderr(&terminal));
+    assert!(stdout(&terminal).contains("100000\r\n"), "{}", stdout(&terminal));
+}
+
+/// `-N` keeps its forwards over a lost connection, with one-time codes on:
+/// nothing can ask for a new one at that point.
+#[test]
+fn forwards_without_a_command_survive_a_reconnect() {
+    use qsh::totp;
+    // The server has to give up on the connection: unlike a session, -N
+    // has nothing to notice a pause with while the connection still works.
+    let s = Server::start_with("127.0.0.1", "client_alive_interval = 1\nclient_alive_count_max = 2\n");
+    let c = Client::paired(&s);
+    let secret = b"0123456789abcdefghij";
+    let path = totp::secret_path(s.home.path());
+    std::fs::write(&path, totp::base32_encode(secret)).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let step = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / totp::STEP;
+    let dir = tempfile::tempdir().unwrap();
+    let script = askpass_script(dir.path(), &[format!("{:06}", totp::code(secret, step))]);
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let to = target.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in target.incoming().map_while(Result::ok) {
+            let _ = conn.write_all(b"hello");
+        }
+    });
+    let port = s.port.to_string();
+    let local = free_port();
+    let l = format!("{local}:127.0.0.1:{to}");
+    let mut child = c
+        .cmd(&["-N", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-L", &l, "-p", &port, &dest()])
+        .env("SSH_ASKPASS", &script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let errors = std::io::BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in errors.lines().map_while(Result::ok) {
+            let _ = tx.send(format!("{line}\n"));
+        }
+    });
+    assert_eq!(hello_through(local), "hello");
+    let mut seen = String::new();
+    lose_connection(&child, &rx, &mut seen);
+    assert_eq!(hello_through(local), "hello");
+    // The end of a -N is the end of what it held: the token is no use now.
+    assert!(child.try_wait().unwrap().is_none(), "{seen}");
+    let pid = child.id().to_string();
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+    assert!(child.wait().unwrap().success());
+}
+
+/// A reconnect that takes long says why, instead of looking like a hang.
+#[test]
+fn slow_reconnect_says_why() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let (mut child, mut stdin, rx) = terminal(c.cmd(&["-tt", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-p", &port, &dest(), "sh"]));
+    let mut seen = String::new();
+    stdin.write_all(b"echo be$((1+1))fore\n").unwrap();
+    wait_for_output(&rx, &mut seen, "be2fore", 10);
+    drop(s);
+    wait_for_output(&rx, &mut seen, "still reconnecting", 40);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `RestoreSession`: a killed qsh leaves its session, and the next run goes
+/// back to it; a window still open keeps its own.
+#[test]
+fn killed_client_comes_back_to_its_session() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    std::fs::write(c.home.path().join(".config/qsh/config"), "Host *\n    RestoreSession yes\n").unwrap();
+    let port = s.port.to_string();
+    let open = || {
+        // A terminal for stdin, which `-tt` alone does not give.
+        let mut command = Command::new("script");
+        let line = format!("{QSH} -p {port} {}", dest());
+        command.args(["-qfc", &line, "/dev/null"]).env("HOME", c.home.path()).env_remove("SSH_AUTH_SOCK");
+        terminal(command)
+    };
+    if !have("script") {
+        return eprintln!("skipped: no script");
+    }
+    // Any login shell: `tty` names the session, the quotes keep the echo
+    // of the command line from matching.
+    let which = |stdin: &mut std::process::ChildStdin, rx: &std::sync::mpsc::Receiver<String>, seen: &mut String| {
+        let start = seen.len();
+        stdin.write_all(b"tty; echo do\"\"ne\n").unwrap();
+        wait_for_output(rx, seen, "done", 20);
+        let text = &seen[start..];
+        let at = text.find("/dev/pts/").unwrap_or_else(|| panic!("{text}"));
+        text[at..].split_whitespace().next().unwrap().to_string()
+    };
+    let (mut first, mut stdin, rx) = open();
+    let mut seen = String::new();
+    let session = which(&mut stdin, &rx, &mut seen);
+    let (mut second, mut stdin2, rx2) = open();
+    let mut other = String::new();
+    assert_ne!(which(&mut stdin2, &rx2, &mut other), session, "the second window took the first one's session");
+    stdin2.write_all(b"exit\n").unwrap();
+    let _ = second.wait();
+    assert!(Command::new("pkill").args(["-KILL", "-P", &first.id().to_string()]).status().unwrap().success());
+    let _ = first.kill();
+    let _ = first.wait();
+    let (mut third, mut stdin3, rx3) = open();
+    let mut back = String::new();
+    wait_for_output(&rx3, &mut back, "back in the session", 10);
+    assert_eq!(which(&mut stdin3, &rx3, &mut back), session);
+    stdin3.write_all(b"exit\n").unwrap();
+    let _ = third.wait();
+    let left: Vec<_> = std::fs::read_dir(c.home.path().join(".config/qsh/sessions")).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// `qshd -t` tells what would only show at login: a certificate clients
+/// would refuse, a chroot it cannot do.
+#[test]
+fn config_check_warns_about_what_cannot_work() {
+    if !have("ssh-keygen") {
+        return eprintln!("skipped: no ssh-keygen");
+    }
+    let keys = tempfile::tempdir().unwrap();
+    let ca = keygen(keys.path(), "host_ca", "ed25519");
+    let home = tempfile::tempdir().unwrap();
+    assert!(Command::new(QSHD).arg("init").env("HOME", home.path()).output().unwrap().status.success());
+    let dir = home.path().join(".config/qsh");
+    let host_pub = dir.join("host_ed25519.pub");
+    let out = Command::new("ssh-keygen").args(["-q", "-s", ca.to_str().unwrap(), "-I", "old", "-h", "-n", "h", "-V", "20200101:20200201"]).arg(&host_pub).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let cert = dir.join("host_ed25519-cert.pub");
+    std::fs::write(dir.join("qshd.toml"), format!("host_certificate = {:?}\nchroot_directory = \"/srv\"\n", cert.display().to_string())).unwrap();
+    let out = Command::new(QSHD).arg("-t").env("HOME", home.path()).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(text.contains("expired"), "{text}");
+    if !nix::unistd::geteuid().is_root() {
+        assert!(text.contains("chroot_directory needs qshd to run as root"), "{text}");
+    }
 }

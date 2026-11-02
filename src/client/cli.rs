@@ -49,6 +49,8 @@ pub struct SshArgs {
     pub x11: Option<bool>,
     pub x11_trusted: bool,
     pub print_config: bool,
+    /// `-C`: compress terminal output.
+    pub compress: bool,
     /// `-O`: a command for the connection master (`check`, `exit`, `stop`).
     pub control_command: Option<String>,
     /// `-f`: go to the background after logging in.
@@ -99,7 +101,7 @@ const APPLIED_OPTIONS: &[&str] = &[
     "forwardx11timeout", "forwardx11trusted", "globalknownhostsfile", "hashknownhosts", "host", "hostkeyalias", "hostname",
     "identitiesonly", "identityagent", "identityfile", "include", "knownhostscommand", "localcommand", "localforward",
     "loglevel", "match", "numberofpasswordprompts", "obscurekeystroketiming", "passwordauthentication", "permitlocalcommand",
-    "persistsession", "port", "predictiveecho", "proxycommand", "proxyjump", "remotecommand", "remoteforward", "requesttty",
+    "persistsession", "port", "restoresession", "predictiveecho", "proxycommand", "proxyjump", "remotecommand", "remoteforward", "requesttty",
     "sendenv", "serveralivecountmax", "serveraliveinterval", "sessiontype", "setenv", "stdinnull", "stricthostkeychecking",
     "tag", "tunnel", "tunneldevice", "user", "userknownhostsfile", "xauthlocation",
 ];
@@ -163,7 +165,8 @@ impl SshArgs {
                 return Ok(());
             }
             // Protocol, compression, GSSAPI, syslog: nothing to do in qsh.
-            '1' | '2' | 'C' | 'K' | 'k' | 'y' => self.ignored.push(format!("-{c}")),
+            'C' => self.compress = true,
+            '1' | '2' | 'K' | 'k' | 'y' => self.ignored.push(format!("-{c}")),
             _ => return Err(format!("unknown option -{c}")),
         }
         self.passthrough.push(format!("-{c}"));

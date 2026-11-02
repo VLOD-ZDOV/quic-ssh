@@ -184,6 +184,12 @@ pub struct SessionOptions {
     pub stdin_null: bool,
     /// Keep a terminal session across lost connections, reconnecting with this.
     pub reconnect: Option<Reconnect>,
+    /// `-C`: the server packs output.
+    pub compress: bool,
+    /// The token of a session to go back to instead of starting one.
+    pub left_behind: Option<Vec<u8>>,
+    /// Where this session's token is kept (`RestoreSession`).
+    pub claim: Option<Arc<crate::client::restore::Claim>>,
     /// `ServerAliveInterval`/`ServerAliveCountMax` (persistent sessions default to 5 s × 3).
     pub server_alive: Option<(Duration, u32)>,
     /// Local echo prediction for a person typing into a terminal.
@@ -402,6 +408,13 @@ pub type Reconnect = Arc<dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, 
 /// count the connection as lost after 3 unanswered pings.
 const DEFAULT_ALIVE: (Duration, u32) = (Duration::from_secs(5), 3);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// Every reconnect starts compression afresh, and a clean start is what
+/// someone reading a secret off message sizes needs, which a person on the
+/// network can force by dropping packets: so many in this time end it.
+const MOST_RESTARTS: usize = 5;
+const RESTART_SPAN: Duration = Duration::from_secs(600);
+/// And so many over a session's life, however slowly.
+const MOST_RESTARTS_EVER: usize = 32;
 /// How long quitting waits for the server to confirm the hangup.
 const HANGUP_WAIT: Duration = Duration::from_secs(3);
 
@@ -440,6 +453,140 @@ async fn try_resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Resul
     }
 }
 
+/// Reports a reconnect that takes long: without this it looks like a hang.
+struct Waiting {
+    since: std::time::Instant,
+    told: Option<(String, std::time::Instant)>,
+}
+
+impl Waiting {
+    /// How long a reconnect may take before qsh says why it does.
+    const SAY_AFTER: Duration = Duration::from_secs(10);
+    const SAY_AGAIN: Duration = Duration::from_secs(60);
+
+    fn new() -> Waiting {
+        Waiting { since: std::time::Instant::now(), told: None }
+    }
+
+    /// What to show now that a try failed with `e`, if anything.
+    fn note(&mut self, e: &anyhow::Error, next: Duration) -> Option<String> {
+        let now = std::time::Instant::now();
+        // The reason may hold what a server or a network said.
+        let reason: String = format!("{e:#}").lines().next().unwrap_or_default().chars().filter(|c| !c.is_control()).collect();
+        let due = match &self.told {
+            None => now.duration_since(self.since) >= Self::SAY_AFTER,
+            Some((said, at)) => *said != reason || now.duration_since(*at) >= Self::SAY_AGAIN,
+        };
+        if !due {
+            return None;
+        }
+        let text = format!("[qsh: still reconnecting after {} s: {reason}; next try in {} s]", now.duration_since(self.since).as_secs(), next.as_secs());
+        self.told = Some((reason, now));
+        Some(text)
+    }
+}
+
+/// `-N`: nothing runs, but the forwards stay, across lost connections too if
+/// `reconnect` is given and the server keeps a token for that. Ends with
+/// `end`, or when the connection is lost for good.
+pub async fn hold(mut conn: Arc<Conn>, reconnect: Option<Reconnect>, forwarder: Arc<crate::client::forward::Forwarder>, alive: Option<(Duration, u32)>, end: impl std::future::Future<Output = ()>) -> Result<i32> {
+    tokio::pin!(end);
+    let mut started = None;
+    if let Some(reconnect) = reconnect {
+        match start_hold(&conn).await {
+            Ok((token, send, recv)) => started = Some((reconnect, token, send, recv)),
+            Err(e) => tracing::debug!("this -N will not survive a lost connection: {e:#}"),
+        }
+    }
+    let Some((reconnect, token, mut send, recv)) = started else {
+        tokio::select! {
+            () = conn.closed() => bail!("connection closed"),
+            () = &mut end => return Ok(0),
+        }
+    };
+    tracing::debug!("this -N survives a lost connection");
+    let mut incoming = Reader::<ServerMsg>::spawn(recv);
+    let (every, max) = alive.unwrap_or(DEFAULT_ALIVE);
+    loop {
+        let mut beat = tokio::time::interval(every);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut missed = 0;
+        loop {
+            tokio::select! {
+                () = conn.closed() => break,
+                msg = incoming.next() => if !matches!(&msg, Err(e) if e.is::<crate::proto::Malformed>()) && !matches!(msg, Ok(Some(_))) {
+                    break;
+                },
+                _ = beat.tick() => {
+                    let asked = async {
+                        let (mut s, mut r) = conn.open_bi().await?;
+                        write_msg(&mut s, &Request::Ping).await?;
+                        expect_ok(&mut r).await?;
+                        anyhow::Ok(())
+                    };
+                    missed = if matches!(tokio::time::timeout(every, asked).await, Ok(Ok(()))) { 0 } else { missed + 1 };
+                    if missed >= max {
+                        break;
+                    }
+                }
+                () = &mut end => {
+                    let _ = write_msg(&mut send, &ClientMsg::Hangup).await;
+                    let _ = tokio::time::timeout(HANGUP_WAIT, incoming.next()).await;
+                    return Ok(0);
+                }
+            }
+        }
+        eprintln!("qsh: connection lost, reconnecting...");
+        let old = conn.clone();
+        tokio::spawn(async move { old.close().await });
+        let mut delay = Duration::from_secs(1);
+        let mut waiting = Waiting::new();
+        let (new_conn, new_send, new_recv) = loop {
+            tokio::select! {
+                () = &mut end => return Ok(0),
+                res = resume(&reconnect, &token, 0) => match res {
+                    Ok(x) => break x,
+                    Err(ResumeError::Gone(e)) => {
+                        eprintln!("qsh: {e}");
+                        return Ok(255);
+                    }
+                    Err(ResumeError::Retry(e)) => {
+                        tracing::debug!("reconnect: {e:#}");
+                        if let Some(text) = waiting.note(&e, delay) {
+                            eprintln!("{text}");
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = &mut end => return Ok(0),
+                        }
+                        delay = (delay * 2).min(MAX_RETRY_DELAY);
+                    }
+                }
+            }
+        };
+        conn = new_conn;
+        send = new_send;
+        incoming = Reader::spawn(new_recv);
+        eprintln!("qsh: reconnected");
+        let gone = forwarder.reconnected(conn.clone());
+        if !gone.is_empty() {
+            eprintln!("qsh: these forwards ended with the old connection: {}", gone.join(", "));
+        }
+    }
+}
+
+async fn start_hold(conn: &Conn) -> Result<(Vec<u8>, SendHalf, RecvHalf)> {
+    if conn.server_version() < crate::proto::HOLD_AND_PACK {
+        bail!("the server's qshd is too old");
+    }
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_msg(&mut send, &Request::Hold).await?;
+    match expect_ok(&mut recv).await? {
+        Reply::Session { token } => Ok((token, send, recv)),
+        other => bail!("unexpected answer {other:?}"),
+    }
+}
+
 /// Runs a command, subsystem or login shell and returns the remote exit code.
 /// With `reconnect`, an interactive session survives lost connections.
 pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
@@ -458,6 +605,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let (send, mut recv) = conn.open_bi().await?;
     let mut send = send;
     let request = match (opts.subsystem.clone(), &pty) {
+        // `qsh` itself ended while the session went on (RestoreSession).
+        _ if opts.left_behind.is_some() => Request::Resume { token: opts.left_behind.clone().unwrap_or_default(), received: 0 },
         (Some(name), _) => Request::Subsystem { name, env: opts.env.clone() },
         (None, Some(spec)) if persistent => Request::Persistent { command: opts.command.clone(), env: opts.env.clone(), pty: spec.clone() },
         (None, _) => Request::Exec { command: opts.command.clone(), env: opts.env.clone(), pty: pty.clone() },
@@ -480,6 +629,18 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         Reply::Session { token } => Some(token),
         _ => None,
     };
+    let mut claim = opts.claim;
+    if let (Some(claim), Some(token)) = (&claim, &token) {
+        if let Err(e) = claim.save(token) {
+            tracing::warn!("cannot keep this session for later: {e:#}");
+        }
+    }
+    let mut compress = opts.compress && conn.server_version() >= crate::proto::HOLD_AND_PACK;
+    match (opts.compress, compress) {
+        (true, true) => tracing::debug!("output is compressed"),
+        (true, false) => tracing::debug!("the server's qshd is too old for compressed output"),
+        (false, _) => tracing::debug!("output is not compressed (Compression no)"),
+    }
     // The loop below waits for keys and timers too: read the server's messages
     // in a task, so a frame is never cut short by another event.
     let mut incoming = Reader::<ServerMsg>::spawn(recv);
@@ -495,6 +656,9 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let report_shown = pty.is_some();
     if report_shown {
         let _ = tx.send(ClientMsg::Shown(0)).await;
+    }
+    if compress {
+        let _ = tx.send(ClientMsg::Compress).await;
     }
     // Where messages go; replaced after a reconnect. Messages sent while there
     // is no working stream are dropped (typing during an outage is lost).
@@ -658,6 +822,15 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
+    // Two size changes make full-screen programs redraw what was lost.
+    async fn redraw(tx: &mpsc::Sender<ClientMsg>) {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            if rows > 1 {
+                let _ = tx.send(ClientMsg::Resize { cols, rows: rows - 1 }).await;
+            }
+            let _ = tx.send(ClientMsg::Resize { cols, rows }).await;
+        }
+    }
     // Ends a persistent session for good (not kept for a reconnect), and
     // waits for the server's exit report so the hangup is not lost when the
     // connection closes right after it.
@@ -709,7 +882,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             }
         }))
     }
+    let mut unpacker = None;
+    // When the connection was lost lately (see `MOST_RESTARTS`).
+    let mut restarts = std::collections::VecDeque::new();
+    let mut all_restarts = 0;
     let mut received: u64 = 0;
+    // What that output took on the way, packed or not.
+    let mut on_the_wire: u64 = 0;
     // Output shown on the current stream, and how much of it was reported.
     let (mut shown, mut reported) = (0u64, 0u64);
     let alive = opts.server_alive.or(token.is_some().then_some(DEFAULT_ALIVE));
@@ -740,6 +919,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             let _ = out.flush().await;
         }
     }
+    if opts.left_behind.is_some() {
+        let _ = stderr.write_all(b"[qsh: back in the session left running]\r\n").await;
+        redraw(&tx).await;
+    }
+    // A session left on purpose stays on the server, and stays claimed.
+    let mut left = false;
     let code = loop {
         let deadline = predictor.as_ref().and_then(Predictor::deadline);
         let lost = tokio::select! {
@@ -774,7 +959,22 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 // Unknown message type from a newer server: skip it.
                 Err(e) if e.is::<crate::proto::Malformed>() => continue,
                 Ok(Some(msg)) => {
+                    let msg = match msg {
+                        ServerMsg::StdoutPacked(d) => {
+                            let data = unpacker.get_or_insert(crate::proto::Unpacker::new()?).unpack(&d)?;
+                            tracing::trace!("output: {} bytes, packed to {}", data.len(), d.len());
+                            on_the_wire += d.len() as u64;
+                            ServerMsg::Stdout(data)
+                        }
+                        ServerMsg::Stdout(d) => {
+                            tracing::trace!("output: {} bytes", d.len());
+                            on_the_wire += d.len() as u64;
+                            ServerMsg::Stdout(d)
+                        }
+                        other => other,
+                    };
                     match msg {
+                        ServerMsg::StdoutPacked(_) => unreachable!("unpacked above"),
                         ServerMsg::Stdout(d) => {
                             received += d.len() as u64;
                             cursor_keys.lock().unwrap().feed(&d);
@@ -803,12 +1003,22 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     }
                     false
                 }
-                Ok(None) | Err(_) if token.is_some() => true,
+                Ok(None) if token.is_some() => {
+                    tracing::debug!("the session's stream ended");
+                    true
+                }
+                Err(e) if token.is_some() => {
+                    tracing::debug!("the session's stream failed: {e:#}");
+                    true
+                }
                 Ok(None) => bail!("connection closed without exit status"),
                 Err(e) => return Err(e),
             },
             code = &mut stop => {
-                if token.is_some() {
+                // A closed terminal is not a closed session if it can come back.
+                if claim.is_some() && token.is_some() {
+                    left = true;
+                } else if token.is_some() {
                     hang_up(&tx, &mut incoming).await;
                 }
                 break code;
@@ -832,7 +1042,11 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 // When a message last arrived (not when the loop got to it), or
                 // a ping was answered.
                 let heard = incoming.last_received().max(*answered.lock().unwrap());
-                !suspended.load(std::sync::atomic::Ordering::SeqCst) && heard.elapsed() >= alive_interval * alive_max
+                let silent = !suspended.load(std::sync::atomic::Ordering::SeqCst) && heard.elapsed() >= alive_interval * alive_max;
+                if silent {
+                    tracing::debug!("nothing heard from the server for {} s", heard.elapsed().as_secs());
+                }
+                silent
             }
         };
         if !lost {
@@ -849,6 +1063,8 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let old = conn.clone();
         tokio::spawn(async move { old.close().await });
         let mut delay = Duration::from_secs(1);
+        let mut waiting = Waiting::new();
+        tracing::debug!("reconnecting, at {received} bytes of output");
         let resumed = loop {
             tokio::select! {
                 () = disconnect.notified() => break None,
@@ -858,10 +1074,16 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                     Err(ResumeError::Gone(e)) => {
                         let _ = stderr.write_all(format!("[qsh: {e}]\r\n").as_bytes()).await;
                         drop(raw);
+                        if let Some(claim) = claim.take() {
+                            claim.forget();
+                        }
                         return Ok(255);
                     }
                     Err(ResumeError::Retry(e)) => {
                         tracing::debug!("reconnect: {e:#}");
+                        if let Some(text) = waiting.note(&e, delay) {
+                            let _ = stderr.write_all(format!("{text}\r\n").as_bytes()).await;
+                        }
                         tokio::select! {
                             () = tokio::time::sleep(delay) => {}
                             () = disconnect.notified() => break None,
@@ -873,8 +1095,10 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         };
         let Some((new_conn, new_send, new_recv)) = resumed else {
             let _ = stderr.write_all(b"\r\nConnection closed (the session is kept on the server for a while).\r\n").await;
+            left = true;
             break 255;
         };
+        tracing::debug!("back after {} ms over {}", waiting.since.elapsed().as_millis(), new_conn.transport_name());
         conn = new_conn;
         incoming = Reader::spawn(new_recv);
         if pings.take().is_some() {
@@ -886,6 +1110,17 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         if report_shown {
             let _ = tx.send(ClientMsg::Shown(0)).await;
         }
+        unpacker = None;
+        restarts.push_back(std::time::Instant::now());
+        restarts.retain(|at: &std::time::Instant| at.elapsed() < RESTART_SPAN);
+        all_restarts += 1;
+        if compress && (restarts.len() >= MOST_RESTARTS || all_restarts >= MOST_RESTARTS_EVER) {
+            compress = false;
+            let _ = stderr.write_all(b"[qsh: the connection keeps dropping: no more compression in this session]\r\n").await;
+        }
+        if compress {
+            let _ = tx.send(ClientMsg::Compress).await;
+        }
         let _ = stderr.write_all(b"[qsh: reconnected]\r\n").await;
         // Forwards added on the way were the old connection's.
         if let Some(f) = &opts.forwarder {
@@ -895,14 +1130,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
                 let _ = stderr.write_all(text.as_bytes()).await;
             }
         }
-        // Two size changes make full-screen programs redraw what was lost.
-        if let Ok((cols, rows)) = crossterm::terminal::size() {
-            if rows > 1 {
-                let _ = tx.send(ClientMsg::Resize { cols, rows: rows - 1 }).await;
-            }
-            let _ = tx.send(ClientMsg::Resize { cols, rows }).await;
-        }
+        redraw(&tx).await;
     };
+    tracing::debug!("session over: {received} bytes of terminal output or stdout, {on_the_wire} on the wire");
+    if let (Some(claim), false) = (claim.take(), left) {
+        claim.forget();
+    }
     clear(&mut predictor).await;
     drop(pings);
     drop(tx);
@@ -916,6 +1149,18 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_reconnect_is_told_about_once_per_reason() {
+        let mut waiting = Waiting::new();
+        let next = Duration::from_secs(4);
+        assert_eq!(waiting.note(&anyhow::anyhow!("no answer"), next), None);
+        waiting.since -= Waiting::SAY_AFTER;
+        let told = waiting.note(&anyhow::anyhow!("no\x1b[2Jr answer\nand more"), next).unwrap();
+        assert!(told.contains("no[2Jr answer; next try in 4 s"), "{told}");
+        assert_eq!(waiting.note(&anyhow::anyhow!("no\x1b[2Jr answer"), next), None);
+        assert!(waiting.note(&anyhow::anyhow!("refused"), next).is_some());
+    }
 
     #[test]
     fn escapes_only_at_line_start() {

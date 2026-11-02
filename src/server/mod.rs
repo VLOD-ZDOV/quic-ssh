@@ -275,25 +275,50 @@ fn banner(cfg: &ServerConfig) -> Option<String> {
 
 /// The host certificate from `host_certificate`, if it is valid for the host key.
 fn host_certificate(cfg: &ServerConfig, host: &Identity) -> Option<Vec<u8>> {
-    use ssh_key::certificate::CertType;
     let path = cfg.host_certificate.as_ref()?;
-    let loaded = std::fs::read_to_string(path)
-        .context("cannot read")
-        .and_then(|t| ssh_key::Certificate::from_openssh(t.trim()).context("cannot parse"));
-    let cert = match loaded {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("host certificate {}: {e:#}", path.display());
-            return None;
+    match load_host_certificate(path, host) {
+        Ok(cert) => {
+            info!("host certificate {:?} for {:?}", cert.key_id(), cert.valid_principals());
+            cert.to_bytes().ok()
         }
-    };
+        Err(e) => {
+            warn!("host certificate {}: {e:#}; not used", path.display());
+            None
+        }
+    }
+}
+
+/// The host certificate, if clients could accept it: one they would refuse
+/// is worse than none, as they would turn away from a host they know.
+fn load_host_certificate(path: &std::path::Path, host: &Identity) -> Result<ssh_key::Certificate> {
+    use ssh_key::certificate::CertType;
+    let text = std::fs::read_to_string(path).context("cannot read")?;
+    let cert = ssh_key::Certificate::from_openssh(text.trim()).context("cannot parse")?;
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(host.public().0));
     if cert.cert_type() != CertType::Host || cert.public_key() != &own {
-        warn!("host certificate {} is not a host certificate for this host key; not used", path.display());
-        return None;
+        anyhow::bail!("not a host certificate for this host key");
     }
-    info!("host certificate {:?} for {:?}", cert.key_id(), cert.valid_principals());
-    cert.to_bytes().ok()
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let ca = cert.signature_key().fingerprint(ssh_key::HashAlg::Sha256);
+    if cert.validate_at(now, [&ca]).is_err() {
+        anyhow::bail!("expired, not valid yet, or its signature does not verify");
+    }
+    Ok(cert)
+}
+
+/// What is set but cannot work here, for `qshd -t` and the log at startup.
+pub fn config_problems(cfg: &ServerConfig, host: Option<&Identity>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let (Some(path), Some(host)) = (&cfg.host_certificate, host) {
+        if let Err(e) = load_host_certificate(path, host) {
+            problems.push(format!("host_certificate {}: {e:#}; it will not be used", path.display()));
+        }
+    }
+    #[cfg(unix)]
+    if !nix::unistd::geteuid().is_root() && (cfg.chroot_directory.is_some() || cfg.matches.iter().any(|m| m.chroot_directory.is_some())) {
+        problems.push("chroot_directory needs qshd to run as root: sessions it applies to will fail".into());
+    }
+    problems
 }
 
 /// Binds the configured address on UDP and TCP. If the default dual-stack
@@ -792,33 +817,29 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         }
         Err(e) => return Err(e),
     };
-    // Once the code has run out, nothing new: not a session, a copy, a
-    // forward, a socket or a resumed session, any of which a shared
-    // connection could otherwise go on opening without a code. What is
-    // under way goes on, and so do pings (ServerAlive). `MayStart` is
-    // refused too: that is how a client learns it.
-    let starts = !matches!(request, Request::Ping);
-    if starts && code_expires.is_some_and(|t| tokio::time::Instant::now() >= t) {
+    // Pings (ServerAlive) and the forwards of what is already running: a
+    // port stays usable as long as the connection, and across a reconnect.
+    // The session they belong to may have them anyway, and what the login
+    // may do still limits them below.
+    let goes_on = matches!(
+        request,
+        Request::Ping
+            | Request::DirectTcp { .. }
+            | Request::DirectStreamLocal { .. }
+            | Request::RemoteForward { .. }
+            | Request::RemoteForwardStreamLocal { .. }
+            | Request::AgentForward
+    );
+    // Once the code has run out, nothing else new: not a session, a copy, a
+    // socket or a resumed session, any of which a shared connection could
+    // otherwise go on opening without a code. `MayStart` is refused too:
+    // that is how a client learns it.
+    if !goes_on && code_expires.is_some_and(|t| tokio::time::Instant::now() >= t) {
         return write_msg(&mut send, &Reply::Err("the one-time code of this connection has expired (totp_valid_for): connect again".into())).await;
     }
     if let Some(allowed) = resume_only {
-        // Pings and forwards go on: the session they belong to may have them
-        // anyway, and what the login may do still limits them below.
-        let goes_on = matches!(
-            request,
-            Request::Ping
-                | Request::DirectTcp { .. }
-                | Request::DirectStreamLocal { .. }
-                | Request::RemoteForward { .. }
-                | Request::RemoteForwardStreamLocal { .. }
-                | Request::AgentForward
-        );
         if !goes_on && !matches!(&request, Request::Resume { token, .. } if token == allowed) {
             return write_msg(&mut send, &Reply::Err("this connection may only resume its session".into())).await;
-        }
-        // The token stands in for the code, not for longer than the code lasts.
-        if goes_on && !matches!(request, Request::Ping) && state.sessions.code_expired(allowed) {
-            return write_msg(&mut send, &Reply::Err("the one-time code of this session has expired (totp_valid_for): connect again".into())).await;
         }
     }
     // Compression only wraps file transfers.
@@ -890,7 +911,6 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             pty: pty.filter(|_| !limits.no_pty),
             remote: Some(conn.remote_addr().ip().to_canonical()),
             agent: None,
-            code_expires: None,
         }
     };
     let files_denied = || Reply::Err("file transfer is not allowed for this key (forced command)".into());
@@ -908,10 +928,10 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
                 return exec::run(send, recv, user, spec, closed).await;
             }
             spec.agent = agent.relay();
-            spec.code_expires = code_expires;
             state.sessions.start(send, recv, user, limits, spec, closed).await
         }
         Request::Resume { token, received } => state.sessions.resume(send, recv, user, limits, &token, received, closed).await,
+        Request::Hold => state.sessions.hold(send, recv, user, limits, closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
         Request::Subsystem { name, env } => match subsystem_command(cfg, user, &name) {
             Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None, true), closed).await,

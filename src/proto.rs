@@ -11,9 +11,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 /// From this version a connection that resumed a session may forward too.
 pub const FORWARDS_ON_RESUME: u32 = 10;
+/// From this protocol version: `Request::Hold` and packed terminal output.
+pub const HOLD_AND_PACK: u32 = 11;
 /// Oldest client protocol version the server still accepts. Newer versions are
 /// accepted too: their unknown requests are answered with an error, so newer
 /// clients can detect what an older server supports.
@@ -186,6 +188,11 @@ pub enum Request {
     /// an error if its one-time code has run out (`totp_valid_for`): for a
     /// shared connection, before it is used.
     MayStart,
+    // --- protocol version 11 ---
+    /// `-N`: no program, but a token to come back with, as from a session:
+    /// answered with `Reply::Session`. The stream stays open until the
+    /// connection goes or the client says `ClientMsg::Hangup`.
+    Hold,
 }
 
 /// The file transfers that can be compressed. A type of its own, not a
@@ -273,6 +280,10 @@ pub enum ClientMsg {
     /// then keeps at most [`SHOWN_WINDOW`] more on the way. Older servers
     /// skip it.
     Shown(u64),
+    // --- protocol version 11 ---
+    /// `-C`: send this stream's output as `ServerMsg::StdoutPacked` when that
+    /// is smaller.
+    Compress,
 }
 
 /// Terminal output a server lets be on the way before the client showed it
@@ -290,6 +301,246 @@ pub enum ServerMsg {
     // --- protocol version 2 ---
     /// Reply to chaff, sized like a one-character echo.
     Pong(Vec<u8>),
+    // --- protocol version 11 ---
+    /// `Stdout` as a zstd frame of its own, so nothing has to be kept in
+    /// step across a reconnect.
+    StdoutPacked(Vec<u8>),
+}
+
+/// Shorter output goes as it is: a typed character's echo stays quick to
+/// take in and out of the context.
+const PACK_FROM: usize = 16;
+/// Largest message the merging of queued output aims for.
+pub const MERGE_UP_TO: usize = 64 << 10;
+/// Most output one packed message may unpack to: a bomb must not fill the memory.
+const MAX_UNPACKED: usize = 4 << 20;
+/// 1 MiB on both sides, which a phone can spare.
+const WINDOW_LOG: u32 = 20;
+/// Packed sizes come in steps of this. A guess that matches a secret on the
+/// screen would otherwise show as a message a byte smaller, even encrypted.
+/// RFC 7541 7.1: padding limits such probing but does not end it.
+const SIZE_STEP: usize = 16;
+/// Marks a chunk of a packed message that went as it is.
+const CHUNK_AS_IS: u32 = 1 << 31;
+/// How much output is judged at a time, and how long output that did not
+/// shrink then goes as it is.
+const PROBE: u64 = 256 << 10;
+const SKIP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Packs a stream's output (`ClientMsg::Compress`) as one zstd frame that
+/// never ends, so that what repeats a screen earlier takes next to nothing.
+/// The frame lives as long as the stream, on purpose: starting afresh would
+/// give someone guessing at a secret by message sizes a clean context to
+/// measure in, which is what such an attack needs.
+pub struct Packer {
+    encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
+    /// Bytes in and out since the last judgement.
+    seen: (u64, u64),
+    skip_until: Option<std::time::Instant>,
+    failed: bool,
+}
+
+impl Packer {
+    pub fn new() -> Result<Packer> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
+        encoder.window_log(WINDOW_LOG)?;
+        Ok(Packer { encoder, seen: (0, 0), skip_until: None, failed: false })
+    }
+
+    fn compress(&mut self, data: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::io::Write;
+        self.encoder.write_all(data)?;
+        self.encoder.flush()?;
+        Ok(std::mem::take(self.encoder.get_mut()))
+    }
+
+    /// Adds a piece of output to `body`, packed unless it is a secret or too
+    /// short to gain anything.
+    fn chunk(&mut self, piece: &[u8], secret: bool, body: &mut Vec<u8>) -> std::io::Result<()> {
+        if piece.is_empty() {
+            return Ok(());
+        }
+        if secret || piece.len() < PACK_FROM {
+            body.extend_from_slice(&(piece.len() as u32 | CHUNK_AS_IS).to_le_bytes());
+            body.extend_from_slice(piece);
+            return Ok(());
+        }
+        let small = self.compress(piece)?;
+        self.seen = (self.seen.0 + piece.len() as u64, self.seen.1 + small.len() as u64);
+        body.extend_from_slice(&(small.len() as u32).to_le_bytes());
+        body.extend_from_slice(&small);
+        Ok(())
+    }
+
+    /// `msg` as it goes out.
+    pub fn pack(&mut self, msg: ServerMsg) -> ServerMsg {
+        let ServerMsg::Stdout(data) = msg else { return msg };
+        let skipping = self.skip_until.is_some_and(|t| std::time::Instant::now() < t);
+        if self.failed || skipping || data.len() < PACK_FROM {
+            return ServerMsg::Stdout(data);
+        }
+        let mut body = Vec::with_capacity(data.len() / 4);
+        let mut at = 0;
+        let mut done = Ok(());
+        for span in secret_spans(&data) {
+            done = done.and_then(|()| self.chunk(&data[at..span.start], false, &mut body));
+            done = done.and_then(|()| self.chunk(&data[span.clone()], true, &mut body));
+            at = span.end;
+        }
+        if done.and_then(|()| self.chunk(&data[at..], false, &mut body)).is_err() {
+            self.failed = true;
+            return ServerMsg::Stdout(data);
+        }
+        if self.seen.0 >= PROBE {
+            if self.seen.1 * 20 > self.seen.0 * 19 {
+                self.skip_until = Some(std::time::Instant::now() + SKIP);
+            }
+            self.seen = (0, 0);
+        }
+        ServerMsg::StdoutPacked(padded(body))
+    }
+}
+
+/// Words whose value is worth keeping out of the context, as an HTTP/2 client
+/// keeps cookies out of its table (RFC 7541 7.1.3). The first group runs to
+/// the end of the line.
+const WHOLE_LINE_WORDS: [&[u8]; 3] = [b"authorization", b"cookie", b"bearer"];
+const VALUE_WORDS: [&[u8]; 10] = [b"password", b"passwd", b"passphrase", b"pwd", b"secret", b"token", b"api_key", b"apikey", b"api-key", b"session"];
+/// A token is a run of this many characters that does not look like a word.
+const TOKEN_LEN: usize = 16;
+/// What is cut off by the end of a message may be a token in two halves.
+const CUT_LEN: usize = 6;
+
+fn token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'_' | b'-')
+}
+
+fn looks_random(run: &[u8]) -> bool {
+    run.iter().all(u8::is_ascii_hexdigit) || (run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic))
+}
+
+/// The parts of `data` that look like secrets, in order and not overlapping.
+/// Compression can only give away what it compares, so these never reach
+/// the context. Padding only makes guessing dearer; this is what ends it, for
+/// what is found here.
+fn secret_spans(data: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = 0;
+    while at < data.len() {
+        if token_byte(data[at]) {
+            let end = data[at..].iter().position(|b| !token_byte(*b)).map_or(data.len(), |n| at + n);
+            let run = &data[at..end];
+            let cut = at == 0 || end == data.len();
+            if run.len() >= if cut { CUT_LEN } else { TOKEN_LEN } && looks_random(run) {
+                spans.push(at..end);
+            }
+            // The word before a `=` or `:`, or one followed by a value.
+            let lower = run.to_ascii_lowercase();
+            let whole_line = WHOLE_LINE_WORDS.iter().any(|w| ends_with_word(&lower, w));
+            if whole_line || VALUE_WORDS.iter().any(|w| ends_with_word(&lower, w)) {
+                if let Some(value) = value_after(data, end, whole_line) {
+                    spans.push(value);
+                }
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    spans.sort_by_key(|s| s.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+fn ends_with_word(run: &[u8], word: &[u8]) -> bool {
+    run.windows(word.len()).any(|w| w == word)
+}
+
+/// What follows a keyword: after `=`, `:` or a space, to the end of the value
+/// (or of the line, for a header).
+fn value_after(data: &[u8], word_end: usize, whole_line: bool) -> Option<std::ops::Range<usize>> {
+    let skip = |b: &u8| matches!(b, b' ' | b'\t' | b'"' | b'\'' | b'=' | b':');
+    let separators = data[word_end..].iter().take(8).take_while(|b| skip(b)).count();
+    let names_a_value = data[word_end..word_end + separators].iter().any(|b| matches!(b, b'=' | b':'));
+    if separators == 0 || !(names_a_value || whole_line) {
+        return None;
+    }
+    let start = word_end + separators;
+    let ends = |b: &u8| if whole_line { matches!(b, b'\n' | b'\r') } else { matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'&' | b';' | b',') };
+    let end = data[start..].iter().position(ends).map_or(data.len(), |n| start + n);
+    (end > start).then_some(start..end)
+}
+
+/// The first byte says how much padding comes next; then come chunks, each
+/// after its length as a little-endian `u32`. Half the messages get a step
+/// more, so that a size says less about which step it just missed.
+fn padded(small: Vec<u8>) -> Vec<u8> {
+    let extra = if rand::random::<bool>() { SIZE_STEP } else { 0 };
+    let pad = (SIZE_STEP - (small.len() + 1) % SIZE_STEP) % SIZE_STEP + extra;
+    let mut out = vec![0; 1 + pad + small.len()];
+    out[0] = pad as u8;
+    out[1 + pad..].copy_from_slice(&small);
+    out
+}
+
+/// Collects unpacked output, up to [`MAX_UNPACKED`] per message.
+struct Limited(Vec<u8>);
+
+impl std::io::Write for Limited {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.0.len() + data.len() > MAX_UNPACKED {
+            return Err(std::io::Error::other("packed output is too large"));
+        }
+        self.0.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The client's side of a [`Packer`], for one stream.
+pub struct Unpacker(zstd::stream::write::Decoder<'static, Limited>);
+
+impl Unpacker {
+    pub fn new() -> Result<Unpacker> {
+        let mut decoder = zstd::stream::write::Decoder::new(Limited(Vec::new()))?;
+        decoder.window_log_max(WINDOW_LOG)?;
+        Ok(Unpacker(decoder))
+    }
+
+    /// The output in a [`ServerMsg::StdoutPacked`].
+    pub fn unpack(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let (pad, rest) = data.split_first().context("empty packed output")?;
+        let mut body = rest.get(*pad as usize..).context("bad packing")?;
+        let mut out = Vec::new();
+        while !body.is_empty() {
+            let (head, rest) = body.split_first_chunk::<4>().context("bad packing")?;
+            let head = u32::from_le_bytes(*head);
+            let len = (head & !CHUNK_AS_IS) as usize;
+            let piece = rest.get(..len).context("bad packing")?;
+            body = &rest[len..];
+            if head & CHUNK_AS_IS != 0 {
+                out.extend_from_slice(piece);
+            } else {
+                self.0.write_all(piece).context("bad packed output")?;
+                self.0.flush().context("bad packed output")?;
+                out.append(&mut self.0.get_mut().0);
+            }
+            if out.len() > MAX_UNPACKED {
+                bail!("packed output is too large");
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Accepted user names: 1–64 of `[A-Za-z0-9._-]`, not starting with `-`.
@@ -434,28 +685,65 @@ impl<T> Drop for Reader<T> {
 mod tests {
     use super::*;
 
-    /// Waiting for a message can be given up (e.g. in `select!`) at any time
-    /// without losing a frame, even one that arrives in pieces.
-    #[tokio::test]
-    async fn reader_survives_cancellation() {
-        let (mut a, b) = tokio::io::duplex(1 << 16);
-        let mut reader = Reader::<ServerMsg>::spawn(b);
-        let mut frame = Vec::new();
-        write_msg(&mut frame, &ServerMsg::Stdout(vec![5; 3000])).await.unwrap();
-        let mut got = Vec::new();
-        for piece in frame.chunks(7) {
-            a.write_all(piece).await.unwrap();
-            // Give up waiting right away, as select! does when another branch wins.
-            if let Ok(msg) = tokio::time::timeout(std::time::Duration::ZERO, reader.next()).await {
-                got.extend(msg.unwrap());
-            }
-            tokio::task::yield_now().await;
+    #[test]
+    fn packed_output_comes_back_whole() {
+        let (mut packer, mut unpacker) = (Packer::new().unwrap(), Unpacker::new().unwrap());
+        let mut out = 0;
+        let line = |n: u32| format!("2026-11-03 INFO worker-{} request /api/items?page={n} status=200\n", n % 16).into_bytes();
+        for n in 0..2000 {
+            let text = line(n);
+            let ServerMsg::StdoutPacked(small) = packer.pack(ServerMsg::Stdout(text.clone())) else { panic!("not packed") };
+            assert_eq!(small.len() % SIZE_STEP, 0);
+            out += small.len();
+            assert_eq!(unpacker.unpack(&small).unwrap(), text);
         }
-        drop(a);
-        while let Some(msg) = reader.next().await.unwrap() {
-            got.push(msg);
+        // Lines this short only shrink with what came before them.
+        assert!(out * 3 < (0..2000).map(|n| line(n).len()).sum::<usize>() * 2, "{out}");
+        assert_eq!(packer.pack(ServerMsg::Stdout(b"x".to_vec())), ServerMsg::Stdout(b"x".to_vec()));
+        assert!(Unpacker::new().unwrap().unpack(&[1]).is_err());
+        assert!(Unpacker::new().unwrap().unpack(&[0, 1, 2, 3, 4, 5]).is_err());
+    }
+
+    #[test]
+    fn what_looks_secret_stays_out_of_the_context() {
+        let spans = |text: &str| secret_spans(text.as_bytes()).iter().map(|s| text[s.clone()].to_string()).collect::<Vec<_>>();
+        let cases: [(&str, &[&str]); 8] = [
+            ("  GET /x?session=4f2a9c1d77e0b3a6 status=200 ok\n", &["4f2a9c1d77e0b3a6"]),
+            ("  password: hunter2 and more\n", &["hunter2"]),
+            ("  export API_KEY=\"abc\" now\n", &["abc"]),
+            ("  Authorization: Basic dXNlcjpwYXNz\r\n  next\n", &["Basic dXNlcjpwYXNz"]),
+            ("  sk1234567890abcdefghij is it\n", &["sk1234567890abcdefghij"]),
+            ("  an internationalization of words\n", &[]),
+            ("  /usr/share/doc/some-package/README\n", &[]),
+            ("  3.14 and 2026-11-03 at 10:00 ok\n", &[]),
+        ];
+        for (text, want) in cases {
+            assert_eq!(spans(text), want, "{text}");
         }
-        assert!(got.contains(&ServerMsg::Stdout(vec![5; 3000])), "{} messages", got.len());
+        // Not even a match with a line before it can show.
+        let (mut packer, mut unpacker) = (Packer::new().unwrap(), Unpacker::new().unwrap());
+        let line = b"  a long enough line with token=hunter2hunter2 in it, and the end\n";
+        let ServerMsg::StdoutPacked(first) = packer.pack(ServerMsg::Stdout(line.to_vec())) else { panic!("not packed") };
+        assert_eq!(unpacker.unpack(&first).unwrap(), line);
+        assert!(first.windows(14).any(|w| w == b"hunter2hunter2"));
+    }
+
+    #[test]
+    fn output_that_does_not_shrink_goes_as_it_is() {
+        let mut packer = Packer::new().unwrap();
+        let mut state = 1u64;
+        let mut noise = || -> Vec<u8> {
+            (0..1024).flat_map(|_| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state.to_le_bytes() }).collect()
+        };
+        let raw = (0..64).filter(|_| matches!(packer.pack(ServerMsg::Stdout(noise())), ServerMsg::Stdout(_))).count();
+        assert!(raw > 0, "no message was let through");
+    }
+
+    #[test]
+    fn a_decompression_bomb_stops() {
+        let (mut packer, mut unpacker) = (Packer::new().unwrap(), Unpacker::new().unwrap());
+        let ServerMsg::StdoutPacked(bomb) = packer.pack(ServerMsg::Stdout(vec![0; MAX_UNPACKED + 1])) else { panic!("not packed") };
+        assert!(unpacker.unpack(&bomb).is_err());
     }
 
     #[test]

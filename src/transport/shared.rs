@@ -67,8 +67,17 @@ pub enum MuxReply {
 /// Client side: a connection whose streams go through a master.
 pub struct SharedConn {
     path: PathBuf,
+    /// Where this master is after `-O stop`.
+    stopped: PathBuf,
     alive: watch::Receiver<bool>,
     transport: &'static str,
+}
+
+/// Where a master's socket goes on `-O stop`: a new master can take the
+/// name, while the clients attached to this one, which open every stream
+/// through the socket, still reach it. As short as the name [`bind`] starts with.
+fn stopped_path(path: &Path, pid: u32) -> PathBuf {
+    path.with_extension(format!("{pid:08x}"))
 }
 
 /// Connects to a master's socket, and makes sure it belongs to this user:
@@ -85,7 +94,11 @@ async fn connect(path: &Path) -> Result<UnixStream> {
 
 impl SharedConn {
     pub async fn open_bi(&self) -> Result<(SendHalf, RecvHalf)> {
-        let mut sock = connect(&self.path).await.context("connection master is gone")?;
+        // Not the name first: it may be another master's by now.
+        let mut sock = match connect(&self.stopped).await {
+            Ok(sock) => sock,
+            Err(_) => connect(&self.path).await.context("connection master is gone")?,
+        };
         write_msg(&mut sock, &MuxRequest::Open).await?;
         // The master may wait for a free stream, as a connection of our own
         // would; only a master that is stuck (stopped with ^Z) takes this long.
@@ -147,7 +160,7 @@ async fn try_attach(path: &Path) -> Result<Conn> {
     };
     debug!("sharing the connection of qsh process {pid} to {remote} ({transport})");
     Ok(Conn {
-        inner: Inner::Shared(SharedConn { path: path.to_path_buf(), alive, transport }),
+        inner: Inner::Shared(SharedConn { path: path.to_path_buf(), stopped: stopped_path(path, pid), alive, transport }),
         peer_key: PublicKey(peer_key),
         exporter: [0; 32],
         remote,
@@ -234,13 +247,30 @@ struct SocketFile {
 }
 
 impl SocketFile {
-    fn remove(&self) {
+    fn ours(&self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.ino() == self.ino)
+    }
+
+    fn stopped_path(&self) -> PathBuf {
+        stopped_path(&self.path, std::process::id())
+    }
+
+    /// Frees the name, and goes on listening under [`stopped_path`].
+    fn step_aside(&self) {
+        if !self.removed.load(Ordering::SeqCst) && self.ours(&self.path) {
+            let _ = std::fs::rename(&self.path, self.stopped_path());
+        }
+    }
+
+    fn remove(&self) {
         if self.removed.swap(true, Ordering::SeqCst) {
             return;
         }
-        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.ino) {
-            let _ = std::fs::remove_file(&self.path);
+        for path in [self.path.clone(), self.stopped_path()] {
+            if self.ours(&path) {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -302,6 +332,16 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile)> {
     let _ = std::fs::remove_file(&tmp);
     result?;
     Ok((listener, SocketFile { path: path.to_path_buf(), ino: ino?, removed: Default::default() }))
+}
+
+/// Whether a socket can be made next to `path`: a socket path that is too
+/// long, a directory that cannot be written.
+pub fn can_listen(path: &Path) -> Result<()> {
+    let tmp = path.with_extension(format!("{:08x}", rand::random::<u32>()));
+    let listener = std::os::unix::net::UnixListener::bind(&tmp).with_context(|| format!("cannot listen on {}", tmp.display()))?;
+    drop(listener);
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
 }
 
 /// Gives the socket at `tmp` its real name. To be called with the lock held.
@@ -570,7 +610,7 @@ async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>
         }
         MuxRequest::Stop => {
             write_msg(&mut sock, &MuxReply::Ok).await?;
-            shared.file.remove();
+            shared.file.step_aside();
             shared.stopped.store(true, Ordering::SeqCst);
             shared.changed.notify_waiters();
         }

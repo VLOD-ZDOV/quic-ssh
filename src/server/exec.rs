@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::users::{Prelude, User};
-use crate::proto::{read_msg_opt, write_msg, ClientMsg, PtySpec, Reply, ServerMsg, SHOWN_WINDOW};
+use crate::proto::{read_msg_opt, write_msg, ClientMsg, Packer, PtySpec, Reply, ServerMsg, MERGE_UP_TO, SHOWN_WINDOW};
 use crate::transport::{RecvHalf, SendHalf};
 
 /// How long to keep draining output after the process exited (background
@@ -40,8 +40,6 @@ pub struct Session {
     pub sftp: Option<Vec<String>>,
     /// The forwarded agent's socket, which a persistent session keeps.
     pub agent: Option<Arc<super::agent::Relay>>,
-    /// When the one-time code of the login that started it runs out.
-    pub code_expires: Option<tokio::time::Instant>,
 }
 
 impl Session {
@@ -313,6 +311,49 @@ pub(super) async fn read_ready<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) 
 }
 
 /// Forwards a child output stream as `ServerMsg`s until EOF.
+/// A stream's output on its way out, packed once the client asks for that.
+#[derive(Default)]
+pub(super) struct Outgoing {
+    pub asked: Arc<AtomicBool>,
+    packer: Option<Packer>,
+    /// Taken from the queue while merging, and next in line.
+    held: Option<ServerMsg>,
+}
+
+impl Outgoing {
+    /// The next message. When packing, output waiting in the queue goes
+    /// along: a link that cannot keep up gets fewer, larger messages.
+    pub async fn next(&mut self, rx: &mut mpsc::Receiver<ServerMsg>) -> Option<ServerMsg> {
+        let mut msg = match self.held.take() {
+            Some(msg) => msg,
+            None => rx.recv().await?,
+        };
+        if self.packer.is_none() && self.asked.swap(false, Ordering::Relaxed) {
+            self.packer = Packer::new().map_err(|e| tracing::warn!("cannot compress output: {e:#}")).ok();
+        }
+        if let (ServerMsg::Stdout(data), true) = (&mut msg, self.packer.is_some()) {
+            while data.len() < MERGE_UP_TO {
+                match rx.try_recv() {
+                    Ok(ServerMsg::Stdout(more)) => data.extend(more),
+                    Ok(other) => {
+                        self.held = Some(other);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        Some(msg)
+    }
+
+    pub fn prepare(&mut self, msg: ServerMsg) -> ServerMsg {
+        match &mut self.packer {
+            Some(packer) => packer.pack(msg),
+            None => msg,
+        }
+    }
+}
+
 async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap: fn(Vec<u8>) -> ServerMsg) {
     let mut buf = vec![0u8; 32 * 1024];
     loop {
@@ -371,7 +412,7 @@ enum Input {
 /// of input is `StdinEof`), so an end, clean or not, means the client is
 /// gone. A clean one is how a client that was killed looks through a shared
 /// connection (its master just passes the closed socket on).
-async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>, pacing: Arc<Pacing>) {
+async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, tx: mpsc::Sender<ServerMsg>, pacing: Arc<Pacing>, asked: Arc<AtomicBool>) {
     loop {
         let msg = match read_msg_opt::<_, ClientMsg>(&mut recv).await {
             Ok(Some(msg)) => msg,
@@ -394,6 +435,10 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
             ClientMsg::Typed { data, .. } => ClientMsg::Stdin(data),
             ClientMsg::Shown(n) => {
                 pacing.shown(n);
+                continue;
+            }
+            ClientMsg::Compress => {
+                asked.store(true, Ordering::Relaxed);
                 continue;
             }
             other => other,
@@ -424,7 +469,7 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
             #[cfg(unix)]
             (ClientMsg::StdinEof, Input::Pty(..)) => {}
             (ClientMsg::Resize { .. }, Input::Pipe(_)) => {}
-            (ClientMsg::Typed { .. } | ClientMsg::Shown(_), _) => unreachable!("handled above"),
+            (ClientMsg::Typed { .. } | ClientMsg::Shown(_) | ClientMsg::Compress, _) => unreachable!("handled above"),
             // Only persistent sessions outlive the stream; this one ends with it anyway.
             (ClientMsg::Hangup, _) => {}
         }
@@ -444,6 +489,8 @@ async fn supervise(
 
     let mut readers = Vec::new();
     let pacing = Arc::new(Pacing::default());
+    let mut outgoing = Outgoing::default();
+    let asked = outgoing.asked.clone();
     #[cfg(unix)]
     let terminal = matches!(io, Io::Pty(_));
     #[cfg(windows)]
@@ -452,14 +499,14 @@ async fn supervise(
         Io::Pipes { stdin, stdout, stderr } => {
             readers.push(tokio::spawn(pump(stdout, tx.clone(), ServerMsg::Stdout)));
             readers.push(tokio::spawn(pump(stderr, tx.clone(), ServerMsg::Stderr)));
-            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone(), pacing.clone()))
+            tokio::spawn(feed(recv, Input::Pipe(Some(stdin)), gone_tx, tx.clone(), pacing.clone(), asked))
         }
         #[cfg(unix)]
         Io::Pty(pty) => {
             let input = PtyInput::new(&pty)?;
             let (r, w) = pty.into_split();
             readers.push(tokio::spawn(pump(r, tx.clone(), ServerMsg::Stdout)));
-            tokio::spawn(feed(recv, Input::Pty(w, input), gone_tx, tx.clone(), pacing.clone()))
+            tokio::spawn(feed(recv, Input::Pty(w, input), gone_tx, tx.clone(), pacing.clone(), asked))
         }
     };
 
@@ -467,13 +514,13 @@ async fn supervise(
     let writer = tokio::spawn(async move {
         let pacing = writer_pacing;
         let mut sent = 0u64;
-        while let Some(msg) = rx.recv().await {
+        while let Some(msg) = outgoing.next(&mut rx).await {
             if let (ServerMsg::Stdout(data), true) = (&msg, terminal) {
                 sent += data.len() as u64;
                 pacing.wait(sent).await;
             }
             let last = matches!(msg, ServerMsg::Exit { .. });
-            if write_msg(&mut send, &msg).await.is_err() {
+            if write_msg(&mut send, &outgoing.prepare(msg)).await.is_err() {
                 return;
             }
             if last {
@@ -716,6 +763,8 @@ mod windows {
             }
         });
         let (gone_tx, mut gone_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut outgoing = super::Outgoing::default();
+        let asked = outgoing.asked.clone();
         let feeder = tokio::spawn(async move {
             loop {
                 match read_msg_opt::<_, ClientMsg>(&mut recv).await {
@@ -723,6 +772,7 @@ mod windows {
                         let _ = input.write_all(&data).await;
                     }
                     Ok(Some(ClientMsg::Resize { cols, rows })) => resizer.resize(rows, cols),
+                    Ok(Some(ClientMsg::Compress)) => asked.store(true, Ordering::Relaxed),
                     Ok(Some(_)) => {}
                     Err(e) if e.is::<crate::proto::Malformed>() => {}
                     Ok(None) | Err(_) => {
@@ -733,9 +783,9 @@ mod windows {
             }
         });
         let writer_task = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
+            while let Some(msg) = outgoing.next(&mut rx).await {
                 let last = matches!(msg, ServerMsg::Exit { .. });
-                if write_msg(&mut send, &msg).await.is_err() || last {
+                if write_msg(&mut send, &outgoing.prepare(msg)).await.is_err() || last {
                     break;
                 }
             }

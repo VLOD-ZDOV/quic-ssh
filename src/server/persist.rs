@@ -78,12 +78,20 @@ enum Input {
     Resize { cols: u16, rows: u16 },
 }
 
+/// What `-N` comes back to: a token and nothing else, no program to keep.
+struct Hold {
+    uid: u32,
+    restrictions: Restrictions,
+    /// Bumped on every attach, so an older attachment knows it was replaced.
+    generation: u64,
+    /// Since when nobody is attached.
+    left_at: Option<Instant>,
+}
+
 struct Detachable {
     uid: u32,
     /// Stays while the session does (see [`super::agent::Relay`]).
     agent: Option<Arc<super::agent::Relay>>,
-    /// Forwards on a resumed connection stop here, as on the first one.
-    code_expires: Option<tokio::time::Instant>,
     /// What the key that started the session was allowed; resuming needs the same.
     restrictions: Restrictions,
     input: mpsc::UnboundedSender<Input>,
@@ -134,6 +142,7 @@ pub struct Sessions {
 #[derive(Default)]
 struct Map {
     sessions: HashMap<Token, Arc<Detachable>>,
+    holds: HashMap<Token, Hold>,
     /// Sessions per uid, counted from the moment one is about to start.
     per_user: HashMap<u32, usize>,
     total: usize,
@@ -178,18 +187,77 @@ impl Sessions {
         self.map.lock().unwrap().sessions.get(&token)?.agent.clone()
     }
 
-    /// Whether the one-time code of a session's first login has run out.
-    pub fn code_expired(&self, token: &[u8]) -> bool {
-        let Ok(token) = Token::try_from(token) else { return true };
-        let map = self.map.lock().unwrap();
-        map.sessions.get(&token).is_none_or(|s| s.code_expires.is_some_and(|t| tokio::time::Instant::now() >= t))
+    pub fn owns(&self, token: &[u8], uid: u32) -> bool {
+        let Ok(token) = Token::try_from(token) else { return false };
+        let mut map = self.map.lock().unwrap();
+        self.drop_old_holds(&mut map);
+        map.sessions.get(&token).map(|s| s.uid).or(map.holds.get(&token).map(|h| h.uid)) == Some(uid)
     }
 
-    pub fn owns(&self, token: &[u8], uid: u32) -> bool {
-        Token::try_from(token)
-            .ok()
-            .and_then(|t| self.map.lock().unwrap().sessions.get(&t).map(|s| s.uid == uid))
-            .unwrap_or(false)
+    fn drop_old_holds(&self, map: &mut Map) {
+        map.holds.retain(|_, h| h.left_at.is_none_or(|at| at.elapsed() < self.timeout));
+    }
+
+    /// Starts a hold (`-N`) and attaches to it.
+    pub async fn hold(&self, mut send: SendHalf, recv: RecvHalf, user: &User, restrictions: &Restrictions, closed: watch::Receiver<bool>) -> Result<()> {
+        if !self.enabled() {
+            return write_msg(&mut send, &Reply::Err("sessions are turned off here (session_timeout)".into())).await;
+        }
+        let mut token = Token::default();
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+        let room = {
+            let mut map = self.map.lock().unwrap();
+            self.drop_old_holds(&mut map);
+            let mine = || map.holds.iter().filter(|(_, h)| h.uid == user.uid);
+            let full = mine().count() >= MAX_PER_USER || map.holds.len() >= MAX_TOTAL;
+            // At the limit, the one left the longest goes (see `reserve`).
+            let oldest = mine().filter_map(|(t, h)| h.left_at.map(|at| (at, *t))).min_by_key(|(at, _)| *at);
+            if let (true, Some((_, old))) = (full, oldest) {
+                map.holds.remove(&old);
+            }
+            let room = !full || oldest.is_some();
+            if room {
+                map.holds.insert(token, Hold { uid: user.uid, restrictions: restrictions.clone(), generation: 0, left_at: None });
+            }
+            room
+        };
+        if !room {
+            return write_msg(&mut send, &Reply::Err(format!("too many sessions (at most {MAX_PER_USER} per user)"))).await;
+        }
+        self.held(send, recv, token, 0, closed).await
+    }
+
+    /// Serves a hold's stream until the client goes.
+    async fn held(&self, mut send: SendHalf, recv: RecvHalf, token: Token, generation: u64, mut closed: watch::Receiver<bool>) -> Result<()> {
+        let mut incoming = Reader::<ClientMsg>::spawn(recv);
+        let answered = write_msg(&mut send, &Reply::Session { token: token.to_vec() }).await;
+        let hung_up = answered.is_ok()
+            && loop {
+                tokio::select! {
+                    msg = incoming.next() => match msg {
+                        Ok(Some(ClientMsg::Hangup)) => break true,
+                        Ok(Some(_)) => {}
+                        Err(e) if e.is::<crate::proto::Malformed>() => {}
+                        Ok(None) | Err(_) => break false,
+                    },
+                    _ = async { closed.wait_for(|c| *c).await.is_ok() } => break false,
+                }
+            };
+        let mut map = self.map.lock().unwrap();
+        if map.holds.get(&token).is_some_and(|h| h.generation == generation) {
+            match hung_up {
+                true => {
+                    map.holds.remove(&token);
+                }
+                false => {
+                    if let Some(h) = map.holds.get_mut(&token) {
+                        h.left_at = Some(Instant::now());
+                    }
+                }
+            }
+        }
+        drop(map);
+        answered
     }
 
     fn remove(&self, token: &Token) {
@@ -264,7 +332,6 @@ impl Sessions {
         let sess = Arc::new(Detachable {
             uid: user.uid,
             agent: session.agent.take(),
-            code_expires: session.code_expires,
             restrictions: restrictions.clone(),
             input: input_tx,
             pending_input: AtomicUsize::new(0),
@@ -397,6 +464,18 @@ impl Sessions {
         received: u64,
         closed: watch::Receiver<bool>,
     ) -> Result<()> {
+        // A hold has no program and no output: only its token comes back.
+        if let Ok(token) = Token::try_from(token) {
+            let hold = self.map.lock().unwrap().holds.get_mut(&token).filter(|h| h.uid == user.uid && &h.restrictions == restrictions).map(|h| {
+                h.generation += 1;
+                h.left_at = None;
+                h.generation
+            });
+            if let Some(generation) = hold {
+                info!("{}: held connection back", user.name);
+                return self.held(send, recv, token, generation, closed).await;
+            }
+        }
         let found = Token::try_from(token).ok().and_then(|t| self.map.lock().unwrap().sessions.get(&t).map(|s| (t, s.clone())));
         match found {
             Some((token, sess)) if sess.uid == user.uid && &sess.restrictions == restrictions => {
@@ -506,11 +585,13 @@ impl Sessions {
         // Output and replies are written by a task of their own, so input
         // (a ^C among it) is taken while a slow client holds output up.
         let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(4);
+        let mut outgoing = exec::Outgoing::default();
+        let asked = outgoing.asked.clone();
         // After the exit status, the stream stays open until the client
         // answers (see below), so its answer is not cut off.
         let mut writer = Abort(tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                write_msg(&mut send, &msg).await?;
+            while let Some(msg) = outgoing.next(&mut out_rx).await {
+                write_msg(&mut send, &outgoing.prepare(msg)).await?;
             }
             std::future::pending::<Result<()>>().await
         }));
@@ -548,6 +629,7 @@ impl Sessions {
                     Ok(Some(ClientMsg::Typed { data, .. })) => sess.send_input(Input::Data(data)),
                     Ok(Some(ClientMsg::Resize { cols, rows })) => sess.send_input(Input::Resize { cols, rows }),
                     Ok(Some(ClientMsg::StdinEof)) => {}
+                    Ok(Some(ClientMsg::Compress)) => asked.store(true, Ordering::Relaxed),
                     Ok(Some(ClientMsg::Shown(n))) => {
                         hangs_up = true;
                         sess.pacing.shown(n);

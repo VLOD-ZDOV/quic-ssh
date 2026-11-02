@@ -225,7 +225,7 @@ pub fn flags_from_options(options: &[String]) -> String {
             ("forwardx11", "no") => "-x".into(),
             // -Y says both.
             ("forwardx11trusted", "yes") if x11 => continue,
-            ("compression", "yes") => "-C".into(),
+            ("compression", "yes" | "auto") => "-C".into(),
             ("sessiontype", "none") => "-N".into(),
             ("requesttty", "no") => "-T".into(),
             ("requesttty", "yes") => "-t".into(),

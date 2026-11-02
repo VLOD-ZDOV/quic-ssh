@@ -114,9 +114,9 @@ pub struct ServerConfig {
     /// Failed key proofs allowed per connection (like sshd's MaxAuthTries).
     pub max_auth_tries: u32,
     /// Seconds a one-time code lasts on its connection: after them, it
-    /// opens nothing new, no session, copy or forwarded connection (a shared
-    /// one, `ControlMaster`, then logs in with a code again; what is under
-    /// way goes on); 0 = as long as the connection.
+    /// starts no session or copy (a shared one, `ControlMaster`, then logs
+    /// in with a code again; what is under way goes on, forwards included);
+    /// 0 = as long as the connection.
     pub totp_valid_for: u64,
     /// Allow `qsh -A` (ssh-agent forwarding).
     #[serde(deserialize_with = "flag")]
@@ -810,6 +810,18 @@ impl ServerConfig {
         if self.pam_service.is_empty() || !self.pam_service.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
             bail!("pam_service: {:?} is not a file name in /etc/pam.d", self.pam_service);
         }
+        let penalties = &self.per_source_penalties;
+        if penalties.enabled && penalties.min > penalties.max {
+            bail!("per_source_penalties: min is above max, so no source would ever be dropped");
+        }
+        if penalties.enabled && penalties.max_sources == 0 {
+            bail!("per_source_penalties: max_sources must be at least 1 (or turn penalties off)");
+        }
+        for entry in self.per_source_penalty_exempt_list.iter().filter(|e| e.contains('/')) {
+            if !cidr_valid(entry) {
+                bail!("per_source_penalty_exempt_list: bad address range {entry:?}");
+            }
+        }
         check_user_entries("allow_users", &self.allow_users)?;
         check_user_entries("deny_users", &self.deny_users)?;
         for (i, m) in self.matches.iter().enumerate() {
@@ -996,6 +1008,14 @@ fn endpoint_list_allows(list: &[String], matches: impl Fn(&str) -> bool) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn penalties_that_cannot_work_are_refused() {
+        for bad in ["per_source_penalties = \"min:100 max:10\"\n", "per_source_penalties = \"max-sources:0\"\n", "per_source_penalty_exempt_list = [\"10.0.0.0/99\"]\n"] {
+            let parsed = toml::from_str::<ServerConfig>(bad).map_err(anyhow::Error::from).and_then(|c| c.validate());
+            assert!(parsed.is_err(), "{bad}");
+        }
+    }
 
     /// The template qshd writes (contrib/qshd.toml) changes nothing as it
     /// is, and every setting in it parses once uncommented.

@@ -221,6 +221,7 @@ async fn open_direct_local(conn: &Conn, path: &str) -> Result<(SendHalf, RecvHal
 
 /// Serves one local connection of a `-L`/`-D` forward through the server.
 async fn serve_local<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(conn: Arc<Conn>, dest: Dest, mut sock: S, peer: String, _busy: crate::transport::Busy) {
+    debug!("forward from {peer} opened");
     let result = match &dest {
         Dest::Tcp { host, port } => match open_direct(&conn, host, *port).await {
             Ok((send, recv)) => bridge_stream(sock, send, recv).await,

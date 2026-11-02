@@ -329,8 +329,9 @@ pub fn main() {
 /// `qshd -t` / `-T`: loads the config (and host key) like the server would.
 fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) -> Result<()> {
     let (cfg, key_path) = load_config(config)?;
-    if key_path.exists() {
-        Identity::load(&key_path).with_context(|| format!("host key {}", key_path.display()))?;
+    let host = key_path.exists().then(|| Identity::load(&key_path).with_context(|| format!("host key {}", key_path.display()))).transpose()?;
+    for problem in server::config_problems(&cfg, host.as_ref()) {
+        eprintln!("qshd: warning: {problem}");
     }
     if !print {
         return Ok(());
@@ -546,6 +547,9 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
     let host = host_key(&key_path)?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        for problem in server::config_problems(&cfg, Some(&host)) {
+            tracing::warn!("{problem}");
+        }
         let listener = server::bind(&cfg, &host).await?;
         let who = match (is_root(), user_name()) {
             (true, _) => "any user can log in".to_string(),
