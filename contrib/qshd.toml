@@ -14,7 +14,7 @@
 # false: UDP only, e.g. on port 22 next to sshd.
 # tcp = true
 
-# Default: host_ed25519 next to this file.
+# Default: host_ed25519 in /etc/qsh (root) or ~/.config/qsh, even with -c elsewhere.
 # host_key = "/etc/qsh/host_ed25519"
 
 # Default: the key's name plus -cert.pub, if that file exists.
@@ -153,6 +153,9 @@
 
 
 # ------------------------------------------------------------------- Tables
+
+# Global settings go above this line: every key below a table header
+# ([set_env], [[match]]) belongs to that table, not to the whole server.
 
 # Variables every session gets.
 # [set_env]

@@ -164,10 +164,28 @@ fn create_default_config(path: Option<&PathBuf>) -> Result<()> {
     }
 }
 
-fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
+/// The system service's config.
+const SYSTEM_CONFIG: &str = "/etc/qsh/config.toml";
+
+/// The config file: `-c`, or the default for root or this user.
+fn config_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(p) => Ok(p),
+        None => Ok(config_dir()?.join(if is_root() { "config.toml" } else { "qshd.toml" })),
+    }
+}
+
+/// Loads the config: it, the host key path, the config path and whether it
+/// was found. A missing file is an error when `required` (given with `-c`,
+/// or a reload); otherwise the defaults.
+fn load_config(path: Option<PathBuf>, required: bool) -> Result<(ServerConfig, PathBuf, PathBuf, bool)> {
     let dir = config_dir()?;
-    let path = path.unwrap_or_else(|| dir.join(if is_root() { "config.toml" } else { "qshd.toml" }));
-    let cfg = ServerConfig::load(&path)?;
+    let required = required || path.is_some();
+    let path = config_path(path)?;
+    let (cfg, found) = match required {
+        true => (ServerConfig::load(&path)?, true),
+        false => ServerConfig::load_optional(&path)?.map_or((ServerConfig::default(), false), |c| (c, true)),
+    };
     let key = cfg.host_key.clone().unwrap_or_else(|| dir.join("host_ed25519"));
     let mut cfg = cfg;
     if cfg.host_certificate.is_none() {
@@ -175,7 +193,7 @@ fn load_config(path: Option<PathBuf>) -> Result<(ServerConfig, PathBuf)> {
         let default = PathBuf::from(format!("{}-cert.pub", key.display()));
         cfg.host_certificate = default.exists().then_some(default);
     }
-    Ok((cfg, key))
+    Ok((cfg, key, path, found))
 }
 
 /// `/etc/qsh` is readable by all, like `/etc/ssh`: the config and the
@@ -328,10 +346,23 @@ pub fn main() {
 
 /// `qshd -t` / `-T`: loads the config (and host key) like the server would.
 fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) -> Result<()> {
-    let (cfg, key_path) = load_config(config)?;
+    let given = config.is_some();
+    let (cfg, key_path, path, found) = load_config(config, false)?;
+    if found {
+        eprintln!("qshd: read {}", path.display());
+    } else {
+        eprintln!("qshd: {} not found, using the defaults", path.display());
+    }
+    if !is_root() && !given && std::path::Path::new(SYSTEM_CONFIG).exists() {
+        // Not -c: the checks would be for this user, not for root (passwords, chroot, the host key).
+        eprintln!("qshd: note: the system service reads {SYSTEM_CONFIG}; check it with sudo qshd -t");
+    }
     let host = key_path.exists().then(|| Identity::load(&key_path).with_context(|| format!("host key {}", key_path.display()))).transpose()?;
     for problem in server::config_problems(&cfg, host.as_ref()) {
         eprintln!("qshd: warning: {problem}");
+    }
+    for line in cfg.match_overrides() {
+        eprintln!("qshd: {line}");
     }
     if !print {
         return Ok(());
@@ -349,10 +380,13 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
                 }
             }
             let user = user.context("-C needs user=NAME")?;
-            let groups = server::user_group_names(&user);
-            let who = qsh::config::Login { user: &user, groups: &groups, addr: addr.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into()) };
-            let login = cfg.for_login(&who);
-            if let Some(reason) = server::login_verdict(&login, &who) {
+            // Like sshd: guessing an address would show the wrong blocks.
+            if let (None, Some(what)) = (addr, cfg.needs_address()) {
+                anyhow::bail!("give addr= in -C: {what} tests the address");
+            }
+            let addr = addr.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED.into());
+            let (login, verdict) = server::check_login(&cfg, &user, addr);
+            if let Some(reason) = verdict {
                 println!("# {user} may not log in: {reason}");
             }
             login
@@ -364,7 +398,7 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
 
 fn init(config: Option<PathBuf>) -> Result<()> {
     create_default_config(config.as_ref())?;
-    let (cfg, key_path) = load_config(config)?;
+    let (cfg, key_path, _, _) = load_config(config, false)?;
     let id = host_key(&key_path)?;
     println!("Host key:    {}", key_path.display());
     println!("Fingerprint: {}", id.public().fingerprint());
@@ -373,7 +407,7 @@ fn init(config: Option<PathBuf>) -> Result<()> {
 }
 
 fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
-    let (cfg, _) = load_config(config)?;
+    let (cfg, ..) = load_config(config, false)?;
     let given = host.is_some();
     let host = match host {
         // Only what a host name or address can contain: the command below is
@@ -533,12 +567,16 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
         .init();
     qsh::platform::raise_fd_limit();
     create_default_config(config.as_ref())?;
-    let (mut cfg, key_path) = load_config(config.clone())?;
+    let (mut cfg, key_path, path, found) = load_config(config.clone(), false)?;
+    if !found {
+        tracing::info!("no config at {}, using the defaults", path.display());
+    }
     if let Some(l) = listen {
         cfg.listen = l;
     }
+    // On a reload a missing file is an error: the old config stays.
     let reload: server::Reload = Box::new(move || {
-        let (mut cfg, _) = load_config(config.clone())?;
+        let (mut cfg, ..) = load_config(config.clone(), true)?;
         if let Some(l) = listen {
             cfg.listen = l;
         }
@@ -549,6 +587,9 @@ fn serve(config: Option<PathBuf>, listen: Option<std::net::SocketAddr>) -> Resul
     rt.block_on(async {
         for problem in server::config_problems(&cfg, Some(&host)) {
             tracing::warn!("{problem}");
+        }
+        for line in cfg.match_overrides() {
+            tracing::info!("{line}");
         }
         let listener = server::bind(&cfg, &host).await?;
         let who = match (is_root(), user_name()) {

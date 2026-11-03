@@ -23,7 +23,8 @@ pub struct ServerConfig {
     /// only, so it can share a port number with sshd (e.g. 22) for `qsh --full`.
     #[serde(deserialize_with = "flag")]
     pub tcp: bool,
-    /// Host key path; defaults to `host_ed25519` next to the config file.
+    /// Host key path; defaults to `host_ed25519` in qshd's config dir
+    /// (`/etc/qsh` or `~/.config/qsh`), even with `--config` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key: Option<PathBuf>,
     /// Also accept keys from `~/.ssh/authorized_keys` (the files in
@@ -155,8 +156,9 @@ pub struct ServerConfig {
     /// Members of these groups may not log in (like DenyGroups).
     #[serde(deserialize_with = "names")]
     pub deny_groups: Vec<String>,
-    /// `yes`, `prohibit-password` (the same: qshd has no passwords), `no`,
-    /// or `forced-commands-only` (like PermitRootLogin).
+    /// `yes` (keys, and passwords with `password_authentication`),
+    /// `prohibit-password` (keys only), `no`, or `forced-commands-only`
+    /// (keys with a forced command only), like PermitRootLogin.
     pub permit_root_login: PermitRootLogin,
     /// Seconds a client has to log in (like LoginGraceTime; 0 = no limit).
     pub login_grace_time: u64,
@@ -378,6 +380,8 @@ pub struct Penalties {
     pub max_sources: usize,
     /// `per_source_penalty_exempt_list` (filled in from the config).
     pub exempt: Vec<String>,
+    /// Items given that qshd does not use as written, for `qshd -t`.
+    pub notes: Vec<String>,
 }
 
 impl Default for Penalties {
@@ -391,6 +395,7 @@ impl Default for Penalties {
             max: Duration::from_secs(600),
             max_sources: 65536,
             exempt: Vec::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -419,10 +424,18 @@ impl Penalties {
             "no" | "false" | "off" | "0" => return Ok(Penalties { enabled: false, ..p }),
             _ => {}
         }
+        // sshd's per-family limits, each at the default until set.
+        let (mut v4, mut v6) = (p.max_sources, p.max_sources);
         for word in text.split_whitespace() {
             let (key, value) = word.split_once(':').ok_or_else(|| format!("bad per_source_penalties item {word:?}"))?;
             if key == "max-sources4" || key == "max-sources6" || key == "max-sources" {
-                p.max_sources = value.parse().map_err(|_| format!("bad {key} {value:?}"))?;
+                let n = value.parse().ok().filter(|&n: &usize| n > 0).ok_or_else(|| format!("bad {key} {value:?}"))?;
+                if key != "max-sources6" {
+                    v4 = n;
+                }
+                if key != "max-sources4" {
+                    v6 = n;
+                }
                 continue;
             }
             let d = seconds(value).ok_or_else(|| format!("bad time {value:?} for {key}"))?;
@@ -433,9 +446,15 @@ impl Penalties {
                 "min" => p.min = d,
                 "max" => p.max = d,
                 // Penalties for events qshd does not have.
-                "crash" | "refuseconnection" => {}
+                "crash" | "refuseconnection" => p.notes.push(format!("per_source_penalties: {key} has no effect in qshd")),
                 _ => return Err(format!("unknown per_source_penalties item {key:?}")),
             }
+        }
+        // One shared table, and a full one penalizes no new source: the
+        // larger limit is the stricter one, not whichever came last.
+        p.max_sources = v4.max(v6);
+        if v4 != v6 {
+            p.notes.push(format!("per_source_penalties: qshd has one limit for IPv4 and IPv6 sources together; using max-sources {}", p.max_sources));
         }
         Ok(p)
     }
@@ -541,15 +560,16 @@ macro_rules! overrides {
         #[derive(Deserialize, Serialize, Debug, Clone, Default)]
         #[serde(default, deny_unknown_fields)]
         pub struct MatchBlock {
-            /// User name patterns (`!` excludes).
-            #[serde(deserialize_with = "names", skip_serializing_if = "Vec::is_empty")]
-            pub user: Vec<String>,
+            /// User name patterns (`!` excludes). Given but empty is an
+            /// error (not "every login").
+            #[serde(deserialize_with = "opt_names", skip_serializing_if = "Option::is_none")]
+            pub user: Option<Vec<String>>,
             /// Group name patterns: any of the user's groups.
-            #[serde(deserialize_with = "names", skip_serializing_if = "Vec::is_empty")]
-            pub group: Vec<String>,
+            #[serde(deserialize_with = "opt_names", skip_serializing_if = "Option::is_none")]
+            pub group: Option<Vec<String>>,
             /// Client address patterns or CIDR ranges.
-            #[serde(deserialize_with = "names", skip_serializing_if = "Vec::is_empty")]
-            pub address: Vec<String>,
+            #[serde(deserialize_with = "opt_names", skip_serializing_if = "Option::is_none")]
+            pub address: Option<Vec<String>>,
             $($(#[$pa])* #[serde(skip_serializing_if = "Option::is_none")] pub $p: Option<$pt>,)*
             /// `"none"` removes a global value.
             $(#[serde(skip_serializing_if = "Option::is_none")] pub $o: Option<$ot>,)*
@@ -646,9 +666,84 @@ pub struct Login<'a> {
 
 impl MatchBlock {
     fn matches(&self, who: &Login) -> bool {
-        (self.user.is_empty() || name_matches(&self.user, who.user))
-            && (self.group.is_empty() || groups_match(&self.group, who.groups))
-            && (self.address.is_empty() || address_allowed(&self.address.join(","), who.addr))
+        self.user.as_ref().is_none_or(|u| name_matches(u, who.user))
+            && self.group.as_ref().is_none_or(|g| groups_match(g, who.groups))
+            && self.address.as_ref().is_none_or(|a| address_allowed(&a.join(","), who.addr))
+    }
+
+    fn conditions(&self) -> [(&'static str, &Option<Vec<String>>); 3] {
+        [("user", &self.user), ("group", &self.group), ("address", &self.address)]
+    }
+
+    /// `user = backup, address = 10.0.0.0/8`, for messages.
+    fn describe(&self) -> String {
+        let given: Vec<String> = self.conditions().iter().filter_map(|(n, v)| v.as_ref().map(|v| format!("{n} = {}", v.join(",")))).collect();
+        if given.is_empty() { "every login".into() } else { given.join(", ") }
+    }
+}
+
+/// Every top-level setting, to catch one that TOML put inside a table
+/// (`[set_env]`, `[subsystems]`) because it came after the table's header.
+/// The test `setting_names_are_complete` keeps it in sync.
+const SETTING_NAMES: &[&str] = &[
+    "listen", "tcp", "host_key", "use_ssh_authorized_keys", "use_qsh_authorized_keys", "authorized_keys_file",
+    "authorized_principals_file", "allow_tcp_forwarding", "disable_forwarding", "allow_stream_local_forwarding",
+    "stream_local_bind_mask", "stream_local_bind_unlink", "x11_forwarding", "x11_display_offset", "x11_use_localhost",
+    "xauth_location", "permit_tunnel", "permit_open", "permit_listen", "max_connections", "max_startups",
+    "max_startups_per_ip", "connection_buffer_mb", "session_scope", "gateway_ports", "subsystems", "trusted_user_ca_keys",
+    "max_auth_tries", "totp_valid_for", "allow_agent_forwarding", "totp", "host_certificate", "revoked_keys",
+    "authorized_keys_command", "authorized_keys_command_user", "session_timeout", "allow_users", "deny_users",
+    "allow_groups", "deny_groups", "permit_root_login", "login_grace_time", "banner", "print_motd", "print_last_log",
+    "permit_user_rc", "max_sessions", "permit_tty", "accept_env", "set_env", "force_command", "chroot_directory",
+    "client_alive_interval", "client_alive_count_max", "refuse_connection", "password_authentication",
+    "permit_empty_passwords", "use_pam", "pam_service", "per_source_penalties", "per_source_penalty_exempt_list", "match",
+];
+
+/// `[[match]]` settings that change who may log in, how, and what they may
+/// do: [`ServerConfig::match_overrides`] reports blocks that change them.
+const ACCESS_SETTINGS: &[&str] = &[
+    "password_authentication", "permit_empty_passwords", "permit_root_login", "totp", "totp_valid_for",
+    "refuse_connection", "allow_users", "deny_users", "allow_groups", "deny_groups", "force_command",
+    "chroot_directory", "authorized_keys_file", "authorized_keys_command", "authorized_keys_command_user",
+    "authorized_principals_file", "trusted_user_ca_keys", "revoked_keys", "use_ssh_authorized_keys",
+    "use_qsh_authorized_keys", "max_auth_tries", "disable_forwarding", "allow_tcp_forwarding",
+    "allow_stream_local_forwarding", "allow_agent_forwarding", "x11_forwarding", "x11_use_localhost", "permit_tunnel",
+    "permit_open", "permit_listen", "gateway_ports", "permit_tty", "permit_user_rc", "accept_env", "set_env",
+    "stream_local_bind_mask", "stream_local_bind_unlink",
+];
+
+/// A host name where only addresses work (qshd does no DNS lookups): not
+/// an address, range or pattern of one (IPv6 has hex letters, so not just
+/// "has letters").
+fn is_host_name(pattern: &str) -> bool {
+    let p = pattern.trim_start_matches('!');
+    !p.is_empty() && p.parse::<IpAddr>().is_err() && !cidr_valid(p) && !p.bytes().all(|b| b.is_ascii_hexdigit() || b":.*?/".contains(&b))
+}
+
+/// A list of `!` patterns only: like in sshd, it matches no one.
+fn only_negations(list: &[String]) -> bool {
+    !list.is_empty() && list.iter().all(|p| p.starts_with('!'))
+}
+
+/// Problems with `allow_users`/`deny_users` entries that make them match
+/// no one: a `!` user, only `!` addresses, a host name.
+fn user_entry_warnings(what: &str, entries: &[String], out: &mut Vec<String>) {
+    for entry in entries {
+        let (user, host) = match entry.rsplit_once('@') {
+            Some((u, h)) => (u, Some(h)),
+            None => (entry.as_str(), None),
+        };
+        if user.starts_with('!') {
+            out.push(format!("{what}: {entry:?}: '!' does not exclude here, so it matches no one"));
+        }
+        let Some(host) = host else { continue };
+        let hosts: Vec<String> = host.split(',').map(str::to_string).collect();
+        if only_negations(&hosts) {
+            out.push(format!("{what}: {entry:?} has only excluded addresses, so it matches no one, as in sshd; write \"{user}@*,{host}\""));
+        }
+        if let Some(h) = hosts.iter().find(|h| is_host_name(h)) {
+            out.push(format!("{what}: {entry:?}: {h:?} is a host name; qshd matches addresses only, so it never matches"));
+        }
     }
 }
 
@@ -772,15 +867,20 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Loads `path` if it exists, otherwise returns defaults.
+    /// Loads `path`; a missing file is an error.
     pub fn load(path: &Path) -> Result<ServerConfig> {
+        Self::load_optional(path)?.with_context(|| format!("config file {} not found", path.display()))
+    }
+
+    /// Loads `path`, or `None` if it does not exist.
+    pub fn load_optional(path: &Path) -> Result<Option<ServerConfig>> {
         let cfg: ServerConfig = match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ServerConfig::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         cfg.validate().with_context(|| format!("invalid {}", path.display()))?;
-        Ok(cfg)
+        Ok(Some(cfg))
     }
 
     /// Limits of 0 would silently refuse every connection or login.
@@ -830,10 +930,22 @@ impl ServerConfig {
             if m.max_auth_tries == Some(0) {
                 bail!("match block {}: max_auth_tries must be at least 1", i + 1);
             }
-            for cidr in m.address.iter().map(|a| a.trim_start_matches('!')).filter(|a| a.contains('/')) {
+            if let Some((name, _)) = m.conditions().into_iter().find(|(_, v)| v.as_ref().is_some_and(Vec::is_empty)) {
+                bail!("[[match]] #{}: {name} is empty, it would match every login", i + 1);
+            }
+            for cidr in m.address.iter().flatten().map(|a| a.trim_start_matches('!')).filter(|a| a.contains('/')) {
                 if !cidr_valid(cidr) {
                     bail!("match block {}: bad address range {cidr:?}", i + 1);
                 }
+            }
+        }
+        let env_tables = std::iter::once(("[set_env]", &self.set_env))
+            .chain(self.matches.iter().filter_map(|m| m.set_env.as_ref().map(|e| ("[match.set_env]", e))));
+        for (table, env) in env_tables.chain([("[subsystems]", &self.subsystems)]) {
+            // In [match.set_env], a block's condition too: lost, the block would match every login.
+            let conditions: &[&str] = if table == "[match.set_env]" { &["user", "group", "address"] } else { &[] };
+            if let Some(name) = env.keys().find(|k| SETTING_NAMES.contains(&k.as_str()) || conditions.contains(&k.as_str())) {
+                bail!("'{name}' is inside {table}: settings must come before the first [table]");
             }
         }
         for name in self.set_env.keys().chain(self.matches.iter().flat_map(|m| m.set_env.iter().flat_map(|e| e.keys()))) {
@@ -857,7 +969,85 @@ impl ServerConfig {
     pub fn needs_groups(&self) -> bool {
         !self.allow_groups.is_empty()
             || !self.deny_groups.is_empty()
-            || self.matches.iter().any(|m| !m.group.is_empty() || m.allow_groups.is_some() || m.deny_groups.is_some())
+            || self.matches.iter().any(|m| m.group.is_some() || m.allow_groups.is_some() || m.deny_groups.is_some())
+    }
+
+    /// The first setting that depends on the client's address: a
+    /// `[[match]]` address condition or a `user@host` entry.
+    pub fn needs_address(&self) -> Option<String> {
+        let has_host = |list: &[String]| list.iter().any(|e| e.contains('@'));
+        if has_host(&self.allow_users) || has_host(&self.deny_users) {
+            return Some(if has_host(&self.deny_users) { "deny_users" } else { "allow_users" }.into());
+        }
+        self.matches.iter().enumerate().find_map(|(i, m)| {
+            let what = if m.address.is_some() {
+                "address"
+            } else if has_host(m.deny_users.as_deref().unwrap_or_default()) {
+                "deny_users"
+            } else if has_host(m.allow_users.as_deref().unwrap_or_default()) {
+                "allow_users"
+            } else {
+                return None;
+            };
+            Some(format!("[[match]] #{} {what}", i + 1))
+        })
+    }
+
+    /// Settings that load but do not do what they seem to, for `qshd -t`
+    /// and the log.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = self.per_source_penalties.notes.clone();
+        user_entry_warnings("allow_users", &self.allow_users, &mut out);
+        user_entry_warnings("deny_users", &self.deny_users, &mut out);
+        for (i, m) in self.matches.iter().enumerate() {
+            let n = i + 1;
+            for (name, list) in m.conditions() {
+                let Some(list) = list else { continue };
+                if only_negations(list) {
+                    out.push(format!("[[match]] #{n}: {name} = {:?} matches no one, as in sshd; write \"*,{}\"", list.join(","), list.join(",")));
+                }
+                if name == "address" {
+                    if let Some(h) = list.iter().find(|a| is_host_name(a)) {
+                        out.push(format!("[[match]] #{n}: address {h:?} is a host name; qshd matches addresses only, so it never matches"));
+                    }
+                }
+            }
+            user_entry_warnings(&format!("[[match]] #{n}: allow_users"), m.allow_users.as_deref().unwrap_or_default(), &mut out);
+            user_entry_warnings(&format!("[[match]] #{n}: deny_users"), m.deny_users.as_deref().unwrap_or_default(), &mut out);
+        }
+        out
+    }
+
+    /// `[[match]]` blocks that change who may log in or how, against the
+    /// global value: `[[match]] #2 (user = backup) changes
+    /// password_authentication: false -> true`. This shows a global setting
+    /// that ended up under a `[[match]]` header by mistake.
+    pub fn match_overrides(&self) -> Vec<String> {
+        fn table(v: &impl Serialize) -> toml::Table {
+            toml::Table::try_from(v).unwrap_or_default()
+        }
+        let unset = |v: Option<&toml::Value>| v.is_none_or(|v| v.as_str() == Some("none"));
+        // permit_open/permit_listen: `[]` and `["any"]` both allow any.
+        let any = toml::Value::Array(vec!["any".into()]);
+        let plain = |name: &str, v: Option<&toml::Value>| match v {
+            Some(v) if v == &any && matches!(name, "permit_open" | "permit_listen") => Some(toml::Value::Array(Vec::new())),
+            v => v.cloned(),
+        };
+        let show = |v: Option<&toml::Value>| v.map_or("unset".to_string(), toml::Value::to_string);
+        let global = table(self);
+        let mut out = Vec::new();
+        for (i, m) in self.matches.iter().enumerate() {
+            let local = table(m);
+            for name in ACCESS_SETTINGS {
+                let Some(new) = local.get(*name) else { continue };
+                let old = global.get(*name);
+                if plain(name, old) == plain(name, Some(new)) || (unset(old) && unset(Some(new))) {
+                    continue;
+                }
+                out.push(format!("[[match]] #{} ({}) changes {name}: {} -> {}", i + 1, m.describe(), show(old), show(Some(new))));
+            }
+        }
+        out
     }
 
     /// The settings for one login: the global ones with matching
@@ -1061,7 +1251,122 @@ mod tests {
         assert!(format!("{:#}", ServerConfig::load(&path).unwrap_err()).contains("max_startups must be at least 1"));
         std::fs::write(&path, "max_startups = 1\n").unwrap();
         assert!(ServerConfig::load(&path).is_ok());
-        assert!(ServerConfig::load(&dir.path().join("missing.toml")).is_ok());
+    }
+
+    /// A typo in `-c` or a file moved away before SIGHUP is not "defaults".
+    #[test]
+    fn missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.toml");
+        assert!(format!("{:#}", ServerConfig::load(&missing).unwrap_err()).contains("not found"));
+        assert!(ServerConfig::load_optional(&missing).unwrap().is_none());
+    }
+
+    /// The names serde knows, from its "unknown field" error.
+    fn known_fields<T: serde::de::DeserializeOwned + std::fmt::Debug>() -> Vec<String> {
+        let err = toml::from_str::<T>("not_a_setting_x = 1").unwrap_err().to_string();
+        let list = err.split("expected one of").nth(1).unwrap_or_else(|| panic!("{err}"));
+        list.split(',').map(|w| w.trim().trim_matches(|c: char| c == '`' || c.is_whitespace()).to_string()).filter(|w| !w.is_empty()).collect()
+    }
+
+    #[test]
+    fn setting_names_are_complete() {
+        let mut known = known_fields::<ServerConfig>();
+        let mut ours: Vec<String> = SETTING_NAMES.iter().map(|s| s.to_string()).collect();
+        known.sort();
+        ours.sort();
+        assert_eq!(ours, known);
+        let block = known_fields::<MatchBlock>();
+        for name in ACCESS_SETTINGS {
+            assert!(block.iter().any(|b| b == name), "{name} is no [[match]] setting");
+        }
+    }
+
+    /// A global setting after `[set_env]`/`[subsystems]` is TOML's key of
+    /// that table: refused rather than silently an env var.
+    #[test]
+    fn setting_inside_a_table() {
+        for (text, table) in [
+            ("[set_env]\nTZ = \"UTC\"\npermit_root_login = \"no\"\n", "[set_env]"),
+            ("[subsystems]\nsftp = \"internal-sftp\"\nallow_users = \"alice\"\n", "[subsystems]"),
+            ("[[match]]\nuser = \"a\"\n[match.set_env]\npassword_authentication = \"no\"\n", "[match.set_env]"),
+            // A condition after the table would be lost: the block would match every login.
+            ("[[match]]\npassword_authentication = true\n[match.set_env]\nFOO = \"1\"\nuser = \"backup\"\n", "'user' is inside [match.set_env]"),
+            ("[[match]]\nuser = \"a\"\n[match.set_env]\naddress = \"10.0.0.0/8\"\n", "'address' is inside [match.set_env]"),
+        ] {
+            let err = toml::from_str::<ServerConfig>(text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(table) && err.contains("must come before the first [table]"), "{err}");
+        }
+        parse("[set_env]\nTZ = \"UTC\"\nPERMIT_ROOT_LOGIN = \"x\"\nuser = \"x\"\n");
+    }
+
+    #[test]
+    fn empty_match_condition() {
+        for (text, what) in [
+            ("[[match]]\nuser = \"\"\npermit_tty = false\n", "user is empty"),
+            ("[[match]]\ngroup = []\n", "group is empty"),
+            ("[[match]]\nuser = \"a\"\n[[match]]\naddress = \" , \"\n", "#2: address is empty"),
+        ] {
+            let err = toml::from_str::<ServerConfig>(text).unwrap().validate().unwrap_err().to_string();
+            assert!(err.contains(what) && err.contains("every login"), "{err}");
+        }
+        // Not given at all: every login, as documented.
+        let cfg = parse("[[match]]\npermit_tty = false\n");
+        assert!(!cfg.for_login(&who("u", &[], "192.0.2.1")).permit_tty);
+    }
+
+    #[test]
+    fn match_warnings() {
+        let cfg = parse(
+            "allow_users = \"!root alice@!10.0.0.0/8 bob@office.example.com carol@2001:db8::1,10.*\"\n\
+             [[match]]\nuser = \"!root\"\naddress = \"!192.0.2.0/24\"\n\
+             [[match]]\naddress = \"vpn.example.com,fe80::/10\"\ndeny_users = \"x@!1.2.3.4\"\n\
+             [[match]]\nuser = \"*,!root\"\naddress = \"10.*,::1,cafe::/16\"\n",
+        );
+        let w = cfg.warnings();
+        let has = |s: &str| w.iter().any(|l| l.contains(s));
+        assert!(has("allow_users: \"!root\": '!' does not exclude"), "{w:#?}");
+        assert!(has("allow_users: \"alice@!10.0.0.0/8\" has only excluded"), "{w:#?}");
+        assert!(has("\"office.example.com\" is a host name"), "{w:#?}");
+        assert!(has("[[match]] #1: user = \"!root\" matches no one"), "{w:#?}");
+        assert!(has("[[match]] #1: address = \"!192.0.2.0/24\" matches no one"), "{w:#?}");
+        assert!(has("[[match]] #2: address \"vpn.example.com\" is a host name"), "{w:#?}");
+        assert!(has("[[match]] #2: deny_users: \"x@!1.2.3.4\""), "{w:#?}");
+        assert!(!w.iter().any(|l| l.contains("#3") || l.contains("carol")), "{w:#?}");
+        assert!(parse("").warnings().is_empty());
+        assert_eq!(parse("[[match]]\naddress = \"10.0.0.0/8\"\n[[match]]\naddress = \"::1\"\n").needs_address().as_deref(), Some("[[match]] #1 address"));
+        assert_eq!(parse("[[match]]\nuser = \"a\"\nallow_users = \"a\"\n").needs_address(), None);
+        // user@host entries test the address too.
+        assert_eq!(parse("deny_users = \"alice@10.*\"\n").needs_address().as_deref(), Some("deny_users"));
+        assert_eq!(parse("allow_users = \"alice@10.0.0.0/8 bob\"\n").needs_address().as_deref(), Some("allow_users"));
+        let cfg = parse("[[match]]\nuser = \"a\"\n[[match]]\nuser = \"b\"\nallow_users = \"b@::1\"\n");
+        assert_eq!(cfg.needs_address().as_deref(), Some("[[match]] #2 allow_users"));
+    }
+
+    #[test]
+    fn match_overrides() {
+        let cfg = parse(
+            "password_authentication = false\nforce_command = \"/bin/global\"\n\
+             [[match]]\nuser = \"admin\"\npermit_tty = false\nmax_sessions = 2\n\
+             [[match]]\nuser = \"backup\"\npassword_authentication = true\npermit_root_login = \"prohibit-password\"\n\
+             deny_users = \"mallory\"\nforce_command = \"none\"\nchroot_directory = \"none\"\n",
+        );
+        assert_eq!(
+            cfg.match_overrides(),
+            [
+                "[[match]] #1 (user = admin) changes permit_tty: true -> false",
+                "[[match]] #2 (user = backup) changes password_authentication: false -> true",
+                "[[match]] #2 (user = backup) changes deny_users: [] -> [\"mallory\"]",
+                "[[match]] #2 (user = backup) changes force_command: \"/bin/global\" -> \"none\"",
+            ]
+        );
+        assert_eq!(parse("[[match]]\npermit_tty = false\n").match_overrides(), ["[[match]] #1 (every login) changes permit_tty: true -> false"]);
+        // `["any"]` is the default `[]`; `["none"]` is not.
+        let cfg = parse("[[match]]\nuser = \"a\"\npermit_open = \"any\"\npermit_listen = \"any\"\n[[match]]\nuser = \"b\"\npermit_open = \"none\"\n");
+        assert_eq!(cfg.match_overrides(), ["[[match]] #2 (user = b) changes permit_open: [] -> [\"none\"]"]);
+        let cfg = parse("[[match]]\nuser = \"a\"\naccept_env = \"LD_PRELOAD\"\nx11_use_localhost = false\n");
+        assert_eq!(cfg.match_overrides().len(), 2, "{:?}", cfg.match_overrides());
+        assert!(parse("").match_overrides().is_empty());
     }
 
     #[test]
@@ -1171,6 +1476,21 @@ mod tests {
         assert_eq!((p.authfail, p.min, p.max), (Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(7200)));
         assert!(toml::from_str::<ServerConfig>("per_source_penalties = \"authfail:x\"").is_err());
         assert!(toml::from_str::<ServerConfig>("per_source_penalties = \"bogus:1\"").is_err());
+        assert!(p.notes.iter().any(|n| n.contains("crash has no effect")), "{:?}", p.notes);
+        // One shared limit: the larger one (a full table penalizes no new source), whatever the order.
+        let p = parse("per_source_penalties = \"max-sources4:1000 max-sources6:65536\"").per_source_penalties;
+        assert_eq!(p.max_sources, 65536);
+        assert_eq!(parse("per_source_penalties = \"max-sources6:65536 max-sources4:1000\"").per_source_penalties.max_sources, 65536);
+        assert!(p.notes.iter().any(|n| n.contains("one limit for IPv4 and IPv6")));
+        let cfg = parse("per_source_penalties = \"max-sources6:500 max-sources4:500 refuseconnection:10s\"");
+        assert_eq!(cfg.per_source_penalties.max_sources, 500);
+        assert_eq!(cfg.warnings(), ["per_source_penalties: refuseconnection has no effect in qshd"]);
+        // A later shared value sets both; a family left out keeps the default.
+        assert_eq!(parse("per_source_penalties = \"max-sources4:100 max-sources6:200 max-sources:50\"").per_source_penalties.max_sources, 50);
+        let p = parse("per_source_penalties = \"max-sources6:1000\"").per_source_penalties;
+        assert_eq!(p.max_sources, Penalties::default().max_sources);
+        assert!(p.notes.iter().any(|n| n.contains("one limit for IPv4 and IPv6")));
+        assert!(toml::from_str::<ServerConfig>("per_source_penalties = \"max-sources4:0\"").is_err());
     }
 
     #[test]

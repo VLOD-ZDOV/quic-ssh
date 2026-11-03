@@ -125,6 +125,7 @@ fn restart_needed(old: &ServerConfig, new: &ServerConfig) -> Vec<&'static str> {
         ("client_alive_count_max", old.client_alive_count_max != new.client_alive_count_max),
         ("per_source_penalties", old.per_source_penalties != new.per_source_penalties),
         ("per_source_penalty_exempt_list", old.per_source_penalty_exempt_list != new.per_source_penalty_exempt_list),
+        ("session_scope", old.session_scope != new.session_scope),
     ] {
         if differs {
             changed.push(name);
@@ -149,6 +150,13 @@ fn reload_on_hangup(state: Arc<State>, reload: Reload) {
                         warn!("config reloaded; changes to {} take effect after a restart", ignored.join(", "));
                     } else {
                         info!("config reloaded");
+                    }
+                    // The host key is not at hand here: host_certificate needs a restart anyway.
+                    for problem in config_problems(&new, None) {
+                        warn!("{problem}");
+                    }
+                    for line in new.match_overrides() {
+                        info!("{line}");
                     }
                     crate::transport::set_server_buffer(new.connection_buffer_mb);
                     *state.cfg.write().unwrap() = Arc::new(new);
@@ -223,9 +231,20 @@ impl Drop for Startup {
     }
 }
 
-/// The groups of user `name` (none if there is no such user), for `qshd -T -C`.
-pub fn user_group_names(name: &str) -> Vec<String> {
-    User::lookup(name).map(|u| u.group_names()).unwrap_or_default()
+/// Looks up the user who logs in as `name`, and their groups if `groups`.
+/// Blocking (NSS may ask LDAP or SSSD).
+fn resolve_user(name: &str, groups: bool) -> Result<(User, Vec<String>)> {
+    if !valid_user_name(name) {
+        bail!("invalid user name");
+    }
+    let u = User::lookup(name)?;
+    // Policies match the name as given: it must be the account's own
+    // (a case-insensitive directory finds "ALICE" for "alice").
+    if u.name != name {
+        bail!("the account's name is {:?}", u.name);
+    }
+    let names = if groups { u.group_names() } else { Vec::new() };
+    Ok((u, names))
 }
 
 /// Why this (existing) user may not log in: allow/deny lists, root login.
@@ -247,13 +266,20 @@ fn refused(cfg: &ServerConfig, who: &crate::config::Login, user: &User) -> Optio
     cfg.login_refused(who)
 }
 
-/// Why the user of `who` may not log in with `cfg` (that login's
-/// settings), as a login would find: for `qshd -T -C`.
-pub fn login_verdict(cfg: &ServerConfig, who: &crate::config::Login) -> Option<String> {
-    match User::lookup(who.user) {
-        Ok(u) => refused(cfg, who, &u),
-        Err(e) => Some(format!("{e:#}")),
-    }
+/// The settings for a login of `name` from `addr`, and why it would be
+/// refused, found as a real login finds them: for `qshd -T -C`.
+pub fn check_login(global: &ServerConfig, name: &str, addr: IpAddr) -> (ServerConfig, Option<String>) {
+    let (user, groups, error) = match resolve_user(name, global.needs_groups()) {
+        Ok((u, g)) => (Some(u), g, None),
+        Err(e) => (None, Vec::new(), Some(format!("{e:#}"))),
+    };
+    let who = crate::config::Login { user: name, groups: &groups, addr: addr.to_canonical() };
+    let cfg = global.for_login(&who);
+    let verdict = match user {
+        Some(u) => refused(&cfg, &who, &u),
+        None => error,
+    };
+    (cfg, verdict)
 }
 
 /// Largest banner sent (like sshd, which reads the whole file, but bounded).
@@ -306,9 +332,10 @@ fn load_host_certificate(path: &std::path::Path, host: &Identity) -> Result<ssh_
     Ok(cert)
 }
 
-/// What is set but cannot work here, for `qshd -t` and the log at startup.
+/// What is set but cannot work here, for `qshd -t` and the log at startup
+/// and after a reload.
 pub fn config_problems(cfg: &ServerConfig, host: Option<&Identity>) -> Vec<String> {
-    let mut problems = Vec::new();
+    let mut problems = cfg.warnings();
     if let (Some(path), Some(host)) = (&cfg.host_certificate, host) {
         if let Err(e) = load_host_certificate(path, host) {
             problems.push(format!("host_certificate {}: {e:#}; it will not be used", path.display()));
@@ -317,6 +344,14 @@ pub fn config_problems(cfg: &ServerConfig, host: Option<&Identity>) -> Vec<Strin
     #[cfg(unix)]
     if !nix::unistd::geteuid().is_root() && (cfg.chroot_directory.is_some() || cfg.matches.iter().any(|m| m.chroot_directory.is_some())) {
         problems.push("chroot_directory needs qshd to run as root: sessions it applies to will fail".into());
+    }
+    let passwords = cfg.password_authentication || cfg.matches.iter().any(|m| m.password_authentication == Some(true));
+    #[cfg(unix)]
+    let shadow = cfg!(target_os = "linux") && nix::unistd::geteuid().is_root();
+    #[cfg(not(unix))]
+    let shadow = false;
+    if passwords && !shadow && !cfg.use_pam {
+        problems.push("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match".into());
     }
     problems
 }
@@ -342,14 +377,6 @@ pub async fn serve(listener: Listener, cfg: ServerConfig, host: &Identity, reloa
     let _ = users::exe_path();
     #[cfg(not(unix))]
     let _ = &reload;
-    let passwords = cfg.password_authentication || cfg.matches.iter().any(|m| m.password_authentication == Some(true));
-    #[cfg(unix)]
-    let shadow = cfg!(target_os = "linux") && nix::unistd::geteuid().is_root();
-    #[cfg(not(unix))]
-    let shadow = false;
-    if passwords && !shadow && !cfg.use_pam {
-        warn!("password_authentication needs qshd to run as root on Linux (to read /etc/shadow); no password will match");
-    }
     let scope = cfg.session_scope;
     tokio::task::spawn_blocking(move || users::set_session_scope(scope)).await?;
     let limit = Arc::new(Semaphore::new(cfg.max_connections));
@@ -461,22 +488,8 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     // User lookups (NSS: maybe LDAP or SSSD) and reading the key files can
     // block: never on a worker thread, which may be the one driving the network.
     let global = state.cfg();
-    let looked_up = if valid_user_name(&name) {
-        let (n, groups) = (name.clone(), global.needs_groups());
-        tokio::task::spawn_blocking(move || {
-            let u = User::lookup(&n)?;
-            // Policies match the name as given: it must be the account's own
-            // (a case-insensitive directory finds "ALICE" for "alice").
-            if u.name != n {
-                bail!("the account's name is {:?}", u.name);
-            }
-            let names = if groups { u.group_names() } else { Vec::new() };
-            Ok((u, names))
-        })
-        .await?
-    } else {
-        Err(anyhow::anyhow!("invalid user name"))
-    };
+    let (n, groups) = (name.clone(), global.needs_groups());
+    let looked_up = tokio::task::spawn_blocking(move || resolve_user(&n, groups)).await?;
     let (user, groups) = match looked_up {
         Ok((u, g)) => (Some(u), g),
         Err(e) => {
@@ -1555,5 +1568,42 @@ mod tests {
         let _c2 = s.try_acquire("2001:db8::2".parse().unwrap()).unwrap();
         assert!(s.busy("2001:db8::3".parse().unwrap()), "same /64");
         assert!(!s.busy("2001:db8:1::1".parse().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_scope_needs_a_restart() {
+        let old = ServerConfig::default();
+        let new = ServerConfig { session_scope: !old.session_scope, ..ServerConfig::default() };
+        assert_eq!(restart_needed(&old, &new), ["session_scope"]);
+    }
+
+    /// The same checks for `qshd -t`, the start and a reload.
+    #[test]
+    fn problems_include_passwords_and_config_warnings() {
+        let cfg: ServerConfig = toml::from_str("[[match]]\nuser = \"!root\"\npassword_authentication = true\n").unwrap();
+        let problems = config_problems(&cfg, None);
+        assert!(problems.iter().any(|p| p.contains("matches no one")), "{problems:?}");
+        #[cfg(unix)]
+        let can_read_shadow = cfg!(target_os = "linux") && nix::unistd::geteuid().is_root();
+        #[cfg(not(unix))]
+        let can_read_shadow = false;
+        assert_eq!(problems.iter().any(|p| p.contains("no password will match")), !can_read_shadow, "{problems:?}");
+    }
+
+    #[test]
+    fn check_login_refuses_bad_names() {
+        let (_, verdict) = check_login(&ServerConfig::default(), "-oops", "192.0.2.1".parse().unwrap());
+        assert_eq!(verdict.as_deref(), Some("invalid user name"));
+    }
+
+    /// An IPv4-mapped address matches IPv4 blocks, as in a real login.
+    #[cfg(unix)]
+    #[test]
+    fn check_login_canonical_address() {
+        let me = nix::unistd::User::from_uid(nix::unistd::getuid()).unwrap().unwrap().name;
+        let cfg: ServerConfig = toml::from_str("[[match]]\naddress = \"192.0.2.0/24\"\nmax_sessions = 2\n").unwrap();
+        let (login, _) = check_login(&cfg, &me, "::ffff:192.0.2.1".parse().unwrap());
+        assert_eq!(login.max_sessions, 2);
     }
 }
