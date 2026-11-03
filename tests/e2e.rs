@@ -442,7 +442,8 @@ fn local_port_forwarding_with(s: Server) {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Generous: under a parallel test run qsh may take long to start.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut sock = loop {
             if let Ok(sock) = std::net::TcpStream::connect(("127.0.0.1", local)) {
                 break sock;
@@ -967,6 +968,55 @@ fn full_mode_hands_over_to_ssh_and_scp() {
     assert_eq!(lines[2], "scp -P 2200 -- local.txt plain:remote.txt");
     assert_eq!(lines[3], "ssh -- plain true");
     assert!(c.home.path().join(".config/qsh/no-qshd").exists());
+
+    // RefuseConnection in qsh's config: ssh does not read that file, so it does not get the host.
+    let qsh_config = |text: &str| {
+        let f = c.home.path().join(".config/qsh/config");
+        std::fs::write(&f, text).unwrap();
+        std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    };
+    qsh_config("Host refused\n  RefuseConnection moved\n");
+    let out = run(&["--full", "refused", "id"]);
+    assert_eq!(out.status.code(), Some(255), "{}", stderr(&out));
+    assert!(stderr(&out).contains("RefuseConnection: moved"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 4, "ssh ran");
+    // Nor a refusal that only may apply there, or RevokedHostKeys.
+    for text in ["Match host refused version OpenSSH_9*\n  RefuseConnection moved\n", "Host refused\n  RevokedHostKeys /x\n"] {
+        qsh_config(text);
+        let out = run(&["--full", "refused", "id"]);
+        assert_eq!(out.status.code(), Some(255), "{}", stderr(&out));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 4, "ssh ran");
+    }
+    // In ssh's own file such a block may not apply: ssh decides.
+    qsh_config("");
+    let f = c.home.path().join(".ssh/config");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, "Match host maybe version OpenSSH_9*\n  RefuseConnection moved\n").unwrap();
+    std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let out = run(&["--full", "maybe", "id"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().last(), Some("ssh maybe id"));
+}
+
+/// A keyword in qsh's config that qsh does not carry out is warned about,
+/// with its file and line; `-q` silences it.
+#[test]
+fn unapplied_config_keyword_warns() {
+    use std::io::Write;
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let file = c.home.path().join(".config/qsh/config");
+    let before = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file).unwrap();
+    write!(f, "\nHost *\n  PubkeyAuthentication no\n").unwrap();
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let line = before.lines().count() + 3;
+    let port = s.port.to_string();
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("line {line}: PubkeyAuthentication is not supported")), "{}", stderr(&out));
+    let out = c.run(&["-q", "-p", &port, &dest(), "true"]);
+    assert!(out.status.success() && !stderr(&out).contains("PubkeyAuthentication"), "{}", stderr(&out));
 }
 
 // ---------------------------------------------------------------------------
@@ -3396,6 +3446,12 @@ fn server_policy() {
     assert!(stdout(&out).contains("max_sessions = 3"), "{}", stdout(&out));
     let out = check(&["-T", "-C", &format!("user={me},addr=192.0.2.1")]);
     assert!(stdout(&out).contains("max_sessions = 10") && stdout(&out).contains("may not log in"), "{}", stdout(&out));
+    // Without addr= the address-dependent settings would be guessed at.
+    let out = check(&["-T", "-C", &format!("user={me}")]);
+    assert!(!out.status.success() && stderr(&out).contains("give addr= in -C: allow_users"), "{}", stderr(&out));
+    // A -c file that does not exist is an error, not the defaults.
+    let out = check(&["-t", "-c", "/nonexistent/qshd.toml"]);
+    assert!(!out.status.success() && stderr(&out).contains("not found"), "{}", stderr(&out));
 
     // A broken config on SIGHUP keeps the old one; a good one applies to new logins.
     std::fs::write(&cfg_path, "allow_users = 5").unwrap();
@@ -3413,6 +3469,12 @@ fn server_policy() {
     sleep(Duration::from_millis(300));
     let out = c.run(&["-p", &port, &dest(), "true"]);
     assert!(!out.status.success() && stderr(&out).contains("denied"), "deny_users: {}", stderr(&out));
+    // A config moved away on SIGHUP keeps the old one, not the defaults.
+    std::fs::remove_file(&cfg_path).unwrap();
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
+    sleep(Duration::from_millis(300));
+    let out = c.run(&["-p", &port, &dest(), "true"]);
+    assert!(!out.status.success() && stderr(&out).contains("denied"), "missing file on reload: {}", stderr(&out));
     std::fs::write(&cfg_path, format!("max_sessions = 0\n[[match]]\nuser = \"{me}\"\nforce_command = \"echo forced:$SSH_ORIGINAL_COMMAND\"\n")).unwrap();
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(s.child.id() as i32), nix::sys::signal::Signal::SIGHUP).unwrap();
     sleep(Duration::from_millis(300));
@@ -4291,4 +4353,12 @@ fn config_check_warns_about_what_cannot_work() {
     if !nix::unistd::geteuid().is_root() {
         assert!(text.contains("chroot_directory needs qshd to run as root"), "{text}");
     }
+    assert!(text.contains(&format!("qshd: read {}", dir.join("qshd.toml").display())), "{text}");
+    // A [[match]] that changes how people log in is shown against the global value.
+    std::fs::write(dir.join("qshd.toml"), "[[match]]\nuser = \"x\"\npassword_authentication = true\n").unwrap();
+    let out = Command::new(QSHD).arg("-t").env("HOME", home.path()).output().unwrap();
+    assert!(stderr(&out).contains("[[match]] #1 (user = x) changes password_authentication: false -> true"), "{}", stderr(&out));
+    let empty = tempfile::tempdir().unwrap();
+    let out = Command::new(QSHD).arg("-t").env("HOME", empty.path()).output().unwrap();
+    assert!(out.status.success() && stderr(&out).contains("not found, using the defaults"), "{}", stderr(&out));
 }

@@ -1,9 +1,16 @@
 # qsh client settings, in the syntax of ~/.ssh/config.
 #
 # Every setting is commented out at its default: uncomment and change what
-# you need. qsh reads this file first, then ~/.ssh/config (HostName, User and
-# IdentityFile from there); `-o Key=value` on the command line wins over
-# both. As in ssh, the first value found for a setting wins: put the blocks
+# you need. qsh reads this file first, then ~/.ssh/config and
+# /etc/ssh/ssh_config: what this file leaves unset is taken from there
+# (ForwardAgent, StrictHostKeyChecking, PasswordAuthentication too), except
+# ProxyJump, ProxyCommand, ControlPath, RestoreSession and the known_hosts
+# settings (from this file only), and Port and the other settings of the ssh
+# session itself (RequestTTY, RemoteCommand, SendEnv...: only with --full).
+# Hosts saved by `qsh ui` come last. `-o Key=value` on the command line wins
+# over all of them. Here, a keyword qsh does not know is an error and one it
+# does not carry out gives a warning. As in ssh, the first value found for a
+# setting wins: put the blocks
 # for single hosts first and the "Host *" block for all of them last.
 # Yes/no settings take yes or no.
 

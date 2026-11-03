@@ -780,22 +780,86 @@ fn update(version: Option<&str>) -> Result<i32> {
 /// `-G`: prints the resolved settings, like ssh. Tools (e.g. git) also use it
 /// to detect an OpenSSH-compatible client.
 fn print_config(t: &Target) {
-    println!("user {}\nhostname {}\nport {}", t.user, t.host, t.port);
+    print!("{}", config_lines(t));
+}
+
+/// The settings with the command-line switches the session applies on top
+/// of the config (-A/-a, -t/-T, --accept-new-host), so -G shows what it gets.
+fn with_switches(mut t: Target, a: &SshArgs) -> Target {
+    t.forward_agent = a.forward_agent.unwrap_or(t.forward_agent);
+    if a.no_tty {
+        t.request_tty = Some("no".into());
+    } else if a.tty > 0 {
+        t.request_tty = Some(if a.tty >= 2 { "force" } else { "yes" }.into());
+    }
+    if a.accept_new_host {
+        t.host_key_policy = client::HostKeyPolicy::AcceptNew;
+    }
+    t
+}
+
+/// The lines of [`print_config`], in a fixed order.
+fn config_lines(t: &Target) -> String {
+    use std::fmt::Write;
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let mut out = format!("user {}\nhostname {}\nport {}\n", t.user, t.host, t.port);
+    let mut line = |key: &str, value: &dyn std::fmt::Display| {
+        let _ = writeln!(out, "{key} {value}");
+    };
     for f in &t.identity_files {
-        println!("identityfile {}", f.display());
+        line("identityfile", &f.display());
     }
     for (name, list) in [("localforward", &t.local_forwards), ("remoteforward", &t.remote_forwards), ("dynamicforward", &t.dynamic_forwards)] {
         for f in list {
-            println!("{name} {f}");
+            line(name, f);
         }
     }
     if let Some(j) = &t.proxy_jump {
-        println!("proxyjump {j}");
+        line("proxyjump", j);
+    }
+    if let Some(c) = &t.proxy_command {
+        line("proxycommand", c);
     }
     if let Some(p) = &t.sharing.path {
-        println!("controlpath {}", p.display());
+        line("controlpath", &p.display());
     }
-    println!("batchmode {}", if t.batch_mode { "yes" } else { "no" });
+    line("batchmode", &yes_no(t.batch_mode));
+    let strict = match t.host_key_policy {
+        client::HostKeyPolicy::Ask => "ask",
+        client::HostKeyPolicy::AcceptNew => "accept-new",
+        client::HostKeyPolicy::Strict => "true",
+    };
+    line("stricthostkeychecking", &strict);
+    line("passwordauthentication", &yes_no(t.password_authentication));
+    line("numberofpasswordprompts", &t.password_prompts);
+    let user_file = t.known_hosts_file.clone().or_else(|| home_dir().ok().map(|h| qsh_dir(&h).join("known_hosts")));
+    if let Some(f) = user_file {
+        line("userknownhostsfile", &f.display());
+    }
+    // The further files qsh only reads: more UserKnownHostsFiles and GlobalKnownHostsFile.
+    let read_also: Vec<String> = t.known_hosts_read_also.iter().map(|f| f.display().to_string()).collect();
+    line("globalknownhostsfile", &if read_also.is_empty() { "none".to_string() } else { read_also.join(" ") });
+    if let Some(c) = &t.known_hosts_command {
+        line("knownhostscommand", c);
+    }
+    line("hashknownhosts", &yes_no(t.hash_known_hosts));
+    if let Some(a) = &t.host_key_alias {
+        line("hostkeyalias", a);
+    }
+    line("addkeystoagent", &t.add_keys_to_agent.as_deref().unwrap_or("no"));
+    match (&t.forward_agent_socket, t.forward_agent) {
+        (Some(socket), true) => line("forwardagent", &socket.display()),
+        (_, on) => line("forwardagent", &yes_no(on)),
+    }
+    line("forwardx11", &yes_no(t.forward_x11.is_some()));
+    line("forwardx11trusted", &yes_no(t.forward_x11 == Some(true)));
+    line("identitiesonly", &yes_no(t.identities_only));
+    line("requesttty", &t.request_tty.as_deref().unwrap_or("auto"));
+    if let Some(c) = &t.local_command {
+        line("localcommand", c);
+    }
+    line("clearallforwardings", &yes_no(t.clear_all_forwardings));
+    out
 }
 
 async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
@@ -815,18 +879,23 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     let target = match Target::resolve(&dest, a.port, &sources(&a)) {
         Ok(t) => t,
         // A user or host qsh cannot take (an AD-style user, say): ssh's job.
-        Err(e) if a.full => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),
+        Err(e) if a.full && !e.is::<client::ConfigError>() => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),
         Err(e) => return Err(e),
     };
+    if !(a.quiet || target.quiet) {
+        for o in &target.unapplied {
+            eprintln!("qsh: warning: {o} is not supported by qsh and has no effect");
+        }
+    }
     tracing::debug!(
-        "{dest}: user {}, host {}, port {}{} (~/.config/qsh/config, then ~/.ssh/config; `qsh -G {dest}` shows all)",
+        "{dest}: user {}, host {}, port {}{} (~/.config/qsh/config, then ~/.ssh/config; `qsh -G {dest}` shows the main settings)",
         target.user,
         target.host,
         target.port,
         target.alt_ports.iter().map(|p| format!(" or {p}")).collect::<String>()
     );
     if a.print_config {
-        print_config(&target);
+        print_config(&with_switches(target, &a));
         return Ok(0);
     }
     if let Some(cmd) = &a.control_command {
@@ -1515,6 +1584,33 @@ mod tests {
         assert!(!tool("-i cp host"));
         assert!(!tool("-o cp host"));
         assert!(!tool("-- cp"));
+    }
+
+    /// `-G` shows the settings that decide how strict qsh is, in a fixed order.
+    #[test]
+    fn printed_config() {
+        let t = Target::parse_with("u@h", Some(1), None, false).unwrap();
+        let t = Target { host_key_policy: client::HostKeyPolicy::Strict, forward_x11: Some(false), password_authentication: false, ..t };
+        let text = config_lines(&t);
+        let keys: Vec<&str> = text.lines().map(|l| l.split(' ').next().unwrap()).collect();
+        let want = [
+            "user", "hostname", "port", "batchmode", "stricthostkeychecking", "passwordauthentication", "numberofpasswordprompts",
+            "userknownhostsfile", "globalknownhostsfile", "hashknownhosts", "addkeystoagent", "forwardagent", "forwardx11",
+            "forwardx11trusted", "identitiesonly", "requesttty", "clearallforwardings",
+        ];
+        // Without a home directory there is no default known_hosts file to show.
+        let keys: Vec<&str> = keys.into_iter().filter(|k| *k != "userknownhostsfile").collect();
+        let want: Vec<&str> = want.into_iter().filter(|k| *k != "userknownhostsfile").collect();
+        assert_eq!(keys, want, "{text}");
+        for line in ["stricthostkeychecking true", "passwordauthentication no", "numberofpasswordprompts 3", "forwardx11 yes", "forwardx11trusted no"] {
+            assert!(text.lines().any(|l| l == line), "{line} in {text}");
+        }
+        // Switches that win over the config show too.
+        let a = SshArgs { forward_agent: Some(true), tty: 2, accept_new_host: true, ..Default::default() };
+        let text = config_lines(&with_switches(t, &a));
+        for line in ["forwardagent yes", "requesttty force", "stricthostkeychecking accept-new"] {
+            assert!(text.lines().any(|l| l == line), "{line} in {text}");
+        }
     }
 
     #[test]

@@ -107,17 +107,19 @@ const APPLIED_OPTIONS: &[&str] = &[
 ];
 
 /// ssh keywords with nothing to do in qsh: its own fixed crypto (TLS 1.3),
-/// logging, GSSAPI, host-based and keyboard-interactive login, old options.
+/// logging, GSSAPI, host-based and keyboard-interactive login, old options,
+/// and those distributions patch in (Debian, Fedora, Apple), which their ssh accepts.
 const QUIET_OPTIONS: &[&str] = &[
-    "casignaturealgorithms", "challengeresponseauthentication", "checkhostip", "cipher", "ciphers", "compressionlevel",
-    "enablesshkeysign", "fingerprinthash", "gssapiauthentication", "gssapiclientidentity", "gssapidelegatecredentials",
-    "gssapikeyexchange", "gssapirenewalforcesrekey", "gssapiserveridentity", "gssapitrustdns", "hostbasedacceptedalgorithms",
-    "hostbasedauthentication", "hostbasedkeytypes", "hostkeyalgorithms", "ignoreunknown", "ipqos", "kbdinteractiveauthentication",
-    "kbdinteractivedevices", "kexalgorithms", "logverbose", "macs", "nohostauthenticationforlocalhost", "preferredauthentications",
-    "protocol", "proxyusefdpass", "pubkeyacceptedalgorithms", "pubkeyacceptedkeytypes", "rekeylimit", "requiredrsasize",
-    "rhostsauthentication", "rhostsrsaauthentication", "rsaauthentication", "streamlocalbindmask", "syslogfacility",
-    "tcpkeepalive", "updatehostkeys", "usekeychain", "useprivilegedport", "useroaming", "versionaddendum", "visualhostkey",
-    "warnweakcrypto",
+    "afstokenpassing", "casignaturealgorithms", "challengeresponseauthentication", "checkhostip", "cipher", "ciphers",
+    "compressionlevel", "enablesshkeysign", "fallbacktorsh", "fingerprinthash", "globalknownhostsfile2", "gssapiauthentication",
+    "gssapiclientidentity", "gssapidelegatecredentials", "gssapikeyexchange", "gssapirenewalforcesrekey", "gssapiserveridentity",
+    "gssapikexalgorithms", "gssapistorecredentialsonrekey", "gssapitrustdns", "hostbasedacceptedalgorithms", "hostbasedauthentication", "hostbasedkeytypes", "hostkeyalgorithms",
+    "ignoreunknown", "ipqos", "kbdinteractiveauthentication", "kbdinteractivedevices", "keepalive", "kerberosauthentication",
+    "kerberostgtpassing", "kexalgorithms", "logverbose", "macs", "nohostauthenticationforlocalhost", "preferredauthentications",
+    "protocol", "protocolkeepalives", "proxyusefdpass", "pubkeyacceptedalgorithms", "pubkeyacceptedkeytypes", "rekeylimit", "requiredrsasize",
+    "rhostsauthentication", "rhostsrsaauthentication", "rsaauthentication", "rsaminsize", "setuptimeout", "skeyauthentication", "streamlocalbindmask",
+    "syslogfacility", "tcpkeepalive", "tisauthentication", "updatehostkeys", "usekeychain", "userknownhostsfile2",
+    "useprivilegedport", "useroaming", "usersh", "versionaddendum", "visualhostkey", "warnweakcrypto",
 ];
 
 /// ssh keywords qsh does not carry out and that would make it less strict
@@ -126,9 +128,40 @@ const REFUSED_OPTIONS: &[&str] = &["permitremoteopen", "refuseconnection", "revo
 
 /// Other ssh keywords qsh does not carry out: a warning.
 const UNAPPLIED_OPTIONS: &[&str] = &[
-    "canonicalizepermittedcnames", "channeltimeout", "gatewayports", "pkcs11provider", "pubkeyauthentication",
-    "securitykeyprovider", "streamlocalbindunlink", "verifyhostkeydns",
+    "canonicalizepermittedcnames", "channeltimeout", "dsaauthentication", "gatewayports", "identityfile2", "pkcs11provider",
+    "pubkeyauthentication", "securitykeyprovider", "smartcarddevice", "streamlocalbindunlink", "verifyhostkeydns",
 ];
+
+/// What qsh does with an ssh config keyword.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Keyword {
+    Applied,
+    /// Nothing to do in qsh (its fixed crypto and the like).
+    Quiet,
+    /// Not carried out, and qsh would be less strict without it.
+    Refused,
+    /// Not carried out: a warning.
+    Unapplied,
+    /// Known to neither qsh nor ssh (a typo, say).
+    Unknown,
+}
+
+/// Sorts a config keyword (any case).
+pub fn keyword_kind(keyword: &str) -> Keyword {
+    let key = keyword.to_ascii_lowercase();
+    let is = |list: &[&str]| list.contains(&key.as_str());
+    if is(APPLIED_OPTIONS) {
+        Keyword::Applied
+    } else if is(QUIET_OPTIONS) {
+        Keyword::Quiet
+    } else if is(REFUSED_OPTIONS) {
+        Keyword::Refused
+    } else if is(UNAPPLIED_OPTIONS) {
+        Keyword::Unapplied
+    } else {
+        Keyword::Unknown
+    }
+}
 
 /// The keyword of a `-o` value (`Key=value` or `Key value`).
 fn option_keyword(v: &str) -> &str {
@@ -310,20 +343,17 @@ impl SshArgs {
             .collect();
         for o in &self.options {
             let key = option_keyword(o).to_ascii_lowercase();
-            let is = |list: &[&str]| list.contains(&key.as_str());
-            if is(APPLIED_OPTIONS) {
-                continue;
-            }
-            if is(QUIET_OPTIONS) {
-                self.ignored.push(format!("-o {o}"));
-            } else if is(REFUSED_OPTIONS) {
-                self.refused.get_or_insert_with(|| format!("-o {}: not supported by qsh (use ssh for this)", option_keyword(o)));
-            } else if is(UNAPPLIED_OPTIONS) {
-                self.unapplied.push(format!("-o {o}"));
-            } else if crate::pattern::name_matches(&ignore_unknown, &key) {
-                self.ignored.push(format!("-o {o}"));
-            } else {
-                self.refused.get_or_insert_with(|| format!("bad configuration option: {}", option_keyword(o)));
+            match keyword_kind(&key) {
+                Keyword::Applied => {}
+                Keyword::Quiet => self.ignored.push(format!("-o {o}")),
+                Keyword::Refused => {
+                    self.refused.get_or_insert_with(|| format!("-o {}: not supported by qsh (use ssh for this)", option_keyword(o)));
+                }
+                Keyword::Unapplied => self.unapplied.push(format!("-o {o}")),
+                Keyword::Unknown if crate::pattern::name_matches(&ignore_unknown, &key) => self.ignored.push(format!("-o {o}")),
+                Keyword::Unknown => {
+                    self.refused.get_or_insert_with(|| format!("bad configuration option: {}", option_keyword(o)));
+                }
             }
         }
     }
@@ -472,5 +502,20 @@ mod tests {
         }
         assert_eq!(option_line("Port=22").unwrap(), "Port 22");
         assert_eq!(option_line("User  bob").unwrap(), "User bob");
+    }
+
+    /// Old names and aliases ssh still takes are no "bad option" (OpenSSH 10.6).
+    #[test]
+    fn ssh_aliases_are_known() {
+        for k in ["KeepAlive", "FallBackToRsh", "UseRsh", "KerberosAuthentication", "KerberosTGTPassing", "AFSTokenPassing",
+            "SkeyAuthentication", "TISAuthentication", "UserKnownHostsFile2", "GlobalKnownHostsFile2",
+            // Distribution patches: a config written for them must not stop qsh.
+            "GSSAPIKexAlgorithms", "GSSAPIKeyExchange", "ProtocolKeepAlives", "SetupTimeOut", "UseKeychain"] {
+            assert_eq!(keyword_kind(k), Keyword::Quiet, "{k}");
+        }
+        for k in ["DSAAuthentication", "IdentityFile2", "SmartcardDevice"] {
+            assert_eq!(keyword_kind(k), Keyword::Unapplied, "{k}");
+        }
+        assert_eq!(keyword_kind("KeepAlve"), Keyword::Unknown);
     }
 }

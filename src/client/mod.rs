@@ -172,6 +172,8 @@ pub struct Target {
     /// `ConnectTimeout` and `ConnectionAttempts`.
     pub connect_timeout: Option<std::time::Duration>,
     pub connection_attempts: u32,
+    /// Keywords in qsh's own config that qsh does not carry out (`FILE line N: Keyword`).
+    pub unapplied: Vec<String>,
 }
 
 /// The server refused the login (as opposed to a network problem).
@@ -185,6 +187,20 @@ impl std::fmt::Display for LoginRefused {
 }
 
 impl std::error::Error for LoginRefused {}
+
+/// The config says not to connect (`RefuseConnection`) or has a keyword
+/// that nobody knows: ssh must not get the host either (it may not read
+/// that file).
+#[derive(Debug)]
+pub struct ConfigError(pub String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Host names and aliases: no option-looking names, whitespace, control
 /// characters or shell metacharacters. They reach ssh's argument list and
@@ -341,6 +357,9 @@ impl Target {
         }
         let lookup_sources = config::Sources { user: cli_user.clone(), ..sources.clone() };
         let cfg = home.map(|h| config::lookup(h, alias, &lookup_sources)).unwrap_or_default();
+        if let Some(why) = cfg.refuse_connection.as_ref().or(cfg.bad_option.as_ref()) {
+            return Err(ConfigError(why.clone()).into());
+        }
         if let Some(keyword) = &cfg.refused {
             bail!("{keyword} in the config is not supported by qsh, which would be less strict than asked (use ssh for this host)");
         }
@@ -487,6 +506,7 @@ impl Target {
             host_key_alias: cfg.host_key_alias,
             connect_timeout: cfg.connect_timeout.filter(|&t| t > 0).map(std::time::Duration::from_secs),
             connection_attempts: cfg.connection_attempts.unwrap_or(1).max(1),
+            unapplied: cfg.unapplied,
             host,
             port,
         })
@@ -1328,5 +1348,26 @@ mod tests {
         // Unknown names pass through unchanged.
         let t = Target::parse_with("u@other", None, Some(home.path()), false).unwrap();
         assert_eq!(t.host, "other");
+    }
+
+    /// RefuseConnection and an unknown keyword stop qsh, and are not handed to ssh.
+    #[test]
+    fn config_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |text: &str| {
+            std::fs::write(dir.join("config"), text).unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(dir.join("config"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        };
+        for (text, says) in [("Host old\n RefuseConnection moved\n", "RefuseConnection: moved"), ("Host other\n Bogus 1\n", "Bad configuration option: Bogus")] {
+            write(text);
+            let e = Target::parse_with("old", None, Some(home.path()), true).unwrap_err();
+            assert!(e.is::<ConfigError>() && e.to_string().contains(says), "{e:#}");
+        }
+        write("Host old\n PubkeyAuthentication no\n");
+        let t = Target::parse_with("old", None, Some(home.path()), false).unwrap();
+        assert_eq!(t.unapplied.len(), 1, "{:?}", t.unapplied);
     }
 }

@@ -1,27 +1,31 @@
 //! Host aliases from `~/.config/qsh/config` and `~/.ssh/config` (ssh_config syntax).
 //!
-//! Precedence: `-o` options, then `~/.config/qsh/config`, then `~/.ssh/config`
-//! (or the `-F` file); within each the first value found wins (IdentityFile
-//! and the forwards accumulate). Supported keywords: `Host` patterns (`*`,
-//! `?`, `!`), `Match`, `Include`, `HostName`, `User`, `Port`,
-//! `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`,
-//! `ProxyJump`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`,
-//! `UserKnownHostsFile`, `ClearAllForwardings`, `EscapeChar`,
-//! `AddressFamily`, `LogLevel`, `ForwardAgent`, `ObscureKeystrokeTiming`,
-//! `ControlMaster`, `ControlPath`, `ControlPersist`, `ProxyCommand`,
-//! `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`,
-//! `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand`,
-//! `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`,
-//! `ConnectionAttempts`, and qsh's own `PersistSession` and `PredictiveEcho`.
-//! `Match` blocks are evaluated for `all`, `host`, `originalhost`, `user`,
-//! `localuser`, `exec`, `localnetwork`, `tagged`, `canonical` and `final`
-//! (with `CanonicalizeHostname`, the configs are read again for the
-//! canonical name); a block whose conditions qsh cannot check (`version`...)
-//! is not used, except that a proxy in it counts. Like ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config`
-//! (not with `-F`), and `#` starts a comment anywhere on a line.
+//! Precedence: `-o` options, then `~/.config/qsh/config`, then
+//! `~/.ssh/config` (or the `-F` file), then what `qsh ui` saved; within each
+//! the first value found wins (IdentityFile and the forwards accumulate).
+//! Supported keywords: `Host` patterns (`*`, `?`, `!`), `Match`, `Include`,
+//! `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`,
+//! `RemoteForward`, `DynamicForward`, `ProxyJump`, `RequestTTY`,
+//! `BatchMode`, `StrictHostKeyChecking`, `UserKnownHostsFile`,
+//! `ClearAllForwardings`, `EscapeChar`, `AddressFamily`, `LogLevel`,
+//! `ForwardAgent`, `ObscureKeystrokeTiming`, `ControlMaster`, `ControlPath`,
+//! `ControlPersist`, `ProxyCommand`, `SendEnv`, `SetEnv`, `RemoteCommand`,
+//! `SessionType`, `StdinNull`, `ForkAfterAuthentication`,
+//! `ExitOnForwardFailure`, `LocalCommand`, `PermitLocalCommand`,
+//! `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`,
+//! `RefuseConnection`, `IgnoreUnknown`, and qsh's own `PersistSession` and
+//! `PredictiveEcho`. `Match` blocks are evaluated for `all`, `host`,
+//! `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`,
+//! `canonical` and `final` (with `CanonicalizeHostname`, the configs are read
+//! again for the canonical name); a block whose conditions qsh cannot check
+//! (`version`...) is not used, except that a proxy or a refusal
+//! (`RevokedHostKeys`, `RefuseConnection`, `PermitRemoteOpen`) in it counts.
+//! Like ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with
+//! `-F`), and `#` starts a comment anywhere on a line. In qsh's own config,
+//! a keyword nobody knows is an error and one qsh does not carry out a warning.
 //!
-//! From `~/.ssh/config`, settings that describe the ssh session itself (`Port`,
-//! the forwards, `RequestTTY`) are only used in `--full` mode. Its
+//! From `~/.ssh/config`, settings that describe the ssh session itself
+//! (`Port`, `RequestTTY`...) are only used in `--full` mode. Its
 //! `ProxyJump`/`ProxyCommand` make `--full` hand the host to ssh, and its
 //! `UserKnownHostsFile` is never used (that file holds ssh host keys, not qshd's).
 
@@ -84,6 +88,14 @@ pub struct HostConfig {
     /// A keyword qsh cannot carry out and would be less strict without
     /// (`RevokedHostKeys`): such a host is ssh's.
     pub refused: Option<String>,
+    /// `RefuseConnection`: ssh's message, with the file and line. Also a
+    /// refusal in qsh's own config, which `--full` must not hand to ssh
+    /// (ssh does not read that file).
+    pub refuse_connection: Option<String>,
+    /// A keyword in qsh's own config that neither qsh nor ssh knows.
+    pub bad_option: Option<String>,
+    /// Keywords in qsh's own config that qsh does not carry out (`FILE line N: Keyword`).
+    pub unapplied: Vec<String>,
     /// `PermitRemoteOpen` other than `any`: qsh cannot check it, so it
     /// refuses dynamic remote forwards (`-R port`).
     pub permit_remote_open: bool,
@@ -124,8 +136,8 @@ pub struct HostConfig {
     pub wants_final: bool,
     /// `CanonicalizeFallbackLocal no` and the name could not be canonicalized.
     pub canonicalize_failed: Option<String>,
-    /// A config file of the user's that others could have written (ssh
-    /// refuses to go on then too).
+    /// A config file (or one it includes) that others could have written
+    /// (ssh refuses to go on then too).
     pub bad_file: Option<String>,
     pub clear_all_forwardings: Option<bool>,
     pub escape_char: Option<String>,
@@ -282,13 +294,26 @@ struct Parser<'a> {
     final_pass: bool,
     /// A `Match final` was seen: the config is read once more at the end.
     wants_final: bool,
-    /// Reading the user's files (whose includes must be safe too), not the system's.
-    users_file: bool,
+    /// The file being read, for messages (`None` for `-o` lines).
+    file: Option<String>,
+    /// Report keywords qsh does not carry out or know (qsh's own config:
+    /// ssh's files are ssh's to judge).
+    check: bool,
+    /// `IgnoreUnknown` patterns (lowercase).
+    ignore_unknown: Option<Vec<String>>,
+    /// Reading a file included from a block that only may apply: nothing in
+    /// it applies for sure, but its proxies and refusals still count.
+    maybe_only: bool,
 }
 
 /// A proxy setting that is not `none`.
 fn is_proxy(keyword: &str, first: Option<&str>) -> bool {
     matches!(keyword, "proxyjump" | "proxycommand") && first.is_some_and(|v| !v.eq_ignore_ascii_case("none"))
+}
+
+/// `FILE line N: ` for messages, as ssh writes it.
+fn at(file: &Option<String>, n: usize) -> String {
+    file.as_ref().map(|f| format!("{f} line {n}: ")).unwrap_or_default()
 }
 
 impl Parser<'_> {
@@ -360,10 +385,13 @@ impl Parser<'_> {
 
     fn feed(&mut self, text: &str, depth: usize) {
         // Lines before the first Host/Match apply to every host.
-        let mut active = Applies::Yes;
-        for line in text.lines() {
+        let maybe_only = self.maybe_only;
+        let cap = |a: Applies| if maybe_only && a == Applies::Yes { Applies::Maybe } else { a };
+        let mut active = cap(Applies::Yes);
+        for (n, line) in text.lines().enumerate() {
             let Some((keyword, args, raw)) = split_line_raw(line) else { continue };
             let first = args.first().cloned();
+            let n = n + 1;
             if keyword == "match" && args.iter().any(|a| a.trim_start_matches('!').eq_ignore_ascii_case("final")) {
                 self.wants_final = true;
             }
@@ -388,37 +416,76 @@ impl Parser<'_> {
                     self.out.needs_proxy = true;
                 }
             }
+            // Likewise a refusal that may apply: fail closed.
+            if active == Applies::Maybe {
+                let where_ = at(&self.file, n);
+                let o = &mut self.out;
+                match keyword.as_str() {
+                    "revokedhostkeys" if self.ours && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                        o.refuse_connection.get_or_insert_with(|| format!("{where_}RevokedHostKeys is not supported by qsh"));
+                    }
+                    "revokedhostkeys" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                        o.refused.get_or_insert_with(|| "RevokedHostKeys".into());
+                    }
+                    "refuseconnection" if self.ours && !args.is_empty() => {
+                        o.refuse_connection.get_or_insert_with(|| format!("{where_}RefuseConnection (in a Match block qsh cannot evaluate): {}", args.join(" ")));
+                    }
+                    // Not a sure refusal: --full lets ssh evaluate the block in its own files.
+                    "refuseconnection" if !args.is_empty() => {
+                        o.refused.get_or_insert_with(|| "RefuseConnection (in a Match block qsh cannot evaluate)".into());
+                    }
+                    "permitremoteopen" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("any")) => o.permit_remote_open = true,
+                    _ => {}
+                }
+            }
+            if self.check {
+                // As ssh: a keyword it does not know is an error anywhere in the file.
+                let name = &line.trim_start()[..keyword.len()];
+                match super::cli::keyword_kind(&keyword) {
+                    super::cli::Keyword::Unknown if !self.ignore_unknown.as_ref().is_some_and(|p| crate::pattern::name_matches(p, &keyword)) => {
+                        self.out.bad_option.get_or_insert_with(|| format!("{}Bad configuration option: {name}", at(&self.file, n)));
+                    }
+                    super::cli::Keyword::Unapplied if active == Applies::Yes => {
+                        push_new(&mut self.out.unapplied, Some(format!("{}{name}", at(&self.file, n))));
+                    }
+                    _ => {}
+                }
+            }
             match keyword.as_str() {
                 "host" => {
-                    active = if host_matches(&args, self.host) { Applies::Yes } else { Applies::No };
+                    active = cap(if host_matches(&args, self.host) { Applies::Yes } else { Applies::No });
                     continue;
                 }
                 "match" => {
-                    active = self.match_applies(&args);
+                    active = cap(self.match_applies(&args));
                     continue;
                 }
                 _ => {}
             }
             let o = &mut self.out;
             match keyword.as_str() {
-                _ if active != Applies::Yes => {}
+                _ if active == Applies::No => {}
                 "include" if depth < MAX_INCLUDE_DEPTH => {
+                    let outer_maybe = self.maybe_only;
+                    self.maybe_only |= active == Applies::Maybe;
                     for pattern in &args {
                         for file in self.expand_include(pattern) {
+                            // Every included file is checked, those the system config includes too (as by ssh).
                             match read_config(&file) {
-                                Err(why) if self.users_file => {
-                                    self.out.bad_file.get_or_insert(why);
+                                Ok(t) => {
+                                    let outer = self.file.replace(file.display().to_string());
+                                    self.feed(&t, depth + 1);
+                                    self.file = outer;
                                 }
-                                Ok(t) => self.feed(&t, depth + 1),
-                                Err(_) => {
-                                    if let Ok(t) = std::fs::read_to_string(&file) {
-                                        self.feed(&t, depth + 1);
-                                    }
+                                Err(why) => {
+                                    self.out.bad_file.get_or_insert(why);
                                 }
                             }
                         }
                     }
+                    self.maybe_only = outer_maybe;
                 }
+                _ if active != Applies::Yes => {}
                 "hostname" if o.hostname.is_none() => o.hostname = first,
                 "user" if o.user.is_none() => o.user = first,
                 "port" if self.full && o.port.is_none() => o.port = first.and_then(|p| p.parse().ok()),
@@ -532,10 +599,20 @@ impl Parser<'_> {
                 "compression" if o.compression.is_none() => o.compression = first.as_deref().map(|v| yes(v) || v.eq_ignore_ascii_case("auto")),
                 "bindaddress" if o.bind_address.is_none() => o.bind_address = first,
                 "bindinterface" if o.bind_interface.is_none() => o.bind_interface = first,
+                "revokedhostkeys" if self.ours && o.refuse_connection.is_none() && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
+                    o.refuse_connection = Some(format!("{}RevokedHostKeys is not supported by qsh", at(&self.file, n)));
+                }
                 "revokedhostkeys" if o.refused.is_none() && first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("none")) => {
                     o.refused = Some("RevokedHostKeys".into());
                 }
                 "permitremoteopen" if first.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("any")) => o.permit_remote_open = true,
+                // Its argument is a message, not yes/no: any one refuses (as in ssh).
+                "refuseconnection" if o.refuse_connection.is_none() && !args.is_empty() => {
+                    o.refuse_connection = Some(format!("{}RefuseConnection: {}", at(&self.file, n), args.join(" ")));
+                }
+                "ignoreunknown" if self.ignore_unknown.is_none() => {
+                    self.ignore_unknown = Some(args.iter().flat_map(|a| a.split(',')).map(str::to_ascii_lowercase).collect());
+                }
                 "obscurekeystroketiming" if o.obscure_keystrokes.is_none() => {
                     o.obscure_keystrokes = first.map(|v| v.to_ascii_lowercase());
                 }
@@ -559,7 +636,10 @@ impl Parser<'_> {
             canonical: false,
             final_pass: false,
             wants_final: false,
-            users_file: true,
+            file: None,
+            check: false,
+            ignore_unknown: None,
+            maybe_only: false,
         }
     }
 
@@ -602,10 +682,23 @@ impl Parser<'_> {
     }
 
     /// Feeds another file, with its own directory for `Include`.
-    fn feed_file(&mut self, text: &str, base: &Path) {
+    fn feed_file(&mut self, text: &str, base: &Path, file: Option<&Path>) {
         self.base = base.to_path_buf();
+        self.file = file.map(|f| f.display().to_string());
         // Blocks do not continue into the next file.
         self.feed(&format!("{text}\nMatch all\n"), 0);
+    }
+
+    /// The system-wide ssh config. Stricter than ssh, which does not check
+    /// this file itself: one others could have written is refused like its
+    /// includes, rather than run.
+    fn feed_system(&mut self, system: &Path) {
+        match read_config(system) {
+            Ok(t) => self.feed_file(&t, system.parent().unwrap_or(Path::new("/")), Some(system)),
+            Err(why) => {
+                self.out.bad_file.get_or_insert(why);
+            }
+        }
     }
 
     fn finish(mut self) -> HostConfig {
@@ -803,7 +896,7 @@ pub struct Sources {
 /// and once more at the end if a `Match final` asks for it.
 pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
     let seed = HostConfig { user: sources.user.clone(), ..Default::default() };
-    let first_pass = lookup_pass(home, host, host, sources, (false, false), (seed.clone(), seed));
+    let first_pass = lookup_pass(home, host, host, sources, (false, false), [seed.clone(), seed.clone(), seed]);
     let first = merge(first_pass.clone());
     let mode = first.canonicalize_hostname.clone().unwrap_or_default();
     let direct = first.proxy_jump.is_none() && first.proxy_command.is_none() && !first.needs_proxy;
@@ -820,14 +913,15 @@ pub fn lookup(home: &Path, host: &str, sources: &Sources) -> HostConfig {
     }
     // Later passes add to what the first one found (the first value still
     // wins, as in ssh), so settings of the original name's blocks stay.
-    let (mut ours, mut ssh) = first_pass;
+    let mut parts = first_pass;
     match &canonical {
         Some(name) => {
-            ours.hostname = Some(name.clone());
-            ssh.hostname = Some(name.clone());
-            merge(lookup_pass(home, name, host, sources, (true, true), (ours, ssh)))
+            for part in &mut parts {
+                part.hostname = Some(name.clone());
+            }
+            merge(lookup_pass(home, name, host, sources, (true, true), parts))
         }
-        None if first.wants_final => merge(lookup_pass(home, host, host, sources, (false, true), (ours, ssh))),
+        None if first.wants_final => merge(lookup_pass(home, host, host, sources, (false, true), parts)),
         None => first,
     }
 }
@@ -850,17 +944,17 @@ fn canonicalize(name: &str, domains: &[String], max_dots: usize) -> Option<Strin
     })
 }
 
-/// One reading of the configs (see [`lookup`]) on top of what `seed` (qsh's
-/// part, ssh's part) has: those parts. `original` is the host as given;
-/// `pass` is (canonical, final).
+/// One reading of the configs (see [`lookup`]) on top of what `seeds` (qsh's
+/// part, ssh's part, `qsh ui`'s part) have: those parts. `original` is the
+/// host as given; `pass` is (canonical, final).
 fn lookup_pass(
     home: &Path,
     host: &str,
     original: &str,
     sources: &Sources,
     (canonical, final_pass): (bool, bool),
-    (ours_seed, ssh_seed): (HostConfig, HostConfig),
-) -> (HostConfig, HostConfig) {
+    [ours_seed, ssh_seed, ui_seed]: [HostConfig; 3],
+) -> [HostConfig; 3] {
     let qsh_dir = crate::keys::qsh_dir(home);
     let ssh_file = sources.ssh_config.clone().unwrap_or_else(|| home.join(".ssh").join("config"));
     // A file others could change is not read at all (as by ssh): its
@@ -870,63 +964,73 @@ fn lookup_pass(
     let read = |r: Result<String, String>| r.unwrap_or_default();
     // Relative Includes in the user's file are in ~/.ssh, even with -F (as in ssh).
     let ssh_dir = home.join(".ssh");
+    let parser = |full, ours, seed| {
+        let mut p = Parser::new(host, &qsh_dir, full, ours);
+        (p.original, p.canonical, p.final_pass, p.out) = (original.to_string(), canonical, final_pass, seed);
+        p
+    };
     // -o lines come first: before any `Host` they apply to every host and win.
-    // `Match all` ends the last `Host` block of each part, so settings in the
-    // next one are not taken as part of it.
-    let ours_text = format!(
-        "{}\nMatch all\n{}\nMatch all\n{}",
-        sources.overrides.join("\n"),
-        read(qsh_config),
-        read(ui_hosts)
-    );
-    let mut ours = Parser::new(host, &qsh_dir, true, true);
-    (ours.original, ours.canonical, ours.final_pass, ours.out) = (original.to_string(), canonical, final_pass, ours_seed);
-    let mut ours = ours.run(&ours_text);
+    let mut ours = parser(true, true, ours_seed);
+    ours.feed_file(&sources.overrides.join("\n"), &qsh_dir, None);
+    ours.check = true;
+    let qsh_file = qsh_dir.join("config");
+    ours.feed_file(&read(qsh_config), &qsh_dir, Some(&qsh_file));
+    let mut ours = ours.finish();
     if bad_file.is_some() {
         ours.bad_file = bad_file;
     }
+    // What `qsh ui` saved comes last of all (see `merge`).
+    let ui = parser(true, true, ui_seed).run(&read(ui_hosts));
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
-    let mut ssh = Parser::new(host, &ssh_dir, sources.full, false);
-    (ssh.original, ssh.canonical, ssh.final_pass, ssh.out) = (original.to_string(), canonical, final_pass, ssh_seed);
+    let mut ssh = parser(sources.full, false, ssh_seed);
     // A tag set by -P or qsh's config is the tag for ssh's `Match tagged` too.
     if ssh.out.tag.is_none() {
         ssh.out.tag = ours.tag.clone();
     }
-    ssh.feed_file(&read(ssh_config), &ssh_dir);
+    ssh.feed_file(&read(ssh_config), &ssh_dir, Some(&ssh_file));
     if sources.ssh_config.is_none() {
-        let system = Path::new(SYSTEM_SSH_CONFIG);
-        ssh.users_file = false;
-        ssh.feed_file(&read(read_config(system)), system.parent().unwrap_or(Path::new("/")));
+        ssh.feed_system(Path::new(SYSTEM_SSH_CONFIG));
     }
-    (ours, ssh.finish())
+    [ours, ssh.finish(), ui]
 }
 
-/// One host's settings from qsh's part and ssh's part of the configs.
-fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
-    // A proxy (or `none`) in qsh's config or -o takes care of ssh's.
-    let ours_decides = ours.proxy_jump.is_some() || ours.proxy_command.is_some() || ours.none_set.iter().any(|n| n == "proxy");
-    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && !ours_decides);
-    let mut set_env = ours.set_env.clone();
-    for e in &ssh.set_env {
+/// `SetEnv`s of `high`, then those of `low` for other variables.
+fn merge_set_env(high: &[String], low: &[String]) -> Vec<String> {
+    let mut set_env = high.to_vec();
+    for e in low {
         let name = e.split('=').next();
         if !set_env.iter().any(|o| o.split('=').next() == name) {
             set_env.push(e.clone());
         }
     }
+    set_env
+}
+
+/// One host's settings from qsh's part, ssh's part and `qsh ui`'s part of
+/// the configs, in this order of precedence: what `qsh ui` saved never
+/// overrides what the user wrote.
+fn merge([ours, ssh, ui]: [HostConfig; 3]) -> HostConfig {
+    under(merge_ssh(ours, ssh), ui)
+}
+
+/// `-o` options for ssh from qsh's part `c` (see `HostConfig::for_ssh`):
+/// what ssh would not get from `over`, the part that ssh reads or that
+/// takes precedence. `wins`: `c` takes precedence over `over`.
+fn ssh_options(c: &HostConfig, over: &HostConfig, wins: bool) -> Vec<String> {
     let mut for_ssh = Vec::new();
-    if let (Some(h), None) = (&ours.hostname, &ssh.hostname) {
+    if let (Some(h), None) = (&c.hostname, &over.hostname) {
         for_ssh.push(format!("HostName={h}"));
     }
-    if let (Some(u), None) = (&ours.user, &ssh.user) {
+    if let (Some(u), None) = (&c.user, &over.user) {
         for_ssh.push(format!("User={u}"));
     }
-    for f in &ours.identity_files {
+    for f in &c.identity_files {
         for_ssh.push(format!("IdentityFile={f}"));
     }
     // Forwards and the like from qsh's own files (`qsh ui` writes them) are
     // wanted when ssh takes over too.
-    for (key, specs) in [("LocalForward", &ours.local_forwards), ("RemoteForward", &ours.remote_forwards)] {
+    for (key, specs) in [("LocalForward", &c.local_forwards), ("RemoteForward", &c.remote_forwards)] {
         for spec in specs {
             let parsed = if key == "LocalForward" { Forward::parse(spec) } else { Forward::parse_remote(spec) };
             match parsed.map(|f| f.config_args()) {
@@ -936,20 +1040,35 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
             }
         }
     }
-    for d in &ours.dynamic_forwards {
+    for d in &c.dynamic_forwards {
         for_ssh.push(format!("DynamicForward={d}"));
     }
     let yes_no = |b: bool| if b { "yes" } else { "no" };
-    match (ours.forward_agent, &ours.forward_agent_socket) {
+    match (c.forward_agent, &c.forward_agent_socket) {
+        _ if !wins && over.forward_agent.is_some() => {}
         (Some(true), Some(socket)) => for_ssh.push(format!("ForwardAgent={socket}")),
         (Some(on), _) => for_ssh.push(format!("ForwardAgent={}", yes_no(on))),
         (None, _) => {}
     }
-    for (key, value) in [("ForwardX11", ours.forward_x11), ("ForwardX11Trusted", ours.forward_x11_trusted), ("Compression", ours.compression)] {
-        if let Some(v) = value {
+    for (key, value, theirs) in [
+        ("ForwardX11", c.forward_x11, over.forward_x11),
+        ("ForwardX11Trusted", c.forward_x11_trusted, over.forward_x11_trusted),
+        ("Compression", c.compression, over.compression),
+    ] {
+        if let Some(v) = value.filter(|_| wins || theirs.is_none()) {
             for_ssh.push(format!("{key}={}", yes_no(v)));
         }
     }
+    for_ssh
+}
+
+/// qsh's part and ssh's part (see [`merge`]).
+fn merge_ssh(ours: HostConfig, ssh: HostConfig) -> HostConfig {
+    // A proxy (or `none`) in qsh's config or -o takes care of ssh's.
+    let ours_decides = ours.proxy_jump.is_some() || ours.proxy_command.is_some() || ours.none_set.iter().any(|n| n == "proxy");
+    let needs_proxy = ours.needs_proxy || (ssh.needs_proxy && !ours_decides);
+    let set_env = merge_set_env(&ours.set_env, &ssh.set_env);
+    let for_ssh = ssh_options(&ours, &ssh, true);
     HostConfig {
         hostname: ours.hostname.or(ssh.hostname),
         user: ours.user.or(ssh.user),
@@ -966,6 +1085,9 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
         needs_proxy,
         batch_mode: ours.batch_mode.or(ssh.batch_mode),
         refused: ours.refused.or(ssh.refused),
+        refuse_connection: ours.refuse_connection.or(ssh.refuse_connection),
+        bad_option: ours.bad_option.or(ssh.bad_option),
+        unapplied: ours.unapplied.into_iter().chain(ssh.unapplied).collect(),
         permit_remote_open: ours.permit_remote_open || ssh.permit_remote_open,
         strict_host_key_checking: ours.strict_host_key_checking.or(ssh.strict_host_key_checking),
         user_known_hosts_file: ours.user_known_hosts_file,
@@ -1031,6 +1153,72 @@ fn merge((ours, ssh): (HostConfig, HostConfig)) -> HostConfig {
     }
 }
 
+/// `low` (qsh ui's part) under `high`: only what `high` leaves unset, its
+/// lists after `high`'s.
+fn under(mut high: HostConfig, low: HostConfig) -> HostConfig {
+    let for_ssh = ssh_options(&low, &high, false);
+    let proxy_decided = high.needs_proxy || high.proxy_jump.is_some() || high.proxy_command.is_some() || high.none_set.iter().any(|n| n == "proxy");
+    // Every field by name, so a new one cannot be forgotten here.
+    let HostConfig {
+        hostname, user, port, ssh_port, identity_files, local_forwards, remote_forwards, dynamic_forwards, proxy_jump,
+        request_tty, needs_proxy, batch_mode, refused, refuse_connection, bad_option, unapplied, permit_remote_open,
+        strict_host_key_checking, user_known_hosts_file, more_known_hosts_files, global_known_hosts_files, hash_known_hosts,
+        known_hosts_command, tag, canonicalize_hostname, canonical_domains, canonicalize_max_dots, canonicalize_fallback_local,
+        add_keys_to_agent, forward_x11, forward_x11_trusted, forward_x11_timeout, xauth_location, tunnel, tunnel_device,
+        escape_commandline, password_authentication, password_prompts, wants_final, canonicalize_failed: _, bad_file,
+        clear_all_forwardings, escape_char, address_family, log_level, forward_agent, forward_agent_socket, obscure_keystrokes,
+        identities_only, identity_agent, certificate_files, persist_session, restore_session, server_alive_interval,
+        server_alive_count_max, control_master, control_path, control_persist, predictive_echo, compression, bind_address,
+        bind_interface, proxy_command, send_env, set_env, remote_command, session_type, stdin_null, fork_after_authentication,
+        exit_on_forward_failure, local_command, permit_local_command, host_key_alias, connect_timeout, connection_attempts,
+        for_ssh: _, none_set,
+    } = low;
+    macro_rules! fill {
+        ($($f:ident)*) => { $(high.$f = high.$f.take().or($f);)* };
+    }
+    macro_rules! append {
+        ($($f:ident)*) => { $(high.$f.extend($f);)* };
+    }
+    fill!(hostname user port ssh_port request_tty batch_mode refused refuse_connection bad_option strict_host_key_checking
+        global_known_hosts_files hash_known_hosts known_hosts_command tag canonicalize_hostname canonical_domains
+        canonicalize_max_dots canonicalize_fallback_local add_keys_to_agent forward_x11 forward_x11_trusted forward_x11_timeout
+        xauth_location tunnel tunnel_device escape_commandline password_authentication password_prompts bad_file
+        clear_all_forwardings escape_char address_family log_level obscure_keystrokes identities_only identity_agent
+        persist_session restore_session server_alive_interval server_alive_count_max control_master control_path
+        control_persist predictive_echo compression bind_address bind_interface remote_command session_type stdin_null
+        fork_after_authentication exit_on_forward_failure local_command permit_local_command host_key_alias connect_timeout
+        connection_attempts);
+    append!(identity_files local_forwards remote_forwards dynamic_forwards unapplied certificate_files send_env none_set);
+    if high.user_known_hosts_file.is_none() {
+        (high.user_known_hosts_file, high.more_known_hosts_files) = (user_known_hosts_file, more_known_hosts_files);
+    }
+    if high.forward_agent.is_none() {
+        (high.forward_agent, high.forward_agent_socket) = (forward_agent, forward_agent_socket);
+    }
+    if !proxy_decided {
+        (high.proxy_jump, high.proxy_command) = (proxy_jump, proxy_command);
+    }
+    high.set_env = merge_set_env(&high.set_env, &set_env);
+    high.needs_proxy |= needs_proxy;
+    high.permit_remote_open |= permit_remote_open;
+    high.wants_final |= wants_final;
+    high.for_ssh.extend(for_ssh);
+    high
+}
+
+/// Writes a test config file not writable by others, whatever the umask
+/// (002 would make it group-writable, and so refused).
+#[cfg(test)]
+fn write_config(path: impl AsRef<Path>, text: impl AsRef<[u8]>) -> std::io::Result<()> {
+    std::fs::write(&path, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1265,78 @@ Host *
         assert!(parse("Host h\n PermitRemoteOpen localhost:8080\n", "h", Path::new("/x"), false).permit_remote_open);
         assert!(!parse("PermitRemoteOpen any\n", "h", Path::new("/x"), false).permit_remote_open);
         assert_eq!(refused("RevokedHostKeys none\n"), None);
+    }
+
+    /// `RefuseConnection MESSAGE` refuses the host, in its block only.
+    #[test]
+    fn refuse_connection() {
+        let text = "Host old\n RefuseConnection \"use new.example\"\nHost *\n RefuseConnection later\n";
+        let refuse = |host: &str| parse(text, host, Path::new("/x"), false).refuse_connection;
+        assert_eq!(refuse("old").as_deref(), Some("RefuseConnection: use new.example"), "the first value wins");
+        assert_eq!(refuse("h").as_deref(), Some("RefuseConnection: later"));
+        assert_eq!(parse("Host old\n RefuseConnection x\n", "h", Path::new("/x"), false).refuse_connection, None);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        write_config(home.path().join(".ssh/config"), "Host old\n RefuseConnection gone\n").unwrap();
+        let c = lookup(home.path(), "old", &Sources::default());
+        let why = c.refuse_connection.unwrap();
+        assert!(why.ends_with(".ssh/config line 2: RefuseConnection: gone"), "{why}");
+    }
+
+    /// Keywords in qsh's own config that qsh does not carry out are warned
+    /// about, unknown ones are an error (as in ssh); ssh's files are ssh's.
+    #[test]
+    fn keywords_qsh_does_not_carry_out() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        let file = dir.join("config").display().to_string();
+        let ours = |text: &str| {
+            write_config(dir.join("config"), text).unwrap();
+            lookup(home.path(), "h", &Sources::default())
+        };
+        let c = ours("Ciphers aes\nHost h\n PubkeyAuthentication no\nHost other\n VerifyHostKeyDNS yes\n");
+        assert_eq!((c.unapplied, c.bad_option), (vec![format!("{file} line 3: PubkeyAuthentication")], None));
+        // A typo is an error even in a block for another host.
+        let c = ours("Host other\n StrictHostKeyCheking yes\n");
+        assert_eq!(c.bad_option, Some(format!("{file} line 2: Bad configuration option: StrictHostKeyCheking")));
+        assert_eq!(ours("IgnoreUnknown Strict*,foo\nHost other\n StrictHostKeyCheking yes\n").bad_option, None);
+        // In an included file: that file's name and line.
+        write_config(dir.join("extra"), "\nBogus 1\n").unwrap();
+        let c = ours("Include extra\n");
+        assert_eq!(c.bad_option, Some(format!("{} line 2: Bad configuration option: Bogus", dir.join("extra").display())));
+        // A second pass (canonical name) does not repeat the warning.
+        let c = ours("CanonicalizeHostname always\nPubkeyAuthentication no\nHost h\n HostName real.\n");
+        assert_eq!((c.hostname.as_deref(), c.unapplied.len()), (Some("real"), 1), "{:?}", c.unapplied);
+        // -o lines are checked by the command line; ssh's own files are not checked.
+        ours("");
+        write_config(home.path().join(".ssh/config"), "Bogus 1\nPubkeyAuthentication no\n").unwrap();
+        let o = Sources { overrides: vec!["PubkeyAuthentication no".into()], ..Default::default() };
+        let c = lookup(home.path(), "h", &o);
+        assert_eq!((c.unapplied, c.bad_option), (vec![], None));
+    }
+
+    /// What `qsh ui` saved never overrides the user's ssh config, but its own
+    /// settings (Port, forwards) still count.
+    #[test]
+    fn ui_hosts_come_last() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = crate::keys::qsh_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+        write_config(dir.join(UI_HOSTS), "Host web\n    HostName 192.0.2.1\n    User olduser\n    Port 5000\n    LocalForward 8000 localhost:80\n    ForwardAgent yes\n").unwrap();
+        let c = lookup(home.path(), "web", &Sources::default());
+        assert_eq!((c.hostname.as_deref(), c.user.as_deref(), c.port), (Some("192.0.2.1"), Some("olduser"), Some(5000)));
+        assert!(c.for_ssh.contains(&"HostName=192.0.2.1".to_string()) && c.for_ssh.contains(&"ForwardAgent=yes".to_string()), "{:?}", c.for_ssh);
+        write_config(home.path().join(".ssh/config"), "Host web\n HostName 192.0.2.2\n User deploy\n ForwardAgent no\n").unwrap();
+        let c = lookup(home.path(), "web", &Sources::default());
+        assert_eq!((c.hostname.as_deref(), c.user.as_deref(), c.forward_agent), (Some("192.0.2.2"), Some("deploy"), Some(false)));
+        assert_eq!((c.port, c.local_forwards.as_slice()), (Some(5000), &["8000:localhost:80".to_string()][..]));
+        assert_eq!(c.for_ssh, ["LocalForward=8000 localhost:80"], "nothing that would override ssh's config");
+        // qsh's own config still comes first.
+        write_config(dir.join("config"), "Host web\n Port 6000\n").unwrap();
+        assert_eq!(lookup(home.path(), "web", &Sources::default()).port, Some(6000));
     }
 
     #[test]
@@ -1155,8 +1415,8 @@ Host *
         let home = tempfile::tempdir().unwrap();
         let ssh = home.path().join(".ssh");
         std::fs::create_dir_all(ssh.join("conf.d")).unwrap();
-        std::fs::write(ssh.join("config"), "Host a b *.x !c\n Port 1\nInclude conf.d/*\nHost *\n").unwrap();
-        std::fs::write(ssh.join("conf.d/more"), "Host d a\n").unwrap();
+        write_config(ssh.join("config"), "Host a b *.x !c\n Port 1\nInclude conf.d/*\nHost *\n").unwrap();
+        write_config(ssh.join("conf.d/more"), "Host d a\n").unwrap();
         assert_eq!(host_aliases(home.path()), vec!["a", "b", "d"]);
     }
 
@@ -1164,8 +1424,8 @@ Host *
     fn includes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("conf.d")).unwrap();
-        std::fs::write(dir.path().join("conf.d/a.conf"), "Host box\n  HostName 192.0.2.7\n").unwrap();
-        std::fs::write(dir.path().join("conf.d/b.conf"), "Host box\n  HostName ignored\n  User u\n").unwrap();
+        write_config(dir.path().join("conf.d/a.conf"), "Host box\n  HostName 192.0.2.7\n").unwrap();
+        write_config(dir.path().join("conf.d/b.conf"), "Host box\n  HostName ignored\n  User u\n").unwrap();
         let c = parse("Include conf.d/*.conf\nHost box\n  Port 9\n", "box", dir.path(), true);
         assert_eq!(c.hostname.as_deref(), Some("192.0.2.7"));
         assert_eq!(c.user.as_deref(), Some("u"));
@@ -1186,19 +1446,19 @@ Host *
         let ours = crate::keys::qsh_dir(home.path());
         std::fs::create_dir_all(&ssh).unwrap();
         std::fs::create_dir_all(&ours).unwrap();
-        std::fs::write(ssh.join("config"), "Host myserver\n HostName 192.0.2.1\n User root\n Port 22\n").unwrap();
-        std::fs::write(ours.join("config"), "Host myserver\n Port 8080\n User admin\n").unwrap();
+        write_config(ssh.join("config"), "Host myserver\n HostName 192.0.2.1\n User root\n Port 22\n").unwrap();
+        write_config(ours.join("config"), "Host myserver\n Port 8080\n User admin\n").unwrap();
         let c = lookup(home.path(), "myserver", &Sources::default());
         assert_eq!(c.hostname.as_deref(), Some("192.0.2.1"));
         assert_eq!(c.user.as_deref(), Some("admin"));
         assert_eq!(c.port, Some(8080));
         // --full: ssh's Port is used when qsh's config has none.
-        std::fs::write(ours.join("config"), "Host other\n Port 1\n").unwrap();
+        write_config(ours.join("config"), "Host other\n Port 1\n").unwrap();
         let full = Sources { full: true, ..Default::default() };
         assert_eq!(lookup(home.path(), "myserver", &full).ssh_port, Some(22));
         assert_eq!(lookup(home.path(), "myserver", &Sources::default()).ssh_port, None);
         // -o wins over both files; ssh's known_hosts file is never used.
-        std::fs::write(ssh.join("config"), "Host myserver\n UserKnownHostsFile /x\n User root\n").unwrap();
+        write_config(ssh.join("config"), "Host myserver\n UserKnownHostsFile /x\n User root\n").unwrap();
         let o = Sources { overrides: vec!["User override".into(), "UserKnownHostsFile ~/kh".into()], ..Default::default() };
         let c = lookup(home.path(), "myserver", &o);
         assert_eq!(c.user.as_deref(), Some("override"));
@@ -1247,6 +1507,31 @@ mod match_tests {
         assert_eq!(c.user, None);
     }
 
+    /// So do refusals: qsh does not connect around them either.
+    #[test]
+    fn unknown_conditions_with_a_refusal() {
+        let c = cfg("Match host h sessiontype shell\n    RevokedHostKeys /x\n    PermitRemoteOpen localhost:80\n    StrictHostKeyChecking yes\n", "h");
+        assert_eq!((c.refused.as_deref(), c.permit_remote_open, c.strict_host_key_checking), (Some("RevokedHostKeys"), true, None));
+        // Only maybe: a refusal ssh may lift (`--full`), not a sure one.
+        let c = cfg("Match version OpenSSH_9*\n    RefuseConnection old\n", "h");
+        assert_eq!((c.refused.as_deref(), c.refuse_connection), (Some("RefuseConnection (in a Match block qsh cannot evaluate)"), None));
+        let c = cfg("Match version OpenSSH_9*\n    RevokedHostKeys none\n    PermitRemoteOpen any\n", "h");
+        assert_eq!((c.refused, c.permit_remote_open), (None, false));
+        let c = cfg("Match host other version OpenSSH_9*\n    RefuseConnection old\n", "h");
+        assert_eq!((c.refused, c.refuse_connection), (None, None), "a block that cannot apply");
+        // The same in a file such a block includes; nothing else there applies.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path().join("policy"), "User other\nHost *\n  RefuseConnection old\n  ProxyJump gate\n").unwrap();
+        let c = Parser::new("h", dir.path(), true, false).run("Match version OpenSSH_9*\n    Include policy\n");
+        assert_eq!((c.refused.as_deref(), c.needs_proxy, c.user), (Some("RefuseConnection (in a Match block qsh cannot evaluate)"), true, None));
+        // In qsh's own config ssh never sees them: they stop qsh, also with --full.
+        let ours = |text: &str| Parser::new("h", Path::new("/nonexistent"), true, true).run(text);
+        for text in ["Match version OpenSSH_9*\n    RefuseConnection old\n", "Match version OpenSSH_9*\n    RevokedHostKeys /x\n", "RevokedHostKeys /x\n"] {
+            let c = ours(text);
+            assert!(c.refused.is_none() && c.refuse_connection.is_some(), "{text:?}: {c:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn exec_localnetwork_and_tagged() {
@@ -1274,10 +1559,10 @@ mod match_tests {
         let dir = crate::keys::qsh_dir(home.path());
         std::fs::create_dir_all(&dir).unwrap();
         let text = "Host h\n  HostName real.\nMatch canonical host real\n  User canon\nMatch final\n  Port 2200\n";
-        std::fs::write(dir.join("config"), text).unwrap();
+        write_config(dir.join("config"), text).unwrap();
         let c = lookup(home.path(), "h", &Sources::default());
         assert_eq!(c.user, None, "no canonicalization asked for");
-        std::fs::write(dir.join("config"), format!("CanonicalizeHostname yes\n{text}")).unwrap();
+        write_config(dir.join("config"), format!("CanonicalizeHostname yes\n{text}")).unwrap();
         let c = lookup(home.path(), "h", &Sources::default());
         assert_eq!(c.user.as_deref(), Some("canon"));
         assert_eq!(c.hostname.as_deref(), Some("real"));
@@ -1286,7 +1571,7 @@ mod match_tests {
 
         // The later pass keeps what the first found for the original name.
         let text = "CanonicalizeHostname always\nHost h\n  HostName real.\n  ProxyJump gate\n  IdentityFile ~/k\nHost *\n  IdentityFile ~/all\n";
-        std::fs::write(dir.join("config"), text).unwrap();
+        write_config(dir.join("config"), text).unwrap();
         let c = lookup(home.path(), "h", &Sources::default());
         assert_eq!((c.hostname.as_deref(), c.proxy_jump.as_deref()), (Some("real"), Some("gate")));
         assert_eq!(c.identity_files, ["~/k", "~/all"], "no repeats from the second pass");
@@ -1300,8 +1585,8 @@ mod match_tests {
         let home = tempfile::tempdir().unwrap();
         let dir = crate::keys::qsh_dir(home.path());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "Include extra\n").unwrap();
-        std::fs::write(dir.join("extra"), "Host h\n  ProxyCommand evil\n").unwrap();
+        write_config(dir.join("config"), "Include extra\n").unwrap();
+        write_config(dir.join("extra"), "Host h\n  ProxyCommand evil\n").unwrap();
         let c = lookup(home.path(), "h", &Sources::default());
         assert!(c.bad_file.is_none());
         std::fs::set_permissions(dir.join("extra"), std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -1311,7 +1596,7 @@ mod match_tests {
         assert!(lookup(home.path(), "x", &Sources::default()).bad_file.is_some());
         // Such a file is not read at all: its `Match exec` does not run.
         let marker = home.path().join("ran");
-        std::fs::write(dir.join("config"), format!("Match exec \"touch {}\"\n  User x\n", marker.display())).unwrap();
+        write_config(dir.join("config"), format!("Match exec \"touch {}\"\n  User x\n", marker.display())).unwrap();
         std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(lookup(home.path(), "x", &Sources::default()).bad_file.is_some());
         assert!(!marker.exists(), "Match exec ran");
@@ -1320,15 +1605,41 @@ mod match_tests {
         assert!(marker.exists(), "the test's Match exec works");
     }
 
+    /// The system config and the files it includes are checked too.
+    #[cfg(unix)]
+    #[test]
+    fn writable_system_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (system, extra) = (dir.path().join("ssh_config"), dir.path().join("extra"));
+        write_config(&system, "Include extra\n").unwrap();
+        write_config(&extra, "Host h\n  ProxyCommand evil\n").unwrap();
+        let mode = |f: &Path, m| std::fs::set_permissions(f, std::fs::Permissions::from_mode(m)).unwrap();
+        let read = || {
+            let mut p = Parser::new("h", dir.path(), true, false);
+            p.feed_system(&system);
+            p.finish()
+        };
+        let c = read();
+        assert!(c.bad_file.is_none() && c.needs_proxy, "{c:?}");
+        for (file, other) in [(&extra, &system), (&system, &extra)] {
+            mode(file, 0o666);
+            mode(other, 0o644);
+            let c = read();
+            assert!(c.bad_file.as_deref().is_some_and(|b| b.contains(&*file.to_string_lossy())), "{c:?}");
+            assert!(!c.needs_proxy, "{c:?}");
+        }
+    }
+
     /// `none` is a first value like any other: later ones do not count.
     #[test]
     fn none_decides() {
         let home = tempfile::tempdir().unwrap();
         let dir = crate::keys::qsh_dir(home.path());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "Host h\n  ProxyJump gate\n  RemoteCommand top\n").unwrap();
+        write_config(dir.join("config"), "Host h\n  ProxyJump gate\n  RemoteCommand top\n").unwrap();
         std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
-        std::fs::write(home.path().join(".ssh/config"), "Host h\n  ProxyCommand nc %h %p\n").unwrap();
+        write_config(home.path().join(".ssh/config"), "Host h\n  ProxyCommand nc %h %p\n").unwrap();
         let o = Sources { overrides: vec!["ProxyJump none".into(), "RemoteCommand none".into()], ssh_config: Some(home.path().join(".ssh/config")), ..Default::default() };
         let c = lookup(home.path(), "h", &o);
         assert_eq!((c.proxy_jump, c.remote_command, c.needs_proxy), (None, None, false));
@@ -1342,7 +1653,7 @@ mod match_tests {
         let home = tempfile::tempdir().unwrap();
         let dir = crate::keys::qsh_dir(home.path());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "Host h\n  User other\nMatch user deploy\n  ProxyJump gate\n").unwrap();
+        write_config(dir.join("config"), "Host h\n  User other\nMatch user deploy\n  ProxyJump gate\n").unwrap();
         let deploy = Sources { user: Some("deploy".into()), ..Default::default() };
         let c = lookup(home.path(), "h", &deploy);
         assert_eq!((c.user.as_deref(), c.proxy_jump.as_deref()), (Some("deploy"), Some("gate")));
