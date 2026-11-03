@@ -434,6 +434,10 @@ impl Server {
                         return Some(denied);
                     }
                 }
+                // Before the open: a refused OPEN must not create or truncate.
+                if self.handles.len() >= MAX_HANDLES {
+                    return Some(status(id, FAILURE, "too many open handles"));
+                }
                 let mut o = OpenOptions::new();
                 o.read(flags & FXF_READ != 0).write(flags & FXF_WRITE != 0).append(flags & FXF_APPEND != 0);
                 if flags & FXF_CREAT != 0 {
@@ -760,7 +764,8 @@ impl Server {
                     Some(p) => p,
                     None => return Some(status(id, NO_SUCH_FILE, "no such user")),
                 };
-                match fs::canonicalize(&expanded) {
+                // As REALPATH: the last part may not exist yet (scp to `~user/new`).
+                match realpath(&expanded) {
                     Ok(p) => name_reply(id, &p),
                     Err(e) => io_status(id, &e),
                 }
@@ -1003,8 +1008,18 @@ mod sys {
         }
     }
 
-    pub(super) fn open_for_attrs(path: &Path) -> io::Result<File> {
-        fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+
+    /// Write access only for a new size: times alone need just the right to
+    /// change attributes, which a read-only file still gives.
+    pub(super) fn open_for_attrs(path: &Path, size: bool) -> io::Result<File> {
+        let mut o = fs::OpenOptions::new();
+        if size {
+            o.write(true);
+        } else {
+            o.access_mode(FILE_WRITE_ATTRIBUTES);
+        }
+        o.custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
     }
 }
 
@@ -1013,7 +1028,7 @@ mod sys {
 #[cfg(windows)]
 fn apply_attrs(path: &Path, a: &Attrs, _follow: bool) -> io::Result<()> {
     if a.size.is_some() || a.times.is_some() {
-        let f = sys::open_for_attrs(path)?;
+        let f = sys::open_for_attrs(path, a.size.is_some())?;
         set_size_and_times(&f, a)?;
     }
     if let Some(perm) = a.perm {
@@ -1167,6 +1182,8 @@ mod tests {
         assert!(reply.windows(new.as_os_str().len()).any(|w| w == new.as_os_str().as_bytes()));
         let missing = root.join("no/such");
         assert_eq!(code(&srv.handle(&packet(REALPATH, 2, &[&s(missing.to_str().unwrap())]))), NO_SUCH_FILE);
+        let reply = srv.handle(&packet(EXTENDED, 5, &[&s("expand-path@openssh.com"), &s(new.to_str().unwrap())]));
+        assert_eq!(reply[0], R_NAME, "expand-path takes a new name too");
 
         let raw = std::ffi::OsStr::from_bytes(b"caf\xe9");
         // macOS (APFS) does not allow such names at all.
@@ -1178,6 +1195,21 @@ mod tests {
         let reply = srv.handle(&packet(READDIR, 4, &[&handle]));
         assert_eq!(reply[0], R_NAME);
         assert!(reply.windows(4).any(|w| w == b"caf\xe9"), "the name's bytes as they are");
+    }
+
+    /// An OPEN refused for too many handles leaves the file as it was.
+    #[test]
+    fn open_past_the_handle_limit_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"keep").unwrap();
+        let mut srv = Server { opts: Options::default(), handles: HashMap::new(), next_handle: 0, owners: Owners::default() };
+        for i in 0..MAX_HANDLES as u32 {
+            assert_eq!(srv.handle(&packet(OPENDIR, i, &[&s(dir.path().to_str().unwrap())]))[0], R_HANDLE);
+        }
+        let flags = (FXF_WRITE | FXF_CREAT | FXF_TRUNC).to_be_bytes();
+        assert_eq!(code(&srv.handle(&packet(OPEN, 0, &[&s(path.to_str().unwrap()), &flags, &0u32.to_be_bytes()]))), FAILURE);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     }
 
     #[test]

@@ -247,7 +247,10 @@ mod imp {
         f.read_to_end(&mut data).ok()?;
         data.as_chunks::<SIZE>().0.iter().rev().find_map(|e| {
             let kind = i16::from_ne_bytes([e[0], e[1]]);
-            (kind == USER_PROCESS && text(&e[USER]) == user).then(|| (get_int(e, TV, TV_FIELD), text(&e[HOST])))
+            // The name as `put` stored it: cut to the field.
+            let name = &e[USER][..e[USER].iter().position(|&b| b == 0).unwrap_or(e[USER].len())];
+            let want = &user.as_bytes()[..user.len().min(e[USER].len())];
+            (kind == USER_PROCESS && name == want).then(|| (get_int(e, TV, TV_FIELD), text(&e[HOST])))
         })
     }
 

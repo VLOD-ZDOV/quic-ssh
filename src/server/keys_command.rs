@@ -133,8 +133,10 @@ fn expand(arg: &str, user: &Who, key: Option<&KeyData>) -> Result<String> {
     Ok(out)
 }
 
-/// How long the command's last run took (ms), for [`Mimic`].
-static LAST_RUN_MS: AtomicU64 = AtomicU64::new(0);
+/// How long the command's last run took (ms), for [`Mimic`]. Until the
+/// first run, a typical time for starting a small program: zero would tell
+/// unknown users apart right after a start.
+static LAST_RUN_MS: AtomicU64 = AtomicU64::new(20);
 
 fn cache_key(per_key: bool, offered: &Offered) -> Vec<u8> {
     if per_key { ssh_key::PublicKey::from(offered.signing_key().clone()).to_bytes().unwrap_or_default() } else { Vec::new() }

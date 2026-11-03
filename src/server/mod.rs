@@ -590,8 +590,16 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     };
     let mut granted = checker.check(&auth::tls_key(key)).await.ok().map(|g| (g, format!("ED25519 {}", key.fingerprint())));
     if granted.is_none() && version >= 4 {
-        let attempt = auth::key_auth(&mut send, &mut recv, &checker, cfg.max_auth_tries);
-        granted = match tokio::time::timeout(left(), attempt).await {
+        // A refused signature is a failed login even if the client hangs up
+        // afterwards (as on the password path). The refused TLS key is not:
+        // clients send a throwaway one on purpose.
+        let mut failed = false;
+        let attempt = auth::key_auth(&mut send, &mut recv, &checker, cfg.max_auth_tries, &mut failed);
+        let result = tokio::time::timeout(left(), attempt).await;
+        if failed {
+            *outcome = Outcome::AuthFailed;
+        }
+        granted = match result {
             Ok(result) => result?,
             Err(_) => {
                 *outcome = Outcome::GraceExceeded;
@@ -1035,7 +1043,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.agent_forwarding() || limits.no_agent_forwarding {
                 return write_msg(&mut send, &Reply::Err("agent forwarding is not allowed".into())).await;
             }
-            let kept = resume_only.and_then(|token| state.sessions.agent(token));
+            let kept = resume_only.and_then(|token| state.sessions.agent(token, user.uid, limits));
             agent::forward(send, recv, conn.clone(), user, agent, kept).await
         }
         #[cfg(unix)]

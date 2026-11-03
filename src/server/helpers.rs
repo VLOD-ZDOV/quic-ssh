@@ -341,13 +341,29 @@ fn enter_chroot(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the user finds `path` (`test`: `-e` there, `-f` a file). On macOS
+/// this process is still root here: asked as the user, so that a symlink
+/// in their home cannot tell them about places only root sees.
+fn user_finds(test: &str, path: &str, as_user: &impl Fn(&mut std::process::Command)) -> bool {
+    if cfg!(target_vendor = "apple") {
+        let mut cmd = std::process::Command::new("/bin/test");
+        cmd.args([test, path]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        as_user(&mut cmd);
+        cmd.status().is_ok_and(|s| s.success())
+    } else if test == "-f" {
+        Path::new(path).is_file()
+    } else {
+        Path::new(path).exists()
+    }
+}
+
 /// What sshd does before a session's program: the last login and the
 /// message of the day for a login shell (both skipped with `~/.hushlogin`),
 /// then the user's `~/.ssh/rc` (through the user's shell, as `$SHELL -c
 /// '/bin/sh .ssh/rc'`), or else the system's `/etc/ssh/sshrc` (`/bin/sh`),
 /// with the session's output. Runs in the home directory if `in_home`.
 fn run_prelude(prelude: &Prelude, in_home: bool, as_user: impl Fn(&mut std::process::Command)) {
-    if (prelude.motd || prelude.last_login.is_some()) && !(in_home && Path::new(".hushlogin").exists()) {
+    if (prelude.motd || prelude.last_login.is_some()) && !(in_home && user_finds("-e", ".hushlogin", &as_user)) {
         let mut out = io::stdout();
         if let Some(last) = &prelude.last_login {
             let _ = writeln!(out, "{last}");
@@ -363,7 +379,7 @@ fn run_prelude(prelude: &Prelude, in_home: bool, as_user: impl Fn(&mut std::proc
     let x11_line = prelude.x11.as_ref().map(|(_, proto, cookie)| format!("{proto} {cookie}\n"));
     let rc = if !prelude.rc {
         None
-    } else if let Some(shell) = prelude.user_rc.as_ref().filter(|_| in_home && Path::new(".ssh/rc").is_file()) {
+    } else if let Some(shell) = prelude.user_rc.as_ref().filter(|_| in_home && user_finds("-f", ".ssh/rc", &as_user)) {
         let mut cmd = std::process::Command::new(shell);
         cmd.args(["-c", "/bin/sh .ssh/rc"]);
         Some((cmd, ".ssh/rc"))

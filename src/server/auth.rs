@@ -183,7 +183,8 @@ impl Checker<'_> {
 /// Key login after the handshake: the client asks which keys would be
 /// accepted, then proves one with a signature. `Ok(None)` = denied (the
 /// caller sends the final "access denied").
-pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checker<'_>, max_tries: u32) -> Result<Option<(Grant, String)>> {
+/// `failed`: set once a signed offer was refused.
+pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checker<'_>, max_tries: u32, failed: &mut bool) -> Result<Option<(Grant, String)>> {
     write_msg(send, &Reply::AuthKey).await?;
     let (mut queries, mut failures) = (0u32, 0u32);
     loop {
@@ -204,6 +205,7 @@ pub async fn key_auth(send: &mut SendHalf, recv: &mut RecvHalf, checker: &Checke
                 Ok((grant, offered)) => return Ok(Some((grant, offered.describe()))),
                 Err(reason) => {
                     warn!("{}: {:?} rejected: {reason}", checker.login.ip, checker.login.user);
+                    *failed = true;
                     failures += 1;
                     if failures >= max_tries {
                         return Ok(None);

@@ -179,14 +179,17 @@ impl Sessions {
         !self.timeout.is_zero()
     }
 
-    /// Whether `token` is a live session of user `uid`.
-    /// The forwarded agent's socket of a session.
+    /// The forwarded agent's socket of a session, for the same user with
+    /// the same restrictions (as a resume needs).
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub fn agent(&self, token: &[u8]) -> Option<Arc<super::agent::Relay>> {
+    pub fn agent(&self, token: &[u8], uid: u32, restrictions: &Restrictions) -> Option<Arc<super::agent::Relay>> {
         let token = Token::try_from(token).ok()?;
-        self.map.lock().unwrap().sessions.get(&token)?.agent.clone()
+        let map = self.map.lock().unwrap();
+        let sess = map.sessions.get(&token).filter(|s| s.uid == uid && &s.restrictions == restrictions)?;
+        sess.agent.clone()
     }
 
+    /// Whether `token` is a live session of user `uid`.
     pub fn owns(&self, token: &[u8], uid: u32) -> bool {
         let Ok(token) = Token::try_from(token) else { return false };
         let mut map = self.map.lock().unwrap();
@@ -292,8 +295,25 @@ impl Sessions {
                     .min_by_key(|(at, ..)| *at)
             };
             let Some((_, token, sess)) = oldest else { return false };
+            // Taken out only if still detached: a resume may have come in
+            // since it was picked.
+            let taken = {
+                let mut map = self.map.lock().unwrap();
+                let ok = map.sessions.get(&token).is_some_and(|s| Arc::ptr_eq(s, &sess)) && !sess.out.lock().unwrap().attached;
+                if ok {
+                    map.sessions.remove(&token);
+                    map.release(sess.uid);
+                }
+                ok
+            };
+            if !taken {
+                continue;
+            }
             info!("too many sessions: closing the one detached the longest");
-            self.hang_up(&token, &sess).await;
+            let kill = sess.kill.lock().unwrap().take();
+            if let Some(kill) = kill {
+                let _ = kill.send(());
+            }
         }
         false
     }

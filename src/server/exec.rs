@@ -765,9 +765,14 @@ mod windows {
         let (gone_tx, mut gone_rx) = tokio::sync::oneshot::channel::<()>();
         let mut outgoing = super::Outgoing::default();
         let asked = outgoing.asked.clone();
+        let chaff_tx = tx.clone();
         let feeder = tokio::spawn(async move {
             loop {
                 match read_msg_opt::<_, ClientMsg>(&mut recv).await {
+                    // Chaff gets an echo-sized reply, as on Unix (see `feed`).
+                    Ok(Some(ClientMsg::Typed { data, .. })) if data.is_empty() => {
+                        let _ = chaff_tx.try_send(ServerMsg::Pong(vec![0]));
+                    }
                     Ok(Some(ClientMsg::Stdin(data) | ClientMsg::Typed { data, .. })) if !data.is_empty() => {
                         let _ = input.write_all(&data).await;
                     }

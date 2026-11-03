@@ -58,7 +58,8 @@ impl Penalties {
     }
 
     fn refused_at(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
-        if !self.settings.enabled {
+        // A neighbor in the same /64 may have earned the entry.
+        if !self.settings.enabled || self.exempt(ip) {
             return None;
         }
         let map = self.sources.lock().unwrap();
@@ -90,7 +91,10 @@ impl Penalties {
             return false;
         }
         let e = map.entry(key).or_insert(Entry { expires: now, enforced: false });
-        e.expires = (e.expires.max(now) + add).min(now + s.max);
+        // Capped, so a huge configured time cannot overflow `Instant` (a
+        // panic here would poison the lock for every later connection).
+        let cap = |d: Duration| d.min(Duration::from_secs(10 * 365 * 24 * 3600));
+        e.expires = (e.expires.max(now) + cap(add)).min(now + cap(s.max));
         let starts = !e.enforced && e.expires - now >= s.min;
         e.enforced |= starts;
         starts
@@ -139,5 +143,21 @@ mod tests {
             off.record_at("192.0.2.9".parse().unwrap(), Outcome::AuthFailed, t);
         }
         assert!(off.refused_at("192.0.2.9".parse().unwrap(), t).is_none());
+        // An exempt host is not dropped for a neighbor in its /64.
+        let p = Penalties::new(Settings { exempt: vec!["2001:db8::1".into()], ..Settings::default() });
+        for _ in 0..10 {
+            p.record_at("2001:db8::2".parse().unwrap(), Outcome::AuthFailed, t);
+        }
+        assert!(p.refused_at("2001:db8::2".parse().unwrap(), t).is_some());
+        assert!(p.refused_at("2001:db8::1".parse().unwrap(), t).is_none());
+    }
+
+    #[test]
+    fn huge_times_do_not_overflow() {
+        let huge = Duration::from_secs(u64::MAX / 2);
+        let p = Penalties::new(Settings { authfail: huge, max: huge, ..Settings::default() });
+        let ip = "192.0.2.1".parse().unwrap();
+        assert!(p.record_at(ip, Outcome::AuthFailed, Instant::now()));
+        assert!(p.refused(ip).is_some());
     }
 }

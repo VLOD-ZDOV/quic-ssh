@@ -27,11 +27,12 @@ fn spawn(user: &User, args: &[&str], stdin: bool) -> Result<Child> {
 }
 
 async fn stderr_text(child: &mut Child) -> String {
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     if let Some(mut e) = child.stderr.take() {
-        let _ = (&mut e).take(4096).read_to_string(&mut text).await;
+        let _ = (&mut e).take(4096).read_to_end(&mut bytes).await;
     }
-    let text = text.trim().to_string();
+    // Lossy: the cut (or a file name) may not be UTF-8, which would lose it all.
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
     if text.is_empty() { "helper failed".into() } else { text }
 }
 

@@ -16,6 +16,8 @@ use crate::transport::{Conn, RecvHalf, SendHalf};
 
 /// How many display numbers above `x11_display_offset` are tried.
 const DISPLAYS: u32 = 1000;
+/// X11 connections open at once per forwarding (a program opens a few).
+const MAX_X11_CONNECTIONS: usize = 64;
 
 /// The forwarded display of a connection.
 #[derive(Clone, Debug)]
@@ -101,7 +103,7 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
     };
     let mut found = None;
     'displays: for n in cfg.x11_display_offset..cfg.x11_display_offset.saturating_add(DISPLAYS) {
-        let Ok(port) = u16::try_from(6000 + n) else { break };
+        let Some(port) = n.checked_add(6000).and_then(|p| u16::try_from(p).ok()) else { break };
         let mut listeners = Vec::new();
         for ip in &ips {
             match listen(SocketAddr::new(*ip, port), cfg.x11_use_localhost) {
@@ -169,11 +171,18 @@ pub async fn forward(mut send: SendHalf, mut recv: RecvHalf, conn: Arc<Conn>, cf
         })
         .collect();
     let mut probe = [0u8; 1];
+    // max_connections does not count these: a limit of their own.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_X11_CONNECTIONS));
     loop {
         tokio::select! {
             Some((tcp, origin)) = rx.recv() => {
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    debug!("X11 connection from {origin}: too many at once");
+                    continue;
+                };
                 let conn = conn.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let _ = tcp.set_nodelay(true);
                     let result = async {
                         let (mut s, r) = conn.open_bi().await?;
