@@ -1280,7 +1280,8 @@ Host *
         write_config(home.path().join(".ssh/config"), "Host old\n RefuseConnection gone\n").unwrap();
         let c = lookup(home.path(), "old", &Sources::default());
         let why = c.refuse_connection.unwrap();
-        assert!(why.ends_with(".ssh/config line 2: RefuseConnection: gone"), "{why}");
+        let file = Path::new(".ssh").join("config");
+        assert!(why.ends_with(&format!("{} line 2: RefuseConnection: gone", file.display())), "{why}");
     }
 
     /// Keywords in qsh's own config that qsh does not carry out are warned

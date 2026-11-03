@@ -4299,21 +4299,23 @@ fn killed_client_comes_back_to_its_session() {
         return eprintln!("skipped: no script");
     }
     // Any login shell: `tty` names the session, the quotes keep the echo
-    // of the command line from matching.
-    let which = |stdin: &mut std::process::ChildStdin, rx: &std::sync::mpsc::Receiver<String>, seen: &mut String| {
-        let start = seen.len();
-        stdin.write_all(b"tty; echo do\"\"ne\n").unwrap();
-        wait_for_output(rx, seen, "done", 20);
-        let text = &seen[start..];
+    // of the command line from matching. Each call has its own mark: a
+    // session comes back with its old screen, earlier marks included.
+    let which = |stdin: &mut std::process::ChildStdin, rx: &std::sync::mpsc::Receiver<String>, seen: &mut String, mark: &str| {
+        stdin.write_all(format!("tty; echo do\"\"ne{mark}\n").as_bytes()).unwrap();
+        wait_for_output(rx, seen, &format!("done{mark}"), 20);
+        let end = seen.rfind(&format!("done{mark}")).unwrap();
+        let start = seen[..end].rfind(&format!("do\"\"ne{mark}")).unwrap_or(0);
+        let text = &seen[start..end];
         let at = text.find("/dev/pts/").unwrap_or_else(|| panic!("{text}"));
         text[at..].split_whitespace().next().unwrap().to_string()
     };
     let (mut first, mut stdin, rx) = open();
     let mut seen = String::new();
-    let session = which(&mut stdin, &rx, &mut seen);
+    let session = which(&mut stdin, &rx, &mut seen, "1");
     let (mut second, mut stdin2, rx2) = open();
     let mut other = String::new();
-    assert_ne!(which(&mut stdin2, &rx2, &mut other), session, "the second window took the first one's session");
+    assert_ne!(which(&mut stdin2, &rx2, &mut other, "2"), session, "the second window took the first one's session");
     stdin2.write_all(b"exit\n").unwrap();
     let _ = second.wait();
     assert!(Command::new("pkill").args(["-KILL", "-P", &first.id().to_string()]).status().unwrap().success());
@@ -4322,7 +4324,7 @@ fn killed_client_comes_back_to_its_session() {
     let (mut third, mut stdin3, rx3) = open();
     let mut back = String::new();
     wait_for_output(&rx3, &mut back, "back in the session", 10);
-    assert_eq!(which(&mut stdin3, &rx3, &mut back), session);
+    assert_eq!(which(&mut stdin3, &rx3, &mut back, "3"), session);
     stdin3.write_all(b"exit\n").unwrap();
     let _ = third.wait();
     let left: Vec<_> = std::fs::read_dir(c.home.path().join(".config/qsh/sessions")).unwrap().collect();
