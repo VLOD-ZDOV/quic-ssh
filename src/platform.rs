@@ -107,6 +107,18 @@ pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::Tcp
     tokio::net::TcpListener::from_std(sock.into())
 }
 
+/// Where writing `path` should go: the file a symlink points to, also one
+/// that does not exist yet (canonicalize fails for those).
+pub fn link_target(path: &Path) -> std::path::PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    match std::fs::read_link(path) {
+        Ok(to) => path.parent().map_or(to.clone(), |dir| dir.join(&to)),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// Replaces `path` with `contents` in one step: written to a temporary file
 /// of a unique name next to it, then renamed over it, so a reader never sees
 /// half a file and two writers never write into the same temporary file.
@@ -115,7 +127,7 @@ pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::Tcp
 pub fn replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let file = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file = link_target(path);
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let tmp = file.with_file_name(format!(".{name}.{}.{}.{nanos}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));

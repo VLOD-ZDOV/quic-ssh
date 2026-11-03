@@ -629,7 +629,11 @@ async fn serve_client(mut sock: UnixStream, conn: &Arc<Conn>, shared: Shared<'_>
                 return write_msg(&mut sock, &MuxReply::Err("this master cannot change forwards".into())).await;
             };
             match hook(kind, spec.clone(), false).await {
-                Ok(msg) => write_msg(&mut sock, &MuxReply::Done(msg)).await?,
+                // A client gone meanwhile: the read below ends at once, and
+                // the forward is taken back.
+                Ok(msg) => {
+                    let _ = write_msg(&mut sock, &MuxReply::Done(msg)).await;
+                }
                 Err(e) => return write_msg(&mut sock, &MuxReply::Err(format!("{e:#}"))).await,
             }
             // The client's end (an exit, a crash, `kill -9`) closes the socket.

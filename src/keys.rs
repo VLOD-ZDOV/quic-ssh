@@ -128,7 +128,8 @@ impl Identity {
 
     /// Writes the key in OpenSSH format (mode 0600) plus a `.pub` file next to it.
     pub fn save(&self, path: &Path, comment: &str) -> Result<()> {
-        if let Some(dir) = path.parent() {
+        // A bare file name has "" as its parent: the current directory.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             create_private_dir(dir)?;
         }
         let kp = Ed25519Keypair::from(&self.signing);
@@ -365,9 +366,10 @@ fn open_strict(path: &Path, home: &Path, uid: u32) -> Result<Option<fs::File>> {
 
 fn read_limited(f: fs::File) -> Result<String> {
     use std::io::Read;
-    let mut text = String::new();
-    Read::take(f, 1 << 20).read_to_string(&mut text)?;
-    Ok(text)
+    // Lossy, as sshd: a bad byte spoils one line, not every key in the file.
+    let mut bytes = Vec::new();
+    Read::take(f, 1 << 20).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Reads an authorized_keys-style file with StrictModes checks (see

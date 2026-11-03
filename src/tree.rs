@@ -5,10 +5,10 @@
 //! files and directories, only relative paths without `..`, never writes
 //! through an existing symlink, and drops setuid/setgid/sticky bits.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -106,7 +106,7 @@ fn safe_join(dest: &Path, entry: &Path) -> Result<PathBuf> {
         match c {
             // On Windows a later `C:x` would replace the whole path, and
             // `name:stream` writes to an alternate data stream.
-            Component::Normal(name) if cfg!(windows) && name.to_string_lossy().contains(':') => {
+            Component::Normal(name) if cfg!(windows) && (name.to_string_lossy().contains(':') || windows_device(&name.to_string_lossy())) => {
                 bail!("refusing unsafe path {:?} in the archive", entry)
             }
             Component::Normal(name) => {
@@ -123,7 +123,19 @@ fn safe_join(dest: &Path, entry: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// A name Windows takes for a device in any directory (`CON`, `nul.txt`,
+/// `COM1 `), or that it would change (a trailing dot or space).
+fn windows_device(name: &str) -> bool {
+    if name.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0')
+}
+
 /// Fails if any existing component of `path` below `dest` is a symlink.
+#[cfg(not(unix))]
 fn no_symlinks_below(dest: &Path, path: &Path) -> Result<()> {
     let rel = path.strip_prefix(dest).expect("path is inside dest");
     let mut cur = dest.to_path_buf();
@@ -249,45 +261,109 @@ fn header_size(field: &[u8]) -> Option<u64> {
 pub fn extract_tree(input: impl Read, dest: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
     let mut archive = tar::Archive::new(MetaLimit::new(input));
+    #[cfg(unix)]
+    let root = at::open_dir(dest).with_context(|| format!("{}", dest.display()))?;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let rel = entry.path()?.into_owned();
         let target = safe_join(dest, &rel)?;
-        no_symlinks_below(dest, &target)?;
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+        let kind = entry.header().entry_type();
+        if !matches!(kind, tar::EntryType::Directory | tar::EntryType::Regular | tar::EntryType::Continuous) {
+            stats.skipped += 1;
+            continue;
+        }
+        // Unix: one directory at a time from `dest`, never through a symlink,
+        // so nothing swapped in meanwhile can lead out of it.
+        #[cfg(unix)]
+        let (parent, name) = {
+            let names: Vec<&std::ffi::OsStr> = target.strip_prefix(dest).expect("inside dest").iter().collect();
+            let (name, dirs) = names.split_last().expect("not empty");
+            (at::walk(&root, dirs).with_context(|| format!("{}", target.display()))?, *name)
+        };
         #[cfg(not(unix))]
-        let _ = mode;
-        match entry.header().entry_type() {
-            tar::EntryType::Directory => {
-                // The mode goes through the umask, as with files and `cp -r`.
-                #[cfg(unix)]
-                let created = {
-                    use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new().mode(mode | 0o700).create(&target)
-                };
-                #[cfg(not(unix))]
-                let created = fs::create_dir(&target);
-                match created {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && target.is_dir() => {}
-                    Err(e) => return Err(e).with_context(|| format!("{}", target.display())),
-                }
-                stats.dirs += 1;
+        {
+            no_symlinks_below(dest, &target)?;
+            let _ = mode;
+        }
+        if kind == tar::EntryType::Directory {
+            // The mode goes through the umask, as with files and `cp -r`.
+            #[cfg(unix)]
+            at::mkdir(&parent, name, mode | 0o700).with_context(|| format!("{}", target.display()))?;
+            #[cfg(not(unix))]
+            match fs::create_dir(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && target.is_dir() => {}
+                Err(e) => return Err(e).with_context(|| format!("{}", target.display())),
             }
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                let mut opts = OpenOptions::new();
-                opts.write(true).create(true).truncate(true);
-                // Besides the symlink check above, never follow one that appears meanwhile.
-                #[cfg(unix)]
-                opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
-                let mut f = opts.open(&target).with_context(|| format!("{}", target.display()))?;
-                stats.bytes += io::copy(&mut entry, &mut f)?;
-                stats.files += 1;
-            }
-            _ => stats.skipped += 1,
+            stats.dirs += 1;
+        } else {
+            #[cfg(unix)]
+            let mut f = at::create(&parent, name, mode).with_context(|| format!("{}", target.display()))?;
+            #[cfg(not(unix))]
+            let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(&target).with_context(|| format!("{}", target.display()))?;
+            stats.bytes += io::copy(&mut entry, &mut f)?;
+            stats.files += 1;
         }
     }
     Ok(stats)
+}
+
+/// Directory-relative steps for [`extract_tree`].
+#[cfg(unix)]
+mod at {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::OwnedFd;
+    use std::path::Path;
+
+    use nix::errno::Errno;
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::{fstatat, mkdirat, Mode, SFlag};
+
+    fn symlink(e: Errno) -> io::Error {
+        match e {
+            // O_NOFOLLOW on a symlink; O_DIRECTORY on one gives ENOTDIR.
+            Errno::ELOOP | Errno::ENOTDIR => io::Error::other("refusing to write through a symlink (or a file where a directory belongs)"),
+            e => e.into(),
+        }
+    }
+
+    pub fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
+        Ok(File::open(dir)?.into())
+    }
+
+    /// Opens each of `dirs` below `root` in turn, none of them a symlink.
+    pub fn walk(root: &OwnedFd, dirs: &[&OsStr]) -> io::Result<OwnedFd> {
+        let mut cur = root.try_clone()?;
+        for d in dirs {
+            cur = openat(&cur, *d, OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC, Mode::empty()).map_err(symlink)?;
+        }
+        Ok(cur)
+    }
+
+    /// A directory `name` in `parent`; one already there must be a real one.
+    pub fn mkdir(parent: &OwnedFd, name: &OsStr, mode: u32) -> io::Result<()> {
+        match mkdirat(parent, name, Mode::from_bits_truncate(mode as _)) {
+            Ok(()) => Ok(()),
+            Err(Errno::EEXIST) => {
+                let st = fstatat(parent, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)?;
+                if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR {
+                    Ok(())
+                } else {
+                    Err(symlink(Errno::ENOTDIR))
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Creates (or truncates) the file `name` in `parent`, never through a symlink.
+    pub fn create(parent: &OwnedFd, name: &OsStr, mode: u32) -> io::Result<File> {
+        let flags = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        Ok(openat(parent, name, flags, Mode::from_bits_truncate(mode as _)).map_err(symlink)?.into())
+    }
 }
 
 /// Where a file or tree named `name` lands: inside `dest` if that is an
@@ -433,6 +509,29 @@ mod tests {
         assert!(extract_tree(&evil_tar("ln/x", tar::EntryType::Regular, None)[..], dst.path()).is_err());
         assert!(extract_tree(&evil_tar("ln", tar::EntryType::Regular, None)[..], dst.path()).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn windows_device_names() {
+        for bad in ["CON", "con.txt", "Nul", "COM1", "lpt9.log", "AUX ", "name.", "conin$"] {
+            assert!(windows_device(bad), "{bad}");
+        }
+        for ok in ["CONSOLE", "COM0", "COM10", "auxiliary.txt", "a.b"] {
+            assert!(!windows_device(ok), "{ok}");
+        }
+    }
+
+    /// A directory entry over a symlink is refused too, and a nested file
+    /// goes where it belongs.
+    #[test]
+    fn directories_step_by_step() {
+        let dst = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dst.path().join("ln")).unwrap();
+        assert!(extract_tree(&evil_tar("ln", tar::EntryType::Directory, None)[..], dst.path()).is_err());
+        fs::create_dir_all(dst.path().join("a/b")).unwrap();
+        extract_tree(&evil_tar("a/b/c", tar::EntryType::Regular, None)[..], dst.path()).unwrap();
+        assert!(fs::read(dst.path().join("a/b/c")).unwrap().starts_with(b"pwned"));
     }
 
     #[test]

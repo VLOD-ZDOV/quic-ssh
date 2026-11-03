@@ -141,6 +141,10 @@ pub async fn serve(o: ServeOptions) -> Result<()> {
             read_peer().await?
         }
     };
+    // Bound before the peer was known (for its STUN report): IPv4.
+    if peer.is_ipv6() != sock.local_addr()?.is_ipv6() {
+        bail!("{peer} is not of this socket's address family ({}); give the peer on the command line", sock.local_addr()?);
+    }
     say(format!("qsh punch: punching {peer}, forwarding to {}", o.target));
     relay(sock, &key, peer, Role::Serve { target }).await
 }
@@ -214,7 +218,7 @@ async fn punch_to_local(hole: &Hole, local: &UdpSocket, connected: bool) -> Resu
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut announced = false;
     loop {
-        let (n, from) = hole.sock.recv_from(&mut buf).await?;
+        let (n, from) = recv(&hole.sock, &mut buf).await?;
         let Some(payload) = unframe(&hole.key, &buf[..n]) else {
             tracing::debug!("{from}: not ours, dropped");
             continue;
@@ -251,12 +255,26 @@ async fn punch_to_local(hole: &Hole, local: &UdpSocket, connected: bool) -> Resu
 async fn local_to_punch(hole: &Hole, local: &UdpSocket) -> Result<()> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
-        let (n, from) = local.recv_from(&mut buf).await?;
+        let (n, from) = recv(local, &mut buf).await?;
         *hole.local.lock().await = Some(from);
         let peer = *hole.peer.lock().await;
         let packet = frame(&hole.key, &buf[..n]);
         if let Err(e) = hole.sock.send_to(&packet, peer).await {
             tracing::debug!("cannot send to {peer}: {e}");
+        }
+    }
+}
+
+/// `recv_from`, past the errors an ICMP answer leaves on a UDP socket (a
+/// stopped qshd, a peer gone for a moment; Windows reports them even on an
+/// unconnected one): they are not worth ending the tunnel.
+async fn recv(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    loop {
+        match sock.recv_from(buf).await {
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset) => {
+                tracing::debug!("receive: {e}");
+            }
+            other => return other,
         }
     }
 }

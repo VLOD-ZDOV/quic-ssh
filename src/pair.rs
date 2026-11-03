@@ -183,7 +183,8 @@ where
     write_msg(send, &mac(&key, b"client", &t).finalize().into_bytes().to_vec()).await?;
     match read_msg(recv).await? {
         Reply::Ok => {}
-        Reply::Err(e) => bail!("{e}"),
+        // The server's words: no control characters reach the terminal.
+        Reply::Err(e) => bail!("{}", e.chars().filter(|c| !c.is_control()).collect::<String>()),
         other => bail!("unexpected reply {other:?}"),
     }
     let server_mac: Vec<u8> = read_msg(recv).await?;
@@ -215,7 +216,7 @@ where
     let key = spake(send, recv, code).await?;
     let client_mac: Vec<u8> = read_msg(recv).await?;
     if mac(&key, b"client", &t).verify_slice(&client_mac).is_err() {
-        write_msg(send, &Reply::Err("wrong pairing code (the code is now used up)".into())).await?;
+        write_msg(send, &Reply::Err("wrong pairing code".into())).await?;
         bail!("wrong pairing code");
     }
     Ok(Verified { key, transcript: t })

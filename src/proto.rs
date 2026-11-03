@@ -1,7 +1,8 @@
 //! Application protocol: length-prefixed postcard messages on QUIC/yamux streams.
 //!
 //! Every operation runs on its own bidirectional stream. The first stream of a
-//! connection carries [`Hello`]; each later stream starts with a [`Request`].
+//! connection carries [`Hello`]; each later one the client opens starts with
+//! a [`Request`], and each one the server opens with [`Opened`].
 
 use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -466,7 +467,8 @@ fn ends_with_word(run: &[u8], word: &[u8]) -> bool {
 /// (or of the line, for a header).
 fn value_after(data: &[u8], word_end: usize, whole_line: bool) -> Option<std::ops::Range<usize>> {
     let skip = |b: &u8| matches!(b, b' ' | b'\t' | b'"' | b'\'' | b'=' | b':');
-    let separators = data[word_end..].iter().take(8).take_while(|b| skip(b)).count();
+    // All of them: a value after more would go unseen (and be compressed).
+    let separators = data[word_end..].iter().take_while(|b| skip(b)).count();
     let names_a_value = data[word_end..word_end + separators].iter().any(|b| matches!(b, b'=' | b':'));
     if separators == 0 || !(names_a_value || whole_line) {
         return None;
@@ -601,10 +603,6 @@ pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mu
     read_msg_opt(r).await?.context("stream closed unexpectedly")
 }
 
-/// Reads a `Reply` and turns `Reply::Err` into an error.
-/// Fails with the peer's error text, made safe to print: no control
-/// characters (escape sequences could redraw the terminal), at most 500
-/// characters.
 /// The server answered a request with `Reply::Err` (as opposed to a
 /// broken connection).
 #[derive(Debug)]
@@ -618,6 +616,10 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// Reads a `Reply` and turns `Reply::Err` into an error.
+/// Fails with the peer's error text, made safe to print: no control
+/// characters (escape sequences could redraw the terminal), at most 500
+/// characters.
 pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply> {
     match read_msg(r).await? {
         Reply::Err(e) => Err(Refused(e.chars().filter(|c| !c.is_control()).take(500).collect()).into()),
@@ -707,9 +709,10 @@ mod tests {
     #[test]
     fn what_looks_secret_stays_out_of_the_context() {
         let spans = |text: &str| secret_spans(text.as_bytes()).iter().map(|s| text[s.clone()].to_string()).collect::<Vec<_>>();
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 9] = [
             ("  GET /x?session=4f2a9c1d77e0b3a6 status=200 ok\n", &["4f2a9c1d77e0b3a6"]),
             ("  password: hunter2 and more\n", &["hunter2"]),
+            ("  password:          hunter2 aligned\n", &["hunter2"]),
             ("  export API_KEY=\"abc\" now\n", &["abc"]),
             ("  Authorization: Basic dXNlcjpwYXNz\r\n  next\n", &["Basic dXNlcjpwYXNz"]),
             ("  sk1234567890abcdefghij is it\n", &["sk1234567890abcdefghij"]),

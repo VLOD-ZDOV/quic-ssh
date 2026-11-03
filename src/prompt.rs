@@ -50,6 +50,8 @@ pub fn line(prompt: &str) -> Result<String> {
     write!(&output, "{prompt}")?;
     (&output).flush()?;
     let mut answer = String::new();
-    std::io::BufReader::new(&input).read_line(&mut answer)?;
+    if std::io::BufReader::new(&input).read_line(&mut answer)? == 0 {
+        bail!("no answer (end of input)");
+    }
     Ok(answer.trim_end_matches(['\r', '\n']).to_string())
 }
