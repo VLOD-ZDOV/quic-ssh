@@ -149,8 +149,13 @@ impl Modes {
                     0
                 }
                 (2, 0x20..=0x3f) => {
-                    if self.params.len() < 32 {
+                    // Room for long mode lists; past it the sequence is
+                    // ignored (a cut list would read its tail as another mode).
+                    if self.params.len() < 256 {
                         self.params.push(b);
+                    } else {
+                        self.params.clear();
+                        self.params.extend_from_slice(b"overflow");
                     }
                     2
                 }
@@ -287,5 +292,13 @@ mod tests {
         assert!(!c.app, "split over two chunks, with other modes");
         c.feed(b"\x1b[?1049h\x1b[1h");
         assert!(!c.app, "not private mode 1, nor 1049");
+        // A long list is read whole (as some programs set all at once).
+        let mut m = Modes::default();
+        m.feed(b"\x1b[?1000;1002;1003;1005;1006;1015;1004;2004;1049h");
+        assert!(m.focus() && !m.app);
+        // One too long for any program is ignored, not read in part.
+        let mut m = Modes::default();
+        m.feed(format!("\x1b[?{}1h", "0;".repeat(200)).as_bytes());
+        assert!(!m.app);
     }
 }

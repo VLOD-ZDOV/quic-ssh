@@ -366,7 +366,7 @@ fn main() {
     let master = std::env::var_os(MASTER_FD).is_some();
     #[cfg(not(unix))]
     let master = false;
-    if !a.background && !master && a.control_command.is_none() {
+    if !a.background && !master && a.control_command.is_none() && std::env::var_os("QSH_NO_FORK").is_none() {
         if let Some(dest) = &a.destination {
             if Target::resolve(dest, a.port, &sources(&a)).is_ok_and(|t| t.fork_after_authentication) {
                 a.background = true;
@@ -1316,7 +1316,6 @@ fn with_doctor_hint(e: anyhow::Error, target: &Target) -> anyhow::Error {
     }
 }
 
-/// Arguments for OpenSSH's ssh: everything ssh understands, as given.
 /// The command line for ssh, without qsh's own long options, and with the
 /// long ones ssh has short (`--port`) spelled as ssh knows them.
 fn without_qsh_options(args: &[String]) -> Vec<String> {

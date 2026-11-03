@@ -53,13 +53,15 @@ impl Report {
             Level::Bad => ("✗", "31", "bad"),
         };
         self.failed |= level == Level::Bad;
+        // Details may hold a server's words (a close reason): no escapes.
+        let detail: String = detail.as_ref().chars().filter(|c| !c.is_control()).collect();
         if let Some(checks) = &mut self.json {
-            let check = Check { section: self.section.clone(), status, check: what.to_string(), detail: detail.as_ref().to_string(), hints: Vec::new() };
+            let check = Check { section: self.section.clone(), status, check: what.to_string(), detail: detail.clone(), hints: Vec::new() };
             checks.push(check);
         } else if self.color {
-            println!("  \x1b[{code}m{mark}\x1b[0m {what:<12} {}", detail.as_ref());
+            println!("  \x1b[{code}m{mark}\x1b[0m {what:<12} {detail}");
         } else {
-            println!("  {mark} {what:<12} {}", detail.as_ref());
+            println!("  {mark} {what:<12} {detail}");
         }
     }
 

@@ -20,13 +20,15 @@ d="$HOME/.config/qsh"
 f="$d/authorized_keys"
 mkdir -p "$d" || exit 1
 if [ -f "$f" ] && grep -q '^ssh-ed25519 @DATA@' "$f"; then
-    echo present
+    echo qsh-copy-id: present
 else
+    # A last line without its newline would swallow the key.
+    [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ] && echo >> "$f"
     printf '%s\n' '@KEY@' >> "$f" || exit 1
-    echo added
+    echo qsh-copy-id: added
 fi
 for p in /etc/qsh/host_ed25519 "$d/host_ed25519" $(sed -n 's/^[[:space:]]*host_key[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /etc/qsh/config.toml "$d/qshd.toml" 2>/dev/null); do
-    [ -r "$p.pub" ] && sed -n '1s/^/key /p' "$p.pub"
+    [ -r "$p.pub" ] && sed -n '1s/^/qsh-copy-id: key /p' "$p.pub"
 done
 exit 0
 "#;
@@ -38,14 +40,16 @@ struct Found {
     host_keys: Vec<PublicKey>,
 }
 
+/// The script's lines carry a mark: shell startup files may print first.
 fn parse(out: &str) -> Result<Found> {
-    let added = match out.lines().next() {
-        Some("added") => true,
-        Some("present") => false,
+    let ours: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix("qsh-copy-id: ")).collect();
+    let added = match ours.first() {
+        Some(&"added") => true,
+        Some(&"present") => false,
         _ => bail!("the key could not be added there"),
     };
     let mut host_keys = Vec::new();
-    for key in out.lines().filter_map(|l| l.strip_prefix("key ")).filter_map(PublicKey::parse_openssh) {
+    for key in ours.iter().filter_map(|l| l.strip_prefix("key ")).filter_map(PublicKey::parse_openssh) {
         if !host_keys.contains(&key) {
             host_keys.push(key);
         }
@@ -94,9 +98,14 @@ mod tests {
     #[test]
     fn script_output() {
         let (a, b) = (Identity::generate().public(), Identity::generate().public());
-        let out = format!("added\nkey {}\nkey {}\nkey {}\n", a.to_openssh("x"), b.to_openssh(""), a.to_openssh("y"));
-        assert_eq!(parse(&out).unwrap(), Found { added: true, host_keys: vec![a, b] });
-        assert_eq!(parse("present\n").unwrap(), Found { added: false, host_keys: vec![] });
+        let out = format!(
+            "Welcome!\nqsh-copy-id: added\nqsh-copy-id: key {}\nqsh-copy-id: key {}\nqsh-copy-id: key {}\n",
+            a.to_openssh("x"),
+            b.to_openssh(""),
+            a.to_openssh("y")
+        );
+        assert_eq!(parse(&out).unwrap(), Found { added: true, host_keys: vec![a, b] }, "a banner before");
+        assert_eq!(parse("qsh-copy-id: present\n").unwrap(), Found { added: false, host_keys: vec![] });
         assert!(parse("").is_err());
     }
 }

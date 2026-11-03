@@ -213,13 +213,27 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool)
     if start > 0 {
         resuming(&name.to_string_lossy(), start, size);
     }
+    let existed = target.exists();
     let mut opts = tokio::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(start == 0);
+    // Writable by its owner until complete, so an interrupted copy of a
+    // read-only file can go on; the mode is set at the end.
     #[cfg(unix)]
-    opts.mode(mode & 0o777);
+    opts.mode(mode & 0o777 | 0o200);
     #[cfg(not(unix))]
-    let _ = mode;
-    let mut file = opts.open(&target).await.with_context(|| format!("cannot create {}", target.display()))?;
+    let _ = (mode, existed);
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut opened = opts.open(&target).await;
+    // A partial copy left read-only (by an older qsh).
+    #[cfg(unix)]
+    if start > 0 && opened.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(&target) {
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(m.permissions().mode() | 0o200));
+            opened = opts.open(&target).await;
+        }
+    }
+    let mut file = opened.with_context(|| format!("cannot create {}", target.display()))?;
     if start > 0 {
         use tokio::io::AsyncSeekExt;
         file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -228,6 +242,13 @@ pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool)
     let got = transfer(&mut recv, &mut file, size - start, &name.to_string_lossy()).await?;
     if got != size - start {
         bail!("transfer interrupted ({} of {size} bytes; run the same copy again to go on)", start + got);
+    }
+    // A file this copy made: read-only now if it is so on the server.
+    #[cfg(unix)]
+    if mode & 0o200 == 0 && (!existed || start > 0) {
+        use std::os::unix::fs::PermissionsExt;
+        let m = file.metadata().await?.permissions().mode();
+        file.set_permissions(std::fs::Permissions::from_mode(m & !0o200)).await?;
     }
     Ok(())
 }

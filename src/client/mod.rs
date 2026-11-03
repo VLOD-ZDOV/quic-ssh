@@ -107,7 +107,7 @@ pub struct Target {
     pub password_prompts: u32,
     /// X11 forwarding (`ForwardX11`, `-X`/`-Y`): `Some(trusted)`.
     pub forward_x11: Option<bool>,
-    /// How long an untrusted cookie stays valid (seconds) and the xauth program.
+    /// How long an untrusted cookie stays valid (seconds, 0: no limit) and the xauth program.
     pub x11_timeout: u32,
     pub xauth: String,
     pub clear_all_forwardings: bool,
@@ -469,7 +469,8 @@ impl Target {
             password_authentication: cfg.password_authentication.unwrap_or(true),
             password_prompts: cfg.password_prompts.unwrap_or(3),
             forward_x11: cfg.forward_x11.unwrap_or(false).then_some(cfg.forward_x11_trusted.unwrap_or(false)),
-            x11_timeout: cfg.forward_x11_timeout.as_deref().and_then(control::parse_time_secs).unwrap_or(1200),
+            // 0 is no timeout (as in ssh), which `parse_time_secs` does not return.
+            x11_timeout: cfg.forward_x11_timeout.as_deref().and_then(|t| if t.trim().trim_end_matches(['s', 'S']) == "0" { Some(0) } else { control::parse_time_secs(t) }).unwrap_or(1200),
             xauth: cfg.xauth_location.clone().unwrap_or_else(|| "xauth".into()),
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
             escape_char: parse_escape(cfg.escape_char.as_deref()),
@@ -1058,10 +1059,14 @@ async fn establish(target: &Target, opts: &ConnectOptions, via: Option<&Conn>) -
     let mut typed = None;
     let mut retries = LOGIN_RETRIES;
     let result = loop {
-        match login_once(target, opts, via, own.as_ref(), false, &mut typed).await {
+        match login_once(target, opts, via, own.as_ref(), None, &mut typed).await {
             // qshd before 0.5 knows only the TLS key: log in again with the own key
             // in the handshake (the host has been accepted by now, so this is no leak).
-            Err(e) if e.is::<TlsKeyOnly>() => break login_once(target, opts, via, own.as_ref(), true, &mut typed).await,
+            // Only the server accepted then may see the own key now.
+            Err(e) if e.is::<TlsKeyOnly>() => {
+                let accepted = e.downcast_ref::<TlsKeyOnly>().map(|t| t.0);
+                break login_once(target, opts, via, own.as_ref(), accepted, &mut typed).await;
+            }
             Err(e) if e.is::<auth::LostAtPrompt>() && retries > 0 => {
                 tracing::debug!("{e}; connecting again");
                 retries -= 1;
@@ -1094,8 +1099,9 @@ async fn add_own_key_to_agent(target: &Target, id: &Identity, policy: &str) {
 }
 
 /// The server refused a throwaway TLS key without asking for other keys.
+/// With the server key accepted on that connection.
 #[derive(Debug)]
-struct TlsKeyOnly;
+struct TlsKeyOnly(PublicKey);
 
 impl std::fmt::Display for TlsKeyOnly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1109,14 +1115,28 @@ impl std::error::Error for TlsKeyOnly {}
 const LOGIN_RETRIES: u32 = 2;
 
 /// One connection and login. `own`: the client's Ed25519 key, if it has
-/// one; `real_tls`: use it in the handshake on every port.
-async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, own: Option<&Identity>, real_tls: bool, typed: &mut auth::Typed) -> Result<Conn> {
+/// one; `real_tls`: use it in the handshake on every port, with a server
+/// that has this key only (accepted on the connection before).
+async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, own: Option<&Identity>, real_tls: Option<PublicKey>, typed: &mut auth::Typed) -> Result<Conn> {
     let throwaway = Identity::generate();
     let own = own.unwrap_or(&throwaway);
     let rejected = Rejection::default();
-    let (tls, hidden) = if real_tls {
-        let check = |p| crate::tls::checked_client_config(own, Some(host_check(target, p, &rejected))).map(|c| (p, c));
-        (target_ports(target).into_iter().map(check).collect::<Result<_>>()?, Vec::new())
+    let (tls, hidden) = if let Some(accepted) = real_tls {
+        let only = |p| {
+            let check = host_check(target, p, &rejected);
+            let rejected = rejected.clone();
+            let only: crate::tls::HostCheck = Arc::new(move |key, cert| {
+                if key != accepted {
+                    // Recorded so open() reports it instead of caching "no qshd".
+                    let reason = "the server's key is not the one accepted a moment ago".to_string();
+                    *rejected.lock().unwrap() = Some(reason.clone());
+                    return Err(reason);
+                }
+                check(key, cert)
+            });
+            crate::tls::checked_client_config(own, Some(only)).map(|c| (p, c))
+        };
+        (target_ports(target).into_iter().map(only).collect::<Result<_>>()?, Vec::new())
     } else {
         tls_configs(target, own, &throwaway, &rejected)?
     };
@@ -1139,7 +1159,7 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
         Ok(auth::Outcome::Denied { reason: e, asked_for_keys }) => {
             conn.close().await;
             if hidden && !asked_for_keys {
-                return Err(TlsKeyOnly.into());
+                return Err(TlsKeyOnly(conn.peer_key()).into());
             }
             if opts.resume.is_some() {
                 return Err(LoginRefused(e).into());
@@ -1234,6 +1254,11 @@ async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Co
             let mut hop = with_known_hosts_command(&hop)?;
             // Nothing may stop to ask on the way when this host may not (qsh multi).
             hop.batch_mode |= target.batch_mode;
+            // A hop's own route is not followed: going around it is not what
+            // the config says.
+            if hop.proxy_jump.is_some() || (hop.proxy_command.is_some() && !hops.is_empty()) {
+                bail!("jump host {spec} has a ProxyJump or ProxyCommand of its own; list the whole chain in ProxyJump instead (a,b,c)");
+            }
             let conn = establish(&hop, &hop_opts, hops.last().map(|c| c.as_ref()))
                 .await
                 .with_context(|| format!("jump host {spec}"))?;

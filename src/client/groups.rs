@@ -34,7 +34,7 @@ pub fn save(home: &Path, groups: &Groups) -> Result<()> {
         }
     }
     // Through a symlink (dotfile managers): replace the file it points to.
-    let file = std::fs::canonicalize(path(home)).unwrap_or_else(|_| path(home));
+    let file = crate::platform::link_target(&path(home));
     crate::keys::create_private_dir(file.parent().context("bad path")?)?;
     let groups: Groups = groups.iter().filter(|(_, hosts)| !hosts.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
     let text = format!("# Host groups for `qsh multi -g NAME` and `qsh ui` (e: a host's groups).\n{}", toml::to_string(&groups)?);
@@ -45,8 +45,9 @@ pub fn save(home: &Path, groups: &Groups) -> Result<()> {
 /// Changes one host's groups in the file (`old`: its previous name, if it
 /// was renamed): reads the file again, so edits made meanwhile are kept,
 /// and writes it only if something changed. A file that cannot be read is
-/// never replaced. Returns the groups now in the file.
-pub fn update(home: &Path, host: &str, old: Option<&str>, names: &[String]) -> Result<Groups> {
+/// never replaced. Returns the groups now in the file and those read, to
+/// put back if what goes with the change fails.
+pub fn update(home: &Path, host: &str, old: Option<&str>, names: &[String]) -> Result<(Groups, Groups)> {
     let mut groups = load(home).context("fix it by hand first; it was not changed")?;
     let before = groups.clone();
     if let Some(old) = old.filter(|o| *o != host) {
@@ -56,7 +57,7 @@ pub fn update(home: &Path, host: &str, old: Option<&str>, names: &[String]) -> R
     if groups != before {
         save(home, &groups)?;
     }
-    Ok(groups)
+    Ok((groups, before))
 }
 
 /// The groups `host` is in.
@@ -88,6 +89,9 @@ pub fn rename(groups: &mut Groups, old: &str, new: &str) {
         for h in hosts.iter_mut().filter(|h| *h == old) {
             *h = new.to_string();
         }
+        // `new` may have been there already.
+        let mut seen = std::collections::HashSet::new();
+        hosts.retain(|h| seen.insert(h.clone()));
     }
 }
 
@@ -122,7 +126,7 @@ mod tests {
         std::fs::write(path(home.path()), "# mine\nweb = [\"w1\"]\n").unwrap();
         update(home.path(), "w1", None, &["web".into()]).unwrap();
         assert!(std::fs::read_to_string(path(home.path())).unwrap().starts_with("# mine"));
-        let g = update(home.path(), "w2", None, &["web".into()]).unwrap();
+        let (g, _) = update(home.path(), "w2", None, &["web".into()]).unwrap();
         assert_eq!(g["web"], ["w1", "w2"]);
     }
 }

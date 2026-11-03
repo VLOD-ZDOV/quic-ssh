@@ -111,6 +111,17 @@ struct SpeedTest {
     current: f64,
     /// Readings for the sparkline, in kbit/s.
     history: Vec<u64>,
+    /// The test's task: stopped with it, so a closed test's readings do not
+    /// end up in the next one.
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for SpeedTest {
+    fn drop(&mut self) {
+        if let Some(t) = &self.task {
+            t.abort();
+        }
+    }
 }
 
 enum Msg {
@@ -144,8 +155,8 @@ struct Form {
     fallback: bool,
     focus: usize,
     error: Option<String>,
-    /// A host from the user's own config files: only the menu's preferences
-    /// (transport, ssh fallback) can change here, never the config itself.
+    /// A host from the user's own config files: only the menu's settings
+    /// (groups, transport, ssh fallback) can change here, never the config itself.
     locked: bool,
 }
 
@@ -215,7 +226,7 @@ impl Form {
         // make of it (a resolved port, user or `Host *` key would otherwise
         // be written back into it).
         let saved = (h.source == Source::Saved)
-            .then(|| home_dir().ok().map(|home| saved::load(&home)))
+            .then(|| home_dir().ok().and_then(|home| saved::load(&home).ok()))
             .flatten()
             .and_then(|all| all.into_iter().find(|s| s.name == h.alias));
         if let Some(s) = saved {
@@ -563,7 +574,8 @@ impl App {
                         form.focus = form.focus.saturating_sub(1).max(if form.locked { FIRST_MENU_FIELD } else { 0 });
                         self.back = 0;
                     }
-                    KeyCode::Enter => match form.result() {
+                    // A locked form saves only the menu fields; the rest comes from a config file.
+                    KeyCode::Enter => match if form.locked { form.group_list().map(drop) } else { form.result().map(drop) } {
                         Ok(_) => {
                             let InputMode::Form(form) = std::mem::replace(&mut self.mode, InputMode::Normal) else { unreachable!() };
                             return Action::Save(form);
@@ -1168,7 +1180,7 @@ fn draw_speedometer(f: &mut Frame, area: Rect, s: &SpeedTest) {
 /// Hosts saved here, from the configs, then known_hosts entries not covered by them.
 fn load_hosts() -> Vec<Host> {
     let home = home_dir().ok();
-    let saved: Vec<String> = home.as_deref().map(saved::load).unwrap_or_default().into_iter().map(|s| s.name).collect();
+    let saved: Vec<String> = home.as_deref().and_then(|h| saved::load(h).ok()).unwrap_or_default().into_iter().map(|s| s.name).collect();
     let mut aliases: Vec<(String, Source)> = home
         .as_deref()
         .map(super::config::host_aliases)
@@ -1310,7 +1322,7 @@ fn start_probes(app: &mut App, only: Option<&str>, force: bool, tx: &mpsc::Unbou
     }
 }
 
-fn run_speed_test(conn: Arc<Conn>, tx: mpsc::UnboundedSender<Msg>) {
+fn run_speed_test(conn: Arc<Conn>, tx: mpsc::UnboundedSender<Msg>) -> tokio::task::AbortHandle {
     let send = move |ev| {
         let _ = tx.send(Msg::Speed(ev));
     };
@@ -1337,7 +1349,8 @@ fn run_speed_test(conn: Arc<Conn>, tx: mpsc::UnboundedSender<Msg>) {
             Ok(()) => Phase::Done,
             Err(e) => Phase::Failed(format!("{e:#}")),
         }));
-    });
+    })
+    .abort_handle()
 }
 
 fn enter() -> std::io::Result<DefaultTerminal> {
@@ -1400,22 +1413,22 @@ fn session_args(opts: &ConnectOptions, prefs: &Prefs, dest: &str) -> Vec<String>
 }
 
 /// Stores a form: the connection in `ui-hosts`, its preferences in the state.
-/// Hosts from the user's own config files only get their preferences stored;
-/// their files are never written.
+/// Hosts from the user's own config files only get their menu settings
+/// stored (groups and preferences); their files are never written.
 fn save_form(app: &mut App, form: &Form) -> Result<String> {
     let home = home_dir()?;
     let member = form.group_list().map_err(anyhow::Error::msg)?;
     if form.locked {
         let name = form.original.clone().unwrap_or_else(|| form.name.clone());
         let prefs = Prefs { transport: TRANSPORTS[form.transport].to_string(), ssh_fallback: form.fallback };
-        app.state.prefs.insert(name.clone(), prefs);
         if member != groups::of(&app.groups, &name) {
-            app.groups = groups::update(&home, &name, None, &member)?;
+            app.groups = groups::update(&home, &name, None, &member)?.0;
         }
+        app.state.prefs.insert(name.clone(), prefs);
         return Ok(name);
     }
     let (entry, prefs) = form.result().map_err(anyhow::Error::msg)?;
-    let mut all = saved::load(&home);
+    let mut all = saved::load(&home)?;
     // A name from the user's config would be shadowed by theirs anyway: refuse it.
     let own: Vec<String> = all.iter().map(|s| s.name.clone()).collect();
     if super::config::host_aliases(&home).iter().any(|a| a == &entry.name && !own.contains(a)) {
@@ -1423,20 +1436,30 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
     }
     if let Some(old) = &form.original {
         all.retain(|s| &s.name != old);
-        if old != &entry.name {
-            app.state.prefs.remove(old);
-            app.state.probes.remove(old);
-        }
     }
     all.retain(|s| s.name != entry.name);
     let name = entry.name.clone();
-    // Groups first: if their file cannot be changed, nothing is saved.
+    // Groups first: if their file cannot be changed, nothing is saved; if
+    // the connection cannot be, they are put back.
     let old = form.original.as_deref().unwrap_or(&name);
+    let mut undo = None;
     if member != groups::of(&app.groups, old) || old != name {
-        app.groups = groups::update(&home, &name, Some(old), &member)?;
+        let (now, was) = groups::update(&home, &name, Some(old), &member)?;
+        undo = (now != was).then_some(was);
+        app.groups = now;
     }
     all.push(entry);
-    saved::save(&home, &all)?;
+    if let Err(e) = saved::save(&home, &all) {
+        if let Some(was) = undo {
+            let _ = groups::save(&home, &was);
+            app.groups = was;
+        }
+        return Err(e);
+    }
+    if old != name {
+        app.state.prefs.remove(old);
+        app.state.probes.remove(old);
+    }
     app.state.prefs.insert(name.clone(), prefs);
     // The address may have changed: check it again.
     app.state.probes.remove(&name);
@@ -1446,7 +1469,7 @@ fn save_form(app: &mut App, form: &Form) -> Result<String> {
 /// Replaces the forwards of a saved connection, keeping its other options.
 fn save_forwards(name: &str, lines: &[String]) -> Result<()> {
     let home = home_dir()?;
-    let mut all = saved::load(&home);
+    let mut all = saved::load(&home)?;
     let entry = all.iter_mut().find(|s| s.name == name).ok_or_else(|| anyhow::anyhow!("{name} is not saved here"))?;
     let forward = |o: &String| {
         let key = o.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
@@ -1459,11 +1482,21 @@ fn save_forwards(name: &str, lines: &[String]) -> Result<()> {
 
 fn delete_saved(app: &mut App, name: &str) -> Result<()> {
     let home = home_dir()?;
-    let mut all = saved::load(&home);
+    let mut all = saved::load(&home)?;
     all.retain(|s| s.name != name);
-    saved::save(&home, &all)?;
+    // Groups first, as in `save_form`, put back if the host stays.
+    let mut undo = None;
     if !groups::of(&app.groups, name).is_empty() {
-        app.groups = groups::update(&home, name, None, &[])?;
+        let (now, was) = groups::update(&home, name, None, &[])?;
+        undo = (now != was).then_some(was);
+        app.groups = now;
+    }
+    if let Err(e) = saved::save(&home, &all) {
+        if let Some(was) = undo {
+            let _ = groups::save(&home, &was);
+            app.groups = was;
+        }
+        return Err(e);
     }
     app.state.prefs.remove(name);
     app.state.probes.remove(name);
@@ -1640,6 +1673,8 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                 target.port = port;
                 target.alt_ports.clear();
                 let alias = host.alias.clone();
+                // Stops a test still running; its queued results are dropped below.
+                app.speed = None;
                 // Log in outside the TUI: it may ask about the host key or a passphrase.
                 leave();
                 eprintln!("Connecting to {alias} for a speed test…");
@@ -1652,6 +1687,9 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                     wait_for_enter();
                 }
                 terminal = enter()?;
+                while let Ok(msg) = rx.try_recv() {
+                    app.apply(msg);
+                }
                 match conn {
                     Ok(conn) => {
                         let transport = conn.transport_name();
@@ -1664,9 +1702,13 @@ pub async fn run(opts: ConnectOptions) -> Result<i32> {
                             up: None,
                             current: 0.0,
                             history: Vec::new(),
+                            task: None,
                         });
                         app.status.clear();
-                        run_speed_test(Arc::new(conn), tx.clone());
+                        let task = run_speed_test(Arc::new(conn), tx.clone());
+                        if let Some(s) = app.speed.as_mut() {
+                            s.task = Some(task);
+                        }
                     }
                     Err(e) => app.status = format!("{alias}: {e:#}"),
                 }
@@ -1744,6 +1786,7 @@ mod tests {
             up: Some(70.1),
             current: 85.2,
             history: vec![10, 50, 80],
+            task: None,
         });
         let screen = render(&mut app, 46, 34);
         assert!(screen.contains("85.2 Mbit/s"), "{screen}");

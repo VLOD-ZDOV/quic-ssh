@@ -1053,12 +1053,13 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
             continue;
         }
         clear(&mut predictor).await;
-        if token.is_none() {
+        // Without a way back (a session picked up without a terminal has a
+        // token, but no reconnect): as ssh.
+        let (Some(token), Some(reconnect)) = (token.as_ref(), opts.reconnect.as_ref()) else {
             let _ = stderr.write_all(b"\r\nTimeout, server not responding.\r\n").await;
             break 255;
-        }
+        };
         // The connection is gone: reconnect and pick the session up where we were.
-        let (Some(token), Some(reconnect)) = (token.as_ref(), opts.reconnect.as_ref()) else { unreachable!() };
         let _ = stderr.write_all(b"\r\n[qsh: connection lost, reconnecting... type ~. to give up]\r\n").await;
         let old = conn.clone();
         tokio::spawn(async move { old.close().await });

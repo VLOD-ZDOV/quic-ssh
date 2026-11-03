@@ -112,6 +112,10 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
             .args(["-T", "-n", "-o", "BatchMode=yes", "--", dest])
             // One hint in the summary instead of one per host.
             .env("QSH_NO_DOCTOR_HINT", "1")
+            // Not into the background (config ForkAfterAuthentication): its
+            // exit code would be that of the login. Not an -o, which an ssh
+            // before 8.7 taking over would refuse.
+            .env("QSH_NO_FORK", "1")
             .args(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -162,8 +166,14 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
                 Line::Out(i, text) => writeln!(out, "{}{text}", prefix(i)),
                 Line::Err(i, text) => writeln!(err, "{}{text}", prefix(i)),
             };
-            // The reader went away (`| head`): stop; the children end with us.
+            // The reader went away (`| head`): stop, and the remote commands
+            // with it (a cancelled task drops, and so kills, its child; the
+            // runtime itself is not dropped before the exit).
             if written.is_err() {
+                for t in tasks {
+                    t.abort();
+                    let _ = t.await;
+                }
                 return Ok(1);
             }
         }
@@ -178,7 +188,10 @@ pub async fn run_each(jobs: &[(String, Vec<String>)], command: &[String], parall
         for (r, e) in results.iter_mut().zip(&ends) {
             r.exit = if let End::Code(c) = e { Some(*c) } else { None };
         }
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        use std::io::Write;
+        if writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&results)?).is_err() {
+            return Ok(1);
+        }
         return Ok(if failed.is_empty() { 0 } else if failed.iter().any(|&(_, e)| broken(e)) { 255 } else { 1 });
     }
     if failed.is_empty() {

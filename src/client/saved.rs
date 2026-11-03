@@ -83,6 +83,8 @@ impl Saved {
 /// Parses the file written by [`save`] (simple `Host` blocks only).
 pub fn parse(text: &str) -> Vec<Saved> {
     let mut out: Vec<Saved> = Vec::new();
+    // Lines under a hand-written Match belong to it, not to the Host above.
+    let mut in_match = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -93,7 +95,12 @@ pub fn parse(text: &str) -> Vec<Saved> {
             None => continue,
         };
         match key.as_str() {
-            "host" => out.push(Saved { name: value, ..Default::default() }),
+            "host" => {
+                in_match = false;
+                out.push(Saved { name: value, ..Default::default() });
+            }
+            "match" => in_match = true,
+            _ if in_match => {}
             _ => {
                 let Some(s) = out.last_mut() else { continue };
                 match key.as_str() {
@@ -101,7 +108,7 @@ pub fn parse(text: &str) -> Vec<Saved> {
                     "user" => s.user = Some(value),
                     "port" => s.port = value.parse().ok(),
                     "identityfile" => s.identity = Some(value),
-                    "match" | "include" => {}
+                    "include" => {}
                     _ => s.options.push(line.split_once(char::is_whitespace).map(|(k, v)| format!("{k} {}", v.trim())).unwrap_or_default()),
                 }
             }
@@ -110,8 +117,23 @@ pub fn parse(text: &str) -> Vec<Saved> {
     out
 }
 
-pub fn load(home: &Path) -> Vec<Saved> {
-    std::fs::read_to_string(path(home)).map(|t| parse(&t)).unwrap_or_default()
+/// The saved connections; none if the file is not there. Another error is
+/// one: read as none, the next save would drop them all.
+pub fn load(home: &Path) -> Result<Vec<Saved>> {
+    let file = path(home);
+    match std::fs::read(&file) {
+        Ok(bytes) => Ok(parse(&String::from_utf8_lossy(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("cannot read {}", file.display()))),
+    }
+}
+
+/// Whether the file has blocks that [`parse`] does not keep.
+fn hand_written(text: &str) -> bool {
+    text.lines().any(|l| {
+        let key = l.trim().split(|c: char| c.is_whitespace() || c == '=').next().unwrap_or("");
+        key.eq_ignore_ascii_case("match") || key.eq_ignore_ascii_case("include")
+    })
 }
 
 /// Writes all saved connections (replacing the file atomically).
@@ -120,6 +142,11 @@ pub fn save(home: &Path, all: &[Saved]) -> Result<()> {
         s.validate().with_context(|| format!("connection {:?}", s.name))?;
     }
     let file = path(home);
+    if let Ok(old) = std::fs::read(&file) {
+        if hand_written(&String::from_utf8_lossy(&old)) {
+            bail!("{} has Match or Include lines, which `qsh ui` cannot keep: edit it by hand", file.display());
+        }
+    }
     let dir = file.parent().context("bad path")?;
     crate::keys::create_private_dir(dir)?;
     let mut text = String::from("# Connections saved in `qsh ui` (n new, e edit, d delete), in ssh_config syntax.\n# Read after ~/.config/qsh/config and ~/.ssh/config; names here are not used there.\n");
@@ -229,7 +256,12 @@ pub fn flags_from_options(options: &[String]) -> String {
             ("sessiontype", "none") => "-N".into(),
             ("requesttty", "no") => "-T".into(),
             ("requesttty", "yes") => "-t".into(),
-            _ => format!("-o {}", quote(format!("{key}={value}"))),
+            // A value saved in quotes as one word: they go, `quote` adds its
+            // own. Several quoted words (`SendEnv "A" "B"`) stay as they are.
+            _ => {
+                let one = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).filter(|v| !v.contains('"'));
+                format!("-o {}", quote(format!("{key}={}", one.unwrap_or(value))))
+            }
         };
         out.push(flag);
     }
@@ -243,6 +275,7 @@ mod tests {
     #[test]
     fn roundtrip_and_lookup() {
         let home = tempfile::tempdir().unwrap();
+        assert!(load(home.path()).unwrap().is_empty(), "no file yet");
         let a = Saved {
             name: "box".into(),
             host: "192.0.2.5".into(),
@@ -253,7 +286,7 @@ mod tests {
         };
         let b = Saved { name: "web".into(), host: "web.example.com".into(), ..Default::default() };
         save(home.path(), &[a.clone(), b.clone()]).unwrap();
-        assert_eq!(load(home.path()), vec![a, b]);
+        assert_eq!(load(home.path()).unwrap(), vec![a, b]);
         // qsh itself reads the file: `qsh box` resolves through it.
         let t = super::super::Target::parse_with("box", None, Some(home.path()), false).unwrap();
         assert_eq!((t.host.as_str(), t.user.as_str(), t.port), ("192.0.2.5", "admin", 2222));
@@ -262,6 +295,23 @@ mod tests {
         assert!(t.ssh_options.iter().any(|o| o == "LocalForward=8080 localhost:80"), "{:?}", t.ssh_options);
         assert!(t.ssh_options.iter().any(|o| o == "ForwardAgent=yes"), "{:?}", t.ssh_options);
         assert!(super::super::config::host_aliases(home.path()).contains(&"web".to_string()));
+        // A file that cannot be read is an error, not "nothing saved".
+        let file = path(home.path());
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(load(home.path()).is_err());
+    }
+
+    #[test]
+    fn hand_written_match_is_kept_apart() {
+        let home = tempfile::tempdir().unwrap();
+        let file = path(home.path());
+        crate::keys::create_private_dir(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "Host a\n    HostName a.example\nMatch host x\n    ProxyJump j\n").unwrap();
+        let all = load(home.path()).unwrap();
+        assert!(all[0].options.is_empty(), "{:?}", all[0].options);
+        assert!(save(home.path(), &all).is_err(), "the Match block would be lost");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("Match host x"));
     }
 
     #[test]
@@ -311,6 +361,11 @@ mod tests {
             "-L 8080:localhost:80 -L [::1]:5432:/run/pg.sock -R 9000 -R 2222:db:22 -D 1080 -N -A -Y -C -o ServerAliveInterval=30 -o \"RemoteCommand=tmux new -A\" -J gw"
         );
         assert_eq!(options_from_flags(&back).unwrap(), lines);
+        // A value written in quotes in the file survives an edit.
+        let quoted = vec!["RemoteCommand \"tmux new -A\"".to_string()];
+        assert_eq!(options_from_flags(&flags_from_options(&quoted)).unwrap(), ["RemoteCommand tmux new -A"]);
+        let words = vec!["SendEnv \"LANG\" \"LC_*\"".to_string()];
+        assert_eq!(options_from_flags(&flags_from_options(&words)).unwrap(), ["SendEnv LANG LC_*"]);
         for bad in ["-p 22", "-L", "-L 80", "8080:x:80", "-o NoValue", "-K", "-o \"Unclosed=1"] {
             assert!(options_from_flags(bad).is_err(), "{bad}");
         }

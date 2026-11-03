@@ -80,8 +80,8 @@ pub fn hosts(home: &Path) -> Vec<String> {
             out.push(dest);
         }
     }
-    // Names a shell would take apart, or that look like options.
-    out.retain(|h| !h.is_empty() && !h.starts_with('-') && !h.contains(|c: char| c.is_whitespace() || "'\"`$\\;&|<>(){}*?".contains(c)));
+    // Names a shell would take apart or expand (globs, ~), or that look like options.
+    out.retain(|h| !h.is_empty() && !h.starts_with('-') && !h.contains(|c: char| c.is_whitespace() || "'\"`$\\;&|<>(){}*?[]~".contains(c)));
     out
 }
 

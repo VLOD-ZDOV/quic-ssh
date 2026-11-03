@@ -344,9 +344,10 @@ pub async fn login(conn: &Conn, send: &mut SendHalf, recv: &mut RecvHalf, target
             }
             Reply::Prompt { text, echo } => {
                 debug!("server asks: {}", server_text(&text).trim());
-                let answer = match typed.take() {
-                    Some((asked, answer)) if asked == text => answer,
-                    _ => ask(&text, echo, target.batch_mode)?,
+                // Kept until its own question comes: a login asks others first.
+                let answer = match typed.take_if(|(asked, _)| *asked == text) {
+                    Some((_, answer)) => answer,
+                    None => ask(&text, echo, target.batch_mode)?,
                 };
                 let answered = async {
                     write_msg(send, &Auth::Response(answer.clone())).await?;

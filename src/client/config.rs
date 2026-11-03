@@ -497,6 +497,11 @@ impl Parser<'_> {
                 "remoteforward" if args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
                 // `RemoteForward [bind:]port` alone: a SOCKS proxy on the server.
                 "remoteforward" if args.len() == 1 => push_new(&mut o.remote_forwards, first),
+                // As ssh: a bad one is an error, not a forward quietly missing.
+                // (ssh's own files are ssh's to judge.)
+                "localforward" | "remoteforward" if self.ours => {
+                    o.bad_option.get_or_insert_with(|| format!("{}Bad forwarding specification: {}", at(&self.file, n), args.join(" ")));
+                }
                 "dynamicforward" => push_new(&mut o.dynamic_forwards, first),
                 "requesttty" if self.full && o.request_tty.is_none() => o.request_tty = first.map(|v| v.to_ascii_lowercase()),
                 // ProxyJump and ProxyCommand compete: the first one found wins (as in ssh).
@@ -738,7 +743,8 @@ fn local_networks_match(patterns: &[String]) -> Option<bool> {
 
 /// Reads a config file; `Err` says why it cannot be trusted: owned by
 /// someone but the user or root, or writable by others (as ssh checks them).
-/// A missing or unreadable file reads as empty.
+/// A missing or unreadable file reads as empty; bytes that are not UTF-8
+/// do not lose the rest of the file.
 fn read_config(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else { return Ok(String::new()) };
@@ -751,8 +757,8 @@ fn read_config(path: &Path) -> Result<String, String> {
             return Err(format!("Bad owner or permissions on {}", path.display()));
         }
     }
-    let mut text = String::new();
-    Ok(f.read_to_string(&mut text).map(|_| text).unwrap_or_default())
+    let mut bytes = Vec::new();
+    Ok(f.read_to_end(&mut bytes).map(|_| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default())
 }
 
 /// Resolves an `Include` argument (relative to the config dir, `~`, `*` in the file name).
@@ -796,8 +802,8 @@ fn collect_aliases(text: &str, base: &Path, depth: usize, out: &mut Vec<String>)
             "include" if depth < MAX_INCLUDE_DEPTH => {
                 for pattern in &args {
                     for file in expand_include(base, pattern) {
-                        if let Ok(t) = std::fs::read_to_string(&file) {
-                            collect_aliases(&t, base, depth + 1, out);
+                        if let Ok(t) = std::fs::read(&file) {
+                            collect_aliases(&String::from_utf8_lossy(&t), base, depth + 1, out);
                         }
                     }
                 }
@@ -812,8 +818,8 @@ pub fn host_aliases(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let qsh_dir = crate::keys::qsh_dir(home);
     for (dir, file) in [(qsh_dir.clone(), "config"), (home.join(".ssh"), "config"), (qsh_dir, UI_HOSTS)] {
-        if let Ok(text) = std::fs::read_to_string(dir.join(file)) {
-            collect_aliases(&text, &dir, 0, &mut out);
+        if let Ok(text) = std::fs::read(dir.join(file)) {
+            collect_aliases(&String::from_utf8_lossy(&text), &dir, 0, &mut out);
         }
     }
     out

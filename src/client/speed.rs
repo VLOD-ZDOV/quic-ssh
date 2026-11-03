@@ -72,7 +72,8 @@ pub async fn upload(conn: &Conn, duration: Duration, mut progress: impl FnMut(u6
     let mut last = start;
     let mut sent = 0u64;
     let buf = vec![0u8; CHUNK];
-    while start.elapsed() < duration {
+    // The server reads no more than it was told: past that, writes would stall.
+    while start.elapsed() < duration && sent + buf.len() as u64 <= MAX_BYTES {
         or_stall(send.write_all(&buf)).await?;
         sent += buf.len() as u64;
         if last.elapsed() >= REPORT_EVERY {

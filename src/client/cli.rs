@@ -90,7 +90,7 @@ fn option_line(o: &str) -> Result<String, String> {
 }
 
 /// `-o` keywords only qsh knows (ssh stops at them).
-const QSH_ONLY_OPTIONS: [&str; 2] = ["PersistSession", "PredictiveEcho"];
+const QSH_ONLY_OPTIONS: [&str; 3] = ["PersistSession", "PredictiveEcho", "RestoreSession"];
 
 /// Keywords the config parser carries out (lowercase).
 const APPLIED_OPTIONS: &[&str] = &[

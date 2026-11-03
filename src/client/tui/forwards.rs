@@ -84,11 +84,12 @@ impl Fwd {
             Ok(f) => f.config_args(),
             Err(_) => (self.spec.clone(), None),
         };
-        let dest = dest.unwrap_or_default();
-        match self.kind {
-            Kind::Local => format!("here {listen}  →  {dest} as seen from the server"),
-            Kind::Remote => format!("server {listen}  →  {dest} here"),
-            Kind::Socks => format!("SOCKS proxy here on {listen}, out through the server"),
+        match (self.kind, dest) {
+            (Kind::Local, dest) => format!("here {listen}  →  {} as seen from the server", dest.unwrap_or_default()),
+            // `-R port` alone: a SOCKS proxy on the server.
+            (Kind::Remote, None) => format!("SOCKS proxy on the server on {listen}, out through here"),
+            (Kind::Remote, Some(dest)) => format!("server {listen}  →  {dest} here"),
+            (Kind::Socks, _) => format!("SOCKS proxy here on {listen}, out through the server"),
         }
     }
 

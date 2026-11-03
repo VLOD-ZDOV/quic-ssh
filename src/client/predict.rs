@@ -464,6 +464,8 @@ impl Predictor {
             // What the screen showed meanwhile is unknown: start from a blank one.
             self.screen = vt100::Parser::new_with_callbacks(rows, cols, 0, Watch::default());
             self.parse = Parse::Ground;
+            // Not to be trusted until the next full redraw.
+            self.trusted = false;
         } else if active {
             self.screen.screen_mut().set_size(rows, cols);
         }

@@ -185,8 +185,9 @@ impl KnownHosts {
     /// pattern) from the user's file, as `ssh-keygen -R`; returns how many.
     pub fn remove(&self, id: &str) -> Result<usize> {
         let Some(path) = &self.path else { return Ok(0) };
-        let text = match fs::read(path) {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        // Bytes, so that the lines kept stay exactly as they were.
+        let raw = match fs::read(path) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
         };
@@ -197,19 +198,19 @@ impl KnownHosts {
                 None => n.eq_ignore_ascii_case(id),
             })
         };
-        let mut kept = String::new();
+        let mut kept = Vec::new();
         let mut removed = 0;
-        for line in text.lines() {
+        for raw_line in raw.split_inclusive(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(raw_line);
             let names = line.trim().split_once(char::is_whitespace).map(|(n, _)| n);
             if names.is_some_and(|n| !n.starts_with(['@', '#']) && names_id(n)) {
                 removed += 1;
             } else {
-                kept.push_str(line);
-                kept.push('\n');
+                kept.extend_from_slice(raw_line);
             }
         }
         if removed > 0 {
-            crate::platform::replace_file(path, kept.as_bytes()).with_context(|| format!("cannot write {}", path.display()))?;
+            crate::platform::replace_file(path, &kept).with_context(|| format!("cannot write {}", path.display()))?;
         }
         Ok(removed)
     }
@@ -250,6 +251,13 @@ mod tests {
         assert_eq!(left.lines().count(), 3, "{left}");
         assert_eq!(kh.lookup("[example.com]:2222").unwrap(), Some(key));
         assert_eq!(kh.remove("example.com").unwrap(), 0);
+        // Lines kept stay byte for byte, also ones that are not UTF-8.
+        let mut bytes = b"# caf\xe9\r\n".to_vec();
+        bytes.extend_from_slice(std::fs::read(&path).unwrap().as_slice());
+        std::fs::write(&path, &bytes).unwrap();
+        kh.add("gone.example", key).unwrap();
+        assert_eq!(kh.remove("gone.example").unwrap(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

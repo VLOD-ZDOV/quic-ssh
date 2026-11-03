@@ -96,23 +96,27 @@ pub fn prepare(display: &str, trusted: bool, xauth: &str, timeout: u32) -> Resul
     } else {
         let dir = private_dir()?;
         let file = dir.join("xauthfile");
+        // Timeout 0: none (as in ssh), so xauth's own idle timeout applies.
+        let timeout_args = if timeout == 0 { vec![] } else { vec!["timeout".to_string(), timeout.to_string()] };
         let generated = Command::new(xauth)
             .arg("-f")
             .arg(&file)
-            .args(["generate", &xauth_name(display), "MIT-MAGIC-COOKIE-1", "untrusted", "timeout", &timeout.to_string()])
+            .args(["generate", &xauth_name(display), "MIT-MAGIC-COOKIE-1", "untrusted"])
+            .args(&timeout_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         let result = match generated {
             Ok(s) if s.success() => list_cookie(xauth, Some(&file), display),
-            _ => Err(anyhow::anyhow!("xauth could not generate an untrusted cookie (the X server may lack the SECURITY extension; -Y forwards with full access)")),
+            Err(e) => Err(anyhow::anyhow!("cannot run {xauth}: {e}")),
+            Ok(_) => Err(anyhow::anyhow!("xauth could not generate an untrusted cookie (the X server may lack the SECURITY extension; -Y forwards with full access)")),
         };
         let _ = std::fs::remove_dir_all(&dir);
         result?
     };
     let fake: Vec<u8> = (0..real.len()).map(|_| rand::random::<u8>()).collect();
-    let refuse_after = (!trusted).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout.into()));
+    let refuse_after = (!trusted && timeout != 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout.into()));
     Ok(X11Auth { display: display.to_string(), proto, fake, real, screen: screen_of(display), refuse_after })
 }
 

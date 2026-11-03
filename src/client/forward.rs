@@ -187,7 +187,8 @@ fn report_failure(target: &str, e: &anyhow::Error) {
     let show = {
         let mut shown = SHOWN.get_or_init(Default::default).lock().unwrap();
         shown.retain(|_, at| now.duration_since(*at) < QUIET_REPEATS);
-        shown.insert(target.to_string(), now).is_none()
+        // The time it was shown, not of the last repeat: shown again after a minute.
+        !shown.contains_key(target) && shown.insert(target.to_string(), now).is_none()
     };
     // Not with -q (LogLevel quiet/error).
     if show && tracing::enabled!(tracing::Level::WARN) {
@@ -442,7 +443,7 @@ impl Forwarder {
     /// end, and they are returned, as `~#` shows them, to tell the user.
     pub fn reconnected(self: &Arc<Self>, conn: Arc<Conn>) -> Vec<String> {
         let keeps = conn.server_version() >= crate::proto::FORWARDS_ON_RESUME;
-        let gone = if keeps { Vec::new() } else { self.list() };
+        let mut gone = if keeps { Vec::new() } else { self.list() };
         self.conn.send_replace(conn.clone());
         if let Some(d) = self.dispatcher.lock().unwrap().take() {
             d.abort();
@@ -463,13 +464,19 @@ impl Forwarder {
                 false
             });
         }
-        let agent = {
+        let (agent, x11) = {
             let mut routes = self.routes.lock().unwrap();
             routes.ports.clear();
             routes.paths.clear();
-            routes.agent.clone()
+            (routes.agent.clone(), routes.x11.take())
         };
+        // The session's DISPLAY was the old connection's, and qshd allows
+        // no new X11 forward on a resumed one: it ends, and the user is told.
+        if x11.is_some() {
+            gone.push("-X (X11)".into());
+        }
         *self.agent_request.lock().unwrap() = None;
+        *self.x11_request.lock().unwrap() = None;
         if keeps {
             tokio::spawn(self.clone().restore(conn, remotes, agent));
         }
@@ -761,7 +768,9 @@ impl Forwarder {
                     (Listen::Unix(p), Listen::Unix(p2)) => p == p2,
                     _ => false,
                 };
-            if same {
+            // Routes are the server's (-R): a local forward on the same port
+            // or path has none to remove.
+            if same && a.kind == 'R' {
                 match &a.fwd.listen {
                     Listen::Tcp { .. } => {
                         if let Some(p) = a.bound {
