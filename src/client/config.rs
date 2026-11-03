@@ -820,8 +820,9 @@ pub fn host_aliases(home: &Path) -> Vec<String> {
 }
 
 /// Connections saved from `qsh ui` (ssh_config syntax), in `~/.config/qsh`.
-/// Read after the user's own config files, and the menu only saves names
-/// that are not in them, so it never overrides what the user wrote.
+/// They win over blocks for many hosts (`Host *`), but come after a block
+/// in the user's own files that names the host, so they never override
+/// what the user wrote for it.
 pub const UI_HOSTS: &str = "ui-hosts";
 
 /// Collects the settings for `host` from config `text`. `full` is false for
@@ -974,13 +975,26 @@ fn lookup_pass(
     ours.feed_file(&sources.overrides.join("\n"), &qsh_dir, None);
     ours.check = true;
     let qsh_file = qsh_dir.join("config");
-    ours.feed_file(&read(qsh_config), &qsh_dir, Some(&qsh_file));
+    let (qsh_text, ssh_text, ui_text) = (read(qsh_config), read(ssh_config), read(ui_hosts));
+    ours.feed_file(&qsh_text, &qsh_dir, Some(&qsh_file));
+    // What `qsh ui` saved describes this host: it wins over the user's
+    // blocks for many hosts (`Host *`), but not over one that names it.
+    let mut named = Vec::new();
+    collect_aliases(&qsh_text, &qsh_dir, 0, &mut named);
+    collect_aliases(&ssh_text, &ssh_dir, 0, &mut named);
+    let ui_last = named.iter().any(|n| n == host || n == original);
+    let mut ui = parser(true, true, ui_seed);
+    if !ui_last {
+        ours.check = false;
+        ours.feed_file(&ui_text, &qsh_dir, None);
+    } else {
+        ui.feed_file(&ui_text, &qsh_dir, None);
+    }
+    let ui = ui.finish();
     let mut ours = ours.finish();
     if bad_file.is_some() {
         ours.bad_file = bad_file;
     }
-    // What `qsh ui` saved comes last of all (see `merge`).
-    let ui = parser(true, true, ui_seed).run(&read(ui_hosts));
     // ssh's own files: the user's, then (without -F) the system-wide one,
     // as ssh reads them; first value wins across both.
     let mut ssh = parser(sources.full, false, ssh_seed);
@@ -988,7 +1002,7 @@ fn lookup_pass(
     if ssh.out.tag.is_none() {
         ssh.out.tag = ours.tag.clone();
     }
-    ssh.feed_file(&read(ssh_config), &ssh_dir, Some(&ssh_file));
+    ssh.feed_file(&ssh_text, &ssh_dir, Some(&ssh_file));
     if sources.ssh_config.is_none() {
         ssh.feed_system(Path::new(SYSTEM_SSH_CONFIG));
     }
@@ -1008,8 +1022,8 @@ fn merge_set_env(high: &[String], low: &[String]) -> Vec<String> {
 }
 
 /// One host's settings from qsh's part, ssh's part and `qsh ui`'s part of
-/// the configs, in this order of precedence: what `qsh ui` saved never
-/// overrides what the user wrote.
+/// the configs, in this order of precedence. `qsh ui`'s part is only set
+/// for a host the user's files name; otherwise it is in qsh's part.
 fn merge([ours, ssh, ui]: [HostConfig; 3]) -> HostConfig {
     under(merge_ssh(ours, ssh), ui)
 }
@@ -1338,6 +1352,11 @@ Host *
         // qsh's own config still comes first.
         write_config(dir.join("config"), "Host web\n Port 6000\n").unwrap();
         assert_eq!(lookup(home.path(), "web", &Sources::default()).port, Some(6000));
+        // A block for every host does not override what was saved for this one.
+        std::fs::remove_file(dir.join("config")).unwrap();
+        write_config(home.path().join(".ssh/config"), "Host *\n User root\n ForwardAgent no\n").unwrap();
+        let c = lookup(home.path(), "web", &Sources::default());
+        assert_eq!((c.hostname.as_deref(), c.user.as_deref(), c.forward_agent), (Some("192.0.2.1"), Some("olduser"), Some(true)));
     }
 
     #[test]

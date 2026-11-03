@@ -7,7 +7,8 @@
 # ProxyJump, ProxyCommand, ControlPath, RestoreSession and the known_hosts
 # settings (from this file only), and Port and the other settings of the ssh
 # session itself (RequestTTY, RemoteCommand, SendEnv...: only with --full).
-# Hosts saved by `qsh ui` come last. `-o Key=value` on the command line wins
+# Hosts saved by `qsh ui` win over blocks for many hosts (Host *), not over
+# one that names the host. `-o Key=value` on the command line wins
 # over all of them. Here, a keyword qsh does not know is an error and one it
 # does not carry out gives a warning. As in ssh, the first value found for a
 # setting wins: put the blocks
