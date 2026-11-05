@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" viewBox="0 0 760 400" role="img" aria-label="File transfer (Mbit/s), higher is better">
+<rect width="760" height="400" fill="#1a1a19" rx="8"/>
+<text x="24.00" y="34.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17" font-weight="600" fill="#ffffff" text-anchor="start">File transfer (Mbit/s), higher is better</text>
+<rect x="24" y="52" width="12" height="12" rx="3" fill="#d95926"/>
+<text x="42.00" y="62.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#c3c2b7" text-anchor="start">scp</text>
+<rect x="91.6" y="52" width="12" height="12" rx="3" fill="#3987e5"/>
+<text x="109.60" y="62.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#c3c2b7" text-anchor="start">qsh cp (QUIC)</text>
+<rect x="231.20000000000002" y="52" width="12" height="12" rx="3" fill="#199e70"/>
+<text x="249.20" y="62.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#c3c2b7" text-anchor="start">qsh cp (TCP fallback)</text>
+<text x="54.00" y="334.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">0</text>
+<line x1="64" y1="270.50" x2="736" y2="270.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54.00" y="274.50" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">50</text>
+<line x1="64" y1="211.00" x2="736" y2="211.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54.00" y="215.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">100</text>
+<line x1="64" y1="151.50" x2="736" y2="151.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54.00" y="155.50" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">150</text>
+<line x1="64" y1="92.00" x2="736" y2="92.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="54.00" y="96.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">200</text>
+<line x1="64" y1="330" x2="736" y2="330" stroke="#383835" stroke-width="1"/>
+<path d="M 80.00 330.00 L 80.00 255.22 Q 80.00 251.22 84.00 251.22 L 120.00 251.22 Q 124.00 251.22 124.00 255.22 L 124.00 330.00 Z" fill="#d95926"/>
+<text x="102.00" y="243.22" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">66.2</text>
+<path d="M 126.00 330.00 L 126.00 232.61 Q 126.00 228.61 130.00 228.61 L 166.00 228.61 Q 170.00 228.61 170.00 232.61 L 170.00 330.00 Z" fill="#3987e5"/>
+<text x="148.00" y="220.61" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">85.2</text>
+<path d="M 172.00 330.00 L 172.00 239.75 Q 172.00 235.75 176.00 235.75 L 212.00 235.75 Q 216.00 235.75 216.00 239.75 L 216.00 330.00 Z" fill="#199e70"/>
+<text x="194.00" y="227.75" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">79.2</text>
+<text x="148.00" y="352.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">upload, RTT 50 ms</text>
+<path d="M 248.00 330.00 L 248.00 321.62 Q 248.00 317.62 252.00 317.62 L 288.00 317.62 Q 292.00 317.62 292.00 321.62 L 292.00 330.00 Z" fill="#d95926"/>
+<text x="270.00" y="309.62" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">10.4</text>
+<path d="M 294.00 330.00 L 294.00 314.60 Q 294.00 310.60 298.00 310.60 L 334.00 310.60 Q 338.00 310.60 338.00 314.60 L 338.00 330.00 Z" fill="#3987e5"/>
+<text x="316.00" y="302.60" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">16.3</text>
+<path d="M 340.00 330.00 L 340.00 317.22 Q 340.00 313.22 344.00 313.22 L 380.00 313.22 Q 384.00 313.22 384.00 317.22 L 384.00 330.00 Z" fill="#199e70"/>
+<text x="362.00" y="305.22" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">14.1</text>
+<text x="316.00" y="352.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">upload, RTT 100 ms, 1% loss</text>
+<path d="M 416.00 330.00 L 416.00 270.93 Q 416.00 266.93 420.00 266.93 L 456.00 266.93 Q 460.00 266.93 460.00 270.93 L 460.00 330.00 Z" fill="#d95926"/>
+<text x="438.00" y="258.93" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">53</text>
+<path d="M 462.00 330.00 L 462.00 250.70 Q 462.00 246.70 466.00 246.70 L 502.00 246.70 Q 506.00 246.70 506.00 250.70 L 506.00 330.00 Z" fill="#3987e5"/>
+<text x="484.00" y="238.70" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">70</text>
+<path d="M 508.00 330.00 L 508.00 206.67 Q 508.00 202.67 512.00 202.67 L 548.00 202.67 Q 552.00 202.67 552.00 206.67 L 552.00 330.00 Z" fill="#199e70"/>
+<text x="530.00" y="194.67" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">107</text>
+<text x="484.00" y="352.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">upload, internet</text>
+<path d="M 584.00 330.00 L 584.00 270.93 Q 584.00 266.93 588.00 266.93 L 624.00 266.93 Q 628.00 266.93 628.00 270.93 L 628.00 330.00 Z" fill="#d95926"/>
+<text x="606.00" y="258.93" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">53</text>
+<path d="M 630.00 330.00 L 630.00 206.67 Q 630.00 202.67 634.00 202.67 L 670.00 202.67 Q 674.00 202.67 674.00 206.67 L 674.00 330.00 Z" fill="#3987e5"/>
+<text x="652.00" y="194.67" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">107</text>
+<path d="M 676.00 330.00 L 676.00 222.14 Q 676.00 218.14 680.00 218.14 L 716.00 218.14 Q 720.00 218.14 720.00 222.14 L 720.00 330.00 Z" fill="#199e70"/>
+<text x="698.00" y="210.14" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">94</text>
+<text x="652.00" y="352.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" fill="#c3c2b7" text-anchor="middle">download, internet</text>
+</svg>

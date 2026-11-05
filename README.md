@@ -51,7 +51,8 @@ It installs `qsh.exe` to `%LOCALAPPDATA%\Programs\qsh` and adds that folder to y
 
 To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. The restart closes the qsh sessions open on that server, so it asks first when run in a terminal; tmux, screen and `nohup` jobs keep running with the unit files from `contrib/` (`KillMode=process`, as for sshd). `qsh update v1.0.2` installs a given release. The script is taken from the latest release, not from the main branch.
 
-### Prebuilt binaries
+<details>
+<summary><b>Prebuilt binaries</b></summary>
 
 To install by hand instead: static Linux builds for x86_64 and aarch64 are on the [Releases](https://github.com/VLOD-ZDOV/quic-ssh/releases) page:
 
@@ -63,7 +64,10 @@ sudo install -m755 qsh-$ARCH-linux/qsh qsh-$ARCH-linux/qshd /usr/local/bin/
 
 The same archive works for both client and server. Checksums are in `SHA256SUMS`.
 
-### macOS
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
 
 Client and server, for Apple Silicon (`aarch64`) and Intel (`x86_64`):
 
@@ -75,13 +79,19 @@ sudo install -m755 qsh-$ARCH-macos/qsh qsh-$ARCH-macos/qshd /usr/local/bin/
 
 Downloaded with curl, the binaries carry no quarantine flag. If you download them with a browser, clear it with `xattr -d com.apple.quarantine qsh qshd`. To run qshd as a service, see `contrib/qshd.plist`. On macOS, account expiry is not checked, because macOS has no shadow database.
 
-### Windows
+</details>
+
+<details>
+<summary><b>Windows</b></summary>
 
 The client, `qsh.exe`, is in `qsh-x86_64-windows.zip`. Unzip it to a folder on your `PATH`. qsh uses `%USERPROFILE%\.ssh` (keys, `config`, `known_hosts` markers) and `%USERPROFILE%\.config\qsh`, and it talks to the Windows OpenSSH agent service (`ssh-agent`) on its own. All features except `-f` are available. `--full` runs `ssh.exe` and waits for it. The Windows build is new and tested automatically; interactive use has seen less real-world testing than on Linux, so please report problems. The zip also has the server, `qshd.exe`, which serves the Windows user it runs as (see below).
 
 **qshd on Windows (new).** Run `qshd.exe` as the user who will log in (to start it at logon: `schtasks /create /tn qshd /sc onlogon /tr "%LOCALAPPDATA%\Programs\qsh\qshd.exe"`) and allow UDP and TCP 4422 in the firewall. Keys go in `%USERPROFILE%\.config\qsh\authorized_keys`; `qshd pair`, `qshd keys` and `qshd totp` work as on Linux. Commands run in `cmd.exe` (set `QSHD_SHELL`, e.g. `pwsh.exe`, for another shell); terminals use ConPTY. Copies (with resume), `-L`/`-R`/`-D` forwards, one-time codes, sftp (paths look like `/C:/Users/me`; only the read-only flag is applied of a file's mode), agent forwarding (`SSH_AUTH_SOCK` names a named pipe) and sessions that survive a lost connection work. Not on Windows: other users, passwords, X11 forwarding, Unix socket forwards and `chroot_directory` (a login it applies to is refused). The user name must be spelled as the account is. qshd does not check who else may write `authorized_keys`: the profile's own permissions keep other users out.
 
-### Android (Termux)
+</details>
+
+<details>
+<summary><b>Android (Termux)</b></summary>
 
 A native Android build (bionic libc, so DNS works) is in the releases as `qsh-aarch64-android`:
 
@@ -94,7 +104,10 @@ qsh pair user@server           # then: qsh ui
 
 Termux sends taps as mouse clicks, so `qsh ui` works by touch: tap a host to select it, tap it again to connect.
 
-### From source
+</details>
+
+<details>
+<summary><b>From source</b></summary>
 
 You need a recent stable Rust toolchain. No C libraries are required.
 
@@ -105,6 +118,8 @@ git clone https://github.com/VLOD-ZDOV/quic-ssh && cd quic-ssh
 cargo build --release          # target/release/qsh and target/release/qshd
 sudo install -m755 target/release/qsh target/release/qshd /usr/local/bin/
 ```
+
+</details>
 
 ## Quick start
 
@@ -210,7 +225,12 @@ qsh completions fish > ~/.config/fish/completions/qsh.fish   # Tab completes com
 qsh update                             # install the latest release (qshd too, if it is next to qsh)
 ```
 
+<details>
+<summary><b>All supported ssh options</b></summary>
+
 Options work as in `ssh`: they can be combined (`-tt`, `-NL…`), placed after the host, and given with or without a space (`-p22`). Also supported: `-l user`, `-o Key=value`, `-F configfile`, `-4`/`-6`, `-q`, `-n`, `-s` (subsystem), `-g` (let other hosts use local forwards), `-e` (escape character), `-T`/`-t`/`-tt`, `-b` and `-B` (the local address or interface connections leave from). ssh options that mean nothing for qsh (ciphers, MACs, key exchange, GSSAPI, `-C` and the like: qsh always uses TLS 1.3) are accepted and ignored (`-v` lists them); for compressed copies use `qsh cp -C`. Other ssh options qsh does not carry out (`-E`, `-I`, `-o PubkeyAuthentication`, `-o VerifyHostKeyDNS`, `-o GatewayPorts`...) give a warning once qsh has connected (not with `-q`). `-Q`, `-o RevokedHostKeys`, `-o PermitRemoteOpen` and `-o RefuseConnection` are refused, since without them qsh would be less strict than asked; so is a host whose config sets `RevokedHostKeys`, and with `PermitRemoteOpen` in the config a dynamic `-R port`. As in ssh, an unknown `-o` keyword is an error, unless `-o IgnoreUnknown` names it. With `--full`, qsh hands all of these to ssh instead, except `RefuseConnection` in a config and a bad keyword, `RevokedHostKeys` or a refusal that may apply in `~/.config/qsh/config` (ssh does not read that file): they stop qsh either way.
+
+</details>
 
 In a session, `~.` at the start of a line disconnects, even when the server no longer responds. `~C` opens a command line to add forwards (`-L`, `-R`, `-D`) or cancel them (`-KL`, `-KR`, `-KD`), `~#` lists them, `~^Z` suspends qsh, `~?` lists the escapes and `~~` sends a literal `~`.
 
@@ -243,6 +263,9 @@ A terminal session (a login shell, or a command with `-t`) is kept by the server
 - Turn it off with `PersistSession no` in `~/.config/qsh/config` (or `-o PersistSession=no`). Port forwards and the forwarded agent survive with the session (with qshd 1.5 or newer; an older qshd ends them and qsh says which): `-L` and `-D` keep listening, `-R` and the agent come back on the new connection, and only connections open through them at that moment are lost. Sessions with X11 forwarding or a tunnel (`-w`) are not kept.
 - `-N` survives too, with qsh and qshd 1.6 or newer: the forwards come back after a lost connection, with one-time codes on as well.
 - A reconnect that takes longer than 10 s says why and when the next try is.
+- With `RestoreSession yes` in `~/.config/qsh/config`, a terminal session also outlives qsh itself: if qsh is killed or its terminal is closed, the next plain `qsh host` goes back to the session while the server keeps it (`session_timeout`). A window that is still open keeps its session. It is off by default: the session's token then sits in a private file under `~/.config/qsh/sessions`, and that file plus your key get back into the session without a one-time code.
+- After `^C`, at most about 1 MiB of output that was already on its way scrolls by (ssh: about 2 MiB), in every terminal session with qshd 1.0.5 or newer.
+- `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
 
 ### Compression
 
@@ -250,14 +273,16 @@ Terminal and command output is compressed with zstd when qsh and qshd are 1.6 or
 
 **Compression is useful, but it can reveal data.** It has a known weakness, the one behind CRIME, BREACH and VORACLE: encryption hides content but not length, so someone who watches the traffic and can also put text on your screen, for example into a log you are following, may guess a secret shown there from how well the guess compresses. qsh defends against this in several ways:
 
+<details>
+<summary><b>How qsh limits the risk</b></summary>
+
 - What looks like a secret never enters the compression context: long random tokens, and the values after words like `password`, `token`, `secret`, `session`, `Cookie` and `Authorization`. These cannot be guessed this way at all.
 - Sizes are rounded to 16 bytes, with a random step added, so a single match does not show.
 - The context lasts as long as the stream. A clean start is what such an attack needs, so a session that keeps losing its connection (5 times in 10 minutes, or 32 times in all) stops compressing.
 
 A secret that does not look like one, such as a plain word with no such keyword before it, is covered only by the last two, which make guessing slow and not impossible. On a host where that matters, and where others can write to what you watch, set `Compression no`.
-- With `RestoreSession yes` in `~/.config/qsh/config`, a terminal session also outlives qsh itself: if qsh is killed or its terminal is closed, the next plain `qsh host` goes back to the session while the server keeps it (`session_timeout`). A window that is still open keeps its session. It is off by default: the session's token then sits in a private file under `~/.config/qsh/sessions`, and that file plus your key get back into the session without a one-time code.
-- After `^C`, at most about 1 MiB of output that was already on its way scrolls by (ssh: about 2 MiB), in every terminal session with qshd 1.0.5 or newer.
-- `ServerAliveInterval` and `ServerAliveCountMax` set how quickly a dead connection is noticed. For other sessions they work as in ssh. qsh asks with pings on streams of their own, so output nobody reads yet, or input the remote command does not read yet, never makes a working connection look dead.
+
+</details>
 
 ### Connection sharing (`ControlMaster`)
 
@@ -302,7 +327,12 @@ Host myserver
     Port 8080
 ```
 
+<details>
+<summary><b>Supported config keywords</b></summary>
+
 Supported: `Host` patterns (`*`, `?`, `!`), `HostName`, `User`, `Port`, `IdentityFile`, `LocalForward`, `RemoteForward`, `DynamicForward`, `RequestTTY`, `BatchMode`, `StrictHostKeyChecking`, `EscapeChar`, `AddressFamily`, `LogLevel`, `IdentitiesOnly`, `IdentityAgent`, `CertificateFile`, `ForwardAgent`, `ServerAliveInterval`, `ServerAliveCountMax`, `PersistSession` and `PredictiveEcho` (qsh only), `Compression` (for `qsh cp`), `ControlMaster`, `ControlPersist`, `ControlPath` (in `~/.config/qsh/config`), `ProxyJump` and `ProxyCommand` (in `~/.config/qsh/config`; qsh then runs over the program's stdin/stdout, e.g. `ProxyCommand qsh -W %h:%p bastion`), `SendEnv`, `SetEnv`, `RemoteCommand`, `SessionType`, `StdinNull`, `ForkAfterAuthentication`, `ExitOnForwardFailure`, `LocalCommand` with `PermitLocalCommand`, `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`, `UserKnownHostsFile` and `GlobalKnownHostsFile` (default `/etc/qsh/known_hosts`), `KnownHostsCommand` and `HashKnownHosts` (in `~/.config/qsh/config`), `AddKeysToAgent`, `PasswordAuthentication`, `NumberOfPasswordPrompts`, `ForwardX11`, `ForwardX11Trusted`, `ForwardX11Timeout`, `XAuthLocation`, `Tunnel`, `TunnelDevice`, `Tag` (or `-P`), `CanonicalizeHostname` with `CanonicalDomains`, `CanonicalizeMaxDots` and `CanonicalizeFallbackLocal`, `BindAddress`, `BindInterface`, `RefuseConnection`, `IgnoreUnknown`, `Include` and `Match` (`all`, `host`, `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`, `canonical`, `final`). A `Match` block whose conditions qsh cannot check (`version`...) is not used, but a `ProxyCommand`, `ProxyJump`, `RevokedHostKeys`, `RefuseConnection` or `PermitRemoteOpen` in it still counts, so qsh never connects around a proxy or a refusal that may apply (also from a file such a block includes). In `~/.config/qsh/config`, as in ssh, an unknown keyword (a typo) is an error unless `IgnoreUnknown` names it, and an ssh keyword qsh does not carry out gives a warning with file and line (not with `-q`); `~/.ssh/config` and `/etc/ssh` files are left to ssh. known_hosts entries may be hashed (`ssh-keygen -H`) or patterns. As with ssh, `/etc/ssh/ssh_config` is read after `~/.ssh/config` (not with `-F`), `#` starts a comment anywhere on a line, and config files (and their Includes) that other users could write are refused; unlike ssh, so is `/etc/ssh/ssh_config` itself. Command-line values (`user@`, `-l`, `:port`, `-p`, `-i`) always win; the user from the command line is also what `Match user` and `%r` see.
+
+</details>
 
 ### OpenSSH-compatible mode (`--full`)
 
@@ -357,6 +387,9 @@ The session stays encrypted end to end: the public host only passes the bytes on
 
 `qsh ui` opens a connection menu with every host from `~/.ssh/config`, `~/.config/qsh/config`, known_hosts and the connections you saved in it:
 
+<details>
+<summary><b>Menu keys and features</b></summary>
+
 - **Status:** each host is checked in the background for qshd (TLS handshake with a throwaway key, no login). The list shows `● quic 42 ms`, `● tcp` (UDP blocked) or `○ ssh` (no qshd), and whether the host key is known, new or changed. Results are cached for 10 minutes in `~/.config/qsh/ui-state.toml`, so reopening the menu does not contact every server again; **`r`** checks everything now.
 - **Connecting:** **⏎ / tap** connects (with `--full` by default, so hosts without qshd open with plain ssh). When the session ends you return to the menu. Recently used hosts move to the top.
 - **One-off connection:** **`c`** connects once to `user@host[:port]` without saving anything.
@@ -371,6 +404,8 @@ The session stays encrypted end to end: the public host only passes the bytes on
 - **Port forwards:** **`f`** lists the host's forwards. **`a`** adds one by picking what it does (open a server's port here, share a port of this machine with the server, or a SOCKS proxy) and typing the ports; **`d`** removes one; **`⏎`** connects with them and **`t`** opens just the tunnel, without a shell. A saved connection keeps its forwards; for other hosts, added ones are for the next connection only.
 - **Other keys:** **`p`** pairs with a code from `qshd pair`, **`/`** filters, **`?`** lists every key (the footer of a narrow screen has room for only a few), **`q`** quits.
 - **Screens:** the layout adapts to narrow phone screens, and the mouse and touch work (scroll, tap).
+
+</details>
 
 `qsh multi` runs a command on several hosts at once, each line prefixed with the host, and lists the hosts where it failed:
 
@@ -421,6 +456,9 @@ Like mosh, qsh shows what you type before the server's echo arrives, when echoes
 | user | a regular user | only that user | `~/.config/qsh/qshd.toml`, `~/.config/qsh/host_ed25519` |
 
 At the first start (or `qshd init`) qshd creates the config with every setting commented out at its default (the template is `contrib/qshd.toml`): readable by all in `/etc/qsh`, like `sshd_config`, private in user mode. An existing file is never changed. Yes/no settings take `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0`. All settings, at their defaults:
+
+<details>
+<summary><b>Full config with comments</b></summary>
 
 ```toml
 listen = "[::]:4422"            # UDP and TCP; falls back to 0.0.0.0 if IPv6 is disabled
@@ -510,6 +548,11 @@ per_source_penalties = true     # drop addresses that keep failing; or "authfail
 # permit_tty = false
 ```
 
+</details>
+
+<details>
+<summary><b>SFTP, chroot, forwarding, reloading, penalties</b></summary>
+
 **SFTP and chroot.** qshd has a built-in SFTP server, `internal-sftp`, like sshd's: it needs no shell (it works for accounts with a `nologin` shell) and no files inside a chroot. Use it as the `sftp` subsystem or as `force_command`, with sshd's options `-R` (read-only), `-u UMASK` and `-d DIR` (start directory; `%u` user, `%d` home). It is also used for `sftp` when OpenSSH's sftp-server is not installed, started through the user's shell then, so `nologin` and `git-shell` accounts get no SFTP that way. qshd runs it built in only where the server names it (a subsystem, `force_command`, a key's `command=`); a client asking to run `internal-sftp` gets the user's shell like any command. `chroot_directory` confines a login's programs and its `qsh cp` transfers to a directory; as with sshd, the directory and all above it must belong to root and be writable by nobody else, or the login fails. The classic SFTP-only setup is the `[[match]]` block above.
 
 Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than root cannot listen on ports below 1024. `allow_tcp_forwarding = false` turns off `-L`, `-R`, `-D` and `-W`.
@@ -519,6 +562,8 @@ Remote forwards (`-R`) listen where `gateway_ports` allows, and users other than
 **Penalties.** As in sshd 9.8 and newer, an address whose connections fail to log in collects penalty time (5 s per failed login, 1 s for a connection that never tries, 10 s for running out of `login_grace_time`); once it has 15 s, its new connections are dropped until the time runs out (at most 10 minutes). IPv6 addresses count per /64. Unknown users and refused pairings count like failed logins, so penalties do not tell which accounts exist.
 
 Users that `deny_users`/`allow_users`/`deny_groups`/`allow_groups` or `permit_root_login = "no"` keep out are treated like unknown users: they get the same "access denied", so the answer does not tell which accounts exist.
+
+</details>
 
 User keys live in `~/.config/qsh/authorized_keys` (unless `use_qsh_authorized_keys = false`) and, if enabled, `~/.ssh/authorized_keys`. All key types work, except DSA and RSA below 2048 bits. These options are enforced:
 
@@ -531,6 +576,9 @@ User keys live in `~/.config/qsh/authorized_keys` (unless `use_qsh_authorized_ke
 
 A line with any other option is **not used at all**: a restriction qsh cannot enforce never turns into access.
 
+<details>
+<summary><b>Certificates, keys from a program, revoking keys, one-time codes, PAM</b></summary>
+
 **Certificates.** Sign keys with `ssh-keygen -s ca -I id -n USER key.pub`, then trust the CA either server-wide (`trusted_user_ca_keys`) or per user with a `cert-authority` line. `force-command`, `source-address` and the `permit-*` extensions are enforced. For host certificates, sign the host key (`ssh-keygen -s ca -I host -h -n host.example.com /etc/qsh/host_ed25519.pub`) and add `@cert-authority *.example.com <CA key>` to `~/.config/qsh/known_hosts` or `~/.ssh/known_hosts` on clients: hosts with a valid certificate are trusted without the first-connection question. `@revoked` lines are honoured. Certificates without an expiry date (`ssh-keygen` without `-V`) work too. As with OpenSSH, a host whose certificate comes from a revoked CA, or from a trusted CA but is expired or made for another name, is refused even if its key is in known_hosts.
 
 **Keys from a program.** `authorized_keys_command` works like sshd's `AuthorizedKeysCommand`: its output is read like an authorized_keys file, in addition to the files. Tokens: `%u` user, `%h` home, `%U` uid, and for the offered key `%f` (fingerprint), `%k` (base64), `%t` (type). With a key token it runs once per offered key. The program needs an absolute path that only root can change (in user mode: root or the server's user), runs with a 10 s limit, and as root only as `authorized_keys_command_user`.
@@ -541,7 +589,7 @@ A line with any other option is **not used at all**: a restriction qsh cannot en
 
 **One-time codes (TOTP).** As the user on the server, run `qshd totp`. It shows a QR code for any authenticator app and turns codes on once you type one back. From then on, logins ask for a code after the key, and each code works only once, also across several qshd of the same user (another port, a user-mode qshd next to the system one). `qshd totp --disable` turns them off. With `totp = "required"`, accounts without codes cannot log in. Resuming a dropped session does not ask again. Right after qshd starts, codes that the previous process might have accepted are refused (up to a minute and a half), so a code seen before a restart cannot be replayed.
 
-**PAM.** A qshd built with `--features pam` (see [From source](#from-source)) can use PAM, like sshd's `UsePAM`: set `use_pam = true` and install a service file as `/etc/pam.d/qshd` (`contrib/qshd.pam` is one for Debian and Ubuntu; elsewhere, start from the system's `/etc/pam.d/sshd`; `pam_service` names another file). Then:
+**PAM.** A qshd built with `--features pam` (see [From source](#installation)) can use PAM, like sshd's `UsePAM`: set `use_pam = true` and install a service file as `/etc/pam.d/qshd` (`contrib/qshd.pam` is one for Debian and Ubuntu; elsewhere, start from the system's `/etc/pam.d/sshd`; `pam_service` names another file). Then:
 
 - every login, with a key too, must pass PAM's account check (`pam_nologin`, `pam_access`, `pam_time`, expired accounts); a refused one gets "access denied" and the reason goes to the log. A password that must be changed (`passwd -e`, `chage -d 0`) refuses the login with a key too, as in sshd, since qsh cannot change it; change it first;
 - with `password_authentication`, passwords are checked by PAM (`pam_authenticate`) instead of /etc/shadow, so LDAP, SSSD and other modules work; their questions go to the client (their other messages only to the log, as they can tell which accounts exist), a module that changes the user name fails the login, and an expired password is refused, as qshd cannot have it changed;
@@ -549,11 +597,31 @@ A line with any other option is **not used at all**: a restriction qsh cannot en
 
 PAM's authentication and the session have separate PAM handles (the session's is in the process that starts the program), so credentials that a module sets while authenticating (a Kerberos ticket) do not reach the session. `pam_motd` and `pam_lastlog` are not needed: qshd shows those itself.
 
+</details>
+
 Logs go to stderr (journald). Set the level with `QSHD_LOG`, for example `QSHD_LOG=qsh=debug`.
 
 ## Benchmarks
 
 Compared with OpenSSH 10 (`ssh`/`scp` with default settings). The network is emulated with `tc netem` on loopback inside a separate network namespace (MTU 1500). Both sides run on the same machine.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-connect-dark.svg">
+  <img alt="Connect and run true, ms, lower is better: ssh 87 / 631 / 1183 / 1000, qsh over QUIC 37 / 188 / 343 / 309, over TCP 15 / 217 / 420 / 337 (loopback, RTT 50 ms, RTT 100 ms with 1% loss, real server)." src="assets/bench-connect-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-transfer-dark.svg">
+  <img alt="File transfer, Mbit/s, higher is better: scp 66.2 / 10.4 / 53 / 53, qsh cp over QUIC 85.2 / 16.3 / 70 / 107, over TCP 79.2 / 14.1 / 107 / 94 (upload RTT 50 ms, upload RTT 100 ms with 1% loss, upload and download over the internet)." src="assets/bench-transfer-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/bench-memory-dark.svg">
+  <img alt="Memory, RSS in MB, lower is better: OpenSSH 8.6 / 23 / 11-13 / 11, qsh 7.5 / 3-5 / 9 / 17 (server idle, server per session, client in a session, client sending 1 GiB)." src="assets/bench-memory-light.svg">
+</picture>
+
+<details>
+<summary><b>All numbers</b></summary>
 
 **Connect and run `true`** (median of 10 runs):
 
@@ -590,6 +658,8 @@ Compared with OpenSSH 10 (`ssh`/`scp` with default settings). The network is emu
 
 sshd starts separate processes for each connection; qshd serves all sessions in one process. The per-session figures include the remote command itself (about 1–2 MB).
 
+</details>
+
 Takeaways:
 
 - **Connecting** is 3–3.4× faster than ssh on any link with noticeable latency. QUIC combines the transport and TLS handshakes into 1 RTT, while ssh spends several RTTs on version exchange, key exchange and authentication.
@@ -601,6 +671,7 @@ To reproduce (needs only util-linux, iproute2 and OpenSSH; no root):
 ```sh
 cargo build --release
 python3 bench/bench.py
+python3 bench/charts.py   # redraw the charts in assets/ (the numbers are in charts.py)
 ```
 
 ## Security
@@ -635,9 +706,14 @@ This is still a young project and has not had an external audit. For critical sy
 
 `qsh update` installs the latest release. Update qshd first when the notes say so.
 
+<details>
+<summary><b>Older versions</b></summary>
+
 qsh and qshd 1.0.5 work with older versions of each other. With both at 1.0.5, a connection over TCP may have up to 512 streams each way (96 before), and `^C` takes effect on the screen quickly (see above).
 
 What v1.0 added on the protocol (banner, passwords, Unix sockets, X11, tunnels) needs qshd 1.0 on the server; with an older qshd, qsh reports that the feature is not supported and the rest works. qsh 0.5 works with qshd 0.4 and newer. Keys other than the Ed25519 TLS key, agent forwarding, one-time codes, host certificates and persistent sessions need qshd 0.5. qsh 0.4 and 0.5 need at least qshd 0.4: older servers reject them with "unsupported protocol version", so update qshd first. qshd 0.5 still accepts older clients.
+
+</details>
 
 ## Development
 
