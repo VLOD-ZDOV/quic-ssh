@@ -120,6 +120,15 @@ pub fn connect_unix(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Listens on TCP `addr` as the user (`-R` in system mode) and hands the
+/// listening socket to qshd: the kernel's rules for binding
+/// (ip_unprivileged_port_start, uid-based LSM or firewall rules) apply to
+/// the user, as in sshd, not to root.
+pub fn listen_tcp_fd(addr: &str) -> Result<()> {
+    let addr: std::net::SocketAddr = addr.parse().context("bad address")?;
+    hand_over(crate::platform::listen_tcp_std(addr)?)
+}
+
 /// Listens on the Unix socket `path` as the user (`-R` from a socket) and
 /// hands the listening socket to qshd over stdout, which is a Unix socket:
 /// qshd accepts the connections, but the file is the user's. `mask` (octal)

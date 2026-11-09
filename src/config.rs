@@ -1147,7 +1147,10 @@ impl ServerConfig {
     /// names: no `=`, NUL or other tricks (compare CVE-2014-2532).
     pub fn accepts_env(&self, name: &str) -> bool {
         let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-        plain && name_matches(&self.accept_env, name)
+        // Whatever `accept_env` says: sshd sets these after the client's
+        // variables, and QSHD_* steer qshd's own helpers.
+        let ours = matches!(name, "USER" | "LOGNAME" | "HOME" | "PATH" | "MAIL" | "SHELL") || name.starts_with("QSHD_");
+        plain && !ours && name_matches(&self.accept_env, name)
     }
 
     /// `chroot_directory` for a user, with its tokens replaced.
@@ -1509,6 +1512,8 @@ mod tests {
         }
         let cfg = parse("accept_env = [\"GIT_*\"]\npermit_open = [\"db:5432\", \"*:443\"]\npermit_listen = \"8080\"");
         assert!(cfg.accepts_env("GIT_PROTOCOL") && !cfg.accepts_env("LANG"));
+        let all = parse("accept_env = [\"*\"]");
+        assert!(all.accepts_env("LANG") && !all.accepts_env("HOME") && !all.accepts_env("USER") && !all.accepts_env("QSHD_PRELUDE"));
         assert!(cfg.may_open("db", 5432) && cfg.may_open("example.com", 443) && !cfg.may_open("db", 22));
         assert!(cfg.may_listen("localhost", 8080) && !cfg.may_listen("localhost", 8081));
         assert!(!parse("permit_open = \"none\"").may_open("db", 1));

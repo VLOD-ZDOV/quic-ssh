@@ -474,7 +474,8 @@ async fn udp_port_closed(addr: SocketAddr, local: Option<SocketAddr>) {
         let mut buf = [0u8; 1];
         loop {
             if let Err(e) = sock.recv(&mut buf).await {
-                if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                // Windows reports the ICMP error as a reset (WSAECONNRESET).
+                if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset) {
                     return std::io::Result::Ok(());
                 }
                 return Err(e);

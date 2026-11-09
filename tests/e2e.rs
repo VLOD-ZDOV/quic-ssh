@@ -471,6 +471,31 @@ fn local_port_forwarding_with(s: Server) {
     }
 }
 
+/// `-R` in system mode listens through a helper running as the user; a
+/// host name to listen on is refused (qshd does no DNS lookups).
+#[test]
+fn remote_forward_through_the_helper() {
+    let env = [("QSHD_TEST_FORWARD_HELPER", "1")];
+    let s = Server::start_env(tempfile::tempdir().unwrap(), "127.0.0.1:0", "gateway_ports = \"clientspecified\"\n", &env);
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let remote = free_port();
+    let mut child = forwarding(&c, &s, "quic", &["-R".into(), format!("127.0.0.1:{remote}:127.0.0.1:{target}")], remote);
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", remote)).unwrap();
+    sock.write_all(b"ping").unwrap();
+    sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = Vec::new();
+    sock.read_to_end(&mut reply).unwrap();
+    assert_eq!(reply, b"echo:ping");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let spec = format!("db.example:{}:127.0.0.1:{target}", free_port());
+    let out = c.run(&["-p", &s.port.to_string(), "-o", "ExitOnForwardFailure=yes", "-N", "-R", &spec, &dest()]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a host name"), "{err}");
+}
+
 /// A target on ::1 only, asked for as 127.0.0.1: reached only with
 /// `loopback_fallback` (qshd, `-L`) or `LoopbackFallback` (qsh, `-R`).
 #[test]

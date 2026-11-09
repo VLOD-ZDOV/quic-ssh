@@ -213,13 +213,19 @@ async fn rewrite_setup<R: AsyncRead + Unpin>(r: &mut R, auth: &X11Auth) -> Resul
     Ok(out)
 }
 
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Serves a connection to the forwarded display: checks and replaces its
 /// cookie, then relays it to the local display.
 pub async fn serve(auth: &X11Auth, send: SendHalf, mut recv: RecvHalf) -> Result<()> {
     if auth.refuse_after.is_some_and(|t| std::time::Instant::now() >= t) {
         bail!("rejected X11 connection after ForwardX11Timeout expired");
     }
-    let setup = rewrite_setup(&mut recv, auth).await?;
+    // X clients send the setup at once. Without a limit, idle connections
+    // to the server's display would hold its X11 slots for good.
+    let setup = tokio::time::timeout(SETUP_TIMEOUT, rewrite_setup(&mut recv, auth))
+        .await
+        .map_err(|_| anyhow::anyhow!("no X11 connection setup in time"))??;
     let mut display = connect_display(&auth.display).await?;
     display.write_all(&setup).await?;
     let (r, w) = tokio::io::split(display);

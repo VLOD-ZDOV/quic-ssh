@@ -93,16 +93,21 @@ pub fn terminal() -> io::Result<(File, File)> {
 /// for IPv6 only: `[::]` next to `0.0.0.0` on the same port would otherwise
 /// clash with it (Linux makes `[::]` take IPv4 too) and be left out.
 pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::from_std(listen_tcp_std(addr)?)
+}
+
+/// [`listen_tcp`] without tokio (for a helper that hands the socket over).
+pub fn listen_tcp_std(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
     listen_tcp_v6only(addr, addr.is_ipv6())
 }
 
 /// Listens on `addr`; `[::]` takes IPv4 too, as QUIC's UDP socket does.
 /// Windows makes IPv6 sockets IPv6-only by default, so this must be explicit.
 pub fn listen_tcp_dual(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-    listen_tcp_v6only(addr, false)
+    tokio::net::TcpListener::from_std(listen_tcp_v6only(addr, false)?)
 }
 
-fn listen_tcp_v6only(addr: std::net::SocketAddr, v6only: bool) -> std::io::Result<tokio::net::TcpListener> {
+fn listen_tcp_v6only(addr: std::net::SocketAddr, v6only: bool) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
     if addr.is_ipv6() {
@@ -114,7 +119,7 @@ fn listen_tcp_v6only(addr: std::net::SocketAddr, v6only: bool) -> std::io::Resul
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     sock.listen(1024)?;
-    tokio::net::TcpListener::from_std(sock.into())
+    Ok(sock.into())
 }
 
 /// For `127.0.0.1` the other loopback `::1`, and back: both mean "this

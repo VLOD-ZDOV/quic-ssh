@@ -93,6 +93,8 @@ enum Cmd {
     #[command(hide = true)]
     InternalListenUnix { path: String, mask: String, unlink: String },
     #[command(hide = true)]
+    InternalListenTcpFd { addr: String },
+    #[command(hide = true)]
     InternalUntar { path: String, name: String },
     #[command(hide = true)]
     InternalTar { path: String },
@@ -317,7 +319,8 @@ pub fn main() {
             | Cmd::InternalConnectFd { .. }
             | Cmd::InternalConnectUnixFd { .. }
             | Cmd::InternalTunFd { .. }
-            | Cmd::InternalListenUnix { .. },
+            | Cmd::InternalListenUnix { .. }
+            | Cmd::InternalListenTcpFd { .. },
         ) => Err(anyhow::anyhow!("not available on Windows")),
         #[cfg(unix)]
         Some(Cmd::InternalConnect { host, port }) => helpers::connect(&host, port),
@@ -331,6 +334,8 @@ pub fn main() {
         Some(Cmd::InternalTunFd { kind, unit }) => helpers::tun_fd(&kind, &unit),
         #[cfg(unix)]
         Some(Cmd::InternalListenUnix { path, mask, unlink }) => helpers::listen_unix(&path, &mask, &unlink),
+        #[cfg(unix)]
+        Some(Cmd::InternalListenTcpFd { addr }) => helpers::listen_tcp_fd(&addr),
         Some(Cmd::Init) => init(cli.config),
         Some(Cmd::Pair { qr, host }) => pair(cli.config, qr, host),
         Some(Cmd::Totp { force, disable }) => totp(force, disable),

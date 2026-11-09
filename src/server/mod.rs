@@ -681,9 +681,20 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     }
     #[cfg(not(all(feature = "pam", target_os = "linux")))]
     let _ = account_checked;
+    // Without PAM (and its pam_nologin), as sshd's do_nologin: /etc/nologin
+    // keeps everyone but root out, and its text says why.
+    if !cfg.use_pam && user.switches() && user.uid != 0 {
+        if let Some(text) = tokio::task::spawn_blocking(|| nologin(std::path::Path::new("/etc/nologin"))).await? {
+            *outcome = Outcome::AuthFailed;
+            warn!("{addr}: {name}: refused because /etc/nologin exists");
+            write_msg(&mut send, &Reply::Err(text)).await?;
+            return Ok(());
+        }
+    }
     // Resuming a session that this user started after a full login: the
-    // session token stands in for the second factor, but such a connection
-    // can do nothing except resume that one session (see StreamCtx::resume_only).
+    // session token stands in for the second factor. Such a connection may
+    // resume that one session and carry on its forwards, nothing else (see
+    // StreamCtx::resume_only and `goes_on`).
     if let Some(token) = &resume {
         if !state.sessions.owns(token, user.uid) {
             write_msg(&mut send, &Reply::Err(persist::GONE.into())).await?;
@@ -869,10 +880,23 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         other => (other, false),
     };
     let limits = &grant.restrictions;
-    // Sessions hold one of the connection's slots while they run.
+    // Sessions hold one of the connection's slots while they run; so do
+    // file transfers (each a helper process, like sftp in sshd) and speed tests.
     let _slot = if matches!(
         request,
-        Request::Exec { .. } | Request::Persistent { .. } | Request::Resume { .. } | Request::Subsystem { .. } | Request::Tunnel { .. }
+        Request::Exec { .. }
+            | Request::Persistent { .. }
+            | Request::Resume { .. }
+            | Request::Subsystem { .. }
+            | Request::Tunnel { .. }
+            | Request::Upload { .. }
+            | Request::Download { .. }
+            | Request::UploadTree { .. }
+            | Request::DownloadTree { .. }
+            | Request::UploadResume { .. }
+            | Request::DownloadFrom { .. }
+            | Request::SpeedDown { .. }
+            | Request::SpeedUp { .. }
     ) {
         match sessions.clone().try_acquire_owned() {
             Ok(slot) => Some(slot),
@@ -1109,6 +1133,10 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             tunnel(send, recv, conn, user, ethernet, unit).await
         }
         Request::Ping | Request::MayStart => write_msg(&mut send, &Reply::Ok).await,
+        // A key bound to one command gets nothing else, bandwidth included.
+        Request::SpeedDown { .. } | Request::SpeedUp { .. } if limits.command.is_some() => {
+            write_msg(&mut send, &Reply::Err("speed tests are not allowed for this key (forced command)".into())).await
+        }
         Request::SpeedDown { bytes } => speed_down(send, bytes).await,
         Request::SpeedUp { bytes } => speed_up(send, recv, bytes).await,
         Request::Compressed(_) => unreachable!("unwrapped above"),
@@ -1170,19 +1198,31 @@ fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<Stri
     None
 }
 
-/// Addresses to listen on for `-R`, following `gateway_ports` like sshd's GatewayPorts.
-fn remote_listen_addrs(gateway: GatewayPorts, bind: &str, port: u16) -> Vec<SocketAddr> {
+/// What to say when `path` (/etc/nologin) exists: its text (the first KiB,
+/// printable), or a plain refusal when it is empty or cannot be read.
+fn nologin(path: &std::path::Path) -> Option<String> {
+    std::fs::symlink_metadata(path).ok()?;
+    let mut text = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::Read::take(std::fs::File::open(path).ok()?, 1024), &mut text);
+    let text: String = text.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+    let text = text.trim();
+    Some(if text.is_empty() { "logins are disabled (/etc/nologin)".into() } else { text.to_string() })
+}
+
+/// Addresses to listen on for `-R`, following `gateway_ports` like sshd's
+/// GatewayPorts; `None` for a host name (qshd does no DNS lookups).
+fn remote_listen_addrs(gateway: GatewayPorts, bind: &str, port: u16) -> Option<Vec<SocketAddr>> {
     let loopback = vec![SocketAddr::from(([127, 0, 0, 1], port)), SocketAddr::from(([0u16, 0, 0, 0, 0, 0, 0, 1], port))];
     let any = vec![SocketAddr::from(([0u8; 4], port)), SocketAddr::from(([0u16; 8], port))];
-    match gateway {
+    Some(match gateway {
         GatewayPorts::No => loopback,
         GatewayPorts::Yes => any,
         GatewayPorts::ClientSpecified => match bind {
             "" | "*" => any,
             "localhost" => loopback,
-            addr => addr.parse::<IpAddr>().map(|ip| vec![SocketAddr::new(ip, port)]).unwrap_or(loopback),
+            addr => vec![SocketAddr::new(addr.parse::<IpAddr>().ok()?, port)],
         },
-    }
+    })
 }
 
 /// `-R`: listens on the server and hands each connection to the client on a
@@ -1197,16 +1237,23 @@ async fn remote_forward(
     port: u16,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    if port != 0 && port < 1024 && user.uid != 0 {
+    // Windows has no privileged ports (and no uid 0: see users_windows.rs).
+    if cfg!(unix) && port != 0 && port < 1024 && user.uid != 0 {
         return write_msg(&mut send, &Reply::Err(format!("only root may listen on port {port}"))).await;
     }
+    let Some(addrs) = remote_listen_addrs(gateway, bind, port) else {
+        return write_msg(&mut send, &Reply::Err(format!("cannot listen on {bind:?}: give an address, not a host name"))).await;
+    };
+    // Tests reach the system-mode path without root (debug builds only).
+    let as_user = user.switches() || cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_FORWARD_HELPER").is_some();
     let mut listeners = Vec::new();
     let mut bound_port = port;
     let mut last_err = None;
-    for mut addr in remote_listen_addrs(gateway, bind, port) {
+    for mut addr in addrs {
         // With port 0, the first listener picks a port and the others reuse it.
         addr.set_port(bound_port);
-        match crate::platform::listen_tcp(addr) {
+        let listener = if as_user { listen_tcp_as(user, addr).await } else { crate::platform::listen_tcp(addr).map_err(Into::into) };
+        match listener {
             Ok(l) => {
                 bound_port = l.local_addr()?.port();
                 listeners.push(l);
@@ -1266,6 +1313,21 @@ async fn remote_forward(
         a.abort();
     }
     Ok(())
+}
+
+/// A TCP listener for `-R` in system mode, bound by a helper running as the
+/// user (see `helpers::listen_tcp_fd`).
+#[cfg(unix)]
+async fn listen_tcp_as(user: &User, addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let fd = socket_from_helper(user.helper(&["internal-listen-tcp-fd", &addr.to_string()])?).await?;
+    let std = std::net::TcpListener::from(fd);
+    std.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(std)?)
+}
+
+#[cfg(not(unix))]
+async fn listen_tcp_as(_: &User, addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    Ok(crate::platform::listen_tcp(addr)?)
 }
 
 #[cfg(unix)]
@@ -1556,12 +1618,26 @@ mod tests {
 
     #[test]
     fn remote_forward_binds_loopback_by_default() {
-        let addrs = remote_listen_addrs(GatewayPorts::No, "0.0.0.0", 8080);
+        let addrs = remote_listen_addrs(GatewayPorts::No, "0.0.0.0", 8080).unwrap();
         assert!(addrs.iter().all(|a| a.ip().is_loopback()), "client asked for all, got {addrs:?}");
-        assert!(remote_listen_addrs(GatewayPorts::Yes, "", 1).iter().all(|a| a.ip().is_unspecified()));
+        assert!(remote_listen_addrs(GatewayPorts::Yes, "", 1).unwrap().iter().all(|a| a.ip().is_unspecified()));
         let cs = remote_listen_addrs(GatewayPorts::ClientSpecified, "192.0.2.5", 1);
-        assert_eq!(cs, vec!["192.0.2.5:1".parse().unwrap()]);
-        assert!(remote_listen_addrs(GatewayPorts::ClientSpecified, "localhost", 1).iter().all(|a| a.ip().is_loopback()));
+        assert_eq!(cs, Some(vec!["192.0.2.5:1".parse().unwrap()]));
+        assert!(remote_listen_addrs(GatewayPorts::ClientSpecified, "localhost", 1).unwrap().iter().all(|a| a.ip().is_loopback()));
+        assert_eq!(remote_listen_addrs(GatewayPorts::ClientSpecified, "db.example", 1), None);
+        // Without clientspecified the name does not matter: loopback.
+        assert!(remote_listen_addrs(GatewayPorts::No, "db.example", 1).is_some());
+    }
+
+    #[test]
+    fn nologin_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nologin");
+        assert_eq!(nologin(&path), None);
+        std::fs::write(&path, "down for maintenance\x1b[2J\n").unwrap();
+        assert_eq!(nologin(&path).as_deref(), Some("down for maintenance[2J"));
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(nologin(&path).as_deref(), Some("logins are disabled (/etc/nologin)"));
     }
 
     #[test]
