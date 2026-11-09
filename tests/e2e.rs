@@ -471,6 +471,44 @@ fn local_port_forwarding_with(s: Server) {
     }
 }
 
+/// `--save NAME` at the end of a long command keeps it for `qsh NAME` and
+/// `qsh ui`, and still connects.
+#[test]
+fn save_keeps_a_command_line_for_later() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let target = echo_server();
+    let up = |child: &mut Child, port: u16| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(child.try_wait().unwrap().is_none(), "qsh exited");
+            assert!(Instant::now() < deadline, "port {port} did not come up");
+            sleep(Duration::from_millis(50));
+        }
+    };
+    let remote = free_port();
+    let (port, spec) = (s.port.to_string(), format!("{remote}:127.0.0.1:{target}"));
+    let mut child = c.cmd(&["-N", "-R", &spec, "-p", &port, &dest(), "--save", "tun"]).stderr(Stdio::null()).spawn().unwrap();
+    up(&mut child, remote);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let saved = std::fs::read_to_string(c.home.path().join(".config/qsh/ui-hosts")).unwrap();
+    assert!(saved.contains("Host tun\n") && saved.contains(&format!("RemoteForward {remote} 127.0.0.1:{target}")), "{saved}");
+    // The name alone brings the same forward back.
+    let g = stdout(&c.run(&["-G", "tun"]));
+    assert!(g.contains(&format!("remoteforward {remote}:127.0.0.1:{target}")) && g.contains(&format!("port {port}")), "{g}");
+    let mut child = c.cmd(&["tun"]).stderr(Stdio::null()).spawn().unwrap();
+    up(&mut child, remote);
+    // SessionType none: no shell that would end at once without input.
+    sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "qsh tun did not keep running");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let again = c.run(&["-N", "-p", &port, &dest(), "--save", "tun"]);
+    assert!(!again.status.success() && String::from_utf8_lossy(&again.stderr).contains("--force"));
+    assert!(!c.run(&["-p", &port, &dest(), "--force", "true"]).status.success());
+}
+
 /// `-R` in system mode listens through a helper running as the user; a
 /// host name to listen on is refused (qshd does no DNS lookups).
 #[test]

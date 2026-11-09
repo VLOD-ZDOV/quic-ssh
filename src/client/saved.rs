@@ -231,6 +231,92 @@ pub fn options_from_flags(text: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// A connection from the command line (`qsh ... HOST --save NAME`), and
+/// what of it a saved connection cannot hold (to warn about).
+pub fn from_args(name: &str, dest: &str, a: &super::cli::SshArgs) -> Result<(Saved, Vec<String>)> {
+    use super::forward::Forward;
+    let (user, rest) = match dest.rsplit_once('@') {
+        Some((u, r)) => (Some(u.to_string()), r),
+        None => (None, dest),
+    };
+    let (host, port) = match rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((h, p)) => (h, p.strip_prefix(':')),
+        // An IPv6 address without brackets has no port.
+        None if rest.matches(':').count() >= 2 => (rest, None),
+        None => match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        },
+    };
+    let port = match port {
+        Some(p) => Some(p.parse::<u16>().with_context(|| format!("invalid port in {dest:?}"))?),
+        None => a.port,
+    };
+    if a.identities.len() > 1 {
+        bail!("only one -i can be saved");
+    }
+    let mut options = Vec::new();
+    let forward = |f: Forward, key: &str| match f.config_args() {
+        (listen, Some(dest)) => format!("{key} {listen} {dest}"),
+        (listen, None) => format!("{key} {listen}"),
+    };
+    for v in &a.local_forwards {
+        options.push(forward(Forward::parse(v)?, "LocalForward"));
+    }
+    for v in &a.remote_forwards {
+        options.push(forward(Forward::parse_remote(v)?, "RemoteForward"));
+    }
+    for v in &a.dynamic_forwards {
+        options.push(forward(Forward::parse_dynamic(v)?, "DynamicForward"));
+    }
+    options.extend(a.jump.as_ref().map(|j| format!("ProxyJump {j}")));
+    options.extend(a.forward_agent.map(|on| format!("ForwardAgent {}", if on { "yes" } else { "no" })));
+    match a.x11 {
+        Some(true) => options.push("ForwardX11 yes".into()),
+        Some(false) => options.push("ForwardX11 no".into()),
+        None => {}
+    }
+    if a.x11 == Some(true) && a.x11_trusted {
+        options.push("ForwardX11Trusted yes".into());
+    }
+    let flags = [
+        (a.compress, "Compression yes"),
+        (a.no_command, "SessionType none"),
+        (a.no_tty, "RequestTTY no"),
+        (a.tty > 0, "RequestTTY yes"),
+        (a.ipv4, "AddressFamily inet"),
+        (a.ipv6, "AddressFamily inet6"),
+        (a.stdin_null, "StdinNull yes"),
+        (a.background, "ForkAfterAuthentication yes"),
+    ];
+    options.extend(flags.iter().filter(|(on, _)| *on).map(|(_, line)| line.to_string()));
+    options.extend(a.escape_char.as_ref().map(|e| format!("EscapeChar {e}")));
+    options.extend(a.options.iter().cloned());
+    let mut left_out = Vec::new();
+    if !a.command.is_empty() {
+        left_out.push(format!("the command {:?}", a.command.join(" ")));
+    }
+    let more = [
+        (a.stdio_forward.is_some(), "-W"),
+        (a.subsystem, "-s"),
+        (a.gateway_ports, "-g"),
+        (a.config_file.is_some(), "-F"),
+        (a.transport != crate::transport::Mode::Auto, "--transport (set it in qsh ui)"),
+        (a.full, "--full"),
+    ];
+    left_out.extend(more.iter().filter(|(on, _)| *on).map(|(_, what)| what.to_string()));
+    let saved = Saved {
+        name: name.to_string(),
+        host: host.to_string(),
+        user: user.or_else(|| a.login.clone()),
+        port,
+        identity: a.identities.first().map(|i| i.display().to_string()),
+        options,
+    };
+    saved.validate()?;
+    Ok((saved, left_out))
+}
+
 /// [`Saved::options`] as ssh's flags, for editing ([`options_from_flags`] reads them back).
 pub fn flags_from_options(options: &[String]) -> String {
     let quote = |s: String| if s.contains(char::is_whitespace) { format!("\"{s}\"") } else { s };
@@ -369,5 +455,27 @@ mod tests {
         for bad in ["-p 22", "-L", "-L 80", "8080:x:80", "-o NoValue", "-K", "-o \"Unclosed=1"] {
             assert!(options_from_flags(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn saved_from_a_command_line() {
+        let args = |s: &str| super::super::cli::SshArgs::parse(s.split_whitespace().map(String::from)).unwrap();
+        let a = args("-N -R 2222:127.0.0.1:4422 -p 4422 -o ServerAliveInterval=15 qsh-tun@server --save tunnel");
+        assert_eq!(a.save.as_deref(), Some("tunnel"));
+        let (s, left_out) = from_args("tunnel", a.destination.as_deref().unwrap(), &a).unwrap();
+        assert_eq!((s.host.as_str(), s.user.as_deref(), s.port), ("server", Some("qsh-tun"), Some(4422)));
+        assert_eq!(s.options, ["RemoteForward 2222 127.0.0.1:4422", "SessionType none", "ServerAliveInterval 15"]);
+        assert!(left_out.is_empty());
+        // Read back as written, with the same flags for qsh ui's form.
+        assert_eq!(parse(&s.block()), std::slice::from_ref(&s));
+        assert_eq!(flags_from_options(&s.options), "-R 2222:127.0.0.1:4422 -N -o ServerAliveInterval=15");
+        let a = args("-l bob -i k1 [2001:db8::1]:2200 uptime --save x");
+        let (s, left_out) = from_args("x", a.destination.as_deref().unwrap(), &a).unwrap();
+        assert_eq!((s.host.as_str(), s.user.as_deref(), s.port, s.identity.as_deref()), ("2001:db8::1", Some("bob"), Some(2200), Some("k1")));
+        // `uptime --save x` is the command here: only options before it count.
+        assert_eq!(a.save, None);
+        assert_eq!(left_out, ["the command \"uptime --save x\""]);
+        let a = args("-i a -i b host --save x");
+        assert!(from_args("x", "host", &a).is_err());
     }
 }

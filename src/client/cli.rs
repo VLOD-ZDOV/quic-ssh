@@ -61,6 +61,9 @@ pub struct SshArgs {
     pub full: bool,
     pub transport: Mode,
     pub accept_new_host: bool,
+    /// `--save NAME`: also keep this connection in `qsh ui` (`--force`: over one of that name).
+    pub save: Option<String>,
+    pub save_force: bool,
     /// Options in a form the real `ssh` understands (for `--full` handover).
     pub passthrough: Vec<String>,
     /// Accepted for compatibility but without effect (reported with -v).
@@ -278,6 +281,8 @@ impl SshArgs {
             "port" => return self.apply_value('p', val(value)?),
             "identity" => return self.apply_value('i', val(value)?),
             "login" => return self.apply_value('l', val(value)?),
+            "save" => self.save = Some(val(value)?),
+            "force" => self.save_force = true,
             other => return Err(format!("unknown option --{other}")),
         }
         Ok(())
@@ -389,7 +394,7 @@ usage: qsh [-46AaCfGgMNnqsTtVvx] [-D [bind:]port] [-e escape_char] [-F configfil
            [-l login] [-O check|exit|stop|forward|cancel] [-o option] [-p port]
            [-R [bind:]port:host:hostport] [-S ctl_path] [-W host:port]
            [--full] [--transport auto|quic|tcp] [--accept-new-host]
-           [user@]host[:port] [command [argument ...]]
+           [--save NAME [--force]] [user@]host[:port] [command [argument ...]]
 
        qsh cp [-r] SRC DST        copy files, one side is [user@]host:path
        qsh pair [user@]host       pair with a server using a code from `qshd pair`

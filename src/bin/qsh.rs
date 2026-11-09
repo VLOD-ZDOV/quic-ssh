@@ -862,6 +862,33 @@ fn config_lines(t: &Target) -> String {
     out
 }
 
+/// `--save NAME`: keeps the connection for `qsh NAME` and `qsh ui`, then
+/// it is made as usual.
+fn save_connection(name: &str, dest: &str, a: &SshArgs) -> Result<()> {
+    use qsh::client::saved;
+    let (entry, left_out) = saved::from_args(name, dest, a).context("--save")?;
+    let home = home_dir()?;
+    let mut all = saved::load(&home)?;
+    let exists = all.iter().any(|s| s.name == name);
+    // A name from the user's own config would win over the saved one anyway.
+    if !exists && client::config::host_aliases(&home).iter().any(|h| h == name) {
+        bail!("--save: {name} is already a host in your config file; pick another name");
+    }
+    if exists && !a.save_force {
+        bail!("--save: a connection named {name} is already saved (--force replaces it)");
+    }
+    all.retain(|s| s.name != name);
+    all.push(entry);
+    saved::save(&home, &all)?;
+    if !a.quiet {
+        eprintln!("qsh: saved as {name}: `qsh {name}` or qsh ui");
+        for what in left_out {
+            eprintln!("qsh: warning: not saved: {what}");
+        }
+    }
+    Ok(())
+}
+
 async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if let Some(why) = a.refused.clone() {
         if a.full {
@@ -876,6 +903,12 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         }
         bail!("missing destination\n{USAGE}");
     };
+    if a.save_force && a.save.is_none() {
+        bail!("--force goes with --save NAME");
+    }
+    if let Some(name) = &a.save {
+        save_connection(name, &dest, &a)?;
+    }
     let target = match Target::resolve(&dest, a.port, &sources(&a)) {
         Ok(t) => t,
         // A user or host qsh cannot take (an AD-style user, say): ssh's job.
@@ -1338,8 +1371,8 @@ fn without_qsh_options(args: &[String]) -> Vec<String> {
             _ => "",
         };
         match name {
-            "--full" | "--accept-new-host" | "--verbose" => {}
-            "--transport" => {
+            "--full" | "--accept-new-host" | "--verbose" | "--force" => {}
+            "--transport" | "--save" => {
                 if value.is_none() {
                     it.next();
                 }

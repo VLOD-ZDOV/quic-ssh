@@ -216,6 +216,7 @@ qsh -G myserver                        # print the resolved settings for a host
 qsh keygen                             # create ~/.config/qsh/id_ed25519 (or: qsh keygen FILE)
 qsh --full myserver                      # OpenSSH-compatible mode, see below
 qsh ui                                 # host menu with status and speed test
+qsh -N -R 2222:localhost:22 server --save tun   # connect and keep it: later `qsh tun`, also in qsh ui
 qsh -O check myserver                  # the shared connection (see below)
 qsh doctor myserver                    # does not connect? checks each step and says what to fix
 qsh -v myserver                        # each step of the connection and login, as ssh -v
@@ -396,6 +397,7 @@ The session stays encrypted end to end: the public host only passes the bytes on
 - **Saved connections:**
   - **`n`** adds one: name, address, user, port, key file, ssh options, transport (auto/QUIC/TCP), and whether to fall back to ssh. **ssh options** takes ssh's own flags, such as `-L 8080:localhost:80 -D 1080 -A -C` or `-o ServerAliveInterval=30`; they are saved as config lines (`LocalForward` and so on), and ssh gets them too when it takes over.
   - **`e`** edits a saved connection, and **`d`** deletes it.
+  - From the command line, `--save NAME` after the host keeps a connection with its port, user, key, forwards and other options, and then connects as usual. A name that is already saved needs `--force`. A remote command, `-W`, `-g` and `--transport` are not saved (qsh says so).
   - They are stored in `~/.config/qsh/ui-hosts` (ssh_config syntax), so `qsh NAME` works on the command line too.
   - Your own config files are never written. For a host from them, **`e`** only changes the menu's settings (transport, ssh fallback), and a saved name cannot clash with a host of yours.
 - **History:** **`Tab`** shows the history with the result of each connection. **⏎** connects again, **`a`** saves an entry as a connection, **`d`** removes it.
