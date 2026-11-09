@@ -93,10 +93,20 @@ pub fn terminal() -> io::Result<(File, File)> {
 /// for IPv6 only: `[::]` next to `0.0.0.0` on the same port would otherwise
 /// clash with it (Linux makes `[::]` take IPv4 too) and be left out.
 pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    listen_tcp_v6only(addr, addr.is_ipv6())
+}
+
+/// Listens on `addr`; `[::]` takes IPv4 too, as QUIC's UDP socket does.
+/// Windows makes IPv6 sockets IPv6-only by default, so this must be explicit.
+pub fn listen_tcp_dual(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    listen_tcp_v6only(addr, false)
+}
+
+fn listen_tcp_v6only(addr: std::net::SocketAddr, v6only: bool) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
     if addr.is_ipv6() {
-        sock.set_only_v6(true)?;
+        sock.set_only_v6(v6only)?;
     }
     // As tokio's bind does: a port in TIME_WAIT can be listened on again.
     #[cfg(unix)]
@@ -105,6 +115,40 @@ pub fn listen_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::Tcp
     sock.bind(&addr.into())?;
     sock.listen(1024)?;
     tokio::net::TcpListener::from_std(sock.into())
+}
+
+/// For `127.0.0.1` the other loopback `::1`, and back: both mean "this
+/// machine", but a service often listens on only one (an IPv6 `[::]`
+/// socket on Windows takes no IPv4), so a refusal on one is worth a try on
+/// the other.
+pub fn other_loopback(host: &str) -> Option<&'static str> {
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(ip) if ip.is_loopback() => Some("::1"),
+        std::net::IpAddr::V6(ip) if ip.is_loopback() => Some("127.0.0.1"),
+        _ => None,
+    }
+}
+
+/// Connects to `host:port` within `timeout`; a refused loopback address
+/// falls back to the other one (see [`other_loopback`]).
+pub async fn connect_tcp(host: &str, port: u16, timeout: std::time::Duration) -> io::Result<tokio::net::TcpStream> {
+    let once = |host: &str| {
+        let connect = tokio::net::TcpStream::connect((host.to_string(), port));
+        async move {
+            match tokio::time::timeout(timeout, connect).await {
+                Ok(r) => r,
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
+            }
+        }
+    };
+    match once(host).await {
+        // The first error is the one to report: it names what was asked for.
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => match other_loopback(host) {
+            Some(other) => once(other).await.map_err(|_| e),
+            None => Err(e),
+        },
+        r => r,
+    }
 }
 
 /// Where writing `path` should go: the file a symlink points to, also one
@@ -227,8 +271,9 @@ pub fn is_broken_pipe_print(info: &std::panic::PanicHookInfo<'_>) -> bool {
     msg.starts_with("failed printing to std") && msg.contains("os error 32")
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     #[test]
     fn replaced_file_keeps_its_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -239,5 +284,27 @@ mod tests {
         super::replace_file(&file, b"new").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn dual_listener_takes_ipv4() {
+        let Ok(l) = super::listen_tcp_dual((std::net::Ipv6Addr::UNSPECIFIED, 0).into()) else { return }; // no IPv6
+        let port = l.local_addr().unwrap().port();
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    }
+
+    #[test]
+    fn other_loopback_pairs_v4_and_v6() {
+        assert_eq!(super::other_loopback("127.0.0.1"), Some("::1"));
+        assert_eq!(super::other_loopback("[::1]"), Some("127.0.0.1"));
+        assert_eq!(super::other_loopback("localhost"), None); // resolves to both already
+        assert_eq!(super::other_loopback("192.0.2.1"), None);
+    }
+
+    #[tokio::test]
+    async fn refused_loopback_tries_the_other() {
+        let Ok(l) = super::listen_tcp((std::net::Ipv6Addr::LOCALHOST, 0).into()) else { return }; // no IPv6
+        let port = l.local_addr().unwrap().port();
+        super::connect_tcp("127.0.0.1", port, std::time::Duration::from_secs(5)).await.unwrap();
     }
 }

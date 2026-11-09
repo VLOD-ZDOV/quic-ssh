@@ -271,10 +271,7 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connects to `host:port` here, giving up after [`CONNECT_TIMEOUT`].
 async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
-        Ok(r) => r,
-        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out")),
-    }
+    crate::platform::connect_tcp(host, port, CONNECT_TIMEOUT).await
 }
 
 /// Connects to a `-R` forward's destination here and relays the stream.

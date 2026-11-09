@@ -1014,15 +1014,13 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             #[cfg(not(unix))]
             let _ = testing;
-            let connect = tokio::net::TcpStream::connect((host.as_str(), port));
-            match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-                Ok(Ok(tcp)) => {
+            match crate::platform::connect_tcp(&host, port, CONNECT_TIMEOUT).await {
+                Ok(tcp) => {
                     let _ = tcp.set_nodelay(true);
                     write_msg(&mut send, &Reply::Ok).await?;
                     crate::transport::splice(tcp, send, recv).await
                 }
-                Ok(Err(e)) => write_msg(&mut send, &Reply::Err(format!("connect {host}:{port}: {e}"))).await,
-                Err(_) => write_msg(&mut send, &Reply::Err(format!("connect {host}:{port}: timed out"))).await,
+                Err(e) => write_msg(&mut send, &Reply::Err(format!("connect {host}:{port}: {e}"))).await,
             }
         }
         Request::Upload { path, name, size, mode } => {

@@ -17,7 +17,12 @@ fn connect_tcp(host: &str, port: u16) -> Result<std::net::TcpStream> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
     let mut last = None;
-    for addr in (host, port).to_socket_addrs().with_context(|| format!("connect {host}:{port}"))? {
+    let mut addrs: Vec<_> = (host, port).to_socket_addrs().with_context(|| format!("connect {host}:{port}"))?.collect();
+    // As crate::platform::connect_tcp: a refused loopback tries the other one.
+    if let Some(other) = crate::platform::other_loopback(host) {
+        addrs.extend((other, port).to_socket_addrs().into_iter().flatten());
+    }
+    for addr in addrs {
         match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),

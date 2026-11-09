@@ -581,14 +581,14 @@ impl Listener {
                 Err(e) => return Err(e).with_context(|| format!("cannot listen on udp {addr}")),
             };
             let Some(udp) = &quic else {
-                let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("cannot listen on tcp {addr}"))?;
+                let l = crate::platform::listen_tcp_dual(addr).with_context(|| format!("cannot listen on tcp {addr}"))?;
                 return Ok(Listener { quic, tcp: Some(l), tls, alive });
             };
             if !tcp {
                 return Ok(Listener { quic, tcp: None, tls, alive });
             }
             let tcp_addr = SocketAddr::new(addr.ip(), udp.local_addr()?.port());
-            match tokio::net::TcpListener::bind(tcp_addr).await {
+            match crate::platform::listen_tcp_dual(tcp_addr) {
                 Ok(l) => return Ok(Listener { quic, tcp: Some(l), tls, alive }),
                 Err(e) if attempt == attempts => return Err(e).with_context(|| format!("cannot listen on tcp {tcp_addr}")),
                 Err(_) => {}
