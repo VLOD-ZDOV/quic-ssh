@@ -394,6 +394,20 @@ impl Parser<'_> {
             let Some((keyword, args, raw)) = split_line_raw(line) else { continue };
             let first = args.first().cloned();
             let n = n + 1;
+            // As ssh: a number that does not parse is an error, not the default.
+            // (ssh's own files are ssh's to judge.)
+            if self.ours && active == Applies::Yes {
+                let bad = match (keyword.as_str(), first.as_deref()) {
+                    ("port", Some(v)) => !v.parse::<u16>().is_ok_and(|p| p > 0),
+                    ("connectionattempts" | "serveralivecountmax", Some(v)) => v.parse::<u32>().is_err(),
+                    ("connecttimeout" | "serveraliveinterval", Some(v)) => seconds(v).is_none(),
+                    _ => false,
+                };
+                if bad {
+                    let name = &line.trim_start()[..keyword.len()];
+                    self.out.bad_option.get_or_insert_with(|| format!("{}Bad value for {name}: {}", at(&self.file, n), args.join(" ")));
+                }
+            }
             if keyword == "match" && args.iter().any(|a| a.trim_start_matches('!').eq_ignore_ascii_case("final")) {
                 self.wants_final = true;
             }
@@ -548,7 +562,7 @@ impl Parser<'_> {
                 "localcommand" if self.full && o.local_command.is_none() && !raw.is_empty() => o.local_command = Some(raw),
                 "permitlocalcommand" if self.full && o.permit_local_command.is_none() => o.permit_local_command = first.as_deref().map(yes),
                 "hostkeyalias" if o.host_key_alias.is_none() => o.host_key_alias = first,
-                "connecttimeout" if o.connect_timeout.is_none() => o.connect_timeout = first.and_then(|v| v.parse().ok()),
+                "connecttimeout" if o.connect_timeout.is_none() => o.connect_timeout = first.as_deref().and_then(seconds),
                 "connectionattempts" if o.connection_attempts.is_none() => o.connection_attempts = first.and_then(|v| v.parse().ok()),
                 "batchmode" if o.batch_mode.is_none() => o.batch_mode = first.as_deref().map(yes),
                 "stricthostkeychecking" if o.strict_host_key_checking.is_none() => {
@@ -598,7 +612,7 @@ impl Parser<'_> {
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
                 "restoresession" if o.restore_session.is_none() => o.restore_session = first.as_deref().map(yes),
                 "loopbackfallback" if o.loopback_fallback.is_none() => o.loopback_fallback = first.as_deref().map(yes),
-                "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
+                "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.as_deref().and_then(seconds),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
                 "controlmaster" if o.control_master.is_none() => o.control_master = first,
                 "controlpath" if self.ours && o.control_path.is_none() => o.control_path = first,
@@ -843,17 +857,25 @@ pub fn parse(text: &str, host: &str, base: &Path, full: bool) -> HostConfig {
 
 /// Parses `ObscureKeystrokeTiming`: `yes` (default 20 ms), `no`, `interval:MS`.
 /// `None` (unset) means the default.
-pub fn keystroke_interval(value: Option<&str>) -> Option<std::time::Duration> {
-    let default = Some(crate::client::keystroke::DEFAULT_INTERVAL);
-    match value {
-        None | Some("yes") => default,
+pub fn keystroke_interval(value: Option<&str>) -> anyhow::Result<Option<std::time::Duration>> {
+    Ok(match value {
+        None | Some("yes") => Some(crate::client::keystroke::DEFAULT_INTERVAL),
         Some("no") => None,
         Some(v) => match v.strip_prefix("interval:").and_then(|ms| ms.parse::<u64>().ok()) {
             Some(0) => None,
             Some(ms) => Some(std::time::Duration::from_millis(ms)),
-            None => default,
+            None => anyhow::bail!("bad ObscureKeystrokeTiming {v:?} (yes, no or interval:MS)"),
         },
+    })
+}
+
+/// A time in seconds as ssh reads `ConnectTimeout` and `ServerAliveInterval`
+/// (`30`, `1m`); `0` is off.
+fn seconds(v: &str) -> Option<u64> {
+    if v.trim_end_matches(['s', 'S']) == "0" {
+        return Some(0);
     }
+    super::control::parse_time_secs(v).map(u64::from)
 }
 
 /// Expands `~`, `%d` (home), `%h` (host name), `%r` (remote user), `%u` (local user), `%%`.
@@ -1332,6 +1354,13 @@ Host *
         write_config(dir.join("extra"), "\nBogus 1\n").unwrap();
         let c = ours("Include extra\n");
         assert_eq!(c.bad_option, Some(format!("{} line 2: Bad configuration option: Bogus", dir.join("extra").display())));
+        // A number that does not parse is an error; ssh's time units are fine.
+        let c = ours("Host h\n Port 99999\n");
+        assert_eq!(c.bad_option, Some(format!("{file} line 2: Bad value for Port: 99999")));
+        assert!(ours("ConnectTimeout -5\n").bad_option.is_some());
+        assert!(ours("ServerAliveCountMax xyz\n").bad_option.is_some());
+        let c = ours("ConnectTimeout 1m\nServerAliveInterval 0\nHost other\n Port 0\n");
+        assert_eq!((c.bad_option, c.connect_timeout, c.server_alive_interval), (None, Some(60), Some(0)));
         // A second pass (canonical name) does not repeat the warning.
         let c = ours("CanonicalizeHostname always\nPubkeyAuthentication no\nHost h\n HostName real.\n");
         assert_eq!((c.hostname.as_deref(), c.unapplied.len()), (Some("real"), 1), "{:?}", c.unapplied);
@@ -1433,10 +1462,11 @@ Host *
     #[test]
     fn keystroke_setting() {
         use std::time::Duration;
-        assert_eq!(keystroke_interval(None), Some(Duration::from_millis(20)));
-        assert_eq!(keystroke_interval(Some("no")), None);
-        assert_eq!(keystroke_interval(Some("interval:80")), Some(Duration::from_millis(80)));
-        assert_eq!(keystroke_interval(Some("interval:0")), None);
+        assert_eq!(keystroke_interval(None).unwrap(), Some(Duration::from_millis(20)));
+        assert_eq!(keystroke_interval(Some("no")).unwrap(), None);
+        assert_eq!(keystroke_interval(Some("interval:80")).unwrap(), Some(Duration::from_millis(80)));
+        assert_eq!(keystroke_interval(Some("interval:0")).unwrap(), None);
+        assert!(keystroke_interval(Some("interval:xyz")).is_err() && keystroke_interval(Some("500")).is_err());
         let c = parse("Host *\n ObscureKeystrokeTiming interval:50\n", "x", Path::new("/x"), false);
         assert_eq!(c.obscure_keystrokes.as_deref(), Some("interval:50"));
     }

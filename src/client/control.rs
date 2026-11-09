@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 
 /// `ControlMaster`: whether this qsh offers its connection to later runs.
@@ -46,20 +47,21 @@ impl Sharing {
     }
 }
 
-pub fn parse_master(v: &str) -> ControlMaster {
+pub fn parse_master(v: &str) -> Option<ControlMaster> {
     match v.to_ascii_lowercase().as_str() {
-        "yes" | "ask" | "true" => ControlMaster::Yes,
-        "auto" | "autoask" => ControlMaster::Auto,
-        _ => ControlMaster::No,
+        "yes" | "ask" | "true" => Some(ControlMaster::Yes),
+        "auto" | "autoask" => Some(ControlMaster::Auto),
+        "no" | "false" => Some(ControlMaster::No),
+        _ => None,
     }
 }
 
 /// `yes`/`0` (forever), `no`, or a time: `600`, `10m`, `1h30m` (ssh's units s m h d w).
-pub fn parse_persist(v: &str) -> Persist {
+pub fn parse_persist(v: &str) -> Option<Persist> {
     match v.to_ascii_lowercase().as_str() {
-        "yes" | "true" | "0" => Persist::Forever,
-        "no" | "false" => Persist::No,
-        t => parse_time(t).map(Persist::For).unwrap_or(Persist::No),
+        "yes" | "true" | "0" => Some(Persist::Forever),
+        "no" | "false" => Some(Persist::No),
+        t => parse_time(t).map(Persist::For),
     }
 }
 
@@ -109,9 +111,16 @@ pub fn default_dir(home: &Path) -> PathBuf {
 /// `ControlPath` and `ControlPersist`. `ControlPath` is only read from qsh's
 /// own config and `-o`/`-S`: one from ssh's config names ssh's sockets,
 /// which speak another protocol.
-pub fn sharing([master, path, persist]: [Option<&str>; 3], home: &Path, host: &str, port: u16, user: &str, local_user: &str) -> Sharing {
-    let master = master.map(parse_master).unwrap_or_default();
-    let persist = persist.map(parse_persist).unwrap_or_default();
+pub fn sharing([master, path, persist]: [Option<&str>; 3], home: &Path, host: &str, port: u16, user: &str, local_user: &str) -> anyhow::Result<Sharing> {
+    // As ssh: a bad value is an error, not sharing quietly off.
+    let master = match master {
+        Some(v) => parse_master(v).with_context(|| format!("bad ControlMaster {v:?} (yes, no, ask, auto, autoask)"))?,
+        None => ControlMaster::default(),
+    };
+    let persist = match persist {
+        Some(v) => parse_persist(v).with_context(|| format!("bad ControlPersist {v:?} (yes, no or a time)"))?,
+        None => Persist::default(),
+    };
     let pattern = match path {
         Some(p) if p.eq_ignore_ascii_case("none") => None,
         Some(p) => Some(p.to_string()),
@@ -139,7 +148,7 @@ pub fn sharing([master, path, persist]: [Option<&str>; 3], home: &Path, host: &s
         }
         super::config::expand_path(&s, home, host, user, local_user)
     });
-    Sharing { master, path, persist }
+    Ok(Sharing { master, path, persist })
 }
 
 #[cfg(test)]
@@ -148,27 +157,30 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(parse_persist("10m"), Persist::For(Duration::from_secs(600)));
-        assert_eq!(parse_persist("1h30m"), Persist::For(Duration::from_secs(5400)));
-        assert_eq!(parse_persist("90"), Persist::For(Duration::from_secs(90)));
-        assert_eq!(parse_persist("yes"), Persist::Forever);
-        assert_eq!(parse_persist("0"), Persist::Forever);
-        assert_eq!(parse_persist("no"), Persist::No);
-        assert_eq!(parse_persist("5x"), Persist::No);
-        assert_eq!(parse_master("autoask"), ControlMaster::Auto);
-        assert_eq!(parse_master("ASK"), ControlMaster::Yes);
+        assert_eq!(parse_persist("10m"), Some(Persist::For(Duration::from_secs(600))));
+        assert_eq!(parse_persist("1h30m"), Some(Persist::For(Duration::from_secs(5400))));
+        assert_eq!(parse_persist("90"), Some(Persist::For(Duration::from_secs(90))));
+        assert_eq!(parse_persist("yes"), Some(Persist::Forever));
+        assert_eq!(parse_persist("0"), Some(Persist::Forever));
+        assert_eq!(parse_persist("no"), Some(Persist::No));
+        assert_eq!(parse_persist("5x"), None);
+        assert_eq!(parse_persist(""), None);
+        assert_eq!(parse_master("autoask"), Some(ControlMaster::Auto));
+        assert_eq!(parse_master("ASK"), Some(ControlMaster::Yes));
+        assert_eq!(parse_master("false"), Some(ControlMaster::No));
+        assert_eq!(parse_master("sometimes"), None);
 
         let home = Path::new("/h");
-        let off = sharing([None, None, None], home, "example.com", 4422, "bob", "me");
+        let off = sharing([None, None, None], home, "example.com", 4422, "bob", "me").unwrap();
         assert_eq!(off.path, None, "off by default");
-        let auto = sharing([Some("auto"), None, None], home, "example.com", 4422, "bob", "me");
+        let auto = sharing([Some("auto"), None, None], home, "example.com", 4422, "bob", "me").unwrap();
         let p = auto.path.unwrap();
         assert!(p.starts_with("/h/.config/qsh/ctl"));
         assert_eq!(p.file_name().unwrap().len(), 16);
-        let other = sharing([Some("auto"), None, None], home, "example.com", 4422, "alice", "me");
+        let other = sharing([Some("auto"), None, None], home, "example.com", 4422, "alice", "me").unwrap();
         assert_ne!(other.path.unwrap(), p, "one master per user@host:port");
-        let custom = sharing([None, Some("~/s/%r@%h:%p%%p"), None], home, "example.com", 22, "bob", "me");
+        let custom = sharing([None, Some("~/s/%r@%h:%p%%p"), None], home, "example.com", 22, "bob", "me").unwrap();
         assert_eq!(custom.path.unwrap(), Path::new("/h/s/bob@example.com:22%p"));
-        assert_eq!(sharing([Some("yes"), Some("none"), None], home, "h", 1, "u", "me").path, None);
+        assert_eq!(sharing([Some("yes"), Some("none"), None], home, "h", 1, "u", "me").unwrap().path, None);
     }
 }

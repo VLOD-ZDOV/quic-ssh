@@ -160,7 +160,7 @@ mod device {
 pub fn parse_units(spec: &str) -> Result<(Option<u32>, Option<u32>)> {
     let unit = |s: &str| -> Result<Option<u32>> {
         match s {
-            "" | "any" => Ok(None),
+            "any" => Ok(None),
             n => n
                 .parse()
                 .map(Some)
@@ -181,5 +181,6 @@ mod tests {
         assert_eq!(super::parse_units("any").unwrap(), (None, None));
         assert_eq!(super::parse_units("any:5").unwrap(), (None, Some(5)));
         assert!(super::parse_units("x").is_err());
+        assert!(super::parse_units("1:").is_err() && super::parse_units(":1").is_err() && super::parse_units("").is_err());
     }
 }

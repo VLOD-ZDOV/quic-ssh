@@ -1215,7 +1215,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         }
     };
     let escape_char = match &a.escape_char {
-        Some(e) => client::parse_escape(Some(e)),
+        Some(e) => client::parse_escape(Some(e))?,
         None => target.escape_char,
     };
     // A terminal session survives lost connections (unless X11 or a tunnel

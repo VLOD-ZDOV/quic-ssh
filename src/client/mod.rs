@@ -219,14 +219,14 @@ fn valid_host(host: &str) -> bool {
 }
 
 /// `EscapeChar`: `none`, a single character, or `^X` for a control character.
-pub fn parse_escape(v: Option<&str>) -> Option<u8> {
-    match v {
+pub fn parse_escape(v: Option<&str>) -> Result<Option<u8>> {
+    Ok(match v {
         None => Some(b'~'),
         Some(v) if v.eq_ignore_ascii_case("none") => None,
         Some(v) if v.len() == 2 && v.starts_with('^') => Some(v.as_bytes()[1].to_ascii_uppercase() & 0x1f),
         Some(v) if v.len() == 1 => Some(v.as_bytes()[0]),
-        Some(_) => Some(b'~'),
-    }
+        Some(v) => bail!("bad escape character {v:?}"),
+    })
 }
 
 /// `StrictHostKeyChecking`, lowercased.
@@ -426,7 +426,7 @@ impl Target {
                 port,
                 &user,
                 &local,
-            ),
+            )?,
             None => control::Sharing::default(),
         };
         let family = match cfg.address_family.as_deref() {
@@ -453,7 +453,7 @@ impl Target {
             proxy_jump: cfg.proxy_jump,
             request_tty: cfg.request_tty,
             needs_proxy: cfg.needs_proxy,
-            keystroke_interval: config::keystroke_interval(cfg.obscure_keystrokes.as_deref()),
+            keystroke_interval: config::keystroke_interval(cfg.obscure_keystrokes.as_deref())?,
             batch_mode: cfg.batch_mode.unwrap_or(false),
             host_key_policy,
             known_hosts_file,
@@ -476,7 +476,7 @@ impl Target {
             x11_timeout: cfg.forward_x11_timeout.as_deref().and_then(|t| if t.trim().trim_end_matches(['s', 'S']) == "0" { Some(0) } else { control::parse_time_secs(t) }).unwrap_or(1200),
             xauth: cfg.xauth_location.clone().unwrap_or_else(|| "xauth".into()),
             clear_all_forwardings: cfg.clear_all_forwardings.unwrap_or(false),
-            escape_char: parse_escape(cfg.escape_char.as_deref()),
+            escape_char: parse_escape(cfg.escape_char.as_deref())?,
             escape_commandline: cfg.escape_commandline.unwrap_or(true),
             family,
             bind,

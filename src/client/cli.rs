@@ -235,7 +235,10 @@ impl SshArgs {
             'F' => self.config_file = Some(PathBuf::from(v)),
             'J' => self.jump = Some(v),
             'W' => self.stdio_forward = Some(v),
-            'e' => self.escape_char = Some(v),
+            'e' => {
+                super::parse_escape(Some(&v)).map_err(|e| e.to_string())?;
+                self.escape_char = Some(v);
+            }
             'O' => match v.as_str() {
                 "check" | "exit" | "stop" | "forward" | "cancel" => self.control_command = Some(v),
                 _ => return Err(format!("unsupported -O command {v:?} (check, exit, stop, forward, cancel)")),
@@ -432,7 +435,7 @@ mod tests {
         assert_eq!(p("-Y -x host").override_lines(), ["ForwardX11 no", "ForwardX11Trusted yes"], "the last X11 switch wins");
         assert_eq!(p("-x -X host").override_lines()[0], "ForwardX11 yes");
         // Values that would become extra config lines, or odd user names.
-        for bad in [["-l", "bob\nProxyCommand evil"], ["-o", "User=x\nMatch exec evil"], ["-J", "gw\rProxyCommand x"], ["-l", "$(id)"]] {
+        for bad in [["-l", "bob\nProxyCommand evil"], ["-o", "User=x\nMatch exec evil"], ["-J", "gw\rProxyCommand x"], ["-l", "$(id)"], ["-e", "abc"]] {
             assert!(SshArgs::parse(bad.iter().map(|s| s.to_string()).chain(["host".into()])).is_err(), "{bad:?}");
         }
     }
