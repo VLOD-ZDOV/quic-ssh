@@ -104,6 +104,10 @@ pub struct ServerConfig {
     /// Who may connect to `-R` listeners: loopback only (`no`), everyone (`yes`),
     /// or whatever address the client asks for (`clientspecified`).
     pub gateway_ports: GatewayPorts,
+    /// A `-L`/`-D` connection refused on 127.0.0.1 tries ::1, and back.
+    /// Off: while the service is down, another local user may listen there.
+    #[serde(deserialize_with = "flag")]
+    pub loopback_fallback: bool,
     /// Subsystems (`qsh -s host NAME`): name → command line, run like sshd as
     /// `$SHELL -c command`. `sftp` is found automatically if OpenSSH's
     /// sftp-server is installed.
@@ -608,6 +612,8 @@ overrides! {
         #[serde(deserialize_with = "opt_flag")]
         disable_forwarding: bool,
         gateway_ports: GatewayPorts,
+        #[serde(deserialize_with = "opt_flag")]
+        loopback_fallback: bool,
         max_auth_tries: u32,
         max_sessions: usize,
         #[serde(deserialize_with = "opt_flag")]
@@ -690,7 +696,7 @@ const SETTING_NAMES: &[&str] = &[
     "authorized_principals_file", "allow_tcp_forwarding", "disable_forwarding", "allow_stream_local_forwarding",
     "stream_local_bind_mask", "stream_local_bind_unlink", "x11_forwarding", "x11_display_offset", "x11_use_localhost",
     "xauth_location", "permit_tunnel", "permit_open", "permit_listen", "max_connections", "max_startups",
-    "max_startups_per_ip", "connection_buffer_mb", "session_scope", "gateway_ports", "subsystems", "trusted_user_ca_keys",
+    "max_startups_per_ip", "connection_buffer_mb", "session_scope", "gateway_ports", "loopback_fallback", "subsystems", "trusted_user_ca_keys",
     "max_auth_tries", "totp_valid_for", "allow_agent_forwarding", "totp", "host_certificate", "revoked_keys",
     "authorized_keys_command", "authorized_keys_command_user", "session_timeout", "allow_users", "deny_users",
     "allow_groups", "deny_groups", "permit_root_login", "login_grace_time", "banner", "print_motd", "print_last_log",
@@ -708,7 +714,7 @@ const ACCESS_SETTINGS: &[&str] = &[
     "authorized_principals_file", "trusted_user_ca_keys", "revoked_keys", "use_ssh_authorized_keys",
     "use_qsh_authorized_keys", "max_auth_tries", "disable_forwarding", "allow_tcp_forwarding",
     "allow_stream_local_forwarding", "allow_agent_forwarding", "x11_forwarding", "x11_use_localhost", "permit_tunnel",
-    "permit_open", "permit_listen", "gateway_ports", "permit_tty", "permit_user_rc", "accept_env", "set_env",
+    "permit_open", "permit_listen", "gateway_ports", "loopback_fallback", "permit_tty", "permit_user_rc", "accept_env", "set_env",
     "stream_local_bind_mask", "stream_local_bind_unlink",
 ];
 
@@ -825,6 +831,7 @@ impl Default for ServerConfig {
             max_startups: 64,
             max_startups_per_ip: 8,
             gateway_ports: GatewayPorts::No,
+            loopback_fallback: false,
             subsystems: BTreeMap::new(),
             trusted_user_ca_keys: None,
             max_auth_tries: 6,

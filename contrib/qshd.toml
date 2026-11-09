@@ -115,6 +115,10 @@
 # -R on loopback only; "yes": all addresses; or "clientspecified".
 # gateway_ports = "no"
 
+# -L/-D refused on 127.0.0.1 tries ::1, and back. Off: while the service is
+# down, another local user may listen on the other address.
+# loopback_fallback = false
+
 # Allowed destinations of -L/-D/-W and listeners of -R.
 # permit_open = ["db.internal:5432"]
 # permit_listen = ["8080"]

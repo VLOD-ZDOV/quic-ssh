@@ -90,7 +90,7 @@ fn option_line(o: &str) -> Result<String, String> {
 }
 
 /// `-o` keywords only qsh knows (ssh stops at them).
-const QSH_ONLY_OPTIONS: [&str; 3] = ["PersistSession", "PredictiveEcho", "RestoreSession"];
+const QSH_ONLY_OPTIONS: [&str; 4] = ["LoopbackFallback", "PersistSession", "PredictiveEcho", "RestoreSession"];
 
 /// Keywords the config parser carries out (lowercase).
 const APPLIED_OPTIONS: &[&str] = &[
@@ -100,7 +100,7 @@ const APPLIED_OPTIONS: &[&str] = &[
     "enableescapecommandline", "escapechar", "exitonforwardfailure", "forkafterauthentication", "forwardagent", "forwardx11",
     "forwardx11timeout", "forwardx11trusted", "globalknownhostsfile", "hashknownhosts", "host", "hostkeyalias", "hostname",
     "identitiesonly", "identityagent", "identityfile", "include", "knownhostscommand", "localcommand", "localforward",
-    "loglevel", "match", "numberofpasswordprompts", "obscurekeystroketiming", "passwordauthentication", "permitlocalcommand",
+    "loglevel", "loopbackfallback", "match", "numberofpasswordprompts", "obscurekeystroketiming", "passwordauthentication", "permitlocalcommand",
     "persistsession", "port", "restoresession", "predictiveecho", "proxycommand", "proxyjump", "remotecommand", "remoteforward", "requesttty",
     "sendenv", "serveralivecountmax", "serveraliveinterval", "sessiontype", "setenv", "stdinnull", "stricthostkeychecking",
     "tag", "tunnel", "tunneldevice", "user", "userknownhostsfile", "xauthlocation",

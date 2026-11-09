@@ -132,6 +132,9 @@ pub struct Target {
     pub certificate_files: Vec<PathBuf>,
     /// Keep terminal sessions across lost connections (`PersistSession`, default yes).
     pub persist_session: bool,
+    /// `LoopbackFallback` (default no): a `-R` target refused on a loopback
+    /// address tries the other one.
+    pub loopback_fallback: bool,
     /// `RestoreSession`: a terminal session outlives qsh itself; the next
     /// run to the host goes back to it.
     pub restore_session: bool,
@@ -485,6 +488,7 @@ impl Target {
             certificate_files,
             persist_session: cfg.persist_session.unwrap_or(true),
             restore_session: cfg.restore_session.unwrap_or(false),
+            loopback_fallback: cfg.loopback_fallback.unwrap_or(false),
             server_alive: cfg
                 .server_alive_interval
                 .filter(|&s| s > 0)

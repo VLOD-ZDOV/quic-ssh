@@ -1000,11 +1000,24 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.may_open(&host, port) {
                 return write_msg(&mut send, &Reply::Err(format!("forwarding to {host}:{port} is not permitted (permit_open)"))).await;
             }
+            // The other loopback must pass the same checks.
+            let fallback = cfg
+                .loopback_fallback
+                .then(|| crate::platform::other_loopback(&host))
+                .flatten()
+                .filter(|other| limits.may_open(other, port) && cfg.may_open(other, port));
             // Tests reach the system-mode path without root (debug builds only).
             let testing = cfg!(debug_assertions) && std::env::var_os("QSHD_TEST_FORWARD_HELPER").is_some();
             #[cfg(unix)]
             if user.switches() || testing {
-                return match connect_as(user, &host, port).await {
+                let mut tcp = connect_as(user, &host, port).await;
+                if let (Err(_), Some(other)) = (&tcp, fallback) {
+                    // The helper's error is text only: any failure tries the other loopback.
+                    if let Ok(t) = connect_as(user, other, port).await {
+                        tcp = Ok(t);
+                    }
+                }
+                return match tcp {
                     Ok(tcp) => {
                         write_msg(&mut send, &Reply::Ok).await?;
                         crate::transport::splice(tcp, send, recv).await
@@ -1014,7 +1027,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             }
             #[cfg(not(unix))]
             let _ = testing;
-            match crate::platform::connect_tcp(&host, port, CONNECT_TIMEOUT).await {
+            match crate::platform::connect_tcp(&host, port, CONNECT_TIMEOUT, fallback).await {
                 Ok(tcp) => {
                     let _ = tcp.set_nodelay(true);
                     write_msg(&mut send, &Reply::Ok).await?;

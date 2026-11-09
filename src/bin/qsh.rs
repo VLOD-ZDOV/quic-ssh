@@ -539,7 +539,7 @@ async fn master_main(a: SshArgs) -> Result<i32> {
         }
         Err(e) => return Err(e),
     };
-    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open);
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open, target.loopback_fallback);
     let master = match Master::start(forwarder.connections(), &path, Some(forward_hook(&forwarder)), forwarder.activity()) {
         Ok(m) => m,
         // Another qsh got there first: use that one.
@@ -1050,7 +1050,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         conn.close().await;
         return Ok(0);
     }
-    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open);
+    let forwarder = forward::Forwarder::new(conn.clone(), a.gateway_ports, target.permit_remote_open, target.loopback_fallback);
     // This run's own forwards, taken back before a master waits for others.
     let mut own: Vec<(char, String)> = Vec::new();
     for (kind, list) in [('L', locals), ('D', dynamics)] {

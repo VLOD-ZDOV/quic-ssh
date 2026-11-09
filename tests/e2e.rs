@@ -471,6 +471,47 @@ fn local_port_forwarding_with(s: Server) {
     }
 }
 
+/// A target on ::1 only, asked for as 127.0.0.1: reached only with
+/// `loopback_fallback` (qshd, `-L`) or `LoopbackFallback` (qsh, `-R`).
+#[test]
+fn loopback_fallback_is_opt_in() {
+    let Ok(l) = TcpListener::bind("[::1]:0") else { return }; // no IPv6
+    let target = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let _ = s.write_all(b"hi");
+        }
+    });
+    let reply = |port: u16| {
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut got = Vec::new();
+        let _ = sock.read_to_end(&mut got);
+        got
+    };
+    let helper = [("QSHD_TEST_FORWARD_HELPER", "1")];
+    let on = "loopback_fallback = true\n";
+    for (config, env, works) in [("", &[][..], false), ("", &helper[..], false), (on, &[][..], true), (on, &helper[..], true)] {
+        let s = Server::start_env(tempfile::tempdir().unwrap(), "127.0.0.1:0", config, env);
+        let c = Client::paired(&s);
+        let local = free_port();
+        let mut child = forwarding(&c, &s, "quic", &["-L".into(), format!("{local}:127.0.0.1:{target}")], local);
+        assert_eq!(reply(local) == b"hi", works, "-L with {config:?} {env:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    let s = Server::start();
+    let c = Client::paired(&s);
+    for (option, works) in [("LoopbackFallback=no", false), ("LoopbackFallback=yes", true)] {
+        let remote = free_port();
+        let forwards = ["-o".into(), option.into(), "-R".into(), format!("{remote}:127.0.0.1:{target}")];
+        let mut child = forwarding(&c, &s, "quic", &forwards, remote);
+        assert_eq!(reply(remote) == b"hi", works, "-R with {option}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
 /// A forward on every address (`-L *:...`, and `-R` with `gateway_ports`)
 /// takes IPv6 connections too: `[::]` must not lose to `0.0.0.0`.
 #[test]

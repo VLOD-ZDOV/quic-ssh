@@ -105,5 +105,10 @@
 #     Exit if a -L/-R/-D forward cannot be set up.
 #     ExitOnForwardFailure no
 
+#     A -R target refused on 127.0.0.1 tries ::1, and back (a Windows
+#     service on [::] takes no IPv4). Off: while the service is down,
+#     another local user may listen on the other address.
+#     LoopbackFallback no
+
 #     Compress `qsh cp` transfers.
 #     Compression no

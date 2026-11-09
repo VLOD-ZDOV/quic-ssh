@@ -119,8 +119,9 @@ fn listen_tcp_v6only(addr: std::net::SocketAddr, v6only: bool) -> std::io::Resul
 
 /// For `127.0.0.1` the other loopback `::1`, and back: both mean "this
 /// machine", but a service often listens on only one (an IPv6 `[::]`
-/// socket on Windows takes no IPv4), so a refusal on one is worth a try on
-/// the other.
+/// socket on Windows takes no IPv4). Trying the other one is opt-in
+/// (`LoopbackFallback`, `loopback_fallback`): while the service is down,
+/// another local user may listen there.
 pub fn other_loopback(host: &str) -> Option<&'static str> {
     match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().ok()? {
         std::net::IpAddr::V4(ip) if ip.is_loopback() => Some("::1"),
@@ -129,9 +130,10 @@ pub fn other_loopback(host: &str) -> Option<&'static str> {
     }
 }
 
-/// Connects to `host:port` within `timeout`; a refused loopback address
-/// falls back to the other one (see [`other_loopback`]).
-pub async fn connect_tcp(host: &str, port: u16, timeout: std::time::Duration) -> io::Result<tokio::net::TcpStream> {
+/// Connects to `host:port` within `timeout`; if that is refused, to
+/// `fallback` (see [`other_loopback`]). The error is the first one: it names
+/// what was asked for.
+pub async fn connect_tcp(host: &str, port: u16, timeout: std::time::Duration, fallback: Option<&str>) -> io::Result<tokio::net::TcpStream> {
     let once = |host: &str| {
         let connect = tokio::net::TcpStream::connect((host.to_string(), port));
         async move {
@@ -142,8 +144,7 @@ pub async fn connect_tcp(host: &str, port: u16, timeout: std::time::Duration) ->
         }
     };
     match once(host).await {
-        // The first error is the one to report: it names what was asked for.
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => match other_loopback(host) {
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => match fallback {
             Some(other) => once(other).await.map_err(|_| e),
             None => Err(e),
         },
@@ -305,6 +306,8 @@ mod tests {
     async fn refused_loopback_tries_the_other() {
         let Ok(l) = super::listen_tcp((std::net::Ipv6Addr::LOCALHOST, 0).into()) else { return }; // no IPv6
         let port = l.local_addr().unwrap().port();
-        super::connect_tcp("127.0.0.1", port, std::time::Duration::from_secs(5)).await.unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        assert!(super::connect_tcp("127.0.0.1", port, timeout, None).await.is_err());
+        super::connect_tcp("127.0.0.1", port, timeout, Some("::1")).await.unwrap();
     }
 }

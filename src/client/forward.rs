@@ -269,15 +269,17 @@ async fn bridge_stream<S: AsyncRead + AsyncWrite + Unpin>(sock: S, send: SendHal
 /// How long connecting to a `-R` destination may take.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Connects to `host:port` here, giving up after [`CONNECT_TIMEOUT`].
-async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    crate::platform::connect_tcp(host, port, CONNECT_TIMEOUT).await
+/// Connects to `host:port` here, giving up after [`CONNECT_TIMEOUT`];
+/// `fallback` is `LoopbackFallback`.
+async fn connect_tcp(host: &str, port: u16, fallback: bool) -> std::io::Result<TcpStream> {
+    let other = fallback.then(|| crate::platform::other_loopback(host)).flatten();
+    crate::platform::connect_tcp(host, port, CONNECT_TIMEOUT, other).await
 }
 
 /// Connects to a `-R` forward's destination here and relays the stream.
-async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String) {
+async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String, fallback: bool) {
     let result = match &dest {
-        Dest::Tcp { host, port } => match connect_tcp(host, *port).await {
+        Dest::Tcp { host, port } => match connect_tcp(host, *port, fallback).await {
             Ok(tcp) => {
                 let _ = tcp.set_nodelay(true);
                 crate::transport::splice(tcp, send, recv).await
@@ -298,7 +300,7 @@ async fn serve_remote(dest: Dest, send: SendHalf, recv: RecvHalf, origin: String
                 let req = tokio::time::timeout(SOCKS_HANDSHAKE, super::socks::accept(&mut stream))
                     .await
                     .map_err(|_| anyhow::anyhow!("no SOCKS request in time"))??;
-                match connect_tcp(&req.host, req.port).await {
+                match connect_tcp(&req.host, req.port, fallback).await {
                     Ok(tcp) => {
                         req.reply(&mut stream, true).await?;
                         let _ = tcp.set_nodelay(true);
@@ -383,6 +385,8 @@ pub struct Forwarder {
     gateway: bool,
     /// `PermitRemoteOpen` is set: qsh cannot check a SOCKS target against it.
     no_dynamic_remote: bool,
+    /// `LoopbackFallback`, for `-R` targets.
+    loopback_fallback: bool,
     active: Mutex<Vec<Active>>,
     held: Mutex<Vec<Forward>>,
     routes: Arc<Mutex<Routes>>,
@@ -403,11 +407,12 @@ impl Drop for Forwarder {
 }
 
 impl Forwarder {
-    pub fn new(conn: Arc<Conn>, gateway: bool, no_dynamic_remote: bool) -> Arc<Forwarder> {
+    pub fn new(conn: Arc<Conn>, gateway: bool, no_dynamic_remote: bool, loopback_fallback: bool) -> Arc<Forwarder> {
         Arc::new(Forwarder {
             conn: tokio::sync::watch::Sender::new(conn),
             gateway,
             no_dynamic_remote,
+            loopback_fallback,
             active: Mutex::default(),
             held: Mutex::default(),
             routes: Arc::default(),
@@ -837,7 +842,7 @@ impl Forwarder {
         if slot.is_some() {
             return;
         }
-        let (conn, routes, activity) = (self.conn(), self.routes.clone(), self.activity.clone());
+        let (conn, routes, activity, fallback) = (self.conn(), self.routes.clone(), self.activity.clone(), self.loopback_fallback);
         let task = tokio::spawn(async move {
             while let Some((send, mut recv)) = conn.accept_bi().await {
                 let (routes, busy) = (routes.clone(), activity.hold());
@@ -864,7 +869,7 @@ impl Forwarder {
                         }
                     };
                     match next {
-                        Some(Next::Remote(dest, origin)) => serve_remote(dest, send, recv, origin).await,
+                        Some(Next::Remote(dest, origin)) => serve_remote(dest, send, recv, origin, fallback).await,
                         Some(Next::Agent(path)) => match crate::agent::connect_raw(path.as_path()).await {
                             Ok(sock) => {
                                 let (ar, aw) = tokio::io::split(sock);

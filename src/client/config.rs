@@ -13,8 +13,8 @@
 //! `SessionType`, `StdinNull`, `ForkAfterAuthentication`,
 //! `ExitOnForwardFailure`, `LocalCommand`, `PermitLocalCommand`,
 //! `HostKeyAlias`, `ConnectTimeout`, `ConnectionAttempts`,
-//! `RefuseConnection`, `IgnoreUnknown`, and qsh's own `PersistSession` and
-//! `PredictiveEcho`. `Match` blocks are evaluated for `all`, `host`,
+//! `RefuseConnection`, `IgnoreUnknown`, and qsh's own `PersistSession`,
+//! `PredictiveEcho` and `LoopbackFallback`. `Match` blocks are evaluated for `all`, `host`,
 //! `originalhost`, `user`, `localuser`, `exec`, `localnetwork`, `tagged`,
 //! `canonical` and `final` (with `CanonicalizeHostname`, the configs are read
 //! again for the canonical name); a block whose conditions qsh cannot check
@@ -158,6 +158,8 @@ pub struct HostConfig {
     /// qsh's `PersistSession`: terminal sessions survive lost connections.
     pub persist_session: Option<bool>,
     pub restore_session: Option<bool>,
+    /// qsh's `LoopbackFallback`: a `-R` target refused on 127.0.0.1 tries ::1, and back.
+    pub loopback_fallback: Option<bool>,
     /// `ServerAliveInterval` (seconds; 0 = off).
     pub server_alive_interval: Option<u64>,
     /// `ServerAliveCountMax`.
@@ -595,6 +597,7 @@ impl Parser<'_> {
                 "certificatefile" => push_new(&mut o.certificate_files, first),
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
                 "restoresession" if o.restore_session.is_none() => o.restore_session = first.as_deref().map(yes),
+                "loopbackfallback" if o.loopback_fallback.is_none() => o.loopback_fallback = first.as_deref().map(yes),
                 "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.and_then(|v| v.parse().ok()),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
                 "controlmaster" if o.control_master.is_none() => o.control_master = first,
@@ -1146,6 +1149,7 @@ fn merge_ssh(ours: HostConfig, ssh: HostConfig) -> HostConfig {
         certificate_files: ours.certificate_files.into_iter().chain(ssh.certificate_files).collect(),
         persist_session: ours.persist_session.or(ssh.persist_session),
         restore_session: ours.restore_session,
+        loopback_fallback: ours.loopback_fallback,
         server_alive_interval: ours.server_alive_interval.or(ssh.server_alive_interval),
         server_alive_count_max: ours.server_alive_count_max.or(ssh.server_alive_count_max),
         control_master: ours.control_master.or(ssh.control_master),
@@ -1187,7 +1191,7 @@ fn under(mut high: HostConfig, low: HostConfig) -> HostConfig {
         add_keys_to_agent, forward_x11, forward_x11_trusted, forward_x11_timeout, xauth_location, tunnel, tunnel_device,
         escape_commandline, password_authentication, password_prompts, wants_final, canonicalize_failed: _, bad_file,
         clear_all_forwardings, escape_char, address_family, log_level, forward_agent, forward_agent_socket, obscure_keystrokes,
-        identities_only, identity_agent, certificate_files, persist_session, restore_session, server_alive_interval,
+        identities_only, identity_agent, certificate_files, persist_session, restore_session, loopback_fallback, server_alive_interval,
         server_alive_count_max, control_master, control_path, control_persist, predictive_echo, compression, bind_address,
         bind_interface, proxy_command, send_env, set_env, remote_command, session_type, stdin_null, fork_after_authentication,
         exit_on_forward_failure, local_command, permit_local_command, host_key_alias, connect_timeout, connection_attempts,
@@ -1204,7 +1208,7 @@ fn under(mut high: HostConfig, low: HostConfig) -> HostConfig {
         canonicalize_max_dots canonicalize_fallback_local add_keys_to_agent forward_x11 forward_x11_trusted forward_x11_timeout
         xauth_location tunnel tunnel_device escape_commandline password_authentication password_prompts bad_file
         clear_all_forwardings escape_char address_family log_level obscure_keystrokes identities_only identity_agent
-        persist_session restore_session server_alive_interval server_alive_count_max control_master control_path
+        persist_session restore_session loopback_fallback server_alive_interval server_alive_count_max control_master control_path
         control_persist predictive_echo compression bind_address bind_interface remote_command session_type stdin_null
         fork_after_authentication exit_on_forward_failure local_command permit_local_command host_key_alias connect_timeout
         connection_attempts);
@@ -1273,6 +1277,7 @@ Host *
         let c = parse(&on, "h", Path::new("/x"), true);
         assert_eq!((c.persist_session, c.predictive_echo.as_deref(), c.control_master.as_deref()), (Some(true), Some("auto"), Some("no")));
         assert_eq!((c.batch_mode, c.compression, c.exit_on_forward_failure), (Some(false), Some(false), Some(false)));
+        assert_eq!(c.loopback_fallback, Some(false));
         assert_eq!((c.strict_host_key_checking.as_deref(), c.escape_char.as_deref(), c.server_alive_count_max), (Some("ask"), Some("~"), Some(3)));
         assert_eq!((c.port, c.connect_timeout, c.obscure_keystrokes.as_deref()), (Some(4422), Some(0), Some("yes")));
         assert_eq!(c.refused, None);
