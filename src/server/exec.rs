@@ -204,10 +204,19 @@ pub(super) struct PtyInput(tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>);
 
 #[cfg(unix)]
 impl PtyInput {
+    // The `AsyncFd` owns its descriptor: the registration's safety contract is
+    // upheld by ownership (see the `SAFETY` comment below).
+    #[allow(unsafe_code)]
     pub(super) fn new(pty: &pty_process::Pty) -> std::io::Result<PtyInput> {
         use std::os::fd::AsFd;
         let fd = pty.as_fd().try_clone_to_owned()?;
-        Ok(PtyInput(tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::WRITABLE)?))
+        // tokio's I/O-safety constructor: the `AsyncFd` owns the descriptor and
+        // no one else can close it.
+        Ok(PtyInput(unsafe {
+            // SAFETY: `fd` is an owned clone owned by this `AsyncFd` for its
+            // whole life: the descriptor stays open and is never aliased.
+            tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::WRITABLE)?
+        }))
     }
 
     pub(super) async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {

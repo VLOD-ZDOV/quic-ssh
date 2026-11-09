@@ -72,11 +72,18 @@ mod device {
 
     impl Device {
         #[cfg(target_os = "linux")]
+        // The `AsyncFd` owns the `File`: the registration's safety contract is
+        // upheld by ownership (see the `SAFETY` comment below).
+        #[allow(unsafe_code)]
         pub fn handed(fd: std::os::fd::OwnedFd) -> Result<Self> {
             use nix::fcntl::{fcntl, FcntlArg, OFlag};
             let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
             fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-            Ok(Device::Handed(tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))?))
+            Ok(Device::Handed(unsafe {
+                // SAFETY: the `File` owns the descriptor and lives inside
+                // this `AsyncFd`: it stays open and unchanged until dropped.
+                tokio::io::unix::AsyncFd::register(std::fs::File::from(fd))?
+            }))
         }
 
         async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
