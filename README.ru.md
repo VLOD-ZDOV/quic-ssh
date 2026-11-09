@@ -1,5 +1,7 @@
 # quic-ssh (qsh)
 
+![qsh: SSH поверх QUIC. Подключение в 3,4 раза быстрее, 3-5 МБ памяти на сессию, в 1,6 раза быстрее при потерях](assets/banner.png)
+
 [English](README.md) | **Русский**
 
 [![CI](https://github.com/VLOD-ZDOV/quic-ssh/actions/workflows/ci.yml/badge.svg)](https://github.com/VLOD-ZDOV/quic-ssh/actions/workflows/ci.yml)
