@@ -10,6 +10,49 @@ keywords = ["ssh", "quic", "remote-shell", "networking"]
 categories = ["command-line-utilities", "network-programming"]
 
 [features]
+# Conveniences, all on by default. `--no-default-features` leaves every one
+# out: the locked-down build, a shell and commands over QUIC/TCP with keys or
+# certificates only, to hosts already known; whatever a request for the rest
+# reaches is a refusal. Pick some back with
+# `--no-default-features --features files,persist`.
+default = ["punch", "pair", "tofu", "forwarding", "agent", "x11", "tunnel", "persist", "sharing", "password", "root-login", "user-rc", "self-update", "files", "compress", "speed", "ui", "predict"]
+# `qsh punch`: NAT traversal through public STUN servers.
+punch = []
+# Pairing codes: `qsh pair`, `qshd pair`.
+pair = []
+# qsh trusts a host key it has never seen (asks, or --accept-new-host);
+# without it only keys already in known_hosts (or a @cert-authority) work.
+tofu = []
+# -L/-R/-D/-W and Unix socket forwarding.
+forwarding = []
+# -A: agent forwarding.
+agent = []
+# -X/-Y: X11 forwarding.
+x11 = []
+# -w: tun/tap tunnels.
+tunnel = []
+# Sessions that survive a lost connection (resume tokens).
+persist = []
+# ControlMaster: one connection shared by many sessions (a local socket).
+sharing = []
+# qshd accepts passwords.
+password = []
+# qshd lets root log in (as `permit_root_login` says).
+root-login = []
+# qshd runs ~/.ssh/rc.
+user-rc = []
+# `qsh update`.
+self-update = []
+# File copies: `qsh cp`, sftp (subsystems), uploads and downloads.
+files = []
+# zstd for file transfers (`-C`, `cp -C`).
+compress = []
+# `qsh speed`: qshd sends and takes bulk test data.
+speed = []
+# `qsh ui`, the menu.
+ui = []
+# Predictive echo: qsh draws typed keys before the server echoes them.
+predict = []
 # PAM for qshd (`use_pam`), on Linux; needs libpam (libpam0g-dev,
 # pam-devel). Not in the static release builds.
 pam = []

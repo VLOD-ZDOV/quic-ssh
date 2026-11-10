@@ -452,6 +452,35 @@ Like mosh, qsh shows what you type before the server's echo arrives, when echoes
 - When the server's output differs, the predicted characters are erased before it is shown, so the screen always ends up exactly as the server drew it.
 - `PredictiveEcho auto` (default), `yes` (also on fast links) or `no`, in `~/.config/qsh/config` or with `-o`.
 
+### Locked-down build
+
+Every convenience is a Cargo feature, on by default. Building without them gives the smallest qsh and qshd: a shell and commands over QUIC or TCP, keys and certificates only, to hosts whose key is already known. Requests for anything else are refused before any of their code runs, and no setting in `qshd.toml` or a `[[match]]` block turns them back on.
+
+```sh
+cargo build --release --no-default-features              # everything off
+cargo build --release --no-default-features --features files,persist   # pick some back
+```
+
+| Feature | What it adds |
+|---|---|
+| `tofu` | trusting a host key seen for the first time (asking, or `--accept-new-host`) |
+| `pair` | pairing codes (`qsh pair`, `qshd pair`) |
+| `password` | password logins on qshd |
+| `root-login` | root logins (as `permit_root_login` says; without it root never logs in) |
+| `user-rc` | `~/.ssh/rc` |
+| `files` | `qsh cp`, sftp and other subsystems |
+| `compress` | zstd for copies and session output |
+| `forwarding` | `-L`, `-R`, `-D`, `-W`, Unix sockets |
+| `agent`, `x11`, `tunnel` | `-A`, `-X`/`-Y`, `-w` |
+| `persist` | sessions that survive a lost connection (resume tokens) |
+| `sharing` | `ControlMaster` |
+| `speed` | `qsh speed` |
+| `punch` | `qsh punch` (NAT traversal through public STUN servers) |
+| `ui`, `predict` | `qsh ui`, echo prediction |
+| `self-update` | `qsh update` |
+
+`qshd -t` lists what the running build was made without. Without `tofu`, add host keys to `known_hosts` yourself (or use a `@cert-authority`); without `pair`, add client keys to `authorized_keys`. A smaller program has less that can go wrong, but no build can promise that it has no bugs: keep it updated.
+
 ## Server configuration
 
 | Mode | Run as | Who can log in | Files |

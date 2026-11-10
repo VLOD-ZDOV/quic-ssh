@@ -15,6 +15,7 @@ pub mod platform;
 pub mod prompt;
 pub mod proto;
 pub mod release;
+#[cfg(feature = "punch")]
 pub mod punch;
 pub mod server;
 pub mod tls;

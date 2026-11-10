@@ -892,6 +892,8 @@ impl ServerConfig {
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
         cfg.validate().with_context(|| format!("invalid {}", path.display()))?;
+        let mut cfg = cfg;
+        cfg.limit_to_build();
         Ok(Some(cfg))
     }
 
@@ -1099,7 +1101,65 @@ impl ServerConfig {
             m.apply(&mut cfg);
         }
         cfg.matches.clear();
+        // After the blocks: none of them can turn on what the build left out.
+        cfg.limit_to_build();
         cfg
+    }
+
+    /// Turns off what this qshd was built without (the default features in
+    /// Cargo.toml; `--no-default-features` is the locked-down build). No
+    /// setting in the file and no `[[match]]` block turns it back on.
+    pub fn limit_to_build(&mut self) {
+        if !cfg!(feature = "forwarding") {
+            self.disable_forwarding = true;
+            self.allow_tcp_forwarding = Forwarding::No;
+            self.allow_stream_local_forwarding = Forwarding::No;
+            self.gateway_ports = GatewayPorts::No;
+        }
+        if !cfg!(feature = "agent") {
+            self.allow_agent_forwarding = false;
+        }
+        if !cfg!(feature = "x11") {
+            self.x11_forwarding = false;
+        }
+        if !cfg!(feature = "tunnel") {
+            self.permit_tunnel = PermitTunnel::No;
+        }
+        if !cfg!(feature = "persist") {
+            self.session_timeout = 0;
+        }
+        if !cfg!(feature = "password") {
+            self.password_authentication = false;
+            self.permit_empty_passwords = false;
+        }
+        if !cfg!(feature = "root-login") {
+            self.permit_root_login = PermitRootLogin::No;
+        }
+        if !cfg!(feature = "user-rc") {
+            self.permit_user_rc = false;
+        }
+    }
+
+    /// What [`limit_to_build`](Self::limit_to_build) takes away, for `qshd -t`.
+    pub fn built_without() -> Vec<&'static str> {
+        [
+            ("forwarding", cfg!(feature = "forwarding")),
+            ("agent", cfg!(feature = "agent")),
+            ("x11", cfg!(feature = "x11")),
+            ("tunnel", cfg!(feature = "tunnel")),
+            ("persist", cfg!(feature = "persist")),
+            ("password", cfg!(feature = "password")),
+            ("root-login", cfg!(feature = "root-login")),
+            ("user-rc", cfg!(feature = "user-rc")),
+            ("pair", cfg!(feature = "pair")),
+            ("files", cfg!(feature = "files")),
+            ("compress", cfg!(feature = "compress")),
+            ("speed", cfg!(feature = "speed")),
+        ]
+        .into_iter()
+        .filter(|(_, on)| !on)
+        .map(|(name, _)| name)
+        .collect()
     }
 
     /// Why the allow/deny lists keep this user out, checked in sshd's order.
@@ -1447,6 +1507,37 @@ mod tests {
         assert!(cfg.login_refused(&who("a", none, "192.0.2.1")).is_some());
     }
 
+    /// What the build left out stays off, whatever the file or a block says.
+    #[test]
+    fn build_limits_win() {
+        let cfg = parse(
+            r#"
+            allow_tcp_forwarding = true
+            allow_agent_forwarding = true
+            x11_forwarding = true
+            permit_tunnel = "yes"
+            password_authentication = true
+            permit_root_login = "yes"
+            permit_user_rc = true
+
+            [[match]]
+            user = "u"
+            allow_tcp_forwarding = true
+            allow_agent_forwarding = true
+            password_authentication = true
+            "#,
+        );
+        let none: &[String] = &[];
+        let c = cfg.for_login(&who("u", none, "192.0.2.9"));
+        assert_eq!(c.local_forwarding(), cfg!(feature = "forwarding"));
+        assert_eq!(c.allow_agent_forwarding, cfg!(feature = "agent"));
+        assert_eq!(c.x11_forwarding, cfg!(feature = "x11"));
+        assert_eq!(c.permit_tunnel != PermitTunnel::No, cfg!(feature = "tunnel"));
+        assert_eq!(c.password_authentication, cfg!(feature = "password"));
+        assert_eq!(c.permit_root_login != PermitRootLogin::No, cfg!(feature = "root-login"));
+        assert_eq!(c.permit_user_rc, cfg!(feature = "user-rc"));
+    }
+
     #[test]
     fn match_blocks() {
         let cfg = parse(
@@ -1476,7 +1567,7 @@ mod tests {
         assert_eq!(a.max_sessions, 2, "settings only the second block has still apply");
         let b = cfg.for_login(&who("u", none, "192.0.2.9"));
         assert_eq!(b.force_command, None, "none removes the global value");
-        assert!(b.local_forwarding() && !b.remote_forwarding());
+        assert!(b.local_forwarding() == cfg!(feature = "forwarding") && !b.remote_forwarding());
         let c = cfg.for_login(&who("u", none, "203.0.113.9"));
         assert_eq!(c.force_command.as_deref(), Some("/bin/global"));
         assert_eq!(c.max_sessions, 10);

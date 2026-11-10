@@ -717,7 +717,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let mut escapes = opts.escape_char.filter(|_| raw.is_some()).map(|c| Escapes { commandline: opts.escape_commandline, ..Escapes::new(c) });
     // Echo prediction, likewise; it sees what is typed and what comes back.
     // Only when the output goes to the terminal too (not `| tee log`).
-    let mut predictor = (raw.is_some() && std::io::stdout().is_terminal() && opts.predict != Mode::Never).then(|| {
+    let mut predictor = (cfg!(feature = "predict") && raw.is_some() && std::io::stdout().is_terminal() && opts.predict != Mode::Never).then(|| {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         Predictor::new(opts.predict, rows, cols)
     });

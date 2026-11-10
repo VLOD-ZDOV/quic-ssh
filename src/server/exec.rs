@@ -447,7 +447,10 @@ async fn feed(mut recv: RecvHalf, mut input: Input, gone: oneshot::Sender<()>, t
                 continue;
             }
             ClientMsg::Compress => {
-                asked.store(true, Ordering::Relaxed);
+                // Without the compress feature, output stays as it is.
+                if cfg!(feature = "compress") {
+                    asked.store(true, Ordering::Relaxed);
+                }
                 continue;
             }
             other => other,

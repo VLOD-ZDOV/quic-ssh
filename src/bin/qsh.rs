@@ -168,12 +168,14 @@ enum Cmd {
         version: Option<String>,
     },
     /// Experimental: reach a qshd behind NAT by punching a UDP hole
+    #[cfg(feature = "punch")]
     Punch {
         #[command(subcommand)]
         cmd: PunchCmd,
     },
 }
 
+#[cfg(feature = "punch")]
 #[derive(Subcommand)]
 enum PunchCmd {
     /// The side behind NAT: wait for the other side and pass the packets to the local qshd
@@ -664,6 +666,16 @@ fn sources(a: &SshArgs) -> Sources {
 }
 
 async fn tool_main(cli: ToolCli) -> Result<i32> {
+    let needs = match &cli.cmd {
+        Cmd::Pair { .. } => Some(("pair", cfg!(feature = "pair"))),
+        Cmd::Cp { .. } => Some(("files", cfg!(feature = "files"))),
+        Cmd::Speed { .. } => Some(("speed", cfg!(feature = "speed"))),
+        Cmd::Update { .. } => Some(("self-update", cfg!(feature = "self-update"))),
+        _ => None,
+    };
+    if let Some((feature, false)) = needs {
+        bail!("this qsh was built without {feature}");
+    }
     let opts = cli.conn.options();
     match cli.cmd {
         Cmd::Keygen { file } => keygen(file),
@@ -682,7 +694,10 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             let target = Target::parse(&destination, cli.conn.port, cli.conn.full)?;
             speed_test(&target, &opts, Duration::from_secs(seconds)).await
         }
+        #[cfg(feature = "ui")]
         Cmd::Ui => qsh::client::tui::run(opts).await,
+        #[cfg(not(feature = "ui"))]
+        Cmd::Ui => bail!("this qsh was built without ui"),
         Cmd::Completions { shell, hosts } => {
             if hosts {
                 for h in client::completions::hosts(&home_dir()?) {
@@ -715,6 +730,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             multi::run(&dests, &command, parallel, &cli.conn.as_args(), json).await
         }
         Cmd::Update { version } => update(version.as_deref()),
+        #[cfg(feature = "punch")]
         Cmd::Punch { cmd } => {
             use qsh::punch;
             match cmd {
@@ -946,6 +962,59 @@ fn save_connection(name: &str, dest: &str, a: &SshArgs) -> Result<()> {
     Ok(())
 }
 
+/// Takes out of a session what this qsh was built without (Cargo features;
+/// `--no-default-features` is the locked-down build). Asked for on the
+/// command line, it is an error; set in a config file (which ssh may share),
+/// it is turned off with a warning.
+fn limit_to_build(a: &mut SshArgs, t: &mut Target) -> Result<()> {
+    let mut off: Vec<&str> = Vec::new();
+    if !cfg!(feature = "forwarding") {
+        if !a.local_forwards.is_empty() || !a.remote_forwards.is_empty() || !a.dynamic_forwards.is_empty() || a.stdio_forward.is_some() {
+            bail!("this qsh was built without forwarding (-L, -R, -D, -W)");
+        }
+        if !t.local_forwards.is_empty() || !t.remote_forwards.is_empty() || !t.dynamic_forwards.is_empty() {
+            off.push("LocalForward/RemoteForward/DynamicForward");
+            t.local_forwards.clear();
+            t.remote_forwards.clear();
+            t.dynamic_forwards.clear();
+        }
+    }
+    if !cfg!(feature = "agent") {
+        if a.forward_agent == Some(true) {
+            bail!("this qsh was built without agent forwarding (-A)");
+        }
+        if t.forward_agent {
+            off.push("ForwardAgent");
+        }
+        (a.forward_agent, t.forward_agent) = (Some(false), false);
+    }
+    if !cfg!(feature = "x11") && t.forward_x11.take().is_some() {
+        off.push("X11 forwarding (-X/-Y, ForwardX11)");
+    }
+    if !cfg!(feature = "tunnel") && t.tunnel.take().is_some() {
+        off.push("Tunnel (-w)");
+    }
+    if !cfg!(feature = "persist") {
+        if t.restore_session {
+            off.push("RestoreSession");
+        }
+        (t.persist_session, t.restore_session) = (false, false);
+    }
+    if !cfg!(feature = "sharing") && t.sharing.path.take().is_some() {
+        off.push("ControlMaster");
+    }
+    if !cfg!(feature = "tofu") {
+        if a.accept_new_host {
+            bail!("this qsh was built without trust on first use (--accept-new-host): add the host key to known_hosts");
+        }
+        t.host_key_policy = client::HostKeyPolicy::Strict;
+    }
+    if !(off.is_empty() || a.quiet || t.quiet) {
+        eprintln!("qsh: warning: this qsh was built without {}; not used", off.join(", "));
+    }
+    Ok(())
+}
+
 async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if let Some(why) = a.refused.clone() {
         if a.full {
@@ -972,6 +1041,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         Err(e) if a.full && !e.is::<client::ConfigError>() => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),
         Err(e) => return Err(e),
     };
+    limit_to_build(&mut a, &mut target)?;
     if !(a.quiet || target.quiet) {
         for o in &target.unapplied {
             eprintln!("qsh: warning: {o} is not supported by qsh and has no effect");
@@ -1292,7 +1362,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
             escape_commandline: target.escape_commandline,
             stdin_null: a.stdin_null || a.background,
             reconnect,
-            compress: a.compress || target.compress_output,
+            compress: (a.compress || target.compress_output) && cfg!(feature = "compress"),
             left_behind,
             claim: claim.filter(|_| pty).map(Arc::new),
             server_alive: target.server_alive,
@@ -1613,7 +1683,7 @@ async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnAr
     if compress && conn.server_version() < 5 {
         eprintln!("qsh: the server's qshd is too old for compression (-C); copying without it");
     }
-    let compress = compress || target.compression;
+    let compress = (compress || target.compression) && cfg!(feature = "compress");
     // Like scp: a source that fails does not stop the others.
     let mut failed = None;
     for job in jobs {

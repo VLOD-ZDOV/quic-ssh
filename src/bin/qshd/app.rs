@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use qsh::config::ServerConfig;
@@ -369,6 +369,10 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
     for line in cfg.match_overrides() {
         eprintln!("qshd: {line}");
     }
+    let without = qsh::config::ServerConfig::built_without();
+    if !without.is_empty() {
+        eprintln!("qshd: built without {} (forced off, whatever the config says)", without.join(", "));
+    }
     if !print {
         return Ok(());
     }
@@ -412,6 +416,9 @@ fn init(config: Option<PathBuf>) -> Result<()> {
 }
 
 fn pair(config: Option<PathBuf>, qr: bool, host: Option<String>) -> Result<()> {
+    if !cfg!(feature = "pair") {
+        bail!("this qshd was built without pairing (the `pair` feature); add keys to authorized_keys instead");
+    }
     let (cfg, ..) = load_config(config, false)?;
     let given = host.is_some();
     let host = match host {

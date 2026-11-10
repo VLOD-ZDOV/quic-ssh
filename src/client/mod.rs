@@ -21,6 +21,7 @@ pub mod session;
 mod socks;
 pub mod speed;
 pub mod saved;
+#[cfg(feature = "ui")]
 pub mod tui;
 pub mod ui_state;
 
@@ -1027,6 +1028,8 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
         HostTrust::Unknown => {
             tracing::debug!("'{hid}' is not in known_hosts");
             let policy = if opts.accept_new_host { HostKeyPolicy::AcceptNew } else { target.host_key_policy };
+            // Built without trust on first use: only keys known beforehand.
+            let policy = if cfg!(feature = "tofu") { policy } else { HostKeyPolicy::Strict };
             let trusted = match policy {
                 _ if !opts.host_keys_from_ssh.is_empty() => {
                     if !opts.host_keys_from_ssh.contains(&key) {
@@ -1042,6 +1045,9 @@ async fn verify_host_key(conn: &Conn, target: &Target, opts: &ConnectOptions) ->
             };
             if !trusted {
                 conn.close().await;
+                if !cfg!(feature = "tofu") {
+                    bail!("host key verification failed for '{hid}' ({}): unknown host; add its key to known_hosts (this qsh never trusts a new one on its own)", key.fingerprint());
+                }
                 bail!("host key verification failed for '{hid}' ({}); use `qsh pair` or --accept-new-host", key.fingerprint());
             }
             known_hosts_for(target)?.0.add(&hid, key)?;
@@ -1283,6 +1289,9 @@ async fn jump_hosts(target: &Target, opts: &ConnectOptions) -> Result<Vec<Arc<Co
 
 /// Pairs this client with the server using a one-time code from `qshd pair`.
 pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<()> {
+    if !cfg!(feature = "pair") {
+        bail!("this qsh was built without pair");
+    }
     refuse_proxy(target)?;
     let id = load_identity(&opts.identities, &target.identity_files, true, target.batch_mode)?;
     // Through qsh's jump hosts, like a login.

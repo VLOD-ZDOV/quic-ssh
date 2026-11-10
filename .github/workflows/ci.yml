@@ -66,6 +66,19 @@ jobs:
       - run: cargo build --locked --features pam
       - run: sudo tests/system-mode.sh target/debug
 
+  # The locked-down build (no default features): it must build without
+  # warnings, and its own refusals are checked by the unit tests.
+  lockdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --no-default-features --lib --bins -- -D warnings
+      - run: cargo test --locked --no-default-features --lib
+
   # Known vulnerabilities in dependencies (RustSec advisory database).
   audit:
     runs-on: ubuntu-latest

@@ -529,6 +529,14 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
         s => Duration::from_secs(s),
     };
     let left = || grace.saturating_sub(started.elapsed());
+    if resume.is_some() && !cfg!(feature = "persist") {
+        *outcome = Outcome::AuthFailed;
+        return write_msg(&mut send, &Reply::Err("this qshd was built without persist (no sessions to resume)".into())).await;
+    }
+    if pairing && !cfg!(feature = "pair") {
+        *outcome = Outcome::AuthFailed;
+        return write_msg(&mut send, &Reply::Err("this qshd was built without pairing; add the key to authorized_keys".into())).await;
+    }
     if pairing {
         // A paired key would go to a file this server does not read.
         let user = user.filter(|_| cfg.use_qsh_authorized_keys);
@@ -855,6 +863,11 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         }
         Err(e) => return Err(e),
     };
+    // What this qshd was built without is refused before anything else
+    // looks at the request: its code is never reached.
+    if let Some(feature) = left_out(&request) {
+        return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
+    }
     // Pings (ServerAlive) and the forwards of what is already running: a
     // port stays usable as long as the connection, and across a reconnect.
     // The session they belong to may have them anyway, and what the login
@@ -1221,6 +1234,39 @@ fn nologin(path: &std::path::Path) -> Option<String> {
     let text: String = text.chars().filter(|&c| !crate::proto::hidden(c) || c == '\n').collect();
     let text = text.trim();
     Some(if text.is_empty() { "logins are disabled (/etc/nologin)".into() } else { text.to_string() })
+}
+
+/// The build feature a request needs, if this qshd was built without it
+/// (`cargo build --no-default-features` leaves them all out).
+fn left_out(request: &Request) -> Option<&'static str> {
+    let needs = match request {
+        Request::Compressed(_) => "compress",
+        Request::Upload { .. }
+        | Request::Download { .. }
+        | Request::UploadTree { .. }
+        | Request::DownloadTree { .. }
+        | Request::UploadResume { .. }
+        | Request::DownloadFrom { .. }
+        | Request::Subsystem { .. } => "files",
+        Request::DirectTcp { .. } | Request::DirectStreamLocal { .. } | Request::RemoteForward { .. } | Request::RemoteForwardStreamLocal { .. } => "forwarding",
+        Request::AgentForward => "agent",
+        Request::X11Forward { .. } => "x11",
+        Request::Tunnel { .. } => "tunnel",
+        Request::Persistent { .. } | Request::Resume { .. } | Request::Hold => "persist",
+        Request::SpeedDown { .. } | Request::SpeedUp { .. } => "speed",
+        _ => return None,
+    };
+    let built = match needs {
+        "compress" => cfg!(feature = "compress"),
+        "files" => cfg!(feature = "files"),
+        "forwarding" => cfg!(feature = "forwarding"),
+        "agent" => cfg!(feature = "agent"),
+        "x11" => cfg!(feature = "x11"),
+        "tunnel" => cfg!(feature = "tunnel"),
+        "persist" => cfg!(feature = "persist"),
+        _ => cfg!(feature = "speed"),
+    };
+    (!built).then_some(needs)
 }
 
 /// Addresses to listen on for `-R`, following `gateway_ports` like sshd's
