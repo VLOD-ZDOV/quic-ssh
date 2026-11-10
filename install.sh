@@ -212,7 +212,12 @@ fi
 name=qsh-$arch-$plat
 say "Downloading $name.tar.gz"
 fetch "$url/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $url/$name.tar.gz"
-fetch "$url/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $url/SHA256SUMS"
+# QSH_SUMS: a SHA256SUMS that `qsh update` has checked the release signature of.
+if [ -n "${QSH_SUMS:-}" ]; then
+    cp "$QSH_SUMS" "$tmp/SHA256SUMS" || die "cannot read $QSH_SUMS"
+else
+    fetch "$url/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $url/SHA256SUMS"
+fi
 
 want=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
 [ -n "$want" ] || die "$name.tar.gz is not in SHA256SUMS"

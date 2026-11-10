@@ -14,6 +14,7 @@ pub mod pattern;
 pub mod platform;
 pub mod prompt;
 pub mod proto;
+pub mod release;
 pub mod punch;
 pub mod server;
 pub mod tls;

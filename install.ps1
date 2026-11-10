@@ -46,7 +46,9 @@
     try {
         Write-Host "Downloading $name.zip"
         Invoke-WebRequest "$url/$name.zip" -OutFile "$tmp\$name.zip" -UseBasicParsing
-        Invoke-WebRequest "$url/SHA256SUMS" -OutFile "$tmp\SHA256SUMS" -UseBasicParsing
+        # QSH_SUMS: a SHA256SUMS that `qsh update` has checked the release signature of.
+        if ($env:QSH_SUMS) { Copy-Item $env:QSH_SUMS "$tmp\SHA256SUMS" }
+        else { Invoke-WebRequest "$url/SHA256SUMS" -OutFile "$tmp\SHA256SUMS" -UseBasicParsing }
         $line = Get-Content "$tmp\SHA256SUMS" | Where-Object { $_ -match "\s\*?$name\.zip$" } | Select-Object -First 1
         if (-not $line) { throw "$name.zip is not in SHA256SUMS" }
         $want = ($line -split '\s+')[0]

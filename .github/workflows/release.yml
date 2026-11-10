@@ -132,7 +132,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          sha256sum *.tar.gz *.zip install.sh install.ps1 > SHA256SUMS
+          # The version line is signed with the hashes: `qsh update` refuses an older list.
+          { echo "# version $TAG"; sha256sum *.tar.gz *.zip install.sh install.ps1; } > SHA256SUMS
           cat > notes.md <<NOTES
           Static Linux binaries (musl) for x86_64 and aarch64, macOS (Apple Silicon and Intel), Windows (qsh and qshd), and a native Android build for Termux (qsh-aarch64-android).
 
@@ -144,4 +145,5 @@ jobs:
 
           See the README for setup.
           NOTES
-          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz *.zip install.sh install.ps1 SHA256SUMS
+          # A draft: it goes public once scripts/sign-release.sh has added SHA256SUMS.sig.
+          gh release create "$TAG" --draft --repo "${{ github.repository }}" --title "$TAG" --notes-file notes.md *.tar.gz *.zip install.sh install.ps1 SHA256SUMS

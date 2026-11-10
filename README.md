@@ -51,7 +51,7 @@ irm https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install.ps1 |
 
 It installs `qsh.exe` to `%LOCALAPPDATA%\Programs\qsh` and adds that folder to your `PATH`.
 
-To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. The restart closes the qsh sessions open on that server, so it asks first when run in a terminal; tmux, screen and `nohup` jobs keep running with the unit files from `contrib/` (`KillMode=process`, as for sshd). `qsh update v1.0.2` installs a given release. The script is taken from the latest release, not from the main branch.
+To update later, run `qsh update`. It installs the latest release to the same folder, updates qshd too if it sits next to qsh, and restarts a running qshd service. The restart closes the qsh sessions open on that server, so it asks first when run in a terminal; tmux, screen and `nohup` jobs keep running with the unit files from `contrib/` (`KillMode=process`, as for sshd). `qsh update v1.0.2` installs a given release. Releases are signed: `qsh update` first checks the signature of the release's `SHA256SUMS` against the release key built into qsh, then runs that release's installer only if its checksum is listed there, and the installer checks the archive against the same list. A release whose files were replaced, or one older than the installed qsh (unless asked for by name), is refused. Releases from before signing cannot be installed with `qsh update`; use the install script for them.
 
 <details>
 <summary><b>Prebuilt binaries</b></summary>

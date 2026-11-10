@@ -748,10 +748,10 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
     }
 }
 
-const INSTALLER: &str = "https://github.com/VLOD-ZDOV/quic-ssh/releases/latest/download/install";
+const RELEASES: &str = "https://github.com/VLOD-ZDOV/quic-ssh/releases";
 
-/// Runs the release's installer in update mode on the directory this qsh is in.
-/// The installer of the latest release also installs older tags.
+/// Runs the release's installer in update mode on the directory this qsh is
+/// in, once the release's signed `SHA256SUMS` checks out and lists it.
 fn update(version: Option<&str>) -> Result<i32> {
     if let Some(v) = version {
         if !v.starts_with('v') || !v[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
@@ -760,24 +760,78 @@ fn update(version: Option<&str>) -> Result<i32> {
     }
     let exe = std::env::current_exe().and_then(|p| p.canonicalize()).context("cannot find this qsh")?;
     let dir = exe.parent().context("cannot find this qsh")?;
+    let base = match version {
+        Some(v) => format!("{RELEASES}/download/{v}"),
+        None => format!("{RELEASES}/latest/download"),
+    };
+    let tmp = std::env::temp_dir().join(format!("qsh-update-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    qsh::keys::create_private_dir(&tmp)?;
+    let result = update_in(&tmp, &base, version, dir);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+fn update_in(tmp: &Path, base: &str, version: Option<&str>, dir: &Path) -> Result<i32> {
+    use qsh::release;
+    let installer = if cfg!(windows) { "install.ps1" } else { "install.sh" };
+    for file in ["SHA256SUMS", "SHA256SUMS.sig", installer] {
+        download(&format!("{base}/{file}"), &tmp.join(file)).with_context(|| format!("cannot download {file}"))?;
+    }
+    let sums = std::fs::read(tmp.join("SHA256SUMS"))?;
+    let sig = std::fs::read_to_string(tmp.join("SHA256SUMS.sig"))?;
+    release::verify(&sums, &sig).context("not updating")?;
+    let sums_text = String::from_utf8_lossy(&sums);
+    let tag = release::version(&sums_text).context("not updating: the signed SHA256SUMS names no release")?;
+    let current = concat!("v", env!("CARGO_PKG_VERSION"));
+    match version {
+        // An old release's signed list must not pass for the one asked for.
+        Some(v) if v != tag => bail!("not updating: asked for {v}, but the signed SHA256SUMS is for {tag}"),
+        Some(_) => {}
+        None if release::older(tag, current) => {
+            bail!("not updating: the latest release ({tag}) is older than this qsh ({current}); use --version to go back")
+        }
+        None => {}
+    }
+    let script = std::fs::read(tmp.join(installer))?;
+    let want = release::listed(&sums_text, installer).with_context(|| format!("not updating: {installer} is not in SHA256SUMS"))?;
+    if release::sha256_hex(&script) != want {
+        bail!("not updating: {installer} does not match its checksum");
+    }
     let mut cmd = if cfg!(windows) {
         let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-Command", &format!("irm {INSTALLER}.ps1 | iex")]);
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(tmp.join(installer));
         c
     } else {
         let mut c = std::process::Command::new("sh");
-        c.args(["-c", &format!(
-            "if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL {INSTALLER}.sh); else s=$(wget -qO- {INSTALLER}.sh); fi || exit 1; sh -c \"$s\" install.sh --update"
-        )]);
+        c.arg(tmp.join(installer)).arg("--update");
         c
     };
-    cmd.env("QSH_BIN_DIR", dir);
-    match version {
-        Some(v) => cmd.env("QSH_VERSION", v),
-        None => cmd.env_remove("QSH_VERSION"),
-    };
+    // The installer takes the archives from that release and checks them
+    // against the list checked here, not one it downloads again.
+    cmd.env("QSH_BIN_DIR", dir).env("QSH_VERSION", tag).env("QSH_SUMS", tmp.join("SHA256SUMS"));
     let status = cmd.status().context("cannot run the installer")?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Saves `url` to `to` with curl or wget (PowerShell on Windows).
+fn download(url: &str, to: &Path) -> Result<()> {
+    use std::process::{Command, Stdio};
+    let ok = if cfg!(windows) {
+        // Through the environment: words after -Command are pasted into the script.
+        let script = "$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri $env:QSH_DL_URL -OutFile $env:QSH_DL_TO -UseBasicParsing";
+        Command::new("powershell").args(["-NoProfile", "-Command", script]).env("QSH_DL_URL", url).env("QSH_DL_TO", to).status()?.success()
+    } else {
+        let curl = Command::new("curl").args(["-fsSL", "-o"]).arg(to).arg(url).stdin(Stdio::null()).status();
+        match curl {
+            Ok(s) => s.success(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Command::new("wget").arg("-qO").arg(to).arg(url).stdin(Stdio::null()).status().context("need curl or wget")?.success(),
+            Err(e) => return Err(e.into()),
+        }
+    };
+    if !ok {
+        bail!("{url}: download failed");
+    }
+    Ok(())
 }
 
 /// `-G`: prints the resolved settings, like ssh. Tools (e.g. git) also use it
