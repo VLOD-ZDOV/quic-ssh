@@ -210,7 +210,45 @@ fn push_new(list: &mut Vec<String>, v: Option<String>) {
 }
 
 fn yes(v: &str) -> bool {
-    matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "on")
+    flag(v) == Some(true)
+}
+
+/// yes/true/on/1 or no/false/off/0, in any case (as qshd.toml takes them).
+fn flag(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "yes" | "true" | "on" | "1" => Some(true),
+        "no" | "false" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// The values a keyword takes, for those with a fixed set: in qsh's own
+/// config anything else is an error, not a quiet "no".
+fn choices(keyword: &str) -> Option<&'static [&'static str]> {
+    const YES_NO: &[&str] = &["yes", "no"];
+    Some(match keyword {
+        "stdinnull" | "forkafterauthentication" | "exitonforwardfailure" | "permitlocalcommand" | "batchmode" | "hashknownhosts"
+        | "enableescapecommandline" | "passwordauthentication" | "forwardx11" | "forwardx11trusted" | "clearallforwardings"
+        | "identitiesonly" | "persistsession" | "restoresession" | "loopbackfallback" | "canonicalizefallbacklocal" => YES_NO,
+        "compression" => &["yes", "no", "auto"],
+        "stricthostkeychecking" => &["yes", "no", "ask", "accept-new"],
+        "requesttty" => &["yes", "no", "force", "auto"],
+        "predictiveecho" => &["yes", "no", "auto", "always", "never"],
+        "addressfamily" => &["any", "inet", "inet6"],
+        "canonicalizehostname" => &["yes", "no", "always"],
+        "controlmaster" => &["yes", "no", "ask", "auto", "autoask"],
+        _ => return None,
+    })
+}
+
+/// A value of a keyword with [`choices`], lower case, with the other
+/// spellings of yes and no (1, on, true...) read as those.
+fn normalized(allowed: &[&str], v: &str) -> String {
+    match flag(v) {
+        Some(true) if allowed.contains(&"yes") => "yes".into(),
+        Some(false) if allowed.contains(&"no") => "no".into(),
+        _ => v.to_ascii_lowercase(),
+    }
 }
 
 use crate::pattern::{host_matches, name_matches, wildcard};
@@ -393,6 +431,11 @@ impl Parser<'_> {
         for (n, line) in text.lines().enumerate() {
             let Some((keyword, args, raw)) = split_line_raw(line) else { continue };
             let first = args.first().cloned();
+            let allowed = choices(&keyword);
+            let first = match (allowed, first) {
+                (Some(allowed), Some(v)) => Some(normalized(allowed, &v)),
+                (_, first) => first,
+            };
             let n = n + 1;
             // As ssh: a number that does not parse is an error, not the default.
             // (ssh's own files are ssh's to judge.)
@@ -406,6 +449,12 @@ impl Parser<'_> {
                 if bad {
                     let name = &line.trim_start()[..keyword.len()];
                     self.out.bad_option.get_or_insert_with(|| format!("{}Bad value for {name}: {}", at(&self.file, n), args.join(" ")));
+                }
+                if let (Some(allowed), Some(v)) = (allowed, first.as_deref()) {
+                    if !allowed.contains(&v) {
+                        let name = &line.trim_start()[..keyword.len()];
+                        self.out.bad_option.get_or_insert_with(|| format!("{}Bad value for {name}: {} (one of: {})", at(&self.file, n), args.join(" "), allowed.join(", ")));
+                    }
                 }
             }
             if keyword == "match" && args.iter().any(|a| a.trim_start_matches('!').eq_ignore_ascii_case("final")) {
@@ -521,6 +570,9 @@ impl Parser<'_> {
                 // `LocalForward [bind:]port host:hostport` → `-L [bind:]port:host:hostport`.
                 // Forwards mean the same whichever server answers: also without --full.
                 "localforward" if args.len() == 2 => push_new(&mut o.local_forwards, Some(format!("{}:{}", args[0], args[1]))),
+                // Also as on the command line (`-L 8080:localhost:80`): what
+                // people paste. The spec itself is checked like -L's.
+                "localforward" if args.len() == 1 && first.as_deref().is_some_and(|v| v.contains(':')) => push_new(&mut o.local_forwards, first),
                 "remoteforward" if args.len() == 2 => push_new(&mut o.remote_forwards, Some(format!("{}:{}", args[0], args[1]))),
                 // `RemoteForward [bind:]port` alone: a SOCKS proxy on the server.
                 "remoteforward" if args.len() == 1 => push_new(&mut o.remote_forwards, first),
@@ -612,10 +664,11 @@ impl Parser<'_> {
                 "escapechar" if o.escape_char.is_none() => o.escape_char = first,
                 "addressfamily" if o.address_family.is_none() => o.address_family = first.map(|v| v.to_ascii_lowercase()),
                 "loglevel" if o.log_level.is_none() => o.log_level = first.map(|v| v.to_ascii_lowercase()),
-                "forwardagent" if o.forward_agent.is_none() => match first.as_deref().map(str::to_ascii_lowercase).as_deref() {
-                    Some("yes" | "true" | "on" | "no" | "false" | "off") | None => o.forward_agent = first.as_deref().map(yes),
+                "forwardagent" if o.forward_agent.is_none() => match first.as_deref().map(flag) {
+                    None => {}
+                    Some(Some(on)) => o.forward_agent = Some(on),
                     // A path or $VARIABLE: forward that agent.
-                    Some(_) => (o.forward_agent, o.forward_agent_socket) = (Some(true), first),
+                    Some(None) => (o.forward_agent, o.forward_agent_socket) = (Some(true), first),
                 },
                 "identitiesonly" if o.identities_only.is_none() => o.identities_only = first.as_deref().map(yes),
                 "identityagent" if o.identity_agent.is_none() => o.identity_agent = first,
@@ -1300,6 +1353,19 @@ Host *
     User fallback
     IdentityFile ~/.ssh/id_%h
 "#;
+
+    #[test]
+    fn value_spellings() {
+        let c = parse("Host h\n BatchMode 1\n ForwardX11 ON\n ForwardAgent 0\n RequestTTY true\n LocalForward 8080:localhost:80\n", "h", Path::new("/x"), true);
+        assert_eq!((c.batch_mode, c.forward_x11, c.forward_agent), (Some(true), Some(true), Some(false)));
+        assert_eq!(c.request_tty.as_deref(), Some("yes"));
+        assert_eq!(c.local_forwards, ["8080:localhost:80"]);
+        assert!(c.bad_option.is_none(), "{:?}", c.bad_option);
+        let bad = parse("Host h\n BatchMode kinda\n", "h", Path::new("/x"), true);
+        assert!(bad.bad_option.unwrap().contains("one of: yes, no"));
+        // ssh's own file is ssh's to judge.
+        assert!(parse("Host h\n BatchMode kinda\n", "h", Path::new("/x"), false).bad_option.is_none());
+    }
 
     #[test]
     fn config_template() {

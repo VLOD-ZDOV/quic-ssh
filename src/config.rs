@@ -343,14 +343,16 @@ impl<'de> Deserialize<'de> for Forwarding {
         #[serde(untagged)]
         enum Raw {
             Bool(bool),
+            Int(i64),
             Text(String),
         }
         Ok(match Raw::deserialize(d)? {
-            Raw::Bool(true) => Forwarding::All,
-            Raw::Bool(false) => Forwarding::No,
+            Raw::Bool(true) | Raw::Int(1) => Forwarding::All,
+            Raw::Bool(false) | Raw::Int(0) => Forwarding::No,
+            Raw::Int(n) => return Err(serde::de::Error::custom(format!("unknown forwarding {n} (yes, no, local, remote)"))),
             Raw::Text(t) => match t.to_ascii_lowercase().as_str() {
-                "yes" | "all" => Forwarding::All,
-                "no" => Forwarding::No,
+                "yes" | "all" | "true" | "on" | "1" => Forwarding::All,
+                "no" | "false" | "off" | "0" => Forwarding::No,
                 "local" => Forwarding::Local,
                 "remote" => Forwarding::Remote,
                 _ => return Err(serde::de::Error::custom(format!("unknown forwarding {t:?} (yes, no, local, remote)"))),
@@ -873,6 +875,89 @@ impl Default for ServerConfig {
     }
 }
 
+/// The file again, with what people write and the strict reading refuses:
+/// a choice in another case (`"No"`, `"ClientSpecified"`), forwarding as
+/// `1`/`0`, a number in quotes, a duration with a unit (`"90s"`, `"5m"`,
+/// `"1h"`, `"1d"`, `"1h30m"`). `None` if it still does not read.
+fn friendlier(text: &str) -> Option<ServerConfig> {
+    use toml::Value;
+    fn fix(table: &mut toml::Table) {
+        for (key, value) in table.iter_mut() {
+            match key.as_str() {
+                "permit_root_login" | "gateway_ports" | "permit_tunnel" | "totp" | "allow_tcp_forwarding" | "allow_stream_local_forwarding" => {
+                    if let Value::String(s) = value {
+                        *s = s.to_ascii_lowercase();
+                    }
+                }
+                "session_timeout" | "login_grace_time" | "totp_valid_for" | "client_alive_interval" => {
+                    if let Some(secs) = value.as_str().and_then(duration_secs) {
+                        *value = Value::Integer(secs);
+                    }
+                }
+                "max_connections" | "max_startups" | "max_startups_per_ip" | "connection_buffer_mb" | "max_auth_tries" | "max_sessions"
+                | "client_alive_count_max" | "x11_display_offset" => {
+                    if let Some(n) = value.as_str().and_then(|s| s.trim().parse::<i64>().ok()) {
+                        *value = Value::Integer(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut doc: toml::Table = text.parse().ok()?;
+    fix(&mut doc);
+    if let Some(Value::Array(blocks)) = doc.get_mut("match") {
+        for block in blocks {
+            if let Value::Table(t) = block {
+                fix(t);
+            }
+        }
+    }
+    Value::Table(doc).try_into().ok()
+}
+
+/// `"90"`, `"90s"`, `"5m"`, `"1h30m"`, `"2d"`, `"1w"` as seconds.
+fn duration_secs(text: &str) -> Option<i64> {
+    let text = text.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(n) = text.parse::<i64>() {
+        return (n >= 0).then_some(n);
+    }
+    let (mut total, mut number) = (0i64, String::new());
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            'w' => 604800,
+            _ => return None,
+        };
+        total = total.checked_add(number.parse::<i64>().ok()?.checked_mul(unit)?)?;
+        number.clear();
+    }
+    number.is_empty().then_some(total)
+}
+
+/// A pointer for an unknown key that is a known one misspelled the usual ways.
+fn unknown_field_hint(message: &str) -> String {
+    let Some(name) = message.strip_prefix("unknown field `").and_then(|m| m.split('`').next()) else { return String::new() };
+    let lower = name.to_ascii_lowercase().replace('-', "_");
+    if lower == "port" {
+        return " (qshd takes the port with the address: listen = \"[::]:2222\")".into();
+    }
+    if lower != name && SETTING_NAMES.contains(&lower.as_str()) {
+        return format!(" (settings are written in lower case with _: {lower})");
+    }
+    String::new()
+}
+
 /// Upper bound for connection and session counts (tokio semaphores allow far more).
 const MAX_COUNT: usize = 1_000_000;
 /// Upper bound for durations in seconds: ten years.
@@ -887,7 +972,18 @@ impl ServerConfig {
     /// Loads `path`, or `None` if it does not exist.
     pub fn load_optional(path: &Path) -> Result<Option<ServerConfig>> {
         let cfg: ServerConfig = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?,
+            Ok(text) => match toml::from_str(&text) {
+                Ok(cfg) => cfg,
+                // Read as written first, so that an error points at its line;
+                // only then with the spellings people use (see `friendlier`).
+                Err(e) => match friendlier(&text) {
+                    Some(cfg) => cfg,
+                    None => {
+                        let hint = unknown_field_hint(e.message());
+                        return Err(anyhow::Error::new(e).context(format!("invalid {}{hint}", path.display())));
+                    }
+                },
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
         };
@@ -1505,6 +1601,20 @@ mod tests {
         assert!(cfg.login_refused(&who("a", &staff, "192.0.2.1")).is_none());
         assert!(cfg.login_refused(&who("a", &both, "192.0.2.1")).is_some());
         assert!(cfg.login_refused(&who("a", none, "192.0.2.1")).is_some());
+    }
+
+    #[test]
+    fn friendly_spellings() {
+        assert_eq!((duration_secs("90"), duration_secs("1h30m"), duration_secs("2d"), duration_secs(" 5M ")), (Some(90), Some(5400), Some(172800), Some(300)));
+        for bad in ["soon", "1x", "m", "", "-5"] {
+            assert_eq!(duration_secs(bad), None, "{bad:?}");
+        }
+        let c = friendlier("session_timeout = \"2h\"\npermit_root_login = \"No\"\nmax_sessions = \"3\"\nallow_tcp_forwarding = 0\n").unwrap();
+        assert_eq!((c.session_timeout, c.permit_root_login, c.max_sessions, c.allow_tcp_forwarding), (7200, PermitRootLogin::No, 3, Forwarding::No));
+        assert!(friendlier("session_timeout = \"soon\"\n").is_none());
+        assert!(unknown_field_hint("unknown field `Port`, expected").contains("listen"));
+        assert!(unknown_field_hint("unknown field `Max_Sessions`, expected").contains("max_sessions"));
+        assert_eq!(unknown_field_hint("unknown field `bogus`, expected"), "");
     }
 
     /// What the build left out stays off, whatever the file or a block says.
