@@ -208,10 +208,11 @@ mod imp {
         f.write_all(&rec)
     }
 
-    /// Reads a NUL-padded text field.
-    fn text(field: &[u8]) -> String {
+    /// Reads a NUL-padded text field. Anyone who can write wtmp picks it, and
+    /// it reaches the terminal in "Last login: ... from <host>".
+    pub(super) fn text(field: &[u8]) -> String {
         let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-        String::from_utf8_lossy(&field[..end]).chars().filter(|c| !c.is_control()).collect()
+        String::from_utf8_lossy(&field[..end]).chars().filter(|&c| !crate::proto::hidden(c)).collect()
     }
 
     fn get_int(buf: &[u8], at: usize, width: usize) -> i64 {
@@ -284,6 +285,12 @@ mod imp {
 #[cfg(all(test, target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
     use super::imp::*;
+
+    #[test]
+    fn text_fields_shown_safely() {
+        let field = "vpn.example.com\u{202E}gro.live\x1b[2J\0\0".as_bytes();
+        assert_eq!(text(field), "vpn.example.comgro.live[2J");
+    }
 
     #[test]
     fn utmp_entries() {

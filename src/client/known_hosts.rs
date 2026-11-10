@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 
 use crate::keys::{create_private_dir, PublicKey};
@@ -70,6 +70,26 @@ pub fn host_id(host: &str, port: u16) -> String {
     }
 }
 
+/// Reads a trust file. `Ok(None)`: it is owned by someone but the user or
+/// root, or anyone may write it (checked on the open file, not the name).
+/// Group write is let through: with per-user groups (umask 002) it is the norm.
+fn read_trusted(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata()?;
+        let me = crate::platform::uid();
+        if (m.uid() != 0 && m.uid() != me) || m.mode() & 0o002 != 0 {
+            return Ok(None);
+        }
+    }
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 impl KnownHosts {
     pub fn new(path: PathBuf) -> KnownHosts {
         KnownHosts { path: Some(path), read_also: Vec::new(), extra: None, hash: false }
@@ -87,8 +107,12 @@ impl KnownHosts {
         let mut text = String::new();
         let own = self.path.iter().map(|p| (p, true));
         for (path, is_own) in own.chain(self.read_also.iter().map(|p| (p, false))) {
-            match fs::read(path) {
-                Ok(b) => text.push_str(&String::from_utf8_lossy(&b)),
+            match read_trusted(path) {
+                Ok(Some(b)) => text.push_str(&String::from_utf8_lossy(&b)),
+                // A pin from a file others can write is no pin: refuse the
+                // user's own file, skip a shared one (as the config is checked).
+                Ok(None) if is_own => bail!("Bad owner or permissions on {}", path.display()),
+                Ok(None) => tracing::warn!("ignoring {}: bad owner or permissions", path.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // Only the user's own file must be readable; others (the
                 // system's, which may be closed to users) are skipped as by ssh.
@@ -168,7 +192,11 @@ impl KnownHosts {
         if let Some(dir) = path.parent() {
             create_private_dir(dir)?;
         }
-        let mut f = OpenOptions::new().read(true).append(true).create(true).open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).append(true).create(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(path)?;
         let id = id.to_ascii_lowercase();
         let name = if self.hash { hash_name(&id) } else { id };
         let mut line = format!("{name} {}\n", key.to_openssh(""));
@@ -181,8 +209,9 @@ impl KnownHosts {
 }
 
 impl KnownHosts {
-    /// Removes the lines that name `id` itself (in plain or hashed, not by a
+    /// Removes every line that trusts a key for `id` (by name, hash or
     /// pattern) from the user's file, as `ssh-keygen -R`; returns how many.
+    /// A pattern left behind would keep the forgotten key trusted.
     pub fn remove(&self, id: &str) -> Result<usize> {
         let Some(path) = &self.path else { return Ok(0) };
         // Bytes, so that the lines kept stay exactly as they were.
@@ -191,19 +220,12 @@ impl KnownHosts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {}", path.display()))),
         };
-        let lower = id.to_ascii_lowercase();
-        let names_id = |field: &str| {
-            field.split(',').any(|n| match n.strip_prefix("|1|") {
-                Some(h) => hashed_matches(h, &lower) || hashed_matches(h, id),
-                None => n.eq_ignore_ascii_case(id),
-            })
-        };
         let mut kept = Vec::new();
         let mut removed = 0;
         for raw_line in raw.split_inclusive(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(raw_line);
             let names = line.trim().split_once(char::is_whitespace).map(|(n, _)| n);
-            if names.is_some_and(|n| !n.starts_with(['@', '#']) && names_id(n)) {
+            if names.is_some_and(|n| !n.starts_with(['@', '#']) && names_match(n, id)) {
                 removed += 1;
             } else {
                 kept.extend_from_slice(raw_line);

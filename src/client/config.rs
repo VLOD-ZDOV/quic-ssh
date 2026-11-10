@@ -213,7 +213,7 @@ fn yes(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "on")
 }
 
-use crate::pattern::{host_matches, wildcard};
+use crate::pattern::{host_matches, name_matches, wildcard};
 use super::forward::Forward;
 
 /// Splits `Keyword value`, `Keyword=value` and `Keyword "quoted value"` lines.
@@ -426,9 +426,16 @@ impl Parser<'_> {
                     continue;
                 }
             }
-            if is_proxy(&keyword, first.as_deref()) && !self.ours {
-                // A proxy that may apply: do not connect around it.
-                if active == Applies::Maybe {
+            // A proxy that may apply: do not connect around it. ssh's file can
+            // hand the host to ssh (--full); in qsh's own there is no one to
+            // hand it to, so refuse.
+            if is_proxy(&keyword, first.as_deref()) && active == Applies::Maybe {
+                if self.ours {
+                    let where_ = at(&self.file, n);
+                    self.out.refuse_connection.get_or_insert_with(|| {
+                        format!("{where_}{keyword} under a Match qsh cannot check; not connecting around it")
+                    });
+                } else {
                     self.out.needs_proxy = true;
                 }
             }
@@ -468,8 +475,12 @@ impl Parser<'_> {
                 }
             }
             match keyword.as_str() {
+                // `Host` patterns are case-sensitive in ssh (only `Match host`
+                // folds case): so in ssh's files. qsh's own config has always
+                // folded case, and configs written for it rely on that.
                 "host" => {
-                    active = cap(if host_matches(&args, self.host) { Applies::Yes } else { Applies::No });
+                    let matched = if self.ours { host_matches(&args, self.host) } else { name_matches(&args, self.host) };
+                    active = cap(if matched { Applies::Yes } else { Applies::No });
                     continue;
                 }
                 "match" => {

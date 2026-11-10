@@ -124,8 +124,10 @@ impl Agent {
             bail!("agent refused to list keys");
         }
         let n = take_u32(&mut rest)?;
+        // No cap on the count: the reply is at most MAX_REPLY bytes, and each
+        // key takes at least 8 of them (a cap would hide keys past it).
         let mut keys = Vec::new();
-        for _ in 0..n.min(1024) {
+        for _ in 0..n {
             let blob = take_string(&mut rest)?.to_vec();
             let comment = String::from_utf8_lossy(take_string(&mut rest)?).into_owned();
             keys.push(AgentKey { blob, comment });

@@ -54,7 +54,7 @@ impl Report {
         };
         self.failed |= level == Level::Bad;
         // Details may hold a server's words (a close reason): no escapes.
-        let detail: String = detail.as_ref().chars().filter(|c| !c.is_control()).collect();
+        let detail: String = detail.as_ref().chars().filter(|&c| !crate::proto::hidden(c)).collect();
         if let Some(checks) = &mut self.json {
             let check = Check { section: self.section.clone(), status, check: what.to_string(), detail: detail.clone(), hints: Vec::new() };
             checks.push(check);

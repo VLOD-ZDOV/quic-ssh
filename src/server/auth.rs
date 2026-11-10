@@ -11,14 +11,12 @@ use tracing::warn;
 use super::users::User;
 use crate::authkeys::{self, AuthorizedKey, Grant, Login, Offered};
 use crate::config::{ServerConfig, Totp};
-use crate::keys::{qsh_dir, read_strict, open_strict_private, PublicKey};
+use crate::keys::{key_allowed, qsh_dir, read_strict, open_strict_private, PublicKey};
 use crate::proto::{auth_data, read_msg, write_msg, Auth, Reply};
 use crate::transport::{RecvHalf, SendHalf};
 
 /// Keys a client may ask about before giving up (agents can hold many).
 const MAX_QUERIES: u32 = 32;
-/// Smallest accepted RSA modulus.
-const MIN_RSA_BITS: usize = 2048;
 
 /// The user's authorized_keys entries (`~/.config/qsh/authorized_keys` if
 /// `use_qsh_authorized_keys`, and `authorized_keys_file` if
@@ -98,27 +96,6 @@ pub fn now() -> u64 {
 /// The TLS handshake key as an offered key.
 pub fn tls_key(key: PublicKey) -> Offered {
     Offered::Key(KeyData::Ed25519(Ed25519PublicKey(key.0)))
-}
-
-/// Exact bit length of a big-endian unsigned integer (leading zero bits do not count).
-fn bit_length(bytes: &[u8]) -> usize {
-    match bytes.iter().position(|&b| b != 0) {
-        Some(i) => (bytes.len() - i) * 8 - bytes[i].leading_zeros() as usize,
-        None => 0,
-    }
-}
-
-fn key_allowed(key: &KeyData) -> Result<()> {
-    if let KeyData::Rsa(rsa) = key {
-        let bits = rsa.n.as_positive_bytes().map(bit_length).unwrap_or(0);
-        if bits < MIN_RSA_BITS {
-            bail!("RSA key too small ({bits} bits, at least {MIN_RSA_BITS} needed)");
-        }
-    }
-    if matches!(key, KeyData::Dsa(_)) {
-        bail!("DSA keys are not accepted");
-    }
-    Ok(())
 }
 
 /// What the server knows while checking keys.
@@ -432,7 +409,6 @@ pub async fn pam_password_auth(send: &mut SendHalf, recv: &mut RecvHalf, user: O
 /// Wrong one-time codes allowed per connection.
 const TOTP_TRIES: u32 = 3;
 
-/// The last accepted time step per user, so a code works only once.
 /// Wrong one-time codes per user allowed within [`TOTP_WINDOW`], over all
 /// connections (one connection only allows [`TOTP_TRIES`]).
 const TOTP_MAX_FAILURES: usize = 10;
@@ -668,6 +644,16 @@ mod tests {
         assert!(!password_matches("", "", false));
         assert!(password_matches("", "", true) && !password_matches("", "x", true));
         assert!(!super::dummy_hash().is_empty());
+        // CVE-2026-123158 ("sshole"): musl's crypt() answers a long password
+        // with "*", matching a locked "*" hash. Here no hash function stands
+        // for the result, and long passwords never match anything.
+        for len in [255, 256, 257, 300, 1024, 1025, 4096] {
+            let long = "a".repeat(len);
+            for hash in ["*", "!", "*LK*", "", sha512, sha256, yes] {
+                assert!(!password_matches(hash, &long, false), "{len} {hash}");
+            }
+        }
+        assert!(!password_matches("*", "*", false) && !password_matches("!", "!", true));
     }
 
     use super::*;
@@ -681,6 +667,7 @@ mod tests {
 
     #[test]
     fn rsa_size_counts_real_bits() {
+        use crate::keys::bit_length;
         assert_eq!(bit_length(&[0x01, 0xff]), 9);
         assert_eq!(bit_length(&[0x80, 0x00]), 16);
         assert_eq!(bit_length(&[0, 0]), 0);

@@ -27,7 +27,10 @@ else
     printf '%s\n' '@KEY@' >> "$f" || exit 1
     echo qsh-copy-id: added
 fi
-for p in /etc/qsh/host_ed25519 "$d/host_ed25519" $(sed -n 's/^[[:space:]]*host_key[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /etc/qsh/config.toml "$d/qshd.toml" 2>/dev/null); do
+# One path per line, read whole: unquoted, a host_key with spaces or * would split and glob.
+{ printf '%s\n' /etc/qsh/host_ed25519 "$d/host_ed25519"
+  sed -n 's/^[[:space:]]*host_key[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' /etc/qsh/config.toml "$d/qshd.toml" 2>/dev/null
+} | while IFS= read -r p; do
     [ -r "$p.pub" ] && sed -n '1s/^/qsh-copy-id: key /p' "$p.pub"
 done
 exit 0

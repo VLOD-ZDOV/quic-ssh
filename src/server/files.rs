@@ -140,6 +140,11 @@ pub async fn upload_resume(
         return write_msg(&mut send, &Reply::Err(err)).await;
     }
     let have = u64::from_be_bytes(header[..8].try_into().unwrap());
+    // The helper runs under the user's shell, so its reported size is not
+    // trusted: a value past the announced total would underflow `size - offset`.
+    if have > size {
+        return write_msg(&mut send, &Reply::Err(format!("target already holds {have} bytes, more than the {size} announced"))).await;
+    }
     let prefix = if have > 0 { header[8..].to_vec() } else { Vec::new() };
     write_msg(&mut send, &Reply::Partial { have, prefix }).await?;
     let ResumeFrom { offset } = read_msg(&mut recv).await?;
@@ -150,7 +155,7 @@ pub async fn upload_resume(
     stdin.write_all(&offset.to_be_bytes()).await?;
     write_msg(&mut send, &Reply::Ok).await?;
     let mut recv = if compressed { decompress(recv) } else { recv };
-    let left = size - offset;
+    let left = size.saturating_sub(offset);
     let copied = tokio::io::copy(&mut (&mut recv).take(left), &mut stdin).await;
     drop(stdin);
     let status = child.wait().await?;

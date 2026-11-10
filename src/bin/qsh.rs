@@ -187,7 +187,8 @@ enum PunchCmd {
         /// Keep this local UDP port between runs, so its NAT mapping survives
         #[arg(long)]
         punch_port: Option<u16>,
-        /// The shared secret both sides give (a fresh one is printed when missing)
+        /// The shared secret both sides give (a fresh one is printed when missing);
+        /// QSH_PUNCH_ID sets it without showing it to other local users
         #[arg(long, value_name = "STRING")]
         id: Option<String>,
         /// Do not ask STUN servers for the public address
@@ -205,7 +206,8 @@ enum PunchCmd {
         /// Keep this local UDP port between runs, so its NAT mapping survives
         #[arg(long)]
         punch_port: Option<u16>,
-        /// The shared secret both sides give (a fresh one is printed when missing)
+        /// The shared secret both sides give (a fresh one is printed when missing);
+        /// QSH_PUNCH_ID sets it without showing it to other local users
         #[arg(long, value_name = "STRING")]
         id: Option<String>,
         /// Do not ask STUN servers for the public address
@@ -717,7 +719,8 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
             use qsh::punch;
             match cmd {
                 PunchCmd::Serve { to, peer, punch_port, id, no_stun } => {
-                    let (secret, fresh) = punch::secret(id);
+                    // QSH_PUNCH_ID keeps a chosen secret out of the process list (`--id` is visible there).
+                    let (secret, fresh) = punch::secret(id.or_else(|| std::env::var("QSH_PUNCH_ID").ok()));
                     if fresh {
                         println!("qsh punch: shared id {secret} (give it to the other side with --id)");
                     }
@@ -730,7 +733,8 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
                     Ok(0)
                 }
                 PunchCmd::Dial { peer, listen, punch_port, id, no_stun } => {
-                    let (secret, fresh) = punch::secret(id);
+                    // QSH_PUNCH_ID keeps a chosen secret out of the process list (`--id` is visible there).
+                    let (secret, fresh) = punch::secret(id.or_else(|| std::env::var("QSH_PUNCH_ID").ok()));
                     if fresh {
                         println!("qsh punch: shared id {secret} (give it to the other side with --id)");
                     }
@@ -761,7 +765,6 @@ fn update(version: Option<&str>) -> Result<i32> {
         c.args(["-NoProfile", "-Command", &format!("irm {INSTALLER}.ps1 | iex")]);
         c
     } else {
-        // Without the script (no network), sh must fail instead of running nothing.
         let mut c = std::process::Command::new("sh");
         c.args(["-c", &format!(
             "if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL {INSTALLER}.sh); else s=$(wget -qO- {INSTALLER}.sh); fi || exit 1; sh -c \"$s\" install.sh --update"
@@ -909,7 +912,7 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
     if let Some(name) = &a.save {
         save_connection(name, &dest, &a)?;
     }
-    let target = match Target::resolve(&dest, a.port, &sources(&a)) {
+    let mut target = match Target::resolve(&dest, a.port, &sources(&a)) {
         Ok(t) => t,
         // A user or host qsh cannot take (an AD-style user, say): ssh's job.
         Err(e) if a.full && !e.is::<client::ConfigError>() => return exec_openssh("ssh", without_qsh_options(&args[1..]), &format!("{e:#}")),

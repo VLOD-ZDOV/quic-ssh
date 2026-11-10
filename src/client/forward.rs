@@ -194,7 +194,7 @@ fn report_failure(target: &str, e: &anyhow::Error) {
     if show && tracing::enabled!(tracing::Level::WARN) {
         // The target (a SOCKS request) and the server's reason are not ours:
         // no control characters reach the terminal.
-        let text: String = format!("{target}: {e:#}").chars().flat_map(|c| if c.is_control() { c.escape_default().collect::<Vec<_>>() } else { vec![c] }).collect();
+        let text: String = format!("{target}: {e:#}").chars().flat_map(|c| if crate::proto::hidden(c) { c.escape_default().collect::<Vec<_>>() } else { vec![c] }).collect();
         say(&format!("qsh: cannot forward to {text} (repeats are not shown for a minute)\r\n"));
     } else {
         debug!("forward to {target}: {e:#}");

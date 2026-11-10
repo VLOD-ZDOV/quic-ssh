@@ -873,6 +873,11 @@ impl Default for ServerConfig {
     }
 }
 
+/// Upper bound for connection and session counts (tokio semaphores allow far more).
+const MAX_COUNT: usize = 1_000_000;
+/// Upper bound for durations in seconds: ten years.
+const MAX_SECS: u64 = 10 * 365 * 24 * 3600;
+
 impl ServerConfig {
     /// Loads `path`; a missing file is an error.
     pub fn load(path: &Path) -> Result<ServerConfig> {
@@ -906,6 +911,28 @@ impl ServerConfig {
         if self.connection_buffer_mb > 4000 {
             bail!("connection_buffer_mb must be at most 4000");
         }
+        // Upper bounds too: a huge value passes `-t` but panics later
+        // (a semaphore's permit limit, `Instant + Duration` overflow).
+        for (name, value) in [
+            ("max_connections", self.max_connections),
+            ("max_startups", self.max_startups),
+            ("max_startups_per_ip", self.max_startups_per_ip),
+            ("max_sessions", self.max_sessions),
+        ] {
+            if value > MAX_COUNT {
+                bail!("{name} must be at most {MAX_COUNT}");
+            }
+        }
+        for (name, value) in [
+            ("totp_valid_for", self.totp_valid_for),
+            ("session_timeout", self.session_timeout),
+            ("login_grace_time", self.login_grace_time),
+            ("client_alive_interval", self.client_alive_interval),
+        ] {
+            if value > MAX_SECS {
+                bail!("{name} must be at most {MAX_SECS} (seconds)");
+            }
+        }
         for mask in std::iter::once(&self.stream_local_bind_mask).chain(self.matches.iter().flat_map(|m| &m.stream_local_bind_mask)) {
             if u32::from_str_radix(mask, 8).map_or(true, |m| m > 0o777) {
                 bail!("stream_local_bind_mask: {mask:?} is not an octal mask like \"0177\"");
@@ -936,6 +963,12 @@ impl ServerConfig {
             check_user_entries(&format!("match block {}: deny_users", i + 1), m.deny_users.as_deref().unwrap_or_default())?;
             if m.max_auth_tries == Some(0) {
                 bail!("match block {}: max_auth_tries must be at least 1", i + 1);
+            }
+            if m.max_sessions.is_some_and(|v| v > MAX_COUNT) {
+                bail!("match block {}: max_sessions must be at most {MAX_COUNT}", i + 1);
+            }
+            if m.totp_valid_for.is_some_and(|v| v > MAX_SECS) {
+                bail!("match block {}: totp_valid_for must be at most {MAX_SECS} (seconds)", i + 1);
             }
             if let Some((name, _)) = m.conditions().into_iter().find(|(_, v)| v.as_ref().is_some_and(Vec::is_empty)) {
                 bail!("[[match]] #{}: {name} is empty, it would match every login", i + 1);
@@ -1168,7 +1201,6 @@ impl ServerConfig {
             .collect()
     }
 
-    /// The text for `qshd -T`.
     /// The text for `qshd -T`.
     pub fn dump(&self) -> Result<String> {
         Ok(toml::to_string(self)?)

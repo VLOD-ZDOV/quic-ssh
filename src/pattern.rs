@@ -27,7 +27,7 @@ pub fn wildcard(pattern: &str, text: &str) -> bool {
 }
 
 /// A pattern list matches if any positive pattern matches and no negated one
-/// does (case-insensitive, like host names in ssh_config and known_hosts).
+/// does (case-insensitive, like `Match host` in ssh_config and known_hosts).
 pub fn host_matches<S: AsRef<str>>(patterns: &[S], host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let mut matched = false;
@@ -44,7 +44,7 @@ pub fn host_matches<S: AsRef<str>>(patterns: &[S], host: &str) -> bool {
     matched
 }
 
-/// Like [`host_matches`], but case-sensitive (user and group names).
+/// Like [`host_matches`], but case-sensitive (user and group names, `Host` lines in ssh's files).
 pub fn name_matches<S: AsRef<str>>(patterns: &[S], name: &str) -> bool {
     let mut matched = false;
     for p in patterns {
@@ -93,15 +93,24 @@ pub fn cidr_contains(cidr: &str, ip: IpAddr) -> Option<bool> {
             let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
             Some(u32::from(n) & mask == u32::from(i) & mask)
         }
-        (IpAddr::V6(n), IpAddr::V6(i)) => {
+        // A v6 range against a v4 client (canonical, so v4-mapped arrives
+        // as v4): compare as `::ffff:a.b.c.d`, or `::ffff:127.0.0.0/104`
+        // would match no one and a deny written that way let everyone in.
+        // `::/0` stays v6-only, as in sshd: only a range inside ::ffff:0:0/96 holds v4.
+        (IpAddr::V6(n), i) => {
             let bits = bits.unwrap_or(128);
+            let i = match i {
+                IpAddr::V4(v4) if bits >= 96 && n.to_ipv4_mapped().is_some() => v4.to_ipv6_mapped(),
+                IpAddr::V4(_) => return (bits <= 128).then_some(false),
+                IpAddr::V6(v6) => v6,
+            };
             if bits > 128 {
                 return None;
             }
             let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
             Some(u128::from(n) & mask == u128::from(i) & mask)
         }
-        _ => Some(false),
+        (IpAddr::V4(_), IpAddr::V6(_)) => Some(false),
     }
 }
 
@@ -184,6 +193,18 @@ mod tests {
         assert!(!wildcard("web-?.example.com", "web-10.example.com"));
         assert!(wildcard("*.example.com", "a.b.example.com"));
         assert!(!wildcard("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn mapped_cidr_holds_v4() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(cidr_contains("::ffff:127.0.0.0/104", ip("127.0.0.1")), Some(true));
+        assert_eq!(cidr_contains("::ffff:127.0.0.0/104", ip("::ffff:127.0.0.1")), Some(true));
+        assert_eq!(cidr_contains("::ffff:10.0.0.0/104", ip("127.0.0.1")), Some(false));
+        // A plain v6 range does not take in v4 clients.
+        assert_eq!(cidr_contains("::/0", ip("127.0.0.1")), Some(false));
+        assert_eq!(cidr_contains("::/0", ip("2001:db8::1")), Some(true));
+        assert_eq!(cidr_contains("::ffff:0:0/129", ip("127.0.0.1")), None);
     }
 
     #[test]

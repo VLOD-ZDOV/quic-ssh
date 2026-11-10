@@ -408,6 +408,8 @@ pub type Reconnect = Arc<dyn Fn(Vec<u8>) -> futures::future::BoxFuture<'static, 
 /// count the connection as lost after 3 unanswered pings.
 const DEFAULT_ALIVE: (Duration, u32) = (Duration::from_secs(5), 3);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+/// A `-N` hold stops reconnecting after this long (qshd's default `session_timeout`).
+const HOLD_GIVE_UP: Duration = Duration::from_secs(3600);
 /// Every reconnect starts compression afresh, and a clean start is what
 /// someone reading a secret off message sizes needs, which a person on the
 /// network can force by dropping packets: so many in this time end it.
@@ -472,7 +474,7 @@ impl Waiting {
     fn note(&mut self, e: &anyhow::Error, next: Duration) -> Option<String> {
         let now = std::time::Instant::now();
         // The reason may hold what a server or a network said.
-        let reason: String = format!("{e:#}").lines().next().unwrap_or_default().chars().filter(|c| !c.is_control()).collect();
+        let reason: String = format!("{e:#}").lines().next().unwrap_or_default().chars().filter(|&c| !crate::proto::hidden(c)).collect();
         let due = match &self.told {
             None => now.duration_since(self.since) >= Self::SAY_AFTER,
             Some((said, at)) => *said != reason || now.duration_since(*at) >= Self::SAY_AGAIN,
@@ -552,6 +554,12 @@ pub async fn hold(mut conn: Arc<Conn>, reconnect: Option<Reconnect>, forwarder: 
                     }
                     Err(ResumeError::Retry(e)) => {
                         tracing::debug!("reconnect: {e:#}");
+                        // No terminal to give up from (`~.`): past the time a
+                        // server keeps a session by default, it is gone.
+                        if waiting.since.elapsed() >= HOLD_GIVE_UP {
+                            eprintln!("qsh: giving up: no connection for {} s ({e:#})", HOLD_GIVE_UP.as_secs());
+                            return Ok(255);
+                        }
                         if let Some(text) = waiting.note(&e, delay) {
                             eprintln!("{text}");
                         }

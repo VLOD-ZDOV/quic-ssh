@@ -866,6 +866,15 @@ fn check_host_cert(cert: &[u8], key: PublicKey, target: &Target, revoked: &[ssh_
     if !cas.contains(cert.signature_key()) {
         return CertVerdict::Unusable(format!("no @cert-authority for {} with the certificate's CA key", target.key_name()));
     }
+    // Hold a host CA to the same key policy the server applies to user CAs
+    // (no small RSA, no DSA).
+    if let Err(e) = crate::keys::key_allowed(cert.signature_key()) {
+        return CertVerdict::Invalid(format!("the certificate authority key is not accepted: {e:#}"));
+    }
+    // OpenSSH rejects a host certificate carrying any critical option; so do we.
+    if cert.critical_options().iter().next().is_some() {
+        return CertVerdict::Invalid("its certificate carries a critical option, which a host certificate must not".into());
+    }
     let own = ssh_key::public::KeyData::Ed25519(ssh_key::public::Ed25519PublicKey(key.0));
     if cert.cert_type() != CertType::Host || cert.public_key() != &own {
         return CertVerdict::Invalid("its certificate is not a host certificate for the key it presented".into());

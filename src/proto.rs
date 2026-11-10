@@ -548,6 +548,20 @@ impl Unpacker {
 /// Accepted user names: 1–64 of `[A-Za-z0-9._-]`, not starting with `-`.
 /// Keeps shell metacharacters, control characters and option-like names out
 /// of everything downstream (compare OpenSSH 10.1/10.6 username fixes).
+/// A character that must not reach a terminal from text we do not control:
+/// controls (Cc: escape sequences, `\r`), and invisible format characters
+/// (Cf: bidi overrides like U+202E that reorder what the user sees,
+/// zero-width ones) plus line/paragraph separators. `char::is_control`
+/// alone sees only Cc. Like OpenSSH's `strnvis`.
+pub fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c as u32,
+            0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0x180E
+            | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+            | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
 pub fn valid_user_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && !name.starts_with('-')
@@ -568,6 +582,16 @@ pub async fn write_msg<W: AsyncWrite + Unpin + ?Sized, T: Serialize>(w: &mut W, 
 pub async fn read_msg_opt<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
     r: &mut R,
 ) -> Result<Option<T>> {
+    read_msg_opt_capped(r, MAX_MSG).await
+}
+
+/// Like [`read_msg_opt`], but rejects frames larger than `limit`. Used before
+/// login, where a small cap keeps an anonymous peer from sending a huge frame
+/// (e.g. a megabyte-long user name) that would then be logged.
+pub async fn read_msg_opt_capped<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
+    r: &mut R,
+    limit: usize,
+) -> Result<Option<T>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -575,7 +599,7 @@ pub async fn read_msg_opt<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_MSG {
+    if len > limit {
         bail!("message too large ({len} bytes)");
     }
     let mut body = vec![0u8; len];
@@ -603,6 +627,11 @@ pub async fn read_msg<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mu
     read_msg_opt(r).await?.context("stream closed unexpectedly")
 }
 
+/// Reads one length-prefixed message, rejecting frames larger than `limit`.
+pub async fn read_msg_capped<R: AsyncRead + Unpin + ?Sized, T: DeserializeOwned>(r: &mut R, limit: usize) -> Result<T> {
+    read_msg_opt_capped(r, limit).await?.context("stream closed unexpectedly")
+}
+
 /// The server answered a request with `Reply::Err` (as opposed to a
 /// broken connection).
 #[derive(Debug)]
@@ -622,7 +651,7 @@ impl std::error::Error for Refused {}
 /// characters.
 pub async fn expect_ok<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> Result<Reply> {
     match read_msg(r).await? {
-        Reply::Err(e) => Err(Refused(e.chars().filter(|c| !c.is_control()).take(500).collect()).into()),
+        Reply::Err(e) => Err(Refused(e.chars().filter(|&c| !hidden(c)).take(500).collect()).into()),
         other => Ok(other),
     }
 }
@@ -782,6 +811,16 @@ mod tests {
         }
         for bad in ["", "-oProxyCommand=x", "a b", "a$b", "a\\b", "a`id`", "a;b", "a\nb", "a/b", "a:b", &"x".repeat(65)] {
             assert!(!valid_user_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_chars() {
+        for c in ['\x1b', '\r', '\u{85}', '\u{202E}', '\u{202C}', '\u{2066}', '\u{200B}', '\u{FEFF}', '\u{2028}', '\u{E0041}'] {
+            assert!(hidden(c), "{c:?}");
+        }
+        for c in ['a', 'я', ' ', '€', '\u{1F600}', '中'] {
+            assert!(!hidden(c), "{c:?}");
         }
     }
 

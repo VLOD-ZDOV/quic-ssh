@@ -30,9 +30,15 @@ use tokio::sync::Mutex;
 use tokio::time::{timeout, Instant};
 
 /// Marks our datagrams, so that a stray packet cannot reach qshd.
-const MAGIC: [u8; 4] = *b"QSHP";
+const MAGIC: [u8; 4] = *b"QSH2";
+/// Bytes of a random secret (`--id`), and of the key derived from it.
 const KEY_LEN: usize = 16;
-const HEADER: usize = MAGIC.len() + KEY_LEN;
+const COUNTER_LEN: usize = 8;
+const TAG_LEN: usize = 16;
+/// `MAGIC`, a per-sender counter, and an HMAC of counter and payload: the key
+/// itself never crosses the network, so seeing packets is not enough to send
+/// some, and a replayed packet cannot move the peer (its counter is old).
+const HEADER: usize = MAGIC.len() + COUNTER_LEN + TAG_LEN;
 const MAX_DATAGRAM: usize = 2048;
 
 /// How often each side sends an empty packet to keep its NAT mapping open.
@@ -81,10 +87,20 @@ fn say(line: impl std::fmt::Display) {
 }
 
 fn key(secret: &str) -> [u8; KEY_LEN] {
-    let digest = Sha256::digest(secret.as_bytes());
+    let digest = Sha256::digest([b"qsh-punch-v2\0".as_slice(), secret.as_bytes()].concat());
     let mut k = [0u8; KEY_LEN];
     k.copy_from_slice(&digest[..KEY_LEN]);
     k
+}
+
+fn tag(key: &[u8; KEY_LEN], counter: &[u8], payload: &[u8]) -> [u8; TAG_LEN] {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
+    mac.update(counter);
+    mac.update(payload);
+    let mut t = [0u8; TAG_LEN];
+    t.copy_from_slice(&mac.finalize().into_bytes()[..TAG_LEN]);
+    t
 }
 
 /// The secret both sides give, or a fresh one (also says whether it is fresh).
@@ -108,19 +124,30 @@ pub fn bind_for(peer: Option<SocketAddr>, port: Option<u16>) -> SocketAddr {
     }
 }
 
-fn frame(key: &[u8; KEY_LEN], payload: &[u8]) -> Vec<u8> {
+fn frame(key: &[u8; KEY_LEN], counter: u64, payload: &[u8]) -> Vec<u8> {
+    let counter = counter.to_be_bytes();
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(key);
+    out.extend_from_slice(&counter);
+    out.extend_from_slice(&tag(key, &counter, payload));
     out.extend_from_slice(payload);
     out
 }
 
-fn unframe<'a>(key: &[u8; KEY_LEN], buf: &'a [u8]) -> Option<&'a [u8]> {
-    if buf.len() < HEADER || buf[..MAGIC.len()] != MAGIC || buf[MAGIC.len()..HEADER] != *key {
+/// The counter and payload of one of our packets; `None` for anything else.
+fn unframe<'a>(key: &[u8; KEY_LEN], buf: &'a [u8]) -> Option<(u64, &'a [u8])> {
+    if buf.len() < HEADER || buf[..MAGIC.len()] != MAGIC {
         return None;
     }
-    Some(&buf[HEADER..])
+    let counter = &buf[MAGIC.len()..MAGIC.len() + COUNTER_LEN];
+    let payload = &buf[HEADER..];
+    let want = tag(key, counter, payload);
+    // Compared in constant time: a timing difference would let the tag be guessed byte by byte.
+    let diff = want.iter().zip(&buf[MAGIC.len() + COUNTER_LEN..HEADER]).fold(0u8, |d, (a, b)| d | (a ^ b));
+    if diff != 0 {
+        return None;
+    }
+    Some((u64::from_be_bytes(counter.try_into().ok()?), payload))
 }
 
 /// A `serve` side: waits for the peer, keeps the hole open, and passes
@@ -184,10 +211,29 @@ struct Hole {
     key: [u8; KEY_LEN],
     peer: Mutex<SocketAddr>,
     local: Mutex<Option<SocketAddr>>,
+    /// Ours for the next packet: starts at the clock, so a restarted side
+    /// still counts above what the other one saw before.
+    sent: std::sync::atomic::AtomicU64,
+    /// The highest counter seen from the peer.
+    seen: Mutex<u64>,
+}
+
+impl Hole {
+    fn frame(&self, payload: &[u8]) -> Vec<u8> {
+        frame(&self.key, self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload)
+    }
 }
 
 async fn relay(sock: UdpSocket, key: &[u8; KEY_LEN], peer: SocketAddr, role: Role) -> Result<()> {
-    let hole = Arc::new(Hole { sock, key: *key, peer: Mutex::new(peer), local: Mutex::new(None) });
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let hole = Arc::new(Hole {
+        sock,
+        key: *key,
+        peer: Mutex::new(peer),
+        local: Mutex::new(None),
+        sent: std::sync::atomic::AtomicU64::new(start),
+        seen: Mutex::new(0),
+    });
     say("qsh punch: waiting for the first packet to cross the NAT");
     match role {
         Role::Serve { target } => {
@@ -219,13 +265,24 @@ async fn punch_to_local(hole: &Hole, local: &UdpSocket, connected: bool) -> Resu
     let mut announced = false;
     loop {
         let (n, from) = recv(&hole.sock, &mut buf).await?;
-        let Some(payload) = unframe(&hole.key, &buf[..n]) else {
+        let Some((counter, payload)) = unframe(&hole.key, &buf[..n]) else {
             tracing::debug!("{from}: not ours, dropped");
             continue;
         };
         {
+            // Only a packet newer than any before moves the peer: a copy of
+            // an old one sent from elsewhere cannot take the tunnel away.
+            let mut seen = hole.seen.lock().await;
+            let fresh = counter > *seen;
+            if fresh {
+                *seen = counter;
+            }
             let mut peer = hole.peer.lock().await;
             if *peer != from {
+                if !fresh {
+                    tracing::debug!("{from}: an old packet from a new address, dropped");
+                    continue;
+                }
                 say(format!("qsh punch: peer moved from {peer} to {from} (its NAT changed the port)"));
                 *peer = from;
             }
@@ -258,7 +315,7 @@ async fn local_to_punch(hole: &Hole, local: &UdpSocket) -> Result<()> {
         let (n, from) = recv(local, &mut buf).await?;
         *hole.local.lock().await = Some(from);
         let peer = *hole.peer.lock().await;
-        let packet = frame(&hole.key, &buf[..n]);
+        let packet = hole.frame(&buf[..n]);
         if let Err(e) = hole.sock.send_to(&packet, peer).await {
             tracing::debug!("cannot send to {peer}: {e}");
         }
@@ -280,8 +337,8 @@ async fn recv(sock: &UdpSocket, buf: &mut [u8]) -> std::io::Result<(usize, Socke
 }
 
 async fn keepalive(hole: &Hole) -> Result<()> {
-    let packet = frame(&hole.key, &[]);
     loop {
+        let packet = hole.frame(&[]);
         let peer = *hole.peer.lock().await;
         if let Err(e) = hole.sock.send_to(&packet, peer).await {
             tracing::debug!("keepalive to {peer}: {e}");
@@ -433,12 +490,21 @@ mod tests {
     #[test]
     fn frames_round_trip() {
         let k = key("secret");
-        let p = frame(&k, b"hello");
-        assert_eq!(unframe(&k, &p), Some(&b"hello"[..]));
+        let p = frame(&k, 7, b"hello");
+        assert_eq!(unframe(&k, &p), Some((7, &b"hello"[..])));
         assert_eq!(unframe(&key("other"), &p), None);
         assert_eq!(unframe(&k, &p[..HEADER - 1]), None);
         assert_eq!(unframe(&k, b"not a qsh punch packet"), None);
-        assert_eq!(unframe(&k, &frame(&k, &[])), Some(&b""[..]));
+        assert_eq!(unframe(&k, &frame(&k, 8, &[])), Some((8, &b""[..])));
+        // The key does not travel: no packet holds it.
+        assert!(!p.windows(KEY_LEN).any(|w| w == k));
+        // A changed byte (payload or counter) is not ours.
+        let mut bad = p.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert_eq!(unframe(&k, &bad), None);
+        bad = p.clone();
+        bad[MAGIC.len()] ^= 1;
+        assert_eq!(unframe(&k, &bad), None);
     }
 
     /// A binding success response with a XOR-MAPPED-ADDRESS, as a server sends.

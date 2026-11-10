@@ -184,7 +184,7 @@ where
     match read_msg(recv).await? {
         Reply::Ok => {}
         // The server's words: no control characters reach the terminal.
-        Reply::Err(e) => bail!("{}", e.chars().filter(|c| !c.is_control()).collect::<String>()),
+        Reply::Err(e) => bail!("{}", e.chars().filter(|&c| !crate::proto::hidden(c)).collect::<String>()),
         other => bail!("unexpected reply {other:?}"),
     }
     let server_mac: Vec<u8> = read_msg(recv).await?;

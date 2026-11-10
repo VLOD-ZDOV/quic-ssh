@@ -19,8 +19,9 @@ with qshd and carries all the traffic through it.
    packets that cross open the path in both directions.
 4. The packets carry a normal qsh connection: `serve` passes them to the local
    qshd, `dial` listens on loopback for the local `qsh`. TLS and the host key
-   check are still between `qsh` and `qshd`; the punching secret only keeps
-   stray packets out.
+   check are still between `qsh` and `qshd`. Each packet carries a counter
+   and an HMAC made with the shared secret (the secret itself never travels),
+   so packets from anyone without it are dropped.
 5. The one-second packets also keep the mapping alive. When a NAT starts using
    a different port for us, the tunnel notices and follows it.
 
@@ -74,7 +75,9 @@ Options worth knowing:
 - `--no-stun` skips STUN (loopback tests, or a public address found another way).
 - `--to 127.0.0.1:4422` (on `serve`) says where the local qshd listens.
 - `--id` is required to match on both sides; a random one is printed when it
-  is missing.
+  is missing. `QSH_PUNCH_ID` sets it too, without showing it to other local
+  users in the process list. Both sides need the same qsh version: the packet
+  format changed in this release.
 
 Keep both `qsh punch` processes running for as long as the tunnel is needed
 (`tmux`, `nohup`, or a service of your own). Stopping either closes the hole.
@@ -85,3 +88,7 @@ Only the qsh protocol, end to end encrypted and authenticated by `qshd`. An
 attacker who learns the shared phrase still faces the normal login: the
 punched socket leads to the same qshd, with the same keys, passwords and
 one-time codes. Nothing is relayed through a third machine.
+
+The tunnel follows the peer to a new address only on a packet newer than any
+seen before: a copy of an old packet, sent from elsewhere by someone who
+watched the traffic, cannot take the tunnel away.

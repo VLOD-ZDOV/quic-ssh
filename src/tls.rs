@@ -106,7 +106,8 @@ impl ServerCertVerifier for HostKeyVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        // At most the SSH host certificate, checked after the handshake.
+        // At most the SSH host certificate; it is checked both here during the
+        // handshake (HostCheck -> judge_host) and again afterwards.
         if intermediates.len() > 1 {
             return Err(TlsError::General("unexpected certificate chain".into()));
         }

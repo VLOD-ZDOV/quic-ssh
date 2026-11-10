@@ -241,7 +241,7 @@ fn cert_key_blob(blob: &[u8]) -> Option<Vec<u8>> {
 /// sequences that could redraw the terminal or fake a local prompt), at most
 /// 200 characters, and marked as coming from the server.
 fn server_text(text: &str) -> String {
-    let clean: String = text.chars().filter(|c| !c.is_control()).take(200).collect();
+    let clean: String = text.chars().filter(|&c| !crate::proto::hidden(c)).take(200).collect();
     format!("(server) {clean}")
 }
 
@@ -249,7 +249,7 @@ fn server_text(text: &str) -> String {
 /// breaks and tabs (like sshd's banner through ssh's `strnvis`), ending
 /// with a line break.
 fn banner_text(text: &str) -> String {
-    let mut out: String = text.chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t').collect();
+    let mut out: String = text.chars().filter(|&c| !crate::proto::hidden(c) || c == '\n' || c == '\t').collect();
     if !out.ends_with('\n') {
         out.push('\n');
     }
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn server_text_is_defused() {
         let t = super::server_text("Code\x1b[2J\x1b]0;x\x07: \r\nEnter passphrase for ~/.ssh/id_ed25519:");
-        assert!(!t.chars().any(char::is_control), "{t:?}");
+        assert!(!t.chars().any(crate::proto::hidden), "{t:?}");
         assert!(t.starts_with("(server) "));
         assert!(super::server_text(&"x".repeat(1000)).len() < 220);
         assert_eq!(super::banner_text("Hi\x1b[2J\r\nthere"), "Hi[2J\nthere\n");

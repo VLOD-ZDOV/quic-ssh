@@ -17,6 +17,9 @@ use crate::authkeys::Restrictions;
 use crate::proto::{write_msg, ClientMsg, Reader, Reply, ServerMsg};
 use crate::transport::{RecvHalf, SendHalf};
 
+/// How long a closed hold's messages are still read for a Hangup.
+const HANGUP_DRAIN: Duration = Duration::from_millis(200);
+
 /// Output kept for a reconnecting client.
 const BUFFER: usize = 1 << 20;
 /// Persistent sessions per user and in total, attached or not.
@@ -237,13 +240,26 @@ impl Sessions {
         let hung_up = answered.is_ok()
             && loop {
                 tokio::select! {
+                    // A message already here goes before the closed connection.
+                    biased;
                     msg = incoming.next() => match msg {
                         Ok(Some(ClientMsg::Hangup)) => break true,
                         Ok(Some(_)) => {}
                         Err(e) if e.is::<crate::proto::Malformed>() => {}
                         Ok(None) | Err(_) => break false,
                     },
-                    _ = async { closed.wait_for(|c| *c).await.is_ok() } => break false,
+                    _ = async { closed.wait_for(|c| *c).await.is_ok() } => {
+                        // The client may have said Hangup just before closing:
+                        // its stated end is no flap to keep the session for.
+                        break loop {
+                            match tokio::time::timeout(HANGUP_DRAIN, incoming.next()).await {
+                                Ok(Ok(Some(ClientMsg::Hangup))) => break true,
+                                Ok(Ok(Some(_))) => {}
+                                Ok(Err(e)) if e.is::<crate::proto::Malformed>() => {}
+                                _ => break false,
+                            }
+                        };
+                    }
                 }
             };
         let mut map = self.map.lock().unwrap();

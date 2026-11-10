@@ -62,7 +62,7 @@ async fn pump<R: AsyncRead + Unpin>(r: R, i: usize, err: bool, tx: mpsc::Unbound
                 let text: String = String::from_utf8_lossy(&buf)
                     .trim_end_matches(['\n', '\r'])
                     .chars()
-                    .filter(|&c| c == '\t' || !c.is_control())
+                    .filter(|&c| c == '\t' || !crate::proto::hidden(c))
                     .collect();
                 let _ = tx.send(if err { Line::Err(i, text) } else { Line::Out(i, text) });
             }

@@ -59,7 +59,7 @@ use tracing::{debug, info, warn};
 use crate::config::{GatewayPorts, PermitRootLogin, ServerConfig};
 use crate::keys::{Identity, PublicKey};
 use crate::authkeys::Grant;
-use crate::proto::{read_msg, valid_user_name, write_msg, Hello, PtySpec, Reply, Request, MIN_VERSION, VERSION};
+use crate::proto::{read_msg, read_msg_capped, valid_user_name, write_msg, Hello, PtySpec, Reply, Request, MIN_VERSION, VERSION};
 use crate::transport::{Conn, Listener, RecvHalf, SendHalf};
 use penalty::Outcome;
 pub use users::INTERNAL_SFTP;
@@ -75,6 +75,9 @@ use users::User;
 
 /// Time a connected client has to open its first stream and say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// The greeting (version + user name + optional resume token) is tiny; cap it
+/// well below `MAX_MSG` so a pre-login peer cannot flood the log with a huge name.
+const HELLO_MAX: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const NO_PAIRING: &str = "no active pairing code for this user (run `qshd pair` on the server; codes expire)";
 /// "No pairing code" always takes this long, so that the time a check for an
@@ -470,7 +473,10 @@ async fn handle_conn(conn: &Arc<Conn>, state: Arc<State>, startup: Startup, outc
     let key = conn.peer_key();
     let (mut send, mut recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.context("closed before hello")?;
-        let hello: Hello = read_msg(&mut recv).await?;
+        // A small cap before login: the greeting is version + user name (<=64)
+        // + optional resume token, never large. This keeps an anonymous peer
+        // from sending a huge name that the rejection path would then log.
+        let hello: Hello = read_msg_capped(&mut recv, HELLO_MAX).await?;
         anyhow::Ok((send, recv, hello))
     })
     .await
@@ -994,10 +1000,18 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             if !cfg.remote_forwarding() {
                 return write_msg(&mut send, &Reply::Err("remote port forwarding is disabled".into())).await;
             }
-            if !limits.may_listen(&bind, port) {
+            // Checked against where qshd will listen, not what was asked:
+            // gateway_ports = "yes" listens on all addresses, and a
+            // `permit_listen = ["localhost:N"]` must not let that through.
+            let listening = match cfg.gateway_ports {
+                GatewayPorts::No => "localhost",
+                GatewayPorts::Yes => "*",
+                GatewayPorts::ClientSpecified => bind.as_str(),
+            };
+            if !limits.may_listen(listening, port) {
                 return write_msg(&mut send, &Reply::Err(format!("listening on port {port} is not permitted for this key"))).await;
             }
-            if !cfg.may_listen(&bind, port) {
+            if !cfg.may_listen(listening, port) {
                 return write_msg(&mut send, &Reply::Err(format!("listening on port {port} is not permitted (permit_listen)"))).await;
             }
             remote_forward(send, recv, conn.clone(), user, cfg.gateway_ports, &bind, port).await
@@ -1204,7 +1218,7 @@ fn nologin(path: &std::path::Path) -> Option<String> {
     std::fs::symlink_metadata(path).ok()?;
     let mut text = String::new();
     let _ = std::io::Read::read_to_string(&mut std::io::Read::take(std::fs::File::open(path).ok()?, 1024), &mut text);
-    let text: String = text.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+    let text: String = text.chars().filter(|&c| !crate::proto::hidden(c) || c == '\n').collect();
     let text = text.trim();
     Some(if text.is_empty() { "logins are disabled (/etc/nologin)".into() } else { text.to_string() })
 }
@@ -1418,7 +1432,7 @@ async fn socket_from_helper(mut helper: tokio::process::Command) -> Result<std::
 }
 
 #[cfg(unix)]
-/// Takes a descriptor sent with SCM_RIGHTS (see `helpers::listen_unix`);
+/// Takes a descriptor sent with SCM_RIGHTS (see `helpers::hand_over`);
 /// `None` if the helper sent none.
 fn receive_fd(sock: impl std::os::fd::AsFd) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};

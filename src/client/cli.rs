@@ -186,9 +186,9 @@ impl SshArgs {
             'q' => self.quiet = true,
             's' => self.subsystem = true,
             'T' => self.no_tty = true,
-            't' => self.tty += 1,
+            't' => self.tty = self.tty.saturating_add(1),
             'V' => self.print_version = true,
-            'v' => self.verbose += 1,
+            'v' => self.verbose = self.verbose.saturating_add(1),
             // X11 forwarding: untrusted (-X), trusted (-Y), off (-x).
             'X' => self.x11 = Some(true),
             'Y' => (self.x11, self.x11_trusted) = (Some(true), true),
@@ -270,7 +270,7 @@ impl SshArgs {
         match name {
             "full" => self.full = true,
             "accept-new-host" => self.accept_new_host = true,
-            "verbose" => self.verbose += 1,
+            "verbose" => self.verbose = self.verbose.saturating_add(1),
             "help" => self.help = true,
             "version" => self.print_version = true,
             "transport" => {

@@ -139,7 +139,7 @@ impl Identity {
         f.write_all(text.as_bytes())?;
         let mut pub_path = path.as_os_str().to_owned();
         pub_path.push(".pub");
-        fs::write(&pub_path, format!("{}\n", self.public().to_openssh(comment)))?;
+        write_replacing(Path::new(&pub_path), format!("{}\n", self.public().to_openssh(comment)).as_bytes())?;
         Ok(())
     }
 
@@ -202,10 +202,32 @@ fn check_private_mode(path: &Path) -> Result<()> {
 /// Creates a directory (and parents) with mode 0700 for the leaf.
 pub fn create_private_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
+        // Every directory made on the way private too: one left to the umask
+        // (e.g. ~/.config under umask 020) could let others plant files below.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         crate::platform::set_mode(dir, 0o700)?;
     }
     Ok(())
+}
+
+/// Writes `path` as a new file and renames it into place: whatever is at
+/// `path` (a symlink planted there) is replaced, never written through.
+fn write_replacing(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    // create_new: fails on anything already there, a symlink included.
+    let written = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(contents)).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// An SSH certificate. `ssh-keygen` without `-V` makes one valid forever,
@@ -281,6 +303,32 @@ impl Cert {
         }
         Ok(())
     }
+}
+
+/// Smallest accepted RSA modulus.
+const MIN_RSA_BITS: usize = 2048;
+
+/// Exact bit length of a big-endian unsigned integer (leading zero bits do not count).
+pub(crate) fn bit_length(bytes: &[u8]) -> usize {
+    match bytes.iter().position(|&b| b != 0) {
+        Some(i) => (bytes.len() - i) * 8 - bytes[i].leading_zeros() as usize,
+        None => 0,
+    }
+}
+
+/// Rejects key types the policy forbids (too-small RSA, DSA): user keys and
+/// CAs on the server, host CAs on the client.
+pub fn key_allowed(key: &KeyData) -> Result<()> {
+    if let KeyData::Rsa(rsa) = key {
+        let bits = rsa.n.as_positive_bytes().map(bit_length).unwrap_or(0);
+        if bits < MIN_RSA_BITS {
+            bail!("RSA key too small ({bits} bits, at least {MIN_RSA_BITS} needed)");
+        }
+    }
+    if matches!(key, KeyData::Dsa(_)) {
+        bail!("DSA keys are not accepted");
+    }
+    Ok(())
 }
 
 /// Parses an authorized_keys-style text and returns all ed25519 keys in it.

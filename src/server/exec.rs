@@ -319,7 +319,6 @@ pub(super) async fn read_ready<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) 
     Ok(n)
 }
 
-/// Forwards a child output stream as `ServerMsg`s until EOF.
 /// A stream's output on its way out, packed once the client asks for that.
 #[derive(Default)]
 pub(super) struct Outgoing {
@@ -363,6 +362,7 @@ impl Outgoing {
     }
 }
 
+/// Forwards a child output stream as `ServerMsg`s until EOF.
 async fn pump<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<ServerMsg>, wrap: fn(Vec<u8>) -> ServerMsg) {
     let mut buf = vec![0u8; 32 * 1024];
     loop {

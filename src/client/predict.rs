@@ -49,9 +49,14 @@ const EXPIRE: Duration = Duration::from_millis(1000);
 /// predictions: too little room to be useful, and the emulator wants some.
 const MIN_COLS: u16 = 20;
 const MIN_ROWS: u16 = 2;
+/// Above any real terminal: the emulator allocates rows × cols cells up
+/// front (twice, with the alternate screen), so 65535×65535 would ask for
+/// over 100 GB. Bigger windows simply get no predictions.
+const MAX_COLS: u16 = 2000;
+const MAX_ROWS: u16 = 2000;
 
 fn usable_size(rows: u16, cols: u16) -> bool {
-    rows >= MIN_ROWS && cols >= MIN_COLS
+    (MIN_ROWS..=MAX_ROWS).contains(&rows) && (MIN_COLS..=MAX_COLS).contains(&cols)
 }
 
 /// Where the terminal's parser is after the server's output so far. Bytes
@@ -197,9 +202,11 @@ pub struct Predictor {
 
 impl Predictor {
     pub fn new(mode: Mode, rows: u16, cols: u16) -> Predictor {
+        // An unusable size predicts nothing: the smallest screen will do until a resize.
+        let (r, c) = if usable_size(rows, cols) { (rows, cols) } else { (MIN_ROWS, MIN_COLS) };
         Predictor {
             mode,
-            screen: vt100::Parser::new_with_callbacks(rows.max(MIN_ROWS), cols.max(MIN_COLS), 0, Watch::default()),
+            screen: vt100::Parser::new_with_callbacks(r, c, 0, Watch::default()),
             pending: VecDeque::new(),
             drawn: 0,
             epoch: 1,
