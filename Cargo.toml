@@ -17,7 +17,8 @@ categories = ["command-line-utilities", "network-programming"]
 # only, to hosts already known). Whatever a request for the rest reaches is a
 # refusal. `scripts/build.py` is a menu for choosing.
 default = ["shell", "exec", "punch", "pair", "tofu", "forwarding", "agent", "x11", "tunnel", "persist", "sharing", "password", "root-login", "user-rc", "self-update", "files", "compress", "speed", "ui", "predict"]
-# Login shells: `qsh host`.
+# Login shells: `qsh host`. No restriction by itself: with `exec` a shell
+# is one command away.
 shell = []
 # Commands: `qsh host command`, forced commands (`command=`, `force_command`).
 exec = []

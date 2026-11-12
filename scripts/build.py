@@ -249,7 +249,8 @@ def warnings(on):
     if "password" in on and "root-login" in on:
         w.append((RED, "password + root-login: with permit_root_login = \"yes\" root can be tried with passwords"))
     if sessions and "shell" not in on:
-        w.append((YELLOW, "no shell: `qsh host` is refused, only `qsh host command`"))
+        w.append((RED, "no shell, but exec: this does not keep users out of a shell, `qsh host bash` is a command too; "
+                       "to really have no shell leave out exec as well, or give the keys a forced command"))
     if sessions and "exec" not in on:
         w.append((YELLOW, "no exec: `qsh host command`, `qsh multi` and keys with a forced command (command=, force_command) are refused"))
     if not sessions:
