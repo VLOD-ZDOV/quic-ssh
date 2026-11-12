@@ -804,7 +804,8 @@ async fn open_any(target: &Target, opts: &ConnectOptions, tls: &HashMap<u16, rus
         }
         let result = transport::connect_probe(&target.host, &target_ports(target), target.family, &target.bind, |p| tls[&p].clone()).await;
         let refused = rejected.lock().unwrap().is_some();
-        cache.set(&hid, !refused && result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
+        // With RequirePostQuantum an older qshd fails the handshake: it is there all the same.
+        cache.set(&hid, !refused && !target.require_post_quantum && result.as_ref().is_err_and(|e| e.is::<transport::Unreachable>()));
         result?
     } else {
         // ConnectionAttempts, one second apart, each within ConnectTimeout.
@@ -1166,8 +1167,9 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
     let mut conn = match open(target, opts, &tls, &rejected, via).await {
         Ok(conn) => conn,
         // A qshd older than 2.0 fails the handshake; it looks like no qshd at all.
+        // A new error, not "unreachable": --full must not hand the host to ssh.
         Err(e) if target.require_post_quantum => {
-            return Err(e.context("RequirePostQuantum is on: only a qshd with the post-quantum key exchange (2.0 or newer) is connected to"));
+            bail!("RequirePostQuantum is on: only a qshd with the post-quantum key exchange (2.0 or newer) is connected to: {e:#}");
         }
         Err(e) => return Err(e),
     };
@@ -1184,6 +1186,9 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
         Ok(auth::Outcome::Welcome(version)) => {
             tracing::debug!("logged in, server protocol version {version}");
             conn.set_server_version(version);
+            if target.require_post_quantum && !conn.post_quantum() {
+                bail!("RequirePostQuantum is on, and the server's protocol version ({version}) is older than the post-quantum key exchange");
+            }
             let kx = if conn.post_quantum() { "X25519MLKEM768 (post-quantum)" } else { "X25519 (not post-quantum: the server is older than 2.0)" };
             tracing::debug!("key exchange: {kx}");
             Ok(conn)
@@ -1243,7 +1248,12 @@ pub async fn connect(target: &Target, opts: &ConnectOptions) -> Result<Conn> {
     #[cfg(unix)]
     if let (true, None, Some(path)) = (opts.share, &opts.resume, &target.sharing.path) {
         if let Some(conn) = transport::shared::attach(path).await {
-            match shared_problem(&conn).await {
+            let problem = match shared_problem(&conn).await {
+                // Made without RequirePostQuantum, to a qshd that has no such key exchange.
+                None if target.require_post_quantum && !conn.post_quantum() => Some("it is not post-quantum (RequirePostQuantum)"),
+                other => other,
+            };
+            match problem {
                 // Sessions through it go on; new ones log in.
                 Some(why) => {
                     tracing::info!("not using the shared connection: {why}; logging in again");
@@ -1310,7 +1320,10 @@ pub async fn pair(target: &Target, opts: &ConnectOptions, code: &str) -> Result<
     // Through qsh's jump hosts, like a login.
     let hops = jump_hosts(target, opts).await?;
     // The server is checked by the pairing code, not by known_hosts.
-    let tls = target_ports(target).into_iter().map(|p| crate::tls::client_config(&id).map(|c| (p, c))).collect::<Result<_>>()?;
+    let tls = target_ports(target)
+        .into_iter()
+        .map(|p| crate::tls::checked_client_config(&id, None, target.require_post_quantum).map(|c| (p, c)))
+        .collect::<Result<_>>()?;
     let mut conn = open(target, opts, &tls, &Rejection::default(), hops.last().map(|c| c.as_ref())).await?;
     conn.set_hops(hops);
     let (mut send, mut recv) = conn.open_bi().await?;

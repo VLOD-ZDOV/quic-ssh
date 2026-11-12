@@ -982,7 +982,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     match request {
         Request::Exec { command, env, pty } => {
             let mut spec = session(command, env, pty, false);
-            if let Some(feature) = session_left_out(&spec) {
+            if let Some(feature) = session_left_out(&spec, false) {
                 return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
             }
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
@@ -990,7 +990,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         }
         Request::Persistent { command, env, pty } => {
             let mut spec = session(command, env, Some(pty), false);
-            if let Some(feature) = session_left_out(&spec) {
+            if let Some(feature) = session_left_out(&spec, false) {
                 return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
             }
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
@@ -1005,7 +1005,14 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         Request::Hold => state.sessions.hold(send, recv, user, limits, closed).await,
         // Like sshd, through the user's shell, so restricted shells (nologin, git-shell) apply.
         Request::Subsystem { name, env } => match subsystem_command(cfg, user, &name) {
-            Some(cmd) => exec::run(send, recv, user, session(Some(cmd), env, None, true), closed).await,
+            Some(cmd) => {
+                let spec = session(Some(cmd), env, None, true);
+                // A forced command runs in the subsystem's place: a command like any other.
+                if let Some(feature) = session_left_out(&spec, limits.command.is_none()) {
+                    return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
+                }
+                exec::run(send, recv, user, spec, closed).await
+            }
             None => write_msg(&mut send, &Reply::Err(format!("subsystem {name:?} is not available"))).await,
         },
         Request::RemoteForward { bind, port } => {
@@ -1277,17 +1284,19 @@ fn left_out(request: &Request) -> Option<&'static str> {
 
 /// The build feature a session needs (`shell` for a login shell, `exec` for
 /// a command), if this qshd was built without it. Asked of what will run: a
-/// forced command is a command whatever the client asked for. qshd's own
-/// SFTP server runs no program and needs neither.
-fn session_left_out(spec: &exec::Session) -> Option<&'static str> {
-    session_needs(spec.command.is_some(), spec.sftp.is_some()).filter(|f| match *f {
+/// forced command is a command whatever the client asked for, a subsystem
+/// too. qshd's own SFTP server runs no program and needs neither, and
+/// `subsystem` (the server's own command for one, no forced command in its
+/// place) belongs to `files`.
+fn session_left_out(spec: &exec::Session, subsystem: bool) -> Option<&'static str> {
+    session_needs(spec.command.is_some(), spec.sftp.is_some(), subsystem).filter(|f| match *f {
         "shell" => !cfg!(feature = "shell"),
         _ => !cfg!(feature = "exec"),
     })
 }
 
-fn session_needs(command: bool, internal_sftp: bool) -> Option<&'static str> {
-    match (internal_sftp, command) {
+fn session_needs(command: bool, internal_sftp: bool, subsystem: bool) -> Option<&'static str> {
+    match (internal_sftp || subsystem, command) {
         (true, _) => None,
         (false, false) => Some("shell"),
         (false, true) => Some("exec"),
@@ -1716,9 +1725,10 @@ mod tests {
 
     #[test]
     fn sessions_need_shell_or_exec() {
-        assert_eq!(session_needs(false, false), Some("shell"));
-        assert_eq!(session_needs(true, false), Some("exec"));
-        assert_eq!(session_needs(true, true), None, "internal-sftp runs no program");
+        assert_eq!(session_needs(false, false, false), Some("shell"));
+        assert_eq!(session_needs(true, false, false), Some("exec"));
+        assert_eq!(session_needs(true, true, false), None, "internal-sftp runs no program");
+        assert_eq!(session_needs(true, false, true), None, "the server's own subsystem command: files");
     }
 
     #[test]
