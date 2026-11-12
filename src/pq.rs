@@ -38,6 +38,22 @@ fn random<const N: usize>() -> Zeroizing<[u8; N]> {
     bytes
 }
 
+/// ML-KEM keeps its matrices on the stack, more than is left of a 1 MiB
+/// main thread (Windows) deep inside a handshake: it runs on a thread of
+/// its own. A handshake has two or three of these, a fraction of a
+/// millisecond each.
+fn on_own_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T, Error> {
+    const STACK: usize = 4 << 20;
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .name("ml-kem".into())
+            .stack_size(STACK)
+            .spawn_scoped(scope, work)
+            .map_err(|e| Error::General(format!("no thread for the key exchange: {e}")))?;
+        thread.join().map_err(|_| Error::General("the key exchange failed".into()))
+    })
+}
+
 const INVALID_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
 
 /// Both secrets in the order the group defines: ML-KEM's, then X25519's.
@@ -54,7 +70,7 @@ impl SupportedKxGroup for Hybrid {
     /// The client's side: a fresh key of each kind.
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
         let classical = X25519.start()?;
-        let post_quantum = mlkem768::generate_key_pair(*random());
+        let post_quantum = on_own_stack(|| mlkem768::generate_key_pair(*random()))?;
         let share = [post_quantum.pk().as_slice(), classical.pub_key()].concat();
         Ok(Box::new(Active { classical, post_quantum, share }))
     }
@@ -66,12 +82,14 @@ impl SupportedKxGroup for Hybrid {
         }
         let (key, classical_share) = client_share.split_at(ENCAPSULATION_KEY_LEN);
         let key = MlKem768PublicKey::try_from(key).map_err(|_| INVALID_SHARE)?;
-        // FIPS 203's check of an encapsulation key received from someone else.
-        if !mlkem768::validate_public_key(&key) {
-            return Err(INVALID_SHARE);
-        }
-        let (ciphertext, post_quantum) = mlkem768::encapsulate(&key, *random());
-        let post_quantum = Zeroizing::new(post_quantum);
+        // With FIPS 203's check of an encapsulation key received from someone else.
+        let (ciphertext, post_quantum) = on_own_stack(|| {
+            mlkem768::validate_public_key(&key).then(|| {
+                let (ciphertext, secret) = mlkem768::encapsulate(&key, *random());
+                (ciphertext, Zeroizing::new(secret))
+            })
+        })?
+        .ok_or(INVALID_SHARE)?;
         let classical = X25519.start_and_complete(classical_share)?;
         Ok(CompletedKeyExchange {
             group: self.name(),
@@ -106,7 +124,8 @@ impl ActiveKeyExchange for Active {
         }
         let (ciphertext, classical_share) = server_share.split_at(CIPHERTEXT_LEN);
         let ciphertext = MlKem768Ciphertext::try_from(ciphertext).map_err(|_| INVALID_SHARE)?;
-        let post_quantum = Zeroizing::new(mlkem768::decapsulate(self.post_quantum.private_key(), &ciphertext));
+        let key = self.post_quantum.private_key();
+        let post_quantum = on_own_stack(|| Zeroizing::new(mlkem768::decapsulate(key, &ciphertext)))?;
         let classical = self.classical.complete(classical_share)?;
         Ok(combine(&post_quantum[..], classical.secret_bytes()))
     }
