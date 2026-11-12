@@ -1216,6 +1216,11 @@ const SFTP_SERVERS: [&str; 5] = [
 
 /// Command line for a subsystem: from the config, or a detected sftp-server.
 fn subsystem_command(cfg: &ServerConfig, user: &User, name: &str) -> Option<String> {
+    // Built without shell and exec: nothing goes through the user's shell
+    // (see `users::NO_PROGRAMS`), so only qshd's own SFTP server, run directly.
+    if users::NO_PROGRAMS {
+        return (name == "sftp" && user.has_login_shell()).then(|| users::INTERNAL_SFTP.to_string());
+    }
     if let Some(cmd) = cfg.subsystems.get(name) {
         return (!cmd.trim().is_empty()).then(|| cmd.clone());
     }

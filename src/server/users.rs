@@ -1,6 +1,6 @@
 //! Target-user lookup and privilege dropping for spawned processes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use nix::unistd::{geteuid, Gid, User as PwUser};
@@ -450,6 +450,12 @@ impl User {
         if self.chroot.is_some() {
             return self.confined_helper(args);
         }
+        if NO_PROGRAMS {
+            if !self.has_login_shell() {
+                bail!("file transfers are not allowed for this account (its shell is not a login shell)");
+            }
+            return self.helper(args);
+        }
         // Through a shell `/proc/self/exe` would be the shell: the path it is.
         let exe = exe_path()?;
         let exe = exe.to_str().context("qshd path is not UTF-8")?;
@@ -457,6 +463,28 @@ impl User {
         cmd.arg("-c").arg(format!("{} {HELPER_FROM_ENV}", shell_quote(exe)?));
         cmd.env(HELPER_ARGS, encode_args(&helper_argv(args)));
         Ok(cmd)
+    }
+}
+
+/// A qshd built without `shell` and `exec` runs no program of the user's,
+/// so not their shell either: its startup files (`~/.zshenv`, fish's
+/// `config.fish`) are the user's to write, and a copy could put code there.
+pub const NO_PROGRAMS: bool = !cfg!(any(feature = "shell", feature = "exec"));
+
+impl User {
+    /// Whether the account's shell is one for logging in: listed in
+    /// /etc/shells, or without that file anything but nologin and false.
+    /// Where the shell is not asked (see [`NO_PROGRAMS`]), this keeps such
+    /// accounts out of file transfers, as the shell would have.
+    pub fn has_login_shell(&self) -> bool {
+        login_shell(std::fs::read_to_string("/etc/shells").ok().as_deref(), &self.shell)
+    }
+}
+
+fn login_shell(shells: Option<&str>, shell: &Path) -> bool {
+    match shells {
+        Some(list) => list.lines().map(str::trim).any(|l| !l.starts_with('#') && Path::new(l) == shell),
+        None => !shell.file_name().is_some_and(|n| n == "nologin" || n == "false"),
     }
 }
 
@@ -578,6 +606,17 @@ fn shell_quote(word: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_shells() {
+        let list = Some("# shells\n/bin/sh\n/usr/bin/fish\n");
+        assert!(login_shell(list, Path::new("/usr/bin/fish")));
+        assert!(!login_shell(list, Path::new("/usr/bin/nologin")));
+        assert!(!login_shell(list, Path::new("/usr/bin/git-shell")));
+        assert!(login_shell(None, Path::new("/bin/zsh")));
+        assert!(!login_shell(None, Path::new("/sbin/nologin")));
+        assert!(!login_shell(None, Path::new("/bin/false")));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

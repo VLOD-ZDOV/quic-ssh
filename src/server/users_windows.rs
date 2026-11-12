@@ -93,6 +93,11 @@ impl User {
         self.helper(args)
     }
 
+    /// As on Unix; here every account has one.
+    pub fn has_login_shell(&self) -> bool {
+        true
+    }
+
     /// The flag that makes the shell run one command line.
     pub fn command_flag(&self) -> &'static str {
         if is_cmd(&self.shell) { "/c" } else { "-c" }
@@ -120,3 +125,5 @@ pub fn set_session_scope(_on: bool) {}
 
 /// The command name of the built-in SFTP server.
 pub const INTERNAL_SFTP: &str = "internal-sftp";
+/// As on Unix: a qshd built without `shell` and `exec` runs no program of the user's.
+pub const NO_PROGRAMS: bool = !cfg!(any(feature = "shell", feature = "exec"));

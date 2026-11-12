@@ -481,7 +481,7 @@ cargo build --release --no-default-features --features shell,exec,files,persist
 
 `--no-default-features` alone now leaves out sessions too (up to 1.10 a shell and commands were always there): add `shell,exec`.
 
-Leaving out `shell` alone is not a restriction: with `exec`, `qsh host bash` still gives a shell, because a shell is a command like any other. It only refuses logins without a command. To have no shell at all, leave out both (forwards and file copies remain), or give keys a forced command (`command="..."` in `authorized_keys`).
+Leaving out `shell` alone is not a restriction: with `exec`, `qsh host bash` still gives a shell, because a shell is a command like any other. It only refuses logins without a command. To have no shell at all, leave out both (forwards and file copies remain; qshd then starts its copy helpers and its own SFTP server directly instead of through the user's shell, whose startup files a copy could change, and other `[subsystems]` are not offered), or give keys a forced command (`command="..."` in `authorized_keys`).
 
 The `hardened` feature changes what qshd starts from; the config file can still set each value:
 
