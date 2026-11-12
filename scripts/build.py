@@ -158,6 +158,7 @@ FORCED = {
 }
 
 RED, YELLOW = "red", "yellow"
+CONFIG_HEADER = "# Written by scripts/build.py"
 
 
 def read_features():
@@ -302,7 +303,7 @@ def config_text(settings, on):
             lines.append(f"{name} = {toml_value(value)}".ljust(40) + f"# {what}")
     if not lines:
         return ""
-    return "# Written by scripts/build.py: what differs from this build's defaults.\n" + "\n".join(lines) + "\n"
+    return CONFIG_HEADER + ": what differs from this build's defaults.\n" + "\n".join(lines) + "\n"
 
 
 def cargo_command(on, bins, target=None, jobs=None):
@@ -338,8 +339,17 @@ def build(on, bins, settings, target=None, jobs=None):
             if os.path.exists(path):
                 print(f"{os.path.relpath(path, ROOT)}  {os.path.getsize(path) / 1048576:.1f} MiB")
     text = config_text(settings, on)
+    path = os.path.join(where, "qshd.toml")
+    if not text and os.path.exists(path):
+        # One written for an earlier build does not belong to this one.
+        with open(path, encoding="utf-8") as f:
+            ours = f.readline().startswith(CONFIG_HEADER)
+        if ours:
+            os.remove(path)
+            print(f"{os.path.relpath(path, ROOT)}  removed: it was for an earlier build, this one has the defaults")
+        else:
+            print(f"{os.path.relpath(path, ROOT)}  is not from this build: do not install it with these programs")
     if text:
-        path = os.path.join(where, "qshd.toml")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         print(f"{os.path.relpath(path, ROOT)}  the settings chosen; install it as qshd's config (see README, Server configuration)")
