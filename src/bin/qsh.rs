@@ -671,6 +671,7 @@ async fn tool_main(cli: ToolCli) -> Result<i32> {
         Cmd::Cp { .. } => Some(("files", cfg!(feature = "files"))),
         Cmd::Speed { .. } => Some(("speed", cfg!(feature = "speed"))),
         Cmd::Update { .. } => Some(("self-update", cfg!(feature = "self-update"))),
+        Cmd::Multi { .. } => Some(("exec", cfg!(feature = "exec"))),
         _ => None,
     };
     if let Some((feature, false)) = needs {
@@ -962,8 +963,19 @@ fn save_connection(name: &str, dest: &str, a: &SshArgs) -> Result<()> {
     Ok(())
 }
 
-/// Takes out of a session what this qsh was built without (Cargo features;
-/// `--no-default-features` is the locked-down build). Asked for on the
+/// A qshd older than 2.0 has no post-quantum key exchange: the connection
+/// works, but what is recorded of it now could be decrypted one day.
+fn warn_not_post_quantum(conn: &qsh::transport::Conn, target: &Target) {
+    if !conn.post_quantum() {
+        eprintln!(
+            "qsh: warning: {} runs a qshd older than 2.0: this connection is not protected against being recorded now and \
+             decrypted later by a quantum computer. Update qshd there (`RequirePostQuantum yes` refuses such servers).",
+            target.host
+        );
+    }
+}
+
+/// Takes out of a session what this qsh was built without (Cargo features). Asked for on the
 /// command line, it is an error; set in a config file (which ssh may share),
 /// it is turned off with a warning.
 fn limit_to_build(a: &mut SshArgs, t: &mut Target) -> Result<()> {
@@ -1079,6 +1091,15 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         Some(other) => bail!("unknown SessionType {other:?} (none, subsystem, default)"),
     }
     a.stdin_null |= target.stdin_null;
+    // A session runs a login shell or a command; -N, -W and subsystems do not.
+    if !(a.no_command || a.subsystem || a.stdio_forward.is_some()) {
+        if a.command.is_empty() && !cfg!(feature = "shell") {
+            bail!("this qsh was built without shell (logins): give a command, or -N for forwards only");
+        }
+        if !a.command.is_empty() && !cfg!(feature = "exec") {
+            bail!("this qsh was built without exec (remote commands)");
+        }
+    }
     if a.background && !a.no_command && a.command.is_empty() && a.stdio_forward.is_none() {
         bail!("cannot go to the background (-f) without a command or -N");
     }
@@ -1199,6 +1220,9 @@ async fn session_main(mut a: SshArgs, args: &[String]) -> Result<i32> {
         }
         Err(e) => return Err(with_doctor_hint(e, &target)),
     };
+    if !quiet {
+        warn_not_post_quantum(&conn, &target);
+    }
     // Only now: had ssh made the connection, it would have used them.
     if !quiet {
         for o in &a.unapplied {
@@ -1679,6 +1703,9 @@ async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnAr
         Err(e) if args.full && e.is::<Unreachable>() => return exec_openssh("scp", scp_args(), &format!("{e:#}")),
         Err(e) => return Err(with_doctor_hint(e, &target)),
     };
+    if !target.quiet {
+        warn_not_post_quantum(&conn, &target);
+    }
     // `-C`, or `Compression yes` in the config (as for ssh).
     if compress && conn.server_version() < 5 {
         eprintln!("qsh: the server's qshd is too old for compression (-C); copying without it");

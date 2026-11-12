@@ -10,12 +10,17 @@ keywords = ["ssh", "quic", "remote-shell", "networking"]
 categories = ["command-line-utilities", "network-programming"]
 
 [features]
-# Conveniences, all on by default. `--no-default-features` leaves every one
-# out: the locked-down build, a shell and commands over QUIC/TCP with keys or
-# certificates only, to hosts already known; whatever a request for the rest
-# reaches is a refusal. Pick some back with
-# `--no-default-features --features files,persist`.
-default = ["punch", "pair", "tofu", "forwarding", "agent", "x11", "tunnel", "persist", "sharing", "password", "root-login", "user-rc", "self-update", "files", "compress", "speed", "ui", "predict"]
+# What qsh and qshd can do, all on by default. `--no-default-features`
+# leaves every one out; pick some back with
+# `--no-default-features --features shell,exec` (the smallest build that
+# still logs in: a shell and commands over QUIC/TCP with keys or certificates
+# only, to hosts already known). Whatever a request for the rest reaches is a
+# refusal. `scripts/build.py` is a menu for choosing.
+default = ["shell", "exec", "punch", "pair", "tofu", "forwarding", "agent", "x11", "tunnel", "persist", "sharing", "password", "root-login", "user-rc", "self-update", "files", "compress", "speed", "ui", "predict"]
+# Login shells: `qsh host`.
+shell = []
+# Commands: `qsh host command`, forced commands (`command=`, `force_command`).
+exec = []
 # `qsh punch`: NAT traversal through public STUN servers.
 punch = []
 # Pairing codes: `qsh pair`, `qshd pair`.
@@ -53,6 +58,11 @@ speed = []
 ui = []
 # Predictive echo: qsh draws typed keys before the server echoes them.
 predict = []
+# Stricter defaults in qshd (the config file can still set each one): 3 key
+# proofs, 30 s to log in, 4 new connections per address, 4 sessions per
+# connection, no `-R`, disconnected sessions kept for 10 minutes, only the
+# post-quantum key exchange (no clients older than 2.0). Off by default.
+hardened = []
 # PAM for qshd (`use_pam`), on Linux; needs libpam (libpam0g-dev,
 # pam-devel). Not in the static release builds.
 pam = []
@@ -100,6 +110,7 @@ async-compression = { version = "0.4.50", features = ["tokio", "zstd"] }
 zstd = "0.14"
 socket2 = { version = "0.6", features = ["all"] }
 zeroize = "1"
+libcrux-ml-kem = { version = "0.0.11", default-features = false, features = ["mlkem768"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource", "net"] }

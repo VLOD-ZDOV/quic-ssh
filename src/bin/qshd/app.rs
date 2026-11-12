@@ -373,6 +373,9 @@ fn check_config(config: Option<PathBuf>, print: bool, connection: Option<&str>) 
     if !without.is_empty() {
         eprintln!("qshd: built without {} (forced off, whatever the config says)", without.join(", "));
     }
+    if cfg!(feature = "hardened") {
+        eprintln!("qshd: hardened build: stricter defaults for what the config does not set (`qshd -T` shows them)");
+    }
     if !print {
         return Ok(());
     }

@@ -22,8 +22,22 @@ use crate::proto::{ALPN, ALPN_HOST_CERT};
 /// Server name sent in SNI; certificates are pinned by key, so it is not checked.
 pub const SERVER_NAME: &str = "qsh";
 
+/// ring's provider, with the post-quantum hybrid key exchange preferred; a
+/// peer that does not have it (qsh before 2.0) gets X25519.
+#[cfg(test)]
 fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    provider_for(false)
+}
+
+/// `post_quantum_only`: no other key exchange, so the handshake with a peer
+/// that lacks the hybrid one fails.
+fn provider_for(post_quantum_only: bool) -> Arc<CryptoProvider> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    if post_quantum_only {
+        provider.kx_groups.clear();
+    }
+    provider.kx_groups.insert(0, crate::pq::X25519_MLKEM768);
+    Arc::new(provider)
 }
 
 /// Self-signed certificate carrying the identity's public key.
@@ -207,8 +221,10 @@ impl rustls::server::ResolvesServerCert for HostCertResolver {
 }
 
 /// `host_cert`: an OpenSSH host certificate for `host`'s key, in wire format.
-pub fn server_config(host: &Identity, host_cert: Option<Vec<u8>>) -> Result<rustls::ServerConfig> {
-    let provider = provider();
+/// `post_quantum_only` (`require_post_quantum`): clients older than 2.0
+/// cannot connect.
+pub fn server_config(host: &Identity, host_cert: Option<Vec<u8>>, post_quantum_only: bool) -> Result<rustls::ServerConfig> {
+    let provider = provider_for(post_quantum_only);
     let (cert, key) = self_signed(host)?;
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -228,12 +244,14 @@ pub fn server_config(host: &Identity, host_cert: Option<Vec<u8>>) -> Result<rust
 
 /// A client config without a host check (probes that do not log in).
 pub fn client_config(id: &Identity) -> Result<rustls::ClientConfig> {
-    checked_client_config(id, None)
+    checked_client_config(id, None, false)
 }
 
 /// A client config whose handshake fails unless `check` accepts the server.
-pub fn checked_client_config(id: &Identity, check: Option<HostCheck>) -> Result<rustls::ClientConfig> {
-    let provider = provider();
+/// `post_quantum_only` (`RequirePostQuantum`): servers older than 2.0 are
+/// not connected to.
+pub fn checked_client_config(id: &Identity, check: Option<HostCheck>, post_quantum_only: bool) -> Result<rustls::ClientConfig> {
+    let provider = provider_for(post_quantum_only);
     let (cert, key) = self_signed(id)?;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -282,14 +300,92 @@ mod tests {
         assert!(!verify(&other));
     }
 
+    fn handshake(client: Arc<rustls::ClientConfig>, server: Arc<rustls::ServerConfig>) -> (rustls::ClientConnection, rustls::ServerConnection) {
+        try_handshake(client, server).expect("handshake")
+    }
+
+    /// `None`: one side refused.
+    fn try_handshake(client: Arc<rustls::ClientConfig>, server: Arc<rustls::ServerConfig>) -> Option<(rustls::ClientConnection, rustls::ServerConnection)> {
+        let mut client = rustls::ClientConnection::new(client, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
+        let mut server = rustls::ServerConnection::new(server).unwrap();
+        for _ in 0..10 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut buf.as_slice()).unwrap();
+            let refused = server.process_new_packets().is_err();
+            let mut buf = Vec::new();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut buf.as_slice()).unwrap();
+            if client.process_new_packets().is_err() || refused {
+                return None;
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Some((client, server));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn key_exchange_is_post_quantum() {
+        use rustls::NamedGroup;
+        let group = |c: &rustls::ClientConnection, s: &rustls::ServerConnection| {
+            let (c, s) = (c.negotiated_key_exchange_group().unwrap().name(), s.negotiated_key_exchange_group().unwrap().name());
+            assert_eq!(c, s);
+            c
+        };
+        let new_server = || server_config(&Identity::generate(), None, false).unwrap();
+        let new_client = || client_config(&Identity::generate()).unwrap();
+        let old_provider = || Arc::new(rustls::crypto::ring::default_provider());
+
+        let (c, s) = handshake(Arc::new(new_client()), Arc::new(new_server()));
+        assert_eq!(group(&c, &s), NamedGroup::X25519MLKEM768);
+
+        // An old server: X25519, and without a second round (HelloRetryRequest).
+        let old_server = rustls::ServerConfig::builder_with_provider(old_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(ClientKeyVerifier { provider: old_provider() }));
+        let (cert, key) = self_signed(&Identity::generate()).unwrap();
+        let mut old_server = old_server.with_single_cert(vec![cert], key).unwrap();
+        old_server.alpn_protocols = vec![ALPN.to_vec()];
+        let old_server = Arc::new(old_server);
+        let (c, s) = handshake(Arc::new(new_client()), old_server.clone());
+        assert_eq!(group(&c, &s), NamedGroup::X25519);
+
+        // An old client.
+        let (cert, key) = self_signed(&Identity::generate()).unwrap();
+        let mut old_client = rustls::ClientConfig::builder_with_provider(old_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(HostKeyVerifier { provider: old_provider(), check: None }))
+            .with_client_auth_cert(vec![cert], key)
+            .unwrap();
+        old_client.alpn_protocols = vec![ALPN.to_vec()];
+        let old_client = Arc::new(old_client);
+        let (c, s) = handshake(old_client.clone(), Arc::new(new_server()));
+        assert_eq!(group(&c, &s), NamedGroup::X25519);
+
+        // Required on one side: the old other side does not get in.
+        let strict_server = Arc::new(server_config(&Identity::generate(), None, true).unwrap());
+        let strict_client = || Arc::new(checked_client_config(&Identity::generate(), None, true).unwrap());
+        assert!(try_handshake(old_client, strict_server.clone()).is_none());
+        assert!(try_handshake(strict_client(), old_server).is_none());
+        let (c, s) = handshake(strict_client(), strict_server.clone());
+        assert_eq!(group(&c, &s), NamedGroup::X25519MLKEM768);
+        let (c, s) = handshake(Arc::new(new_client()), strict_server);
+        assert_eq!(group(&c, &s), NamedGroup::X25519MLKEM768);
+    }
+
     /// The client's certificate goes out only after the host check: a
     /// refused server never learns the client's key.
     #[test]
     fn refused_server_never_sees_the_client_key() {
-        let server_cfg = Arc::new(server_config(&Identity::generate(), None).unwrap());
+        let server_cfg = Arc::new(server_config(&Identity::generate(), None, false).unwrap());
         let refuse: HostCheck = Arc::new(|_, _| Err("refused".into()));
         for (check, accepted) in [(None, true), (Some(refuse), false)] {
-            let client_cfg = Arc::new(checked_client_config(&Identity::generate(), check).unwrap());
+            let client_cfg = Arc::new(checked_client_config(&Identity::generate(), check, false).unwrap());
             let mut client = rustls::ClientConnection::new(client_cfg, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
             let mut server = rustls::ServerConnection::new(server_cfg.clone()).unwrap();
             for _ in 0..10 {

@@ -12,6 +12,7 @@ pub mod keys;
 pub mod pair;
 pub mod pattern;
 pub mod platform;
+pub mod pq;
 pub mod prompt;
 pub mod proto;
 pub mod release;

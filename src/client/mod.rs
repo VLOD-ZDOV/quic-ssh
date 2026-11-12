@@ -139,6 +139,9 @@ pub struct Target {
     /// `RestoreSession`: a terminal session outlives qsh itself; the next
     /// run to the host goes back to it.
     pub restore_session: bool,
+    /// `RequirePostQuantum` (default no): only the post-quantum key
+    /// exchange, so a qshd older than 2.0 is not connected to.
+    pub require_post_quantum: bool,
     /// `ServerAliveInterval` and `ServerAliveCountMax`: ping the server when
     /// it has been quiet this long, give up after this many unanswered pings.
     pub server_alive: Option<(std::time::Duration, u32)>,
@@ -489,6 +492,7 @@ impl Target {
             certificate_files,
             persist_session: cfg.persist_session.unwrap_or(true),
             restore_session: cfg.restore_session.unwrap_or(false),
+            require_post_quantum: cfg.require_post_quantum.unwrap_or(false),
             loopback_fallback: cfg.loopback_fallback.unwrap_or(false),
             server_alive: cfg
                 .server_alive_interval
@@ -1004,7 +1008,7 @@ fn tls_configs(target: &Target, own: &Identity, throwaway: &Identity, rejected: 
             hidden.push(port);
         }
         let id = if pinned { own } else { throwaway };
-        configs.insert(port, crate::tls::checked_client_config(id, Some(host_check(target, port, rejected)))?);
+        configs.insert(port, crate::tls::checked_client_config(id, Some(host_check(target, port, rejected)), target.require_post_quantum)?);
     }
     Ok((configs, hidden))
 }
@@ -1153,13 +1157,20 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
                 }
                 check(key, cert)
             });
-            crate::tls::checked_client_config(own, Some(only)).map(|c| (p, c))
+            crate::tls::checked_client_config(own, Some(only), target.require_post_quantum).map(|c| (p, c))
         };
         (target_ports(target).into_iter().map(only).collect::<Result<_>>()?, Vec::new())
     } else {
         tls_configs(target, own, &throwaway, &rejected)?
     };
-    let mut conn = open(target, opts, &tls, &rejected, via).await?;
+    let mut conn = match open(target, opts, &tls, &rejected, via).await {
+        Ok(conn) => conn,
+        // A qshd older than 2.0 fails the handshake; it looks like no qshd at all.
+        Err(e) if target.require_post_quantum => {
+            return Err(e.context("RequirePostQuantum is on: only a qshd with the post-quantum key exchange (2.0 or newer) is connected to"));
+        }
+        Err(e) => return Err(e),
+    };
     verify_host_key(&conn, target, opts).await?;
     let hidden = hidden.contains(&conn.remote_addr().port()) && !std::ptr::eq(own, &throwaway);
     let tls_id = if hidden { &throwaway } else { own };
@@ -1173,6 +1184,8 @@ async fn login_once(target: &Target, opts: &ConnectOptions, via: Option<&Conn>, 
         Ok(auth::Outcome::Welcome(version)) => {
             tracing::debug!("logged in, server protocol version {version}");
             conn.set_server_version(version);
+            let kx = if conn.post_quantum() { "X25519MLKEM768 (post-quantum)" } else { "X25519 (not post-quantum: the server is older than 2.0)" };
+            tracing::debug!("key exchange: {kx}");
             Ok(conn)
         }
         Ok(auth::Outcome::Denied { reason: e, asked_for_keys }) => {

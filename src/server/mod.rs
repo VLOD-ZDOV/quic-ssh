@@ -129,6 +129,7 @@ fn restart_needed(old: &ServerConfig, new: &ServerConfig) -> Vec<&'static str> {
         ("per_source_penalties", old.per_source_penalties != new.per_source_penalties),
         ("per_source_penalty_exempt_list", old.per_source_penalty_exempt_list != new.per_source_penalty_exempt_list),
         ("session_scope", old.session_scope != new.session_scope),
+        ("require_post_quantum", old.require_post_quantum != new.require_post_quantum),
     ] {
         if differs {
             changed.push(name);
@@ -363,7 +364,7 @@ pub fn config_problems(cfg: &ServerConfig, host: Option<&Identity>) -> Vec<Strin
 /// address is unavailable (IPv6 disabled), falls back to IPv4.
 pub async fn bind(cfg: &ServerConfig, host: &Identity) -> Result<Listener> {
     crate::transport::set_server_buffer(cfg.connection_buffer_mb);
-    let tls = crate::tls::server_config(host, host_certificate(cfg, host))?;
+    let tls = crate::tls::server_config(host, host_certificate(cfg, host), cfg.require_post_quantum)?;
     let alive = (cfg.client_alive_interval > 0)
         .then(|| crate::transport::Alive { interval: Duration::from_secs(cfg.client_alive_interval), count: cfg.client_alive_count_max });
     match Listener::bind(cfg.listen, tls.clone(), cfg.tcp, alive).await {
@@ -981,11 +982,17 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
     match request {
         Request::Exec { command, env, pty } => {
             let mut spec = session(command, env, pty, false);
+            if let Some(feature) = session_left_out(&spec) {
+                return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
+            }
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
             exec::run(send, recv, user, spec, closed).await
         }
         Request::Persistent { command, env, pty } => {
             let mut spec = session(command, env, Some(pty), false);
+            if let Some(feature) = session_left_out(&spec) {
+                return write_msg(&mut send, &Reply::Err(format!("this qshd was built without {feature}"))).await;
+            }
             spec.prelude.last_login = last_login(cfg, user, limits, &spec).await;
             // Without a terminal (no-pty) or with sessions turned off: a plain session.
             if spec.pty.is_none() || !state.sessions.enabled() || spec.sftp.is_some() {
@@ -1236,8 +1243,7 @@ fn nologin(path: &std::path::Path) -> Option<String> {
     Some(if text.is_empty() { "logins are disabled (/etc/nologin)".into() } else { text.to_string() })
 }
 
-/// The build feature a request needs, if this qshd was built without it
-/// (`cargo build --no-default-features` leaves them all out).
+/// The build feature a request needs, if this qshd was built without it.
 fn left_out(request: &Request) -> Option<&'static str> {
     let needs = match request {
         Request::Compressed(_) => "compress",
@@ -1267,6 +1273,25 @@ fn left_out(request: &Request) -> Option<&'static str> {
         _ => cfg!(feature = "speed"),
     };
     (!built).then_some(needs)
+}
+
+/// The build feature a session needs (`shell` for a login shell, `exec` for
+/// a command), if this qshd was built without it. Asked of what will run: a
+/// forced command is a command whatever the client asked for. qshd's own
+/// SFTP server runs no program and needs neither.
+fn session_left_out(spec: &exec::Session) -> Option<&'static str> {
+    session_needs(spec.command.is_some(), spec.sftp.is_some()).filter(|f| match *f {
+        "shell" => !cfg!(feature = "shell"),
+        _ => !cfg!(feature = "exec"),
+    })
+}
+
+fn session_needs(command: bool, internal_sftp: bool) -> Option<&'static str> {
+    match (internal_sftp, command) {
+        (true, _) => None,
+        (false, false) => Some("shell"),
+        (false, true) => Some("exec"),
+    }
 }
 
 /// Addresses to listen on for `-R`, following `gateway_ports` like sshd's
@@ -1687,6 +1712,13 @@ mod tests {
         assert_eq!(remote_listen_addrs(GatewayPorts::ClientSpecified, "db.example", 1), None);
         // Without clientspecified the name does not matter: loopback.
         assert!(remote_listen_addrs(GatewayPorts::No, "db.example", 1).is_some());
+    }
+
+    #[test]
+    fn sessions_need_shell_or_exec() {
+        assert_eq!(session_needs(false, false), Some("shell"));
+        assert_eq!(session_needs(true, false), Some("exec"));
+        assert_eq!(session_needs(true, true), None, "internal-sftp runs no program");
     }
 
     #[test]

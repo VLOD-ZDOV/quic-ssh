@@ -12,7 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
+/// From this version (qsh 2.0) both sides have the post-quantum key exchange
+/// and prefer it, so a connection between two of them uses it.
+pub const POST_QUANTUM: u32 = 12;
 /// From this version a connection that resumed a session may forward too.
 pub const FORWARDS_ON_RESUME: u32 = 10;
 /// From this protocol version: `Request::Hold` and packed terminal output.

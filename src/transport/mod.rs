@@ -142,6 +142,13 @@ impl Conn {
         self.server_version
     }
 
+    /// Whether the session keys came from the post-quantum key exchange. A
+    /// server of protocol version 12 or newer has it and prefers it, as this
+    /// client does, and TLS 1.3 does not let anyone in between take it out.
+    pub fn post_quantum(&self) -> bool {
+        self.server_version >= crate::proto::POST_QUANTUM
+    }
+
     /// Keeps the jump-host connections alive as long as this one.
     pub fn set_hops(&mut self, hops: Vec<Arc<Conn>>) {
         self.hops = hops;

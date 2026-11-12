@@ -157,6 +157,11 @@ async fn host(r: &mut Report, dest: &str, port: Option<u16>, opts: &ConnectOptio
             r.line(Level::Ok, "host key", format!("trusted ({})", conn.peer_key().fingerprint()));
             let ping = super::speed::ping(&conn).await.map(ms).unwrap_or_else(|e| format!("{e:#}"));
             r.line(Level::Ok, "login", format!("as {} over {} in {} (round trip {ping})", target.user, conn.transport_name(), ms(took)));
+            if conn.post_quantum() {
+                r.line(Level::Ok, "key exchange", "post-quantum (X25519MLKEM768)");
+            } else {
+                r.line(Level::Note, "key exchange", "X25519, not post-quantum: update qshd to 2.0 or newer");
+            }
             if conn.server_version() < crate::proto::VERSION {
                 r.line(Level::Note, "qshd", format!("older protocol ({}); update qshd for every feature", conn.server_version()));
             }

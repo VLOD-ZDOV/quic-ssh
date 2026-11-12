@@ -82,6 +82,9 @@ pub struct ServerConfig {
     /// Addresses `-R` may listen on: `port`, `host:port` (like PermitListen).
     #[serde(deserialize_with = "names")]
     pub permit_listen: Vec<String>,
+    /// Only the post-quantum key exchange: clients older than qsh 2.0, which
+    /// do not have it, cannot connect.
+    pub require_post_quantum: bool,
     /// Maximum simultaneous connections.
     pub max_connections: usize,
     /// Maximum connections that have not authenticated yet (like sshd's MaxStartups).
@@ -698,7 +701,7 @@ const SETTING_NAMES: &[&str] = &[
     "authorized_principals_file", "allow_tcp_forwarding", "disable_forwarding", "allow_stream_local_forwarding",
     "stream_local_bind_mask", "stream_local_bind_unlink", "x11_forwarding", "x11_display_offset", "x11_use_localhost",
     "xauth_location", "permit_tunnel", "permit_open", "permit_listen", "max_connections", "max_startups",
-    "max_startups_per_ip", "connection_buffer_mb", "session_scope", "gateway_ports", "loopback_fallback", "subsystems", "trusted_user_ca_keys",
+    "max_startups_per_ip", "connection_buffer_mb", "require_post_quantum", "session_scope", "gateway_ports", "loopback_fallback", "subsystems", "trusted_user_ca_keys",
     "max_auth_tries", "totp_valid_for", "allow_agent_forwarding", "totp", "host_certificate", "revoked_keys",
     "authorized_keys_command", "authorized_keys_command_user", "session_timeout", "allow_users", "deny_users",
     "allow_groups", "deny_groups", "permit_root_login", "login_grace_time", "banner", "print_motd", "print_last_log",
@@ -807,6 +810,10 @@ fn check_user_entries(what: &str, entries: &[String]) -> Result<()> {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        // The `hardened` build starts from stricter values; the config file
+        // can still set each of them.
+        let hardened = cfg!(feature = "hardened");
+        let forwarding = if hardened { Forwarding::Local } else { Forwarding::All };
         ServerConfig {
             listen: SocketAddr::from(([0u16; 8], crate::DEFAULT_PORT)),
             tcp: true,
@@ -815,9 +822,9 @@ impl Default for ServerConfig {
             use_qsh_authorized_keys: true,
             authorized_keys_file: vec![".ssh/authorized_keys".into()],
             authorized_principals_file: None,
-            allow_tcp_forwarding: Forwarding::All,
+            allow_tcp_forwarding: forwarding,
             disable_forwarding: false,
-            allow_stream_local_forwarding: Forwarding::All,
+            allow_stream_local_forwarding: forwarding,
             stream_local_bind_mask: "0177".into(),
             stream_local_bind_unlink: false,
             x11_forwarding: false,
@@ -827,16 +834,17 @@ impl Default for ServerConfig {
             permit_tunnel: PermitTunnel::No,
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
+            require_post_quantum: hardened,
             max_connections: 256,
             connection_buffer_mb: 32,
             session_scope: true,
             max_startups: 64,
-            max_startups_per_ip: 8,
+            max_startups_per_ip: if hardened { 4 } else { 8 },
             gateway_ports: GatewayPorts::No,
             loopback_fallback: false,
             subsystems: BTreeMap::new(),
             trusted_user_ca_keys: None,
-            max_auth_tries: 6,
+            max_auth_tries: if hardened { 3 } else { 6 },
             totp_valid_for: 3600,
             allow_agent_forwarding: true,
             totp: Totp::Optional,
@@ -844,18 +852,18 @@ impl Default for ServerConfig {
             revoked_keys: None,
             authorized_keys_command: None,
             authorized_keys_command_user: None,
-            session_timeout: 3600,
+            session_timeout: if hardened { 600 } else { 3600 },
             allow_users: Vec::new(),
             deny_users: Vec::new(),
             allow_groups: Vec::new(),
             deny_groups: Vec::new(),
             permit_root_login: PermitRootLogin::ProhibitPassword,
-            login_grace_time: 120,
+            login_grace_time: if hardened { 30 } else { 120 },
             banner: None,
             print_motd: true,
             print_last_log: true,
             permit_user_rc: true,
-            max_sessions: 10,
+            max_sessions: if hardened { 4 } else { 10 },
             permit_tty: true,
             accept_env: vec!["LANG".into(), "LC_*".into(), "COLORTERM".into()],
             set_env: BTreeMap::new(),
@@ -1203,7 +1211,7 @@ impl ServerConfig {
     }
 
     /// Turns off what this qshd was built without (the default features in
-    /// Cargo.toml; `--no-default-features` is the locked-down build). No
+    /// Cargo.toml). No
     /// setting in the file and no `[[match]]` block turns it back on.
     pub fn limit_to_build(&mut self) {
         if !cfg!(feature = "forwarding") {
@@ -1239,6 +1247,8 @@ impl ServerConfig {
     /// What [`limit_to_build`](Self::limit_to_build) takes away, for `qshd -t`.
     pub fn built_without() -> Vec<&'static str> {
         [
+            ("shell", cfg!(feature = "shell")),
+            ("exec", cfg!(feature = "exec")),
             ("forwarding", cfg!(feature = "forwarding")),
             ("agent", cfg!(feature = "agent")),
             ("x11", cfg!(feature = "x11")),
@@ -1680,7 +1690,27 @@ mod tests {
         assert!(b.local_forwarding() == cfg!(feature = "forwarding") && !b.remote_forwarding());
         let c = cfg.for_login(&who("u", none, "203.0.113.9"));
         assert_eq!(c.force_command.as_deref(), Some("/bin/global"));
-        assert_eq!(c.max_sessions, 10);
+        assert_eq!(c.max_sessions, ServerConfig::default().max_sessions);
+    }
+
+    #[test]
+    fn hardened_defaults() {
+        let d = ServerConfig::default();
+        let strict = (3, 30, 4, 4, 600, Forwarding::Local, true);
+        let usual = (6, 120, 8, 10, 3600, Forwarding::All, false);
+        let got = (
+            d.max_auth_tries,
+            d.login_grace_time,
+            d.max_startups_per_ip,
+            d.max_sessions,
+            d.session_timeout,
+            d.allow_tcp_forwarding,
+            d.require_post_quantum,
+        );
+        assert_eq!(got, if cfg!(feature = "hardened") { strict } else { usual });
+        // The config file still decides.
+        let c = parse("max_auth_tries = 5\nallow_tcp_forwarding = true\n");
+        assert_eq!((c.max_auth_tries, c.allow_tcp_forwarding), (5, Forwarding::All));
     }
 
     #[test]

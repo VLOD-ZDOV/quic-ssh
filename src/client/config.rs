@@ -158,6 +158,8 @@ pub struct HostConfig {
     /// qsh's `PersistSession`: terminal sessions survive lost connections.
     pub persist_session: Option<bool>,
     pub restore_session: Option<bool>,
+    /// qsh's `RequirePostQuantum`: only servers with the post-quantum key exchange.
+    pub require_post_quantum: Option<bool>,
     /// qsh's `LoopbackFallback`: a `-R` target refused on 127.0.0.1 tries ::1, and back.
     pub loopback_fallback: Option<bool>,
     /// `ServerAliveInterval` (seconds; 0 = off).
@@ -229,7 +231,7 @@ fn choices(keyword: &str) -> Option<&'static [&'static str]> {
     Some(match keyword {
         "stdinnull" | "forkafterauthentication" | "exitonforwardfailure" | "permitlocalcommand" | "batchmode" | "hashknownhosts"
         | "enableescapecommandline" | "passwordauthentication" | "forwardx11" | "forwardx11trusted" | "clearallforwardings"
-        | "identitiesonly" | "persistsession" | "restoresession" | "loopbackfallback" | "canonicalizefallbacklocal" => YES_NO,
+        | "identitiesonly" | "persistsession" | "restoresession" | "requirepostquantum" | "loopbackfallback" | "canonicalizefallbacklocal" => YES_NO,
         "compression" => &["yes", "no", "auto"],
         "stricthostkeychecking" => &["yes", "no", "ask", "accept-new"],
         "requesttty" => &["yes", "no", "force", "auto"],
@@ -675,6 +677,7 @@ impl Parser<'_> {
                 "certificatefile" => push_new(&mut o.certificate_files, first),
                 "persistsession" if o.persist_session.is_none() => o.persist_session = first.as_deref().map(yes),
                 "restoresession" if o.restore_session.is_none() => o.restore_session = first.as_deref().map(yes),
+                "requirepostquantum" if o.require_post_quantum.is_none() => o.require_post_quantum = first.as_deref().map(yes),
                 "loopbackfallback" if o.loopback_fallback.is_none() => o.loopback_fallback = first.as_deref().map(yes),
                 "serveraliveinterval" if o.server_alive_interval.is_none() => o.server_alive_interval = first.as_deref().and_then(seconds),
                 "serveralivecountmax" if o.server_alive_count_max.is_none() => o.server_alive_count_max = first.and_then(|v| v.parse().ok()),
@@ -1235,6 +1238,7 @@ fn merge_ssh(ours: HostConfig, ssh: HostConfig) -> HostConfig {
         certificate_files: ours.certificate_files.into_iter().chain(ssh.certificate_files).collect(),
         persist_session: ours.persist_session.or(ssh.persist_session),
         restore_session: ours.restore_session,
+        require_post_quantum: ours.require_post_quantum,
         loopback_fallback: ours.loopback_fallback,
         server_alive_interval: ours.server_alive_interval.or(ssh.server_alive_interval),
         server_alive_count_max: ours.server_alive_count_max.or(ssh.server_alive_count_max),
@@ -1277,7 +1281,7 @@ fn under(mut high: HostConfig, low: HostConfig) -> HostConfig {
         add_keys_to_agent, forward_x11, forward_x11_trusted, forward_x11_timeout, xauth_location, tunnel, tunnel_device,
         escape_commandline, password_authentication, password_prompts, wants_final, canonicalize_failed: _, bad_file,
         clear_all_forwardings, escape_char, address_family, log_level, forward_agent, forward_agent_socket, obscure_keystrokes,
-        identities_only, identity_agent, certificate_files, persist_session, restore_session, loopback_fallback, server_alive_interval,
+        identities_only, identity_agent, certificate_files, persist_session, restore_session, require_post_quantum, loopback_fallback, server_alive_interval,
         server_alive_count_max, control_master, control_path, control_persist, predictive_echo, compression, bind_address,
         bind_interface, proxy_command, send_env, set_env, remote_command, session_type, stdin_null, fork_after_authentication,
         exit_on_forward_failure, local_command, permit_local_command, host_key_alias, connect_timeout, connection_attempts,
@@ -1294,7 +1298,7 @@ fn under(mut high: HostConfig, low: HostConfig) -> HostConfig {
         canonicalize_max_dots canonicalize_fallback_local add_keys_to_agent forward_x11 forward_x11_trusted forward_x11_timeout
         xauth_location tunnel tunnel_device escape_commandline password_authentication password_prompts bad_file
         clear_all_forwardings escape_char address_family log_level obscure_keystrokes identities_only identity_agent
-        persist_session restore_session loopback_fallback server_alive_interval server_alive_count_max control_master control_path
+        persist_session restore_session require_post_quantum loopback_fallback server_alive_interval server_alive_count_max control_master control_path
         control_persist predictive_echo compression bind_address bind_interface remote_command session_type stdin_null
         fork_after_authentication exit_on_forward_failure local_command permit_local_command host_key_alias connect_timeout
         connection_attempts);

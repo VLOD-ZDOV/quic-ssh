@@ -454,15 +454,51 @@ Like mosh, qsh shows what you type before the server's echo arrives, when echoes
 
 ### Locked-down build
 
-Every convenience is a Cargo feature, on by default. Building without them gives the smallest qsh and qshd: a shell and commands over QUIC or TCP, keys and certificates only, to hosts whose key is already known. Requests for anything else are refused before any of their code runs, and no setting in `qshd.toml` or a `[[match]]` block turns them back on.
+Everything qsh and qshd can do is a Cargo feature, on by default, so a build can leave parts out. Requests for what was left out are refused before any of their code runs, and no setting in `qshd.toml` or a `[[match]]` block turns them back on. The release binaries have everything.
+
+`scripts/build.py` is a menu for it (Python 3, nothing to install; Linux and macOS): tick the features, see which source files the build uses and what it warns about, press Enter to build. `Tab` goes to qshd's settings; what you change there is written to a `qshd.toml` beside the programs.
 
 ```sh
-cargo build --release --no-default-features              # everything off
-cargo build --release --no-default-features --features files,persist   # pick some back
+scripts/build.py                               # the menu, starting from the hardened profile
+scripts/build.py --profile minimal --build     # without the menu
+scripts/build.py --profile hardened --features +root-login --print   # only show the cargo command
+scripts/build.py --profile forward-only --map  # which files that build uses
 ```
+
+| Profile | What it has |
+|---|---|
+| `hardened` | `shell`, `exec`, `files`, `compress`, `persist`, `tofu`, `predict`, `forwarding`, `pair`, and the `hardened` defaults |
+| `full` | everything, as in the releases |
+| `minimal` | `shell` and `exec`: a shell and commands over QUIC or TCP, keys and certificates only, to hosts whose key is already known |
+| `forward-only` | `forwarding`: port forwards with `-N`, no sessions |
+
+Without the script, name the features yourself:
+
+```sh
+cargo build --release --no-default-features --features shell,exec          # minimal
+cargo build --release --no-default-features --features shell,exec,files,persist
+```
+
+`--no-default-features` alone now leaves out sessions too (up to 1.10 a shell and commands were always there): add `shell,exec`.
+
+The `hardened` feature changes what qshd starts from; the config file can still set each value:
+
+| Setting | Usual | `hardened` |
+|---|---|---|
+| `max_auth_tries` | 6 | 3 |
+| `login_grace_time` | 120 | 30 |
+| `max_startups_per_ip` | 8 | 4 |
+| `max_sessions` | 10 | 4 |
+| `session_timeout` | 3600 | 600 |
+| `allow_tcp_forwarding`, `allow_stream_local_forwarding` | `true` | `"local"` (no `-R`) |
+| `require_post_quantum` | `false` | `true` (no clients older than 2.0) |
+
+The `hardened` profile has no `root-login`: root cannot log in at all, not even with a key. Before installing it on a server you reach as root, set up a user with a key and `sudo`, or add `root-login`.
 
 | Feature | What it adds |
 |---|---|
+| `shell` | login shells (`qsh host`) |
+| `exec` | commands (`qsh host command`, `qsh multi`, forced commands) |
 | `tofu` | trusting a host key seen for the first time (asking, or `--accept-new-host`) |
 | `pair` | pairing codes (`qsh pair`, `qshd pair`) |
 | `password` | password logins on qshd |
@@ -478,6 +514,7 @@ cargo build --release --no-default-features --features files,persist   # pick so
 | `punch` | `qsh punch` (NAT traversal through public STUN servers) |
 | `ui`, `predict` | `qsh ui`, echo prediction |
 | `self-update` | `qsh update` |
+| `hardened` | stricter qshd defaults (above); off by default |
 
 `qshd -t` lists what the running build was made without. Without `tofu`, add host keys to `known_hosts` yourself (or use a `@cert-authority`); without `pair`, add client keys to `authorized_keys`. A smaller program has less that can go wrong, but no build can promise that it has no bugs: keep it updated.
 
@@ -506,6 +543,7 @@ connection_buffer_mb = 32       # per connection: data held for programs that ha
                                 # near 0; it fills when forwards stop reading (up to 1/8 of it each), and when full
                                 # the whole connection waits. RAM at worst: max_connections × this (256 × 32 MiB
                                 # = 8 GiB), plus up to 256 KiB per open stream over TCP. Small VM: 8-16; busy proxy: 64-256
+require_post_quantum = false    # true: only the post-quantum key exchange; clients older than qsh 2.0 cannot connect
 session_scope = true            # as root under systemd: each session in its own scope in user-UID.slice, so
                                 # `systemctl status qshd` shows qshd itself and restarting it leaves tmux running
 tcp = true                      # false: UDP only, e.g. on port 22 next to sshd for `qsh --full`
@@ -711,6 +749,7 @@ python3 bench/charts.py   # redraw the charts in assets/ (the numbers are in cha
 ## Security
 
 - **Encryption** is TLS 1.3 only (rustls with ring), over both QUIC and TCP. There is no custom cryptography.
+- **Post-quantum key exchange** (from 2.0): the session keys come from X25519MLKEM768, which is X25519 together with ML-KEM-768 (FIPS 203; the `libcrux-ml-kem` crate, written in Rust). Traffic recorded today stays private unless both are broken, so a quantum computer built later does not open it. Both sides need 2.0 or newer: with an older one the connection uses X25519 alone, and qsh warns about it (`qsh -v` and `qsh doctor` name the key exchange). `RequirePostQuantum yes` in `~/.config/qsh/config` (or `-o`) makes qsh refuse older servers, and `require_post_quantum = true` in qshd's config keeps older clients out. Logging in still uses Ed25519 signatures: those cannot be broken afterwards from a recording, only by a quantum computer present during the connection.
 - **The server** presents a self-signed certificate carrying its Ed25519 key. The client checks that key against `known_hosts` (TOFU, like ssh). If the key changes (or is revoked, or its host certificate is invalid), the handshake is broken off before the client shows its own key, so an impostor does not even learn who is connecting.
 - **The client** logs in with mutual TLS using its Ed25519 key, or after the handshake with a signature by any SSH key or certificate over data bound to the TLS session. Either way, the login cannot be relayed to another connection. To a host it does not know yet, the client shows its key only after the host is accepted (the handshake uses a throwaway key). Private key files that other users can read are refused, as by OpenSSH. Passwords are off unless the server sets `password_authentication` (system mode on Linux; yescrypt and SHA-crypt hashes from /etc/shadow, checked after the host key is verified, with the same work for unknown users). A second factor (TOTP) can be added.
 - **Pairing** uses SPAKE2 over the code plus key confirmation bound to the TLS session (exporter) and both keys. A man in the middle can neither brute-force the code offline nor relay the proof. The code pairs one device, allows 3 attempts (a typo does not waste it, and someone who only knows the user name must fail 3 logins to waste it) and expires after 10 minutes.

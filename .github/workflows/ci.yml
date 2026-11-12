@@ -66,8 +66,9 @@ jobs:
       - run: cargo build --locked --features pam
       - run: sudo tests/system-mode.sh target/debug
 
-  # The locked-down build (no default features): it must build without
-  # warnings, and its own refusals are checked by the unit tests.
+  # Builds with features left out (none, and the hardened profile): they
+  # must build without warnings, and their refusals are checked by the unit
+  # tests. scripts/build.py's tables must match the source.
   lockdown:
     runs-on: ubuntu-latest
     steps:
@@ -78,6 +79,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --no-default-features --lib --bins -- -D warnings
       - run: cargo test --locked --no-default-features --lib
+      - run: cargo clippy --locked --no-default-features --features shell,exec,files,compress,persist,tofu,predict,forwarding,pair,hardened --lib --bins -- -D warnings
+      - run: cargo test --locked --no-default-features --features shell,exec,files,compress,persist,tofu,predict,forwarding,pair,hardened --lib
+      - run: python3 scripts/build.py --check
 
   # Known vulnerabilities in dependencies (RustSec advisory database).
   audit:
