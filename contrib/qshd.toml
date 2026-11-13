@@ -1,7 +1,10 @@
 # qshd configuration.
 #
-# Every setting is commented out at its default: uncomment and change what
-# you need. Check with `qshd -t`, apply with `systemctl reload qshd` (or a
+# Every setting is commented out: uncomment and change what you need. A
+# line shows the default, or, where the default is "not set" (a path, a
+# list, a command), an example. A qshd built with the `hardened` feature
+# starts from stricter values for some (`qshd -T` shows the ones in
+# effect). Check with `qshd -t`, apply with `systemctl reload qshd` (or a
 # restart). `qshd -T` prints the settings in effect. Yes/no settings take
 # true/false, yes/no, on/off or 1/0.
 
@@ -67,6 +70,13 @@
 # Or "yes", "no", "forced-commands-only".
 # permit_root_login = "prohibit-password"
 
+# true: only the post-quantum key exchange; clients older than qsh 2.0
+# cannot connect.
+# require_post_quantum = false
+
+# true: every connection is refused (for a [[match]] block).
+# refuse_connection = false
+
 # max_auth_tries = 6
 
 # Seconds to log in; 0 = no limit.
@@ -126,8 +136,17 @@
 # Unix sockets: or "no", "local", "remote".
 # allow_stream_local_forwarding = true
 
+# Permissions taken from -R sockets, and whether a stale socket file is
+# removed before listening.
+# stream_local_bind_mask = "0177"
+# stream_local_bind_unlink = false
+
 # allow_agent_forwarding = true
+
 # x11_forwarding = false
+# x11_display_offset = 10
+# x11_use_localhost = true
+# xauth_location = "/usr/bin/xauth"
 
 # qsh -w: "yes", "point-to-point", "ethernet".
 # permit_tunnel = "no"

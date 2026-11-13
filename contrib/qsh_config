@@ -1,6 +1,7 @@
 # qsh client settings, in the syntax of ~/.ssh/config.
 #
-# Every setting is commented out at its default: uncomment and change what
+# Every setting is commented out at its default (where a note says
+# otherwise, the default is to leave it unset): uncomment and change what
 # you need. qsh reads this file first, then ~/.ssh/config and
 # /etc/ssh/ssh_config: what this file leaves unset is taken from there
 # (ForwardAgent, StrictHostKeyChecking, PasswordAuthentication too), except
@@ -110,5 +111,6 @@
 #     another local user may listen on the other address.
 #     LoopbackFallback no
 
-#     Compress `qsh cp` transfers.
+#     yes: compress `qsh cp` transfers too. no: nothing is compressed.
+#     Unset, terminal output is compressed and copies are not.
 #     Compression no
