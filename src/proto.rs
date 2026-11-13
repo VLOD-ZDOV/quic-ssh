@@ -728,6 +728,21 @@ impl<T> Drop for Reader<T> {
 mod tests {
     use super::*;
 
+    /// A login signature is for one connection, one user and one key: made
+    /// for another of any of them, it is over other data.
+    #[test]
+    fn login_signature_is_for_one_connection_user_and_key() {
+        let signed = auth_data(&[1; 32], "alice", b"key");
+        assert_eq!(signed, auth_data(&[1; 32], "alice", b"key"));
+        assert_ne!(signed, auth_data(&[2; 32], "alice", b"key"), "another connection");
+        assert_ne!(signed, auth_data(&[1; 32], "bob", b"key"), "another user");
+        assert_ne!(signed, auth_data(&[1; 32], "alice", b"other"), "another key");
+        // Lengths go in front of each part, so parts cannot run into each other.
+        assert_ne!(auth_data(&[1; 32], "ab", b"c"), auth_data(&[1; 32], "a", b"bc"));
+        // Not what ssh signs for a login, a git commit or a file with the same key.
+        assert!(signed.windows(AUTH_NAMESPACE.len()).any(|w| w == AUTH_NAMESPACE.as_bytes()));
+    }
+
     #[test]
     fn packed_output_comes_back_whole() {
         let (mut packer, mut unpacker) = (Packer::new().unwrap(), Unpacker::new().unwrap());

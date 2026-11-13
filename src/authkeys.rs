@@ -572,6 +572,16 @@ mod tests {
         assert!(!r.may_listen("", 9001) && !r.may_listen("0.0.0.0", 8080));
     }
 
+    /// `principals=""` names nobody: not the empty name, which a
+    /// certificate signed with `ssh-keygen -n ""` carries.
+    #[test]
+    fn empty_principals_name_nobody() {
+        let e = parse_line(&format!("cert-authority,principals=\"\" {KEY}")).unwrap().unwrap();
+        assert_eq!(e.principals, Some(Vec::new()));
+        let e = parse_line(&format!("cert-authority,principals=\"a,,b\" {KEY}")).unwrap().unwrap();
+        assert_eq!(e.principals, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
     #[test]
     fn principals_file() {
         let mut bad = 0;

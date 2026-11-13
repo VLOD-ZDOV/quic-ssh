@@ -1228,6 +1228,39 @@ fn cve_download_strips_setuid_bits() {
     assert_eq!(std::fs::metadata(&local).unwrap().permissions().mode() & 0o7000, 0);
 }
 
+/// The same for uploads: the helper that writes the file takes no setuid,
+/// setgid or sticky bit, whatever mode it is handed.
+#[test]
+fn cve_upload_drops_setuid_bits() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut helper = Command::new(QSHD)
+        .args(["internal-recv", "--", dir.path().to_str().unwrap(), "suid", "1", "7755"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    helper.stdin.take().unwrap().write_all(b"x").unwrap();
+    assert!(helper.wait().unwrap().success());
+    let mode = std::fs::metadata(dir.path().join("suid")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o7000, 0, "{mode:o}");
+    assert_ne!(mode & 0o100, 0, "{mode:o}");
+}
+
+/// An argument that is not UTF-8 is refused with a message, by qsh and by
+/// qshd: no panic, and no lossy conversion that could name another file.
+#[test]
+fn arguments_that_are_not_utf8_are_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let bad = std::ffi::OsStr::from_bytes(b"ho\xffst");
+    for program in [QSH, QSHD] {
+        let out = Command::new(program).arg(bad).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(255), "{program}: {}", stderr(&out));
+        assert!(stderr(&out).contains("is not valid UTF-8") && !stderr(&out).contains("panicked"), "{program}: {}", stderr(&out));
+    }
+}
+
 /// OpenSSH 10.4/10.6: a download could land outside the intended directory.
 #[test]
 fn cve_download_target_stays_in_destination() {
