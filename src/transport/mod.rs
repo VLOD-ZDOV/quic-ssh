@@ -157,9 +157,8 @@ impl Conn {
     /// True for a connection through another qsh's master (see [`shared`]).
     pub fn is_shared(&self) -> bool {
         #[cfg(unix)]
-        if matches!(self.inner, Inner::Shared(_)) {
-            return true;
-        }
+        return matches!(self.inner, Inner::Shared(_));
+        #[cfg(not(unix))]
         false
     }
 
