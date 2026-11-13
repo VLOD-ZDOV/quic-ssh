@@ -140,6 +140,39 @@ fn qshd_on_windows() {
         assert_eq!(std::fs::read(&back).unwrap(), data);
         let _ = std::fs::remove_file(home.join(format!("qsh-win-{t}.bin")));
     }
+    // What a Unix shell does to a command line, qsh does here: `*` and `?`
+    // in local paths (in any case), `~` for the profile, and single quotes
+    // taken off. Remote wildcards are qshd's.
+    {
+        let from = std::env::temp_dir().join("qsh-win-glob");
+        let back = std::env::temp_dir().join("qsh-win-glob-back");
+        for d in [&from, &back] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir(d).unwrap();
+        }
+        for f in ["qshw1.txt", "qshw2.txt", "qshw3.md"] {
+            std::fs::write(from.join(f), f).unwrap();
+        }
+        let cp = |name: &str, from: &str, to: &str| {
+            let mut cmd = Command::new(QSH);
+            cmd.args(["cp", "-v", "--transport", "tcp", "-p", &port, from, to]);
+            step(name, cmd, &log)
+        };
+        let out = cp("qsh cp local *", &format!(r"{}\QSHW*.TXT", from.display()), &format!("{dest}:"));
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(std::fs::read_to_string(home.join("qshw2.txt")).unwrap(), "qshw2.txt");
+        assert!(!home.join("qshw3.md").exists());
+        let out = cp("qsh cp remote ?", &format!("'{dest}:qshw?.txt'"), back.to_str().unwrap());
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(std::fs::read_to_string(back.join("qshw1.txt")).unwrap(), "qshw1.txt");
+        assert_eq!(std::fs::read_to_string(back.join("qshw2.txt")).unwrap(), "qshw2.txt");
+        let out = cp("qsh cp ~", r"~\qshw1.txt", &format!("{dest}:qshw-home.txt"));
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(std::fs::read_to_string(home.join("qshw-home.txt")).unwrap(), "qshw1.txt");
+        for f in ["qshw1.txt", "qshw2.txt", "qshw-home.txt"] {
+            let _ = std::fs::remove_file(home.join(f));
+        }
+    }
     // The built-in SFTP server, with Windows's own sftp and qsh as its transport.
     if !wine {
         let local = std::env::temp_dir().join("qsh-win-sftp.txt");

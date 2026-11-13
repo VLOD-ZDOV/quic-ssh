@@ -36,7 +36,7 @@ impl Location {
         // `C:\dir` and `C:/dir` on Windows are local, as with scp there.
         let b = s.as_bytes();
         if cfg!(windows) && b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
-            return Location::Local(PathBuf::from(s));
+            return Location::Local(crate::platform::local_path(s));
         }
         let colon = if let Some(close) = s.find("]:").filter(|_| s.contains('[')) {
             Some(close + 1)
@@ -53,9 +53,71 @@ impl Location {
                 };
                 Location::Remote { dest: s[..i].to_string(), path: path.to_string() }
             }
-            _ => Location::Local(PathBuf::from(s)),
+            _ => Location::Local(crate::platform::local_path(s)),
         }
     }
+}
+
+/// What the wildcards in remote path `pattern` name on the server, and
+/// whether each is a directory. `None` for a path without wildcards, and
+/// for an older server, which gets the path as it is.
+pub async fn glob(conn: &Conn, pattern: &str) -> Result<Option<Vec<(String, bool)>>> {
+    if !crate::pattern::has_wildcard(pattern) || conn.server_version() < crate::proto::GLOB {
+        return Ok(None);
+    }
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_msg(&mut send, &Request::Glob { pattern: pattern.to_string() }).await?;
+    match expect_ok(&mut recv).await? {
+        Reply::Matches(found) if found.is_empty() => bail!("{pattern}: no match"),
+        Reply::Matches(found) => match found.iter().find(|(path, _)| !named_by(pattern, path)) {
+            Some((path, _)) => bail!("the server answered {pattern} with {path:?}, which it does not name"),
+            None => Ok(Some(found)),
+        },
+        other => bail!("unexpected reply {other:?}"),
+    }
+}
+
+/// Whether `pattern` can name `path`. The names of the files a download
+/// writes must be ones the user asked for, never the server's choice: it
+/// could send a `.bashrc` for `*.log` (scp's CVE-2019-6111). Case is
+/// ignored, as a Windows server does.
+fn named_by(pattern: &str, path: &str) -> bool {
+    let parts = |s: &str| s.split(['/', '\\']).filter(|p| !p.is_empty()).map(str::to_string).collect::<Vec<_>>();
+    let (pattern, path) = (parts(pattern), parts(path));
+    pattern.len() == path.len()
+        && pattern.iter().zip(&path).all(|(part, name)| {
+            let wild = crate::pattern::has_wildcard(part);
+            (!wild || !matches!(name.as_str(), "." | "..")) && crate::pattern::part_matches(part, name, true, wild)
+        })
+}
+
+/// A path without the single quotes around it: cmd.exe hands them on as
+/// they are, so a command line written for a Unix shell works there too.
+pub fn unquote(path: &str) -> &str {
+    path.strip_prefix('\'').and_then(|p| p.strip_suffix('\'')).unwrap_or(path)
+}
+
+/// Local sources with their wildcards expanded, for Windows, whose shells
+/// leave that to the program. A pattern that matches nothing stays as it is.
+pub fn expand_local(sources: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in sources {
+        let found = match Location::parse(s) {
+            Location::Local(path) if crate::pattern::has_wildcard(s) => {
+                // `*.*` is every file there, with a dot in its name or not.
+                let all = path.file_name().is_some_and(|n| n == "*.*");
+                let path = if all { path.with_file_name("*") } else { path };
+                crate::pattern::glob(&path.to_string_lossy(), false).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        if found.is_empty() {
+            out.push(s.clone());
+        } else {
+            out.extend(found);
+        }
+    }
+    out
 }
 
 /// The SHA-256 of a file's first `n` bytes (`None` if it cannot be read).
@@ -341,6 +403,25 @@ fn report(stats: &crate::tree::Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_names_only_what_was_asked() {
+        assert!(named_by("logs/*.log", "logs/a.log"));
+        assert!(named_by("/var/*/app?.log", "/var/x/app1.log"));
+        assert!(named_by("Logs\\*.LOG", "Logs\\a.log"));
+        assert!(named_by(".*rc", ".bashrc"));
+        for bad in [".bashrc", "logs/.bashrc", "logs/a.txt", "other/a.log", "logs/x/a.log", "a.log", "logs/../a.log"] {
+            assert!(!named_by("logs/*.log", bad), "{bad}");
+        }
+        assert!(!named_by("*", ".bashrc") && !named_by("*", "..") && !named_by("*/a", "../a"));
+    }
+
+    #[test]
+    fn unquoted() {
+        assert_eq!(unquote("'host:logs/*.log'"), "host:logs/*.log");
+        assert_eq!(unquote("it's"), "it's");
+        assert_eq!(unquote("'"), "'");
+    }
 
     #[test]
     fn parse_locations() {

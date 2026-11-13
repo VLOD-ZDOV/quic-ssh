@@ -395,6 +395,73 @@ fn copy_several_sources_and_home() {
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
 }
 
+/// `*` and `?` in a remote path are expanded by the server, as scp's are
+/// by the remote shell.
+#[test]
+fn copy_remote_wildcards() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let home = s.home.path();
+    std::fs::create_dir_all(home.join("box/sub")).unwrap();
+    for f in ["box/a.log", "box/b.log", "box/c.txt", "box/sub/d.log"] {
+        std::fs::write(home.join(f), f).unwrap();
+    }
+    let back = c.home.path().join("back");
+    std::fs::create_dir(&back).unwrap();
+    let out = c.run(&["cp", "-p", &port, &format!("{}:box/*.log", dest()), back.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(back.join("a.log")).unwrap(), "box/a.log");
+    assert_eq!(std::fs::read_to_string(back.join("b.log")).unwrap(), "box/b.log");
+    assert!(!back.join("c.txt").exists());
+    // Several matches onto a file: refused.
+    let file = c.home.path().join("one.txt");
+    std::fs::write(&file, "mine").unwrap();
+    let out = c.run(&["cp", "-p", &port, &format!("{}:box/*.log", dest()), file.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+    // One match may get a new name.
+    let renamed = c.home.path().join("renamed.txt");
+    let out = c.run(&["cp", "-p", &port, &format!("{}:~/box/?.txt", dest()), renamed.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "box/c.txt");
+    let out = c.run(&["cp", "-p", &port, &format!("{}:box/*.none", dest()), back.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no match"), "{}", stderr(&out));
+    // With -r, files and directories alike; without it, a directory fails
+    // and the files are still copied.
+    let all = c.home.path().join("all");
+    std::fs::create_dir(&all).unwrap();
+    let out = c.run(&["cp", "-r", "-p", &port, &format!("{}:box/*", dest()), all.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(all.join("sub/d.log")).unwrap(), "box/sub/d.log");
+    assert_eq!(std::fs::read_to_string(all.join("c.txt")).unwrap(), "box/c.txt");
+    let flat = c.home.path().join("flat");
+    std::fs::create_dir(&flat).unwrap();
+    let out = c.run(&["cp", "-p", &port, &format!("{}:box/*", dest()), flat.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(flat.join("a.log").exists() && !flat.join("sub").exists());
+}
+
+/// CVE-2019-6111: a server that answers a wildcard with a name the pattern
+/// does not cover gets nothing written.
+#[test]
+fn cve_wildcard_names_are_the_clients() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join("box")).unwrap();
+    for f in ["box/a.log", "box/.bashrc"] {
+        std::fs::write(home.path().join(f), "from the server").unwrap();
+    }
+    let s = Server::start_env(home, "127.0.0.1:0", "", &[("QSHD_TEST_GLOB_EXTRA", "box/.bashrc")]);
+    let c = Client::paired(&s);
+    let back = c.home.path().join("back");
+    std::fs::create_dir(&back).unwrap();
+    let out = c.run(&["cp", "-p", &s.port.to_string(), &format!("{}:box/*.log", dest()), back.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("does not name"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_dir(&back).unwrap().count(), 0);
+}
+
 /// Echo server that answers each connection with "echo:" + what it received.
 fn echo_server() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();

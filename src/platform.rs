@@ -277,6 +277,23 @@ pub fn is_broken_pipe_print(info: &std::panic::PanicHookInfo<'_>) -> bool {
     msg.starts_with("failed printing to std") && msg.contains("os error 32")
 }
 
+/// A local path from the command line. Windows shells leave `~` as it is,
+/// so there a leading `~`, `~/` or `~\` becomes the home directory.
+pub fn local_path(text: &str) -> std::path::PathBuf {
+    match dirs::home_dir().filter(|_| cfg!(windows)) {
+        Some(home) => in_home(text, &home),
+        None => text.into(),
+    }
+}
+
+fn in_home(text: &str, home: &Path) -> std::path::PathBuf {
+    match text.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with(['/', '\\']) => home.join(&rest[1..]),
+        _ => text.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -314,5 +331,17 @@ mod tests {
         let timeout = std::time::Duration::from_secs(5);
         assert!(super::connect_tcp("127.0.0.1", port, timeout, None).await.is_err());
         super::connect_tcp("127.0.0.1", port, timeout, Some("::1")).await.unwrap();
+    }
+
+    #[test]
+    fn tilde_is_home() {
+        use super::in_home;
+        use std::path::Path;
+        let home = Path::new("/home/me");
+        assert_eq!(in_home("~", home), home);
+        assert_eq!(in_home("~/a/b.txt", home), home.join("a/b.txt"));
+        assert_eq!(in_home("~\\a.txt", home), home.join("a.txt"));
+        assert_eq!(in_home("~other/a", home), Path::new("~other/a"));
+        assert_eq!(in_home("a/~/b", home), Path::new("a/~/b"));
     }
 }

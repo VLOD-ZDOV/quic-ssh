@@ -915,6 +915,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             | Request::DownloadTree { .. }
             | Request::UploadResume { .. }
             | Request::DownloadFrom { .. }
+            | Request::Glob { .. }
             | Request::SpeedDown { .. }
             | Request::SpeedUp { .. }
     ) {
@@ -1049,6 +1050,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
         | Request::DownloadTree { .. }
         | Request::UploadResume { .. }
         | Request::DownloadFrom { .. }
+        | Request::Glob { .. }
             if limits.command.is_some() =>
         {
             write_msg(&mut send, &files_denied()).await
@@ -1105,6 +1107,7 @@ async fn handle_stream(mut send: SendHalf, mut recv: RecvHalf, ctx: StreamCtx<'_
             until_closed(closed, files::upload(send, recv, user, &path, &name, (size, mode), compressed)).await
         }
         Request::Download { path } => until_closed(closed, files::download(send, user, &path, compressed)).await,
+        Request::Glob { pattern } => until_closed(closed, files::glob(send, user, &pattern)).await,
         Request::UploadResume { path, name, size, mode } => {
             until_closed(closed, files::upload_resume(send, recv, user, &path, &name, (size, mode), compressed)).await
         }
@@ -1265,6 +1268,7 @@ fn left_out(request: &Request) -> Option<&'static str> {
         | Request::DownloadTree { .. }
         | Request::UploadResume { .. }
         | Request::DownloadFrom { .. }
+        | Request::Glob { .. }
         | Request::Subsystem { .. } => "files",
         Request::DirectTcp { .. } | Request::DirectStreamLocal { .. } | Request::RemoteForward { .. } | Request::RemoteForwardStreamLocal { .. } => "forwarding",
         Request::AgentForward => "agent",

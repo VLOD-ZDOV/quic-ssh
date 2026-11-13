@@ -213,6 +213,39 @@ pub async fn download(mut send: SendHalf, user: &User, path: &str, compressed: b
     Ok(())
 }
 
+/// What `pattern` names (`Request::Glob`), found by a helper as the user.
+pub async fn glob(mut send: SendHalf, user: &User, pattern: &str) -> Result<()> {
+    let Some((mut child, out)) = start(&mut send, user, &["internal-glob", pattern], false).await? else {
+        return Ok(());
+    };
+    // Kept well under a message's size limit.
+    const MAX: u64 = 512 * 1024;
+    let mut list = Vec::new();
+    out.take(MAX + 1).read_to_end(&mut list).await?;
+    if list.len() as u64 > MAX {
+        return write_msg(&mut send, &Reply::Err(format!("{pattern}: too many matches"))).await;
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        return write_msg(&mut send, &Reply::Err(failure(&mut child, status).await)).await;
+    }
+    let mut found = Vec::new();
+    let mut rest = list.as_slice();
+    while let [kind, a, b, c, d, tail @ ..] = rest {
+        let len = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
+        let Some((path, tail)) = tail.split_at_checked(len) else { break };
+        found.push((String::from_utf8_lossy(path).into_owned(), *kind == b'd'));
+        rest = tail;
+    }
+    // Tests play a server that names a file nobody asked for (debug builds only).
+    if cfg!(debug_assertions) {
+        found.extend(std::env::var("QSHD_TEST_GLOB_EXTRA").ok().map(|path| (path, false)));
+    }
+    write_msg(&mut send, &Reply::Matches(found)).await?;
+    send.shutdown().await?;
+    Ok(())
+}
+
 pub async fn upload_tree(mut send: SendHalf, recv: RecvHalf, user: &User, path: &str, name: &str, compressed: bool) -> Result<()> {
     let Some((mut child, _)) = start(&mut send, user, &["internal-untar", path, name], true).await? else {
         return Ok(());

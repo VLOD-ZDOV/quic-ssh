@@ -26,6 +26,60 @@ pub fn wildcard(pattern: &str, text: &str) -> bool {
     p[pi..].iter().all(|&c| c == '*')
 }
 
+pub fn has_wildcard(text: &str) -> bool {
+    text.contains(['*', '?'])
+}
+
+/// Most paths one pattern may expand to (`*/*/*` grows fast).
+const MAX_MATCHES: usize = 10_000;
+
+/// The existing paths `pattern` names, sorted: `*` and `?` in any part of
+/// the path, as in a shell (on Windows case is ignored). With `skip_dot`
+/// they skip names that start with a dot unless the part does too.
+pub fn glob(pattern: &str, skip_dot: bool) -> std::io::Result<Vec<String>> {
+    let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    // What comes before the first part with a wildcard stays as written.
+    let first = pattern.find(['*', '?']).unwrap_or(pattern.len());
+    let head = pattern[..first].rfind(is_sep).map_or(0, |i| i + 1);
+    let parts: Vec<&str> = pattern[head..].split(is_sep).filter(|p| !p.is_empty()).collect();
+    let mut found = vec![pattern[..head].to_string()];
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let mut next = Vec::new();
+        for base in &found {
+            let mut names = if has_wildcard(part) {
+                let dir = if base.is_empty() { "." } else { base.as_str() };
+                let Ok(entries) = std::fs::read_dir(dir) else { continue };
+                entries.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| part_matches(part, n, cfg!(windows), skip_dot)).collect()
+            } else {
+                vec![part.to_string()]
+            };
+            names.sort();
+            for name in names {
+                let path = format!("{base}{name}");
+                if last && std::fs::symlink_metadata(&path).is_ok() {
+                    next.push(path);
+                } else if !last && std::path::Path::new(&path).is_dir() {
+                    next.push(path + "/");
+                }
+            }
+            if next.len() > MAX_MATCHES {
+                return Err(std::io::Error::other(format!("{pattern}: more than {MAX_MATCHES} matches")));
+            }
+        }
+        found = next;
+    }
+    Ok(if parts.is_empty() { Vec::new() } else { found })
+}
+
+/// Whether one part of a path pattern names `name`.
+pub fn part_matches(part: &str, name: &str, ignore_case: bool, skip_dot: bool) -> bool {
+    if skip_dot && name.starts_with('.') && !part.starts_with('.') {
+        return false;
+    }
+    if ignore_case { wildcard(&part.to_lowercase(), &name.to_lowercase()) } else { wildcard(part, name) }
+}
+
 /// A pattern list matches if any positive pattern matches and no negated one
 /// does (case-insensitive, like `Match host` in ssh_config and known_hosts).
 pub fn host_matches<S: AsRef<str>>(patterns: &[S], host: &str) -> bool {
@@ -185,6 +239,30 @@ pub fn source_address_allowed(list: &str, ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        for d in ["logs", "old", ".git"] {
+            std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        for f in ["a.txt", "b.txt", "c.md", ".hidden.txt", "logs/x.log", "old/y.log", "old/z.txt", ".git/h.log"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let found = |p: &str| -> Vec<String> {
+            glob(&format!("{root}/{p}"), true).unwrap().into_iter().map(|f| f[root.len() + 1..].to_string()).collect()
+        };
+        assert_eq!(found("*.txt"), ["a.txt", "b.txt"]);
+        assert_eq!(found("?.md"), ["c.md"]);
+        assert_eq!(found("*/*.log"), ["logs/x.log", "old/y.log"]);
+        assert_eq!(found("o*/"), ["old"]);
+        assert_eq!(found("*/z.txt"), ["old/z.txt"]);
+        assert_eq!(found("*.none"), [""; 0]);
+        assert_eq!(found(".*.txt"), [".hidden.txt"]);
+        assert_eq!(found("*"), ["a.txt", "b.txt", "c.md", "logs", "old"]);
+        assert_eq!(glob(&format!("{root}/*.txt"), false).unwrap().len(), 3);
+    }
 
     #[test]
     fn wildcards() {

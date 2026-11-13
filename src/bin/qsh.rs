@@ -62,7 +62,7 @@ struct ConnArgs {
     port: Option<u16>,
 
     /// Private key (default ~/.ssh/id_ed25519, then ~/.config/qsh/id_ed25519)
-    #[arg(short = 'i', long, global = true, value_name = "FILE")]
+    #[arg(short = 'i', long, global = true, value_name = "FILE", value_parser = local_path)]
     identity: Vec<PathBuf>,
 
     /// Transport to use
@@ -107,7 +107,7 @@ enum Cmd {
     },
     /// Create a new key at ~/.config/qsh/id_ed25519 (or FILE)
     Keygen {
-        #[arg(value_name = "FILE")]
+        #[arg(value_name = "FILE", value_parser = local_path)]
         file: Option<PathBuf>,
     },
     /// Measure latency and throughput to a server
@@ -302,6 +302,10 @@ fn finish(result: Result<i32>) -> ! {
     };
     // Exit right away: a blocked stdin reader thread must not keep the process alive.
     std::process::exit(code);
+}
+
+fn local_path(text: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(qsh::platform::local_path(text))
 }
 
 fn main() {
@@ -1640,12 +1644,14 @@ async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnAr
         Upload { local: PathBuf, remote: String },
         Download { remote: String, local: PathBuf },
     }
+    let paths: Vec<String> = paths.iter().map(|p| if cfg!(windows) { copy::unquote(p) } else { p }.to_string()).collect();
     let (srcs, dst) = paths.split_at(paths.len() - 1);
     let dst = &dst[0];
-    let several = srcs.len() > 1;
+    let srcs = if cfg!(windows) { copy::expand_local(srcs) } else { srcs.to_vec() };
+    let mut several = srcs.len() > 1;
     let mut host: Option<String> = None;
     let mut jobs = Vec::new();
-    for src in srcs {
+    for src in &srcs {
         let (dest, job) = match (Location::parse(src), Location::parse(dst)) {
             (Location::Local(local), Location::Remote { dest, mut path }) => {
                 // Into the directory, never one file over another.
@@ -1713,18 +1719,42 @@ async fn cp(paths: &[String], (recursive, compress): (bool, bool), args: &ConnAr
     let compress = (compress || target.compression) && cfg!(feature = "compress");
     // Like scp: a source that fails does not stop the others.
     let mut failed = None;
+    let mut fail = |e: anyhow::Error, several: bool| {
+        if several {
+            eprintln!("qsh: {e:#}");
+        }
+        failed = Some(e);
+    };
     for job in jobs {
         let result = match (job, recursive) {
             (Direction::Upload { local, remote }, false) => copy::upload(&conn, &local, &remote, compress).await,
             (Direction::Upload { local, remote }, true) => copy::upload_tree(&conn, &local, &remote, compress).await,
-            (Direction::Download { remote, local }, false) => copy::download(&conn, &remote, &local, compress).await,
-            (Direction::Download { remote, local }, true) => copy::download_tree(&conn, &remote, &local, compress).await,
+            (Direction::Download { remote, local }, _) => match copy::glob(&conn, &remote).await {
+                Ok(None) if recursive => copy::download_tree(&conn, &remote, &local, compress).await,
+                Ok(None) => copy::download(&conn, &remote, &local, compress).await,
+                Ok(Some(found)) if found.len() > 1 && !local.is_dir() => {
+                    Err(anyhow::anyhow!("{}: not a directory ({remote} names several files)", local.display()))
+                }
+                // Each match is a source of its own, as if a shell had expanded them.
+                Ok(Some(found)) => {
+                    several |= found.len() > 1;
+                    for (path, dir) in found {
+                        let result = if dir && recursive {
+                            copy::download_tree(&conn, &path, &local, compress).await
+                        } else {
+                            copy::download(&conn, &path, &local, compress).await
+                        };
+                        if let Err(e) = result {
+                            fail(e, several);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = result {
-            if several {
-                eprintln!("qsh: {e:#}");
-            }
-            failed = Some(e);
+            fail(e, several);
         }
     }
     conn.close().await;

@@ -12,7 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const ALPN: &[u8] = b"qsh/1";
 /// Offered (never selected) by clients that want the server's host certificate.
 pub const ALPN_HOST_CERT: &[u8] = b"qsh-host-cert";
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
+/// From this protocol version: `Request::Glob` (wildcards in remote paths).
+pub const GLOB: u32 = 13;
 /// From this version (qsh 2.0) both sides have the post-quantum key exchange
 /// and prefer it, so a connection between two of them uses it.
 pub const POST_QUANTUM: u32 = 12;
@@ -72,6 +74,9 @@ pub enum Reply {
     /// Answer to `Request::DownloadFrom`: the file's `size` and `mode`; the
     /// bytes from `start` on follow.
     FileFrom { size: u64, mode: u32, start: u64 },
+    // --- protocol version 13 ---
+    /// Answer to `Request::Glob`: the paths found, and whether each is a directory.
+    Matches(Vec<(String, bool)>),
 }
 
 /// Client messages on the hello stream while logging in (protocol version 4).
@@ -197,6 +202,10 @@ pub enum Request {
     /// answered with `Reply::Session`. The stream stays open until the
     /// connection goes or the client says `ClientMsg::Hangup`.
     Hold,
+    // --- protocol version 13 ---
+    /// The paths that `pattern` (with `*` and `?`) names on the server:
+    /// answered with `Reply::Matches`.
+    Glob { pattern: String },
 }
 
 /// The file transfers that can be compressed. A type of its own, not a

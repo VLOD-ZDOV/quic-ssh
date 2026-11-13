@@ -98,6 +98,8 @@ enum Cmd {
     InternalUntar { path: String, name: String },
     #[command(hide = true)]
     InternalTar { path: String },
+    #[command(hide = true)]
+    InternalGlob { pattern: String },
 }
 
 #[cfg(unix)]
@@ -312,6 +314,7 @@ pub fn main() {
         Some(Cmd::InternalAddKey { line }) => transfer::add_key(&line),
         Some(Cmd::InternalUntar { path, name }) => transfer::untar(&path, &name),
         Some(Cmd::InternalTar { path }) => transfer::tar(&path),
+        Some(Cmd::InternalGlob { pattern }) => transfer::glob(&pattern),
         #[cfg(not(unix))]
         Some(
             Cmd::InternalConnect { .. }

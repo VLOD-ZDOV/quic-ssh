@@ -133,6 +133,24 @@ pub fn send(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Writes "ok" and then what `pattern` matches: for each path a `d`
+/// (directory) or `f`, its length (u32 BE) and the path itself. Names
+/// with a dot in front are skipped as a shell does, on Windows too: the
+/// client refuses them (see its `named_by`).
+pub fn glob(pattern: &str) -> Result<()> {
+    let found = crate::pattern::glob(pattern, true)?;
+    let mut out = io::stdout().lock();
+    writeln!(out, "ok")?;
+    for path in found {
+        let kind = if Path::new(&path).is_dir() { b'd' } else { b'f' };
+        out.write_all(&[kind])?;
+        out.write_all(&(path.len() as u32).to_be_bytes())?;
+        out.write_all(path.as_bytes())?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 /// Receives a tar stream on stdin into `path` (or `path/name` if `path` is a
 /// directory). Prints "ok" once the target directory exists.
 pub fn untar(path: &str, name: &str) -> Result<()> {

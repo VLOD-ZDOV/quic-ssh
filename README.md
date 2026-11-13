@@ -86,7 +86,7 @@ Downloaded with curl, the binaries carry no quarantine flag. If you download the
 <details>
 <summary><b>Windows</b></summary>
 
-The client, `qsh.exe`, is in `qsh-x86_64-windows.zip`. Unzip it to a folder on your `PATH`. qsh uses `%USERPROFILE%\.ssh` (keys, `config`, `known_hosts` markers) and `%USERPROFILE%\.config\qsh`, and it talks to the Windows OpenSSH agent service (`ssh-agent`) on its own. All features except `-f` are available. `--full` runs `ssh.exe` and waits for it. The Windows build is new and tested automatically; interactive use has seen less real-world testing than on Linux, so please report problems. The zip also has the server, `qshd.exe`, which serves the Windows user it runs as (see below).
+The client, `qsh.exe`, is in `qsh-x86_64-windows.zip`. Unzip it to a folder on your `PATH`. qsh uses `%USERPROFILE%\.ssh` (keys, `config`, `known_hosts` markers) and `%USERPROFILE%\.config\qsh`, and it talks to the Windows OpenSSH agent service (`ssh-agent`) on its own. All features except `-f` are available. What a Unix shell does to a command line, qsh does itself here: `qsh cp` expands `*` and `?` in local paths and takes single quotes off a path (`'host:logs/*.log'` works in cmd.exe too), and a leading `~` in a local path (`cp`, `-i`, `-F`, `keygen`) is your profile folder. `--full` runs `ssh.exe` and waits for it. The Windows build is new and tested automatically; interactive use has seen less real-world testing than on Linux, so please report problems. The zip also has the server, `qshd.exe`, which serves the Windows user it runs as (see below).
 
 **qshd on Windows (new).** Run `qshd.exe` as the user who will log in (to start it at logon: `schtasks /create /tn qshd /sc onlogon /tr "%LOCALAPPDATA%\Programs\qsh\qshd.exe"`) and allow UDP and TCP 4422 in the firewall. Keys go in `%USERPROFILE%\.config\qsh\authorized_keys`; `qshd pair`, `qshd keys` and `qshd totp` work as on Linux. Commands run in `cmd.exe` (set `QSHD_SHELL`, e.g. `pwsh.exe`, for another shell); terminals use ConPTY. Copies (with resume), `-L`/`-R`/`-D` forwards, one-time codes, sftp (paths look like `/C:/Users/me`; only the read-only flag is applied of a file's mode), agent forwarding (`SSH_AUTH_SOCK` names a named pipe) and sessions that survive a lost connection work. Not on Windows: other users, passwords, X11 forwarding, Unix socket forwards and `chroot_directory` (a login it applies to is refused). The user name must be spelled as the account is. qshd does not check who else may write `authorized_keys`: the profile's own permissions keep other users out.
 
@@ -207,6 +207,8 @@ sudo qsh -w any:3 -N alice@host        # a non-root user: only a device made for
 qsh cp file.txt user@host:dir/         # upload
 qsh cp a.txt b.txt user@host:~/inbox   # several files into a directory (~ is the home directory)
 qsh cp user@host:logs/app.log .        # download
+qsh cp 'user@host:logs/*.log' .        # wildcards (* and ?) in a remote path; needs qshd newer than 2.0
+                                       # (* skips names that start with a dot, as in a shell: use .* for those)
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
 qsh cp -C logs.txt host:               # compressed (zstd), for text on slow links
 qsh cp big.iso host:                   # cut off? run it again: it goes on where it stopped

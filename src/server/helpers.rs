@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 
 use super::transfer::pump;
 pub use super::transfer::{add_key, pair_take, recv, recv_resume, send, send_from, tar, untar};
+use super::transfer::glob;
 pub use super::users::{decode_args, Prelude, BECOME, HELPER_ARGS, HELPER_FROM_ENV, PRELUDE_ENV, SESSION_ENV};
 
 /// Connects to `host:port` (as the user the helper runs as).
@@ -314,6 +315,7 @@ pub fn run_internal(program: &str, args: &[String]) -> Result<()> {
         ("internal-send-from", [path, offset, prefix]) => send_from(path, offset, prefix),
         ("internal-untar", [path, name]) => untar(path, name),
         ("internal-tar", [path]) => tar(path),
+        ("internal-glob", [pattern]) => glob(pattern),
         ("internal-connect-unix", [path]) => connect_unix(path),
         ("internal-connect-unix-fd", [path]) => connect_unix_fd(path),
         ("internal-listen-unix", [path, mask, unlink]) => listen_unix(path, mask, unlink),

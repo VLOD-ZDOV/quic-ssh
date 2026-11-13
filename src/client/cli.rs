@@ -227,12 +227,12 @@ impl SshArgs {
             }
             'l' if !crate::proto::valid_user_name(&v) => return Err(format!("invalid user name {v:?}")),
             'l' => self.login = Some(v),
-            'i' => self.identities.push(PathBuf::from(v)),
+            'i' => self.identities.push(crate::platform::local_path(&v)),
             'L' => self.local_forwards.push(v),
             'R' => self.remote_forwards.push(v),
             'D' => self.dynamic_forwards.push(v),
             'o' => self.options.push(option_line(&v)?),
-            'F' => self.config_file = Some(PathBuf::from(v)),
+            'F' => self.config_file = Some(crate::platform::local_path(&v)),
             'J' => self.jump = Some(v),
             'W' => self.stdio_forward = Some(v),
             'e' => {
