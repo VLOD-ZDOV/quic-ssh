@@ -3333,6 +3333,27 @@ fn command_on_several_hosts() {
     assert_eq!(v[1]["exit"], 255);
 }
 
+/// A server that has the whole file answers and closes the stream before
+/// the client has written its end: the copy is complete, not an error.
+#[test]
+fn upload_is_complete_when_the_server_finishes_first() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    let local = c.home.path().join("text.txt");
+    let text: Vec<u8> = (0..50_000).flat_map(|i| format!("line {i}: the same old text again\n").into_bytes()).collect();
+    std::fs::write(&local, &text).unwrap();
+    for (t, flags) in [("quic", &["-C"][..]), ("tcp", &["-C"][..]), ("quic", &[][..])] {
+        let remote = format!("{}:up-{t}-{}", dest(), flags.len());
+        let mut args = vec!["cp", "--transport", t, "-p", &port];
+        args.extend(flags);
+        args.extend([local.to_str().unwrap(), &remote]);
+        let out = c.cmd(&args).env("QSH_TEST_SLOW_UPLOAD_END", "1").output().unwrap();
+        assert!(out.status.success(), "{t} {flags:?}: {}", stderr(&out));
+        assert_eq!(std::fs::read(s.home.path().join(format!("up-{t}-{}", flags.len()))).unwrap(), text, "{t} {flags:?}");
+    }
+}
+
 /// `qsh cp -C`: zstd-compressed copies, files and trees, both ways.
 #[test]
 fn compressed_copies() {

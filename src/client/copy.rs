@@ -217,6 +217,10 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -
     let mut answer = answer(recv);
     let sending = async {
         let sent = transfer(&mut file, &mut send, left, &name).await?;
+        // Tests let the server finish first (debug builds only).
+        if cfg!(debug_assertions) && std::env::var_os("QSH_TEST_SLOW_UPLOAD_END").is_some() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         send.shutdown().await?;
         anyhow::Ok(sent)
     };
@@ -226,12 +230,23 @@ pub async fn upload(conn: &Conn, local: &Path, remote: &str, compressed: bool) -
         sent = &mut sending => match sent {
             Ok(n) if n != left => Err(changed()),
             Ok(_) => answer.await?,
-            Err(e) => Err(server_reason(&mut answer, e).await),
+            // A server that has all the bytes answers and closes the stream
+            // without waiting for its end (of a compressed one, the last
+            // frame): writing that end then fails, and the copy is complete.
+            Err(e) => match verdict(&mut answer).await {
+                Some(Ok(())) => Ok(()),
+                Some(Err(server)) => Err(server),
+                None => Err(e),
+            },
         },
-        // The server took it all; only our end of the stream was left to send.
+        // The server took it all; only our end of the stream was left to
+        // send, and writing it to a stream the server has closed may fail.
         early = &mut answer => {
             early??;
-            if sending.await? != left { Err(changed()) } else { Ok(()) }
+            match sending.await {
+                Ok(n) if n != left => Err(changed()),
+                _ => Ok(()),
+            }
         }
     }
 }
@@ -246,10 +261,15 @@ fn answer(mut recv: RecvHalf) -> tokio::task::JoinHandle<Result<()>> {
 /// Why sending failed: the server's reason if it gave one, which says more
 /// than our write error ("stopped by peer").
 async fn server_reason(answer: &mut tokio::task::JoinHandle<Result<()>>, write: anyhow::Error) -> anyhow::Error {
-    match tokio::time::timeout(Duration::from_secs(2), answer).await {
-        Ok(Ok(Err(server))) => server,
+    match verdict(answer).await {
+        Some(Err(server)) => server,
         _ => write,
     }
+}
+
+/// The server's answer after our sending failed, if it comes soon.
+async fn verdict(answer: &mut tokio::task::JoinHandle<Result<()>>) -> Option<Result<()>> {
+    tokio::time::timeout(Duration::from_secs(2), answer).await.ok()?.ok()
 }
 
 pub async fn download(conn: &Conn, remote: &str, local: &Path, compressed: bool) -> Result<()> {
