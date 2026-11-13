@@ -207,7 +207,7 @@ sudo qsh -w any:3 -N alice@host        # a non-root user: only a device made for
 qsh cp file.txt user@host:dir/         # upload
 qsh cp a.txt b.txt user@host:~/inbox   # several files into a directory (~ is the home directory)
 qsh cp user@host:logs/app.log .        # download
-qsh cp 'user@host:logs/*.log' .        # wildcards (* and ?) in a remote path; needs qshd newer than 2.0
+qsh cp 'user@host:logs/*.log' .        # wildcards (* and ?) in a remote path; needs qshd 2.1 or newer
                                        # (* skips names that start with a dot, as in a shell: use .* for those)
 qsh cp -r project/ user@host:src/      # copy a directory (either direction)
 qsh cp -C logs.txt host:               # compressed (zstd), for text on slow links

@@ -207,7 +207,7 @@ sudo qsh -w any:3 -N alice@host        # не root: только созданн�
 qsh cp file.txt user@host:dir/         # загрузить
 qsh cp a.txt b.txt user@host:~/inbox   # несколько файлов в каталог (~ — домашний каталог)
 qsh cp user@host:logs/app.log .        # скачать
-qsh cp 'user@host:logs/*.log' .        # шаблоны (* и ?) в удалённом пути; нужен qshd новее 2.0
+qsh cp 'user@host:logs/*.log' .        # шаблоны (* и ?) в удалённом пути; нужен qshd 2.1 или новее
                                        # (* пропускает имена с точкой в начале, как в оболочке: для них пиши .*)
 qsh cp -r project/ user@host:src/      # скопировать каталог (в любую сторону)
 qsh cp -C logs.txt host:               # со сжатием (zstd), для текста на медленном канале
