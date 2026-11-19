@@ -160,7 +160,14 @@ pub fn serve(opts: Options) -> Result<()> {
         let reply = server.handle(&packet);
         output.write_all(&(reply.len() as u32).to_be_bytes())?;
         output.write_all(&reply)?;
-        output.flush()?;
+        // Pipelined requests already here are answered first, in one write.
+        // Only a whole packet counts: waiting for the rest of one with the
+        // reply unsent could wait for good on a client that waits for it.
+        let ready = input.buffer();
+        let whole = ready.len() >= 4 && ready.len() - 4 >= u32::from_be_bytes([ready[0], ready[1], ready[2], ready[3]]) as usize;
+        if !whole {
+            output.flush()?;
+        }
     }
 }
 
@@ -412,7 +419,7 @@ impl Server {
 
     fn handle_id(m: &mut Msg) -> Option<u32> {
         let b = m.bytes()?;
-        Some(u32::from_be_bytes(b.try_into().ok().unwrap_or([0xff; 4])))
+        b.try_into().ok().map(u32::from_be_bytes)
     }
 
     fn file(&mut self, h: u32) -> Option<&mut File> {
