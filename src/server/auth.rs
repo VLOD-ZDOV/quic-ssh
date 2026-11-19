@@ -581,18 +581,27 @@ pub async fn second_factor(
         if let Err(e) = lock_briefly(&file).await {
             warn!("{}: cannot lock the one-time code file ({e}); another qshd of the user could take the same code", user.name);
         }
-        {
+        // The file is read and marked outside `used`: on a slow or hung
+        // file system (NFS, a FUSE mount of the user's) only this login waits.
+        let taken = step_taken(&file);
+        let step = {
             let mut state = used.lock().unwrap();
-            let last = state.last_used(user.uid).max(step_taken(&file));
-            if let Some(step) = crate::totp::verify(&secret, &answer, now(), Some(last)) {
-                state.used.insert(user.uid, step);
-                state.failures.remove(&user.uid);
-                take_step(&file, &path, step);
-                return Ok(Ok(true));
+            let last = state.last_used(user.uid).max(taken);
+            let step = crate::totp::verify(&secret, &answer, now(), Some(last));
+            match step {
+                Some(step) => {
+                    state.used.insert(user.uid, step);
+                    state.failures.remove(&user.uid);
+                }
+                None => state.failures.entry(user.uid).or_default().push_back(std::time::Instant::now()),
             }
-            let _ = file.unlock();
-            state.failures.entry(user.uid).or_default().push_back(std::time::Instant::now());
+            step
+        };
+        if let Some(step) = step {
+            take_step(&file, &path, step);
+            return Ok(Ok(true));
         }
+        let _ = file.unlock();
         warn!("{}: wrong one-time code", user.name);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
