@@ -502,11 +502,17 @@ impl Sessions {
     ) -> Result<()> {
         // A hold has no program and no output: only its token comes back.
         if let Ok(token) = Token::try_from(token) {
-            let hold = self.map.lock().unwrap().holds.get_mut(&token).filter(|h| h.uid == user.uid && &h.restrictions == restrictions).map(|h| {
+            let hold = {
+                let mut map = self.map.lock().unwrap();
+                // A hold left longer than session_timeout ago is gone, even
+                // if nothing has swept it out yet.
+                self.drop_old_holds(&mut map);
+                map.holds.get_mut(&token).filter(|h| h.uid == user.uid && &h.restrictions == restrictions).map(|h| {
                 h.generation += 1;
                 h.left_at = None;
                 h.generation
-            });
+            })
+            };
             if let Some(generation) = hold {
                 info!("{}: held connection back", user.name);
                 return self.held(send, recv, token, generation, closed).await;
