@@ -215,11 +215,14 @@ impl std::error::Error for ConfigError {}
 /// elsewhere (a git submodule's URL): as ssh does since 9.6, such names are
 /// refused (compare CVE-2023-51385). Nor can a name be a pattern list
 /// (`*?,!`): written to known_hosts as it is, `evil.example,github.com`
-/// would pin a key for another host.
+/// would pin a key for another host. On Windows commands run through
+/// `cmd /C`, where `%VAR%` expands and `^` escapes, so those go too (`%`
+/// stays elsewhere: an IPv6 zone such as `fe80::1%eth0`).
 fn valid_host(host: &str) -> bool {
+    let cmd = if cfg!(windows) { "%^" } else { "" };
     !host.is_empty()
         && !host.starts_with('-')
-        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}*?,!".contains(c))
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}*?,!".contains(c) || cmd.contains(c))
 }
 
 /// `EscapeChar`: `none`, a single character, or `^X` for a control character.
