@@ -13,47 +13,148 @@ use crate::client::predict::{Mode, Predictor};
 use crate::proto::{expect_ok, read_msg_opt, write_msg, ClientMsg, PtySpec, Reader, Reply, Request, ServerMsg};
 use crate::transport::{Conn, RecvHalf, SendHalf};
 
-/// Turns off, on drop, the terminal modes the session left on.
-struct RestoreModes(Arc<std::sync::Mutex<super::keys_vt::Modes>>);
-
-impl Drop for RestoreModes {
-    fn drop(&mut self) {
-        use std::io::Write;
-        let reset = self.0.lock().map(|m| m.restore()).unwrap_or_default();
-        if !reset.is_empty() {
-            let mut out = std::io::stdout();
-            let _ = out.write_all(&reset).and_then(|()| out.flush());
-        }
-    }
+/// Puts the local terminal into raw mode and restores it on drop: turns off
+/// the modes the remote program left on (so the terminal does not keep
+/// reporting focus or the mouse to whatever runs next), and on Unix takes in
+/// what the terminal still sends for the session before the next program
+/// can read it (see [`tty::settle`]).
+struct RawMode {
+    modes: Arc<std::sync::Mutex<super::keys_vt::Modes>>,
+    #[cfg(unix)]
+    reader: Option<tty::Reader>,
 }
 
-/// Puts the local terminal into raw mode and restores it on drop.
-struct RawMode;
-
 impl RawMode {
-    fn enable() -> Result<RawMode> {
+    fn enable(modes: Arc<std::sync::Mutex<super::keys_vt::Modes>>) -> Result<RawMode> {
         crossterm::terminal::enable_raw_mode()?;
         // Windows consoles: interpret the remote side's VT output (colors,
         // cursor movement). Keys are encoded by `keys_vt`.
         #[cfg(windows)]
         crossterm::ansi_support::supports_ansi();
-        Ok(RawMode)
+        Ok(RawMode {
+            modes,
+            #[cfg(unix)]
+            reader: None,
+        })
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        // Mouse reports still on their way, and the terminal's answers to
-        // what the remote side asked last (fish asks for the cursor position,
-        // the background color and DA1), would otherwise land in the local
-        // shell as text like `<35;176;2M` or `[?61;4;6c`. Give them a moment
-        // to arrive, then drop what was not read.
+        use std::io::Write;
+        let mut reset = self.modes.lock().map(|m| m.restore()).unwrap_or_default();
+        // Only once nothing else reads the terminal, and only where the
+        // question reaches it.
         #[cfg(unix)]
-        {
-            std::thread::sleep(Duration::from_millis(50));
-            let _ = nix::sys::termios::tcflush(std::io::stdin(), nix::sys::termios::FlushArg::TCIFLUSH);
+        let settle = self.reader.take().map(tty::Reader::stop).is_some() && std::io::stdout().is_terminal();
+        #[cfg(unix)]
+        if settle {
+            reset.extend_from_slice(tty::MARKER);
+        }
+        let mut out = std::io::stdout();
+        if !reset.is_empty() {
+            let _ = out.write_all(&reset).and_then(|()| out.flush());
+        }
+        #[cfg(unix)]
+        if settle {
+            tty::settle(Duration::from_millis(500));
         }
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// The terminal as the input of a session, on Unix.
+#[cfg(unix)]
+mod tty {
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    use nix::errno::Errno;
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use tokio::sync::mpsc;
+
+    /// Device status report: every VT100-like terminal (and tmux, screen)
+    /// answers `ESC [ 0 n`, after what it answered or reported before, and
+    /// remote programs hardly ask it (unlike DA1 or the cursor position).
+    pub const MARKER: &[u8] = b"\x1b[5n";
+
+    /// Reads the terminal in a thread that can be stopped. A read left
+    /// pending in tokio's blocking pool cannot be, and would take what the
+    /// terminal sends after the session, maybe the next command line.
+    pub struct Reader {
+        wake: OwnedFd,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Reader {
+        pub fn spawn() -> std::io::Result<(Reader, mpsc::UnboundedReceiver<Vec<u8>>)> {
+            let (stop, wake) = nix::unistd::pipe()?;
+            // Unbounded: the thread must never wait on anything but `poll`, or
+            // `stop` could wait for it.
+            let (tx, rx) = mpsc::unbounded_channel();
+            let thread = std::thread::spawn(move || {
+                let stdin = std::io::stdin();
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN), PollFd::new(stop.as_fd(), PollFlags::POLLIN)];
+                    match poll(&mut fds, PollTimeout::NONE) {
+                        Ok(_) => {}
+                        Err(Errno::EINTR) => continue,
+                        Err(_) => break,
+                    }
+                    if fds[1].any() != Some(false) || fds[0].any() != Some(true) {
+                        break;
+                    }
+                    match nix::unistd::read(&stdin, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(Errno::EINTR | Errno::EAGAIN) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            Ok((Reader { wake, thread }, rx))
+        }
+
+        /// Stops the thread; it reads nothing more.
+        pub fn stop(self) {
+            let _ = nix::unistd::write(&self.wake, &[0]);
+            let _ = self.thread.join();
+        }
+    }
+
+    /// After [`MARKER`] was written: reads until the terminal's answer to it,
+    /// so the answers to what the remote side asked last (fish asks for the
+    /// cursor position, the background color, DA1) and mouse reports still
+    /// on their way do not show up in the local shell as `<35;176;2M` or
+    /// `[?61;4;6c`. What is typed after the answer stays for the next
+    /// program. Gives up after `wait` on a terminal that does not answer.
+    pub fn settle(wait: Duration) {
+        let stdin = std::io::stdin();
+        let deadline = Instant::now() + wait;
+        let mut seen = Vec::new();
+        // A byte at a time: what follows the answer is not taken with it.
+        let mut buf = [0u8; 1];
+        while !seen.windows(4).any(|w| w == b"\x1b[0n" || w == b"\x1b[3n") {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::try_from(left).unwrap_or(PollTimeout::MAX)) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(_) => return,
+            }
+            match nix::unistd::read(&stdin, &mut buf) {
+                Ok(0) => return,
+                Ok(_) => seen.push(buf[0]),
+                Err(Errno::EINTR | Errno::EAGAIN) => {}
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -98,15 +199,24 @@ pub fn termination_signal(watch_sigint: bool) -> impl std::future::Future<Output
 /// encoded as a terminal would send them.
 enum Input {
     Stdin(tokio::io::Stdin, Vec<u8>),
+    #[cfg(unix)]
+    Tty(mpsc::UnboundedReceiver<Vec<u8>>),
     #[cfg(windows)]
     Keys(mpsc::Receiver<Vec<u8>>),
 }
 
 impl Input {
     #[cfg_attr(not(windows), allow(unused_variables))]
-    fn new(console: bool, modes: Arc<std::sync::Mutex<super::keys_vt::Modes>>) -> Input {
+    fn new(raw: Option<&mut RawMode>, modes: Arc<std::sync::Mutex<super::keys_vt::Modes>>) -> Input {
+        #[cfg(unix)]
+        if let Some(raw) = raw {
+            if let Ok((reader, rx)) = tty::Reader::spawn() {
+                raw.reader = Some(reader);
+                return Input::Tty(rx);
+            }
+        }
         #[cfg(windows)]
-        if console {
+        if raw.is_some() {
             let (tx, rx) = mpsc::channel(64);
             std::thread::spawn(move || loop {
                 use crossterm::event::Event;
@@ -135,6 +245,8 @@ impl Input {
                 Ok(0) | Err(_) => None,
                 Ok(n) => Some(buf[..n].to_vec()),
             },
+            #[cfg(unix)]
+            Input::Tty(rx) => rx.recv().await,
             #[cfg(windows)]
             Input::Keys(rx) => rx.recv().await,
         }
@@ -664,8 +776,12 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let mut incoming = Reader::<ServerMsg>::spawn(recv);
     let keystroke_interval = opts.keystroke_interval;
 
-    let raw = match raw_wanted {
-        true => Some(RawMode::enable()?),
+    // The terminal modes the remote program set: application cursor keys
+    // (for Windows, where qsh encodes the keys itself), and what to turn
+    // off at the end (see `RawMode`).
+    let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::Modes::default()));
+    let mut raw = match raw_wanted {
+        true => Some(RawMode::enable(cursor_keys.clone())?),
         false => None,
     };
 
@@ -735,12 +851,6 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     // terminal) could be the Enter before a password prompt, and the
     // predictor would then draw the password. Only typed input goes here.
     let (typed_tx, mut typed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // The terminal modes the remote program set: application cursor keys
-    // (for Windows, where qsh encodes the keys itself), and what to turn
-    // off at the end, so the local terminal does not keep reporting focus
-    // or the mouse to whatever runs next.
-    let cursor_keys = std::sync::Arc::new(std::sync::Mutex::new(super::keys_vt::Modes::default()));
-    let _modes_restored = raw.is_some().then(|| RestoreModes(cursor_keys.clone()));
     let typed_tx = predictor.is_some().then_some(typed_tx);
     let disconnect = std::sync::Arc::new(tokio::sync::Notify::new());
     // qsh's own messages (the `~?` help) are written by the main loop, after
@@ -758,7 +868,7 @@ pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
         let forwarder = opts.forwarder.clone();
         #[cfg(unix)]
         let (answered, suspended) = (answered.clone(), suspended.clone());
-        let mut input = Input::new(raw.is_some(), cursor_keys.clone());
+        let mut input = Input::new(raw.as_mut(), cursor_keys.clone());
         tokio::spawn(async move {
             loop {
                 match input.next().await {

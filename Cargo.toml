@@ -114,7 +114,7 @@ zeroize = "1"
 libcrux-ml-kem = { version = "0.0.11", default-features = false, features = ["mlkem768"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource", "net"] }
+nix = { version = "0.30", features = ["user", "process", "signal", "term", "fs", "ioctl", "hostname", "resource", "net", "poll"] }
 pty-process = { version = "0.5", features = ["async"] }
 rustix = { version = "1", features = ["net"] }
 sha-crypt = "0.6"

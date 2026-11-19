@@ -1436,6 +1436,55 @@ fn terminal_modes_left_on_are_turned_off() {
     let _ = child.wait();
 }
 
+/// What the terminal still sends for a session that ends (mouse reports
+/// on their way, answers to the remote side's last questions) is taken in
+/// by qsh, not left for the local shell to print as `<35;176;2M`; what is
+/// typed after it stays for the shell.
+#[test]
+fn terminal_answers_after_a_session_do_not_reach_the_shell() {
+    let s = Server::start();
+    let c = Client::paired(&s);
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let slave = || Stdio::from(std::fs::File::from(pty.slave.try_clone().unwrap()));
+    let mut child = Command::new(QSH)
+        .args(["-t", "-p", &s.port.to_string(), &dest(), "printf", "'\\033[?1000h\\033[?1006h'"])
+        .env("HOME", c.home.path())
+        .env("TERM", "xterm")
+        .stdin(slave())
+        .stdout(slave())
+        .stderr(slave())
+        .spawn()
+        .unwrap();
+    let mut master = std::fs::File::from(pty.master);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    let mut out = Vec::new();
+    let mut answered = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        let mut buf = [0u8; 4096];
+        match master.read(&mut buf) {
+            Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
+            _ => sleep(Duration::from_millis(20)),
+        }
+        // As a terminal would: what was on its way, the answer, then a key.
+        if !answered && out.windows(4).any(|w| w == b"\x1b[5n") {
+            master.write_all(b"\x1b[<35;176;2M\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?61;4;6c\x1b[30;1R\x1b[0nnext\n").unwrap();
+            answered = true;
+        }
+    }
+    assert!(answered, "no question at the end: {:?}", String::from_utf8_lossy(&out));
+    assert!(child.wait().unwrap().success());
+    // Back in line mode, the shell would read this.
+    let mut left = std::fs::File::from(pty.slave);
+    nix::fcntl::fcntl(&left, nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK)).unwrap();
+    let mut rest = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n @ 1..) = left.read(&mut buf) {
+        rest.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(String::from_utf8_lossy(&rest), "next\n");
+}
+
 /// Typing into a real terminal with keystroke timing obfuscation (on by
 /// default): every character arrives, in order, and chaff never leaks into
 /// the session.
