@@ -84,13 +84,21 @@ impl Penalties {
             return false;
         }
         let mut map = self.sources.lock().unwrap();
-        map.retain(|_, e| e.expires > now);
         let key = source(ip);
+        // Expired entries are swept only when the table looks full, not on
+        // every failed login: a sweep walks all of it under the lock.
+        if !map.contains_key(&key) && map.len() >= s.max_sources {
+            map.retain(|_, e| e.expires > now);
+        }
         // Like sshd with overflow "permissive": a full table adds nothing.
         if !map.contains_key(&key) && map.len() >= s.max_sources {
             return false;
         }
         let e = map.entry(key).or_insert(Entry { expires: now, enforced: false });
+        // A penalty that ran out starts over, as if swept.
+        if e.expires <= now {
+            *e = Entry { expires: now, enforced: false };
+        }
         // Capped, so a huge configured time cannot overflow `Instant` (a
         // panic here would poison the lock for every later connection).
         let cap = |d: Duration| d.min(Duration::from_secs(10 * 365 * 24 * 3600));
@@ -123,6 +131,9 @@ mod tests {
         }
         assert!(p.refused_at(ip, t + Duration::from_secs(599)).is_some());
         assert!(p.refused_at(ip, t + Duration::from_secs(601)).is_none(), "capped at max");
+        // Run out, it starts over: one more failure is below the minimum again.
+        assert!(!p.record_at(ip, Outcome::AuthFailed, t + Duration::from_secs(601)));
+        assert!(p.refused_at(ip, t + Duration::from_secs(601)).is_none(), "an old penalty is not kept");
     }
 
     #[test]
