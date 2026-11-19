@@ -216,13 +216,15 @@ impl std::error::Error for ConfigError {}
 /// refused (compare CVE-2023-51385). Nor can a name be a pattern list
 /// (`*?,!`): written to known_hosts as it is, `evil.example,github.com`
 /// would pin a key for another host. On Windows commands run through
-/// `cmd /C`, where `%VAR%` expands and `^` escapes, so those go too (`%`
-/// stays elsewhere: an IPv6 zone such as `fe80::1%eth0`).
+/// `cmd /C`, where `%VAR%` expands and `^` escapes: no `^`, and a `%` only
+/// as the zone of an IPv6 address (`fe80::1%12`).
 fn valid_host(host: &str) -> bool {
-    let cmd = if cfg!(windows) { "%^" } else { "" };
+    let cmd_safe = !cfg!(windows)
+        || !host.contains('^') && host.split_once('%').is_none_or(|(addr, zone)| addr.contains(':') && !zone.is_empty() && zone.chars().all(|c| c.is_ascii_alphanumeric()));
     !host.is_empty()
         && !host.starts_with('-')
-        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}*?,!".contains(c) || cmd.contains(c))
+        && cmd_safe
+        && !host.chars().any(|c| c.is_whitespace() || c.is_control() || "'`\"$\\;&<>|(){}*?,!".contains(c))
 }
 
 /// `EscapeChar`: `none`, a single character, or `^X` for a control character.
@@ -1369,6 +1371,10 @@ mod tests {
     #[test]
     fn shell_metacharacters_in_host_names() {
         for bad in ["a$(id)", "a;b", "a`id`", "a|b", "a&b", "a>b", "-oProxyCommand=x", "a b", "a'b", "{a,b}", "evil.example,github.com", "*", "h?st", "!h"] {
+            assert!(Target::parse_with(bad, None, None, false).is_err(), "{bad}");
+        }
+        #[cfg(windows)]
+        for bad in ["%TEMP%", "a%b", "a^b"] {
             assert!(Target::parse_with(bad, None, None, false).is_err(), "{bad}");
         }
         for good in ["host.example.com", "192.0.2.1", "[2001:db8::1]:22", "fe80::1%eth0", "user@host_1"] {
