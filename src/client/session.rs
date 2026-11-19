@@ -42,15 +42,13 @@ impl RawMode {
 impl Drop for RawMode {
     fn drop(&mut self) {
         use std::io::Write;
-        let mut reset = self.modes.lock().map(|m| m.restore()).unwrap_or_default();
+        let reset = self.modes.lock().map(|m| m.restore()).unwrap_or_default();
         // Only once nothing else reads the terminal, and only where the
         // question reaches it.
         #[cfg(unix)]
         let settle = self.reader.take().map(tty::Reader::stop).is_some() && std::io::stdout().is_terminal();
         #[cfg(unix)]
-        if settle {
-            reset.extend_from_slice(tty::MARKER);
-        }
+        let reset = if settle { [reset.as_slice(), tty::MARKER].concat() } else { reset };
         let mut out = std::io::stdout();
         if !reset.is_empty() {
             let _ = out.write_all(&reset).and_then(|()| out.flush());
