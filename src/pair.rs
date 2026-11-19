@@ -97,24 +97,31 @@ pub fn discard_used(home: &Path) {
 /// Reads the pending code, using up one of its tries. Runs as the target user.
 pub fn take_pending(home: &Path) -> Result<String> {
     let path = pending_path(home);
+    // Taken by a rename before anything else can fail: of two tries at once
+    // only one gets the file, so each try costs one (open, then remove, let
+    // a second try remove the file the first had just put back).
+    let taken = path.with_extension(format!("taken-{:016x}", rand::thread_rng().gen::<u64>()));
+    match std::fs::rename(&path, &taken) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no pairing code is active; run `qshd pair` on the server first")
+        }
+        Err(e) => return Err(e).context("cannot take pairing file"),
+    }
     let mut o = OpenOptions::new();
     o.read(true);
     #[cfg(unix)]
     o.custom_flags(libc::O_NOFOLLOW);
     // No O_NOFOLLOW on Windows: a link is refused before it is opened.
     #[cfg(not(unix))]
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+    let link = std::fs::symlink_metadata(&taken).is_ok_and(|m| !m.file_type().is_file());
+    #[cfg(unix)]
+    let link = false;
+    let opened = if link { Err(std::io::Error::other("link")) } else { o.open(&taken) };
+    let _ = std::fs::remove_file(&taken);
+    let Ok(mut f) = opened else {
         bail!("pairing file has unsafe owner or permissions");
-    }
-    let mut f = match o.open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!("no pairing code is active; run `qshd pair` on the server first")
-        }
-        Err(e) => return Err(e).context("cannot open pairing file"),
     };
-    // Taken before anything else can fail: two tries at once cannot both have it.
-    std::fs::remove_file(&path).context("cannot remove pairing file")?;
     let meta = f.metadata()?;
     #[cfg(unix)]
     let unsafe_file = meta.uid() != nix::unistd::geteuid().as_raw() || meta.mode() & 0o077 != 0;
