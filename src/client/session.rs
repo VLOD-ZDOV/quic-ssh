@@ -43,6 +43,16 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // Mouse reports still on their way, and the terminal's answers to
+        // what the remote side asked last (fish asks for the cursor position,
+        // the background color and DA1), would otherwise land in the local
+        // shell as text like `<35;176;2M` or `[?61;4;6c`. Give them a moment
+        // to arrive, then drop what was not read.
+        #[cfg(unix)]
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = nix::sys::termios::tcflush(std::io::stdin(), nix::sys::termios::FlushArg::TCIFLUSH);
+        }
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
