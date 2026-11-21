@@ -720,7 +720,15 @@ async fn start_hold(conn: &Conn) -> Result<(Vec<u8>, SendHalf, RecvHalf)> {
 pub async fn run(mut conn: Arc<Conn>, opts: SessionOptions) -> Result<i32> {
     let pty = if opts.pty && opts.subsystem.is_none() {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        // As in ssh, SetEnv TERM sets the PTY type unless its value is empty.
+        let term = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "TERM")
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("TERM").ok())
+            .unwrap_or_else(|| "xterm-256color".into());
         Some(PtySpec { term, cols, rows })
     } else {
         None

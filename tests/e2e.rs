@@ -3915,6 +3915,31 @@ fn client_session_keywords() {
     assert!(!out.status.success() && stderr(&out).contains("only root"), "{}", stderr(&out));
 }
 
+/// `SetEnv TERM` sets the PTY type even when qshd rejects forwarded variables.
+#[test]
+fn set_env_term_is_the_terminal_type() {
+    let s = Server::start_with("127.0.0.1", "accept_env = []\n");
+    let c = Client::paired(&s);
+    let port = s.port.to_string();
+    for (set_env, local_term, expected) in [
+        ("SetEnv=TERM=xterm-256color", Some("xterm-ghostty"), "xterm-256color"),
+        ("SetEnv=TERM=", Some("xterm-ghostty"), "xterm-ghostty"),
+        ("SetEnv=TERM=", None, "xterm-256color"),
+    ] {
+        // The first SetEnv wins; an empty first value falls back to local TERM.
+        let mut cmd = c.cmd(&[
+            "-tt", "-o", "SendEnv=TERM", "-o", set_env, "-o", "SetEnv=TERM=dumb", "-p", &port, &dest(), "test -t 0 && printf '%s\\n' \"$TERM\"",
+        ]);
+        match local_term {
+            Some(term) => cmd.env("TERM", term),
+            None => cmd.env_remove("TERM"),
+        };
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{set_env}, local TERM={local_term:?}: {}", stderr(&out));
+        assert_eq!(stdout(&out).trim_end_matches(['\r', '\n']), expected, "{set_env}, local TERM={local_term:?}");
+    }
+}
+
 /// known_hosts: hashed names (HashKnownHosts), a global file, and
 /// KnownHostsCommand; AddKeysToAgent with a real ssh-agent.
 #[test]
