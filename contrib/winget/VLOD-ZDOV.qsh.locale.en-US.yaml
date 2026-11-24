@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: VLOD-ZDOV.qsh
+PackageVersion: 2.1.1
+PackageLocale: en-US
+Publisher: VLOD-ZDOV
+PublisherUrl: https://github.com/VLOD-ZDOV
+PublisherSupportUrl: https://github.com/VLOD-ZDOV/quic-ssh/issues
+PackageName: qsh
+PackageUrl: https://github.com/VLOD-ZDOV/quic-ssh
+License: GPL-3.0-only
+LicenseUrl: https://github.com/VLOD-ZDOV/quic-ssh/blob/main/LICENSE
+ShortDescription: Secure shell over QUIC with automatic TCP fallback
+Description: |-
+  qsh is an SSH-compatible shell and file transfer tool running over QUIC (HTTP/3 transport) with automatic fallback to standard SSH over TCP.
+  Features include 0-RTT reconnects, session persistence across IP roaming, NAT traversal (UDP hole punching), and high-throughput transfer.
+Moniker: qsh
+Tags:
+  - cli
+  - network
+  - quic
+  - remote-shell
+  - ssh
+  - terminal
+ReleaseNotesUrl: https://github.com/VLOD-ZDOV/quic-ssh/releases/tag/v2.1.1
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
