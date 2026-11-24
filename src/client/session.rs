@@ -569,7 +569,7 @@ async fn try_resume(reconnect: &Reconnect, token: &[u8], received: u64) -> Resul
     write_msg(&mut send, &Request::Resume { token: token.to_vec(), received }).await.map_err(ResumeError::Retry)?;
     match read_msg_opt::<_, Reply>(&mut recv).await {
         Ok(Some(Reply::Session { .. })) => Ok((conn, send, recv)),
-        Ok(Some(Reply::Err(e))) => Err(ResumeError::Gone(e)),
+        Ok(Some(Reply::Err(e))) => Err(ResumeError::Gone(e.chars().filter(|&c| !crate::proto::hidden(c)).take(500).collect())),
         Ok(other) => Err(ResumeError::Retry(anyhow::anyhow!("unexpected answer {other:?}"))),
         Err(e) => Err(ResumeError::Retry(e)),
     }
