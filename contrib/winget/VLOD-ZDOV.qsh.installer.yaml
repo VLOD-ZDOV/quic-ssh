@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 
 PackageIdentifier: VLOD-ZDOV.qsh
-PackageVersion: 2.1.1
+PackageVersion: 2.1.2
 InstallerType: zip
 NestedInstallerType: portable
 Commands:
@@ -14,8 +14,8 @@ Installers:
         PortableCommandAlias: qsh
       - RelativeFilePath: qsh-x86_64-windows\qshd.exe
         PortableCommandAlias: qshd
-    InstallerUrl: https://github.com/VLOD-ZDOV/quic-ssh/releases/download/v2.1.1/qsh-x86_64-windows.zip
-    InstallerSha256: 9B92CBDAA1C34A6C0D11DFAB4FB6A24388B1686D28A2EACB3BFF19790DF5FF09
+    InstallerUrl: https://github.com/VLOD-ZDOV/quic-ssh/releases/download/v2.1.2/qsh-x86_64-windows.zip
+    InstallerSha256: 73C20F72C98FE030A52B299BF41E7CE200C66A8359BB115B55CE8D4B2E35979F
 ManifestType: installer
 ManifestVersion: 1.6.0
-ReleaseDate: 2026-11-20
+ReleaseDate: 2026-11-24
